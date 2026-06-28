@@ -1,0 +1,8 @@
+# Exp 6 — 3 start configurations for 2-robot fusion (atlas + bestla).
+# Each config places the two robots in different regions of cmu_forest so
+# their exploration overlaps partially but not completely. Coordinates in
+# metres, yaw in radians.
+# config_id,atlas_x,atlas_y,atlas_yaw,bestla_x,bestla_y,bestla_yaw
+c1,-8.0,0.0,0.0,8.0,0.0,3.1416
+c2,0.0,-8.0,1.5708,0.0,8.0,-1.5708
+c3,-6.0,-6.0,0.7854,6.0,6.0,-2.3562

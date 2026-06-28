@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>explo_planner</name>
+  <version>0.1.0</version>
+  <description>
+    NBV exploration planner using Expected Information Gain (EIG) from
+    SCovox Beta-conjugate occupancy maps. Supports EIG, entropy, frontier,
+    and random planner types for ablation experiments.
+  </description>
+  <maintainer email="kalhan@todo.todo">kalhan</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>scovox_core</depend>
+  <depend>scovox_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+
+  <build_depend>eigen</build_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

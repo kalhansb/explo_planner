@@ -1,0 +1,125 @@
+explo_planner:
+  ros__parameters:
+    use_sim_time: true
+    planner_type: "eig"          # eig | entropy | frontier | random
+    map_type: "dscovox"          # dscovox | logodds
+    robot_name: "atlas"
+    max_steps: 200
+    output_csv: "/tmp/exploration_eig.csv"
+    map_resolution: 0.10
+
+    # Frames — planner reads dscovox map (in map_frame) and uses TF
+    # map_frame -> base_frame for the robot pose. Goals are published in
+    # map_frame for the nav stack to consume.
+    map_frame: "map"
+    base_frame: ""   # empty -> defaults to <robot_name>/base_link
+
+    # Navigation
+    goal_xy_tolerance: 0.3
+    goal_yaw_tolerance: 0.2
+    integrate_wait: 2.0
+
+    # Smart navigate timeout. Total budget per NAVIGATE cycle is computed
+    # at entry from straight-line distance to the goal:
+    #   budget = clamp(dist / speed_est * safety, min, max)
+    # so a 2 m hop gets ~8 s and an 8 m hop gets ~32 s. Tune speed_est down
+    # if the controller is slower than expected (obstacle avoidance, tight
+    # corridors); tune safety up if you want more headroom.
+    nav_speed_estimate_mps: 0.15
+    nav_safety_factor: 3.0
+    nav_min_timeout_sec: 30.0
+    nav_max_timeout_sec: 180.0
+
+    # No-progress watchdog (runs in parallel with the budget). If the robot
+    # hasn't accumulated >= progress_min_distance_m of travel within
+    # progress_window_sec, the goal fails immediately — wedged-robot case.
+    progress_window_sec: 15.0
+    progress_min_distance_m: 0.2
+
+    # Failed-goal blacklist. After a navigate timeout, the failed goal is
+    # parked for failed_goal_ttl_sec; subsequent picks reject any candidate
+    # within failed_goal_radius_m of an active entry. Prevents the planner
+    # from re-picking the same unreachable goal when the robot is stuck.
+    failed_goal_radius_m: 2.0
+    failed_goal_ttl_sec: 60.0
+
+    # Coverage-based termination. Once the unknown fraction in the ROI of
+    # the planning_map drops below done_unknown_fraction for
+    # done_min_consecutive_steps PLAN cycles in a row, the planner declares
+    # the map saturated and transitions to DONE. Set done_unknown_fraction
+    # <= 0 to disable (then only max_steps stops the planner).
+    done_unknown_fraction: 0.05
+    done_min_consecutive_steps: 3
+
+    # Candidate generation
+    # Polar enabled: with frontier-only mode the planner exhausted reachable
+    # candidates (~70 cand) when the robot pushed to ROI corners and entered
+    # an oscillation loop until the planner timeout fired.  Polar adds
+    # n_radial*n_rings*n_yaw = 96 grid samples around the robot, giving
+    # consistent fallback options.  Affects both A/B map types equally.
+    candidate_enable_polar: true
+    candidate_n_radial: 8
+    candidate_n_rings: 3
+    candidate_min_radius: 2.0
+    candidate_max_radius: 8.0
+    candidate_n_yaw: 4
+    candidate_robot_z: 0.3
+    candidate_occ_thresh: 0.7
+
+    # Region of interest (XY bounding box, map frame, metres). The planner
+    # will not select candidates outside this box. KEEP IN SYNC with the
+    # dscovox planning_map size + origin in simple_nav_3d.launch.py so the
+    # global planner is constrained to the same area.
+    # Default: 60x60 m centred at the world origin.
+    roi_min_x: -30.0
+    roi_max_x:  30.0
+    roi_min_y: -30.0
+    roi_max_y:  30.0
+
+    # FOV evaluation (matches simulated RGBD: 320x240, 60deg HFOV)
+    fov_hfov: 1.047              # 60 degrees
+    fov_vfov: 0.785              # ~45 degrees (from 320x240 aspect)
+    fov_min_range: 0.3
+    fov_max_range: 10.0
+    fov_h_rays: 16
+    fov_v_rays: 12
+    fov_occ_stop: 0.7
+
+    # ----------------------------------------------------------------
+    # Utility math + multi-robot coordination
+    # ----------------------------------------------------------------
+    # Normalised per-candidate utility (Burgard et al. 2005):
+    #
+    #   U(c) = α · info_gain(c)/max_info  −  β · path_cost(c)/max_cost
+    #
+    # Both info_gain and path_cost are divided by the per-tick candidate
+    # pool maximum, mapping each to [0, 1]. This makes α and β true
+    # relative weights independent of the raw magnitudes:
+    #
+    #   α = β = 1.0  →  equal weight to information and proximity
+    #   α > β        →  explore: travel far for the best viewpoint
+    #   α < β        →  exploit: prefer nearby, lower-cost candidates
+    #
+    # info_gain comes from FOV raycasting (EIG / entropy / frontier count);
+    # path_cost comes from CostGrid (bounded Dijkstra over planning_map).
+    utility_alpha_info: 1.0
+    utility_beta_cost: 1.0
+
+    # Bounded grid Dijkstra. 0 = auto = candidate_max_radius + 2 m slack
+    # (so the entire candidate disc is covered, plus a margin for diagonals).
+    # ~5 k cells flooded at the auto bound -> well under 1 ms per PLAN tick;
+    # set this >> map size to fall through to a full unbounded flood (~5 ms).
+    cost_grid_radius_cap_m: 0.0
+
+    # Multi-robot coordination. When false the MinPos branch is skipped and
+    # single-robot behaviour is bit-for-bit preserved (the utility math
+    # above still runs in single-robot mode).
+    coordination_enabled: false
+
+    # MinPos parameters. claim_radius is the disc each robot reserves around
+    # its currently-selected goal; ttl is how long an unrefreshed claim
+    # survives before peers can take its target.
+    coord_claim_radius_m: 0.0       # 0 = auto = fov_max_range (Burgard 2005)
+    coord_claim_ttl_sec: 5.0        # 5 x heartbeat; stalled peer releases ~5 s
+    coord_intent_topic: "/exploration/intents"
+    coord_heartbeat_hz: 1.0
