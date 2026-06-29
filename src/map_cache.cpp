@@ -2,6 +2,7 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <unordered_map>
 #include <cmath>
+#include <limits>
 
 namespace explo_planner {
 
@@ -10,6 +11,16 @@ MapCache::MapCache(double resolution)
       grid_(std::make_unique<Grid>(resolution)) {}
 
 void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
+  // Unbounded: ingest every voxel. ±inf bounds make the clip a no-op.
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  updateFromScovoxMap(msg,
+                      Eigen::Vector3f(-kInf, -kInf, -kInf),
+                      Eigen::Vector3f( kInf,  kInf,  kInf));
+}
+
+void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+                                   const Eigen::Vector3f& roi_min,
+                                   const Eigen::Vector3f& roi_max) {
   double res = msg.resolution > 0.0f ? static_cast<double>(msg.resolution)
                                      : resolution_;
   grid_ = std::make_unique<Grid>(res);
@@ -17,6 +28,18 @@ void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
 
   auto acc = grid_->createAccessor();
   for (const auto& vx : msg.voxels) {
+    const float x = vx.position.x, y = vx.position.y, z = vx.position.z;
+    // Drop non-finite positions: posToCoord casts float->int32, which is UB for
+    // NaN/inf. Must precede the clip — an inf coordinate would pass the AABB
+    // test against ±inf bounds (the unbounded overload).
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+      continue;
+    // Clip to the ROI AABB (inclusive). Against ±inf bounds (unbounded overload)
+    // every finite position passes, so this is free in the full-map case.
+    if (x < roi_min.x() || x > roi_max.x() ||
+        y < roi_min.y() || y > roi_max.y() ||
+        z < roi_min.z() || z > roi_max.z())
+      continue;
     UnifiedVoxel uv;
     uv.a_occ    = vx.a_occ;
     uv.a_free   = vx.a_free;
@@ -44,6 +67,10 @@ void MapCache::updateFromLogOddsCloud(
 
   auto acc = grid_->createAccessor();
   for (; ix != ix.end(); ++ix, ++iy, ++iz, ++ip) {
+    // Organized / log-odds clouds mark invalid returns with NaN/inf xyz; skip
+    // them before posToCoord (float->int32 cast is UB on non-finite input).
+    if (!std::isfinite(*ix) || !std::isfinite(*iy) || !std::isfinite(*iz))
+      continue;
     float p = *ip;
     // Clamp to avoid log(0)
     p = std::clamp(p, 0.001f, 0.999f);

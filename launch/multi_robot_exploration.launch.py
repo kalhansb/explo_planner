@@ -54,8 +54,8 @@ def launch_setup(context):
         nodes.append(Node(
             package="explo_planner",
             # Comparison node: honours the planner:= arg (eig/entropy/frontier/
-            # random/ssmi). The EIG-only explo_planner_node ignores planner_type.
-            executable="exploration_planner_comp_node",
+            # random/ssmi). The EIG-only explo_planner_node has no planner_type.
+            executable="exploration_planner_node",
             namespace=robot,
             name="explo_planner",
             output="screen",

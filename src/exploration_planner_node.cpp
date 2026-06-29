@@ -1,31 +1,9 @@
-/// @file explo_planner_node.cpp
-/// @brief Standalone SCovox Beta EIG exploration planner node — self-contained.
-///
-/// This is the EIG-only planner that the exploration/exploitation system is
-/// built on top of. It is a deliberate DUPLICATE of ExplorationPlannerNode
-/// (exploration_planner_node.hpp/.cpp): that node is the multi-planner
-/// comparison harness (eig/entropy/frontier/random/ssmi) used for experiments;
-/// this one is hard-wired to the SCovox Beta expected-information-gain scorer
-/// and owns its own copy of the state machine so it can diverge as the
-/// exploration/exploitation behaviour grows without disturbing the comparison
-/// node. The reusable pieces (scoring, candidate generation, FOV evaluation,
-/// cost grid, coordination, map cache, metrics) are still shared via
-/// explo_planner_lib.
-///
-/// Map ingest is topic-based (not the old GetRegion service). In "dscovox" mode
-/// the planner SUBSCRIBES to the fused ScovoxMap topic (latched QoS) and rebuilds
-/// a local, ROI-clipped MapCache from it each PLAN tick; in "logodds" mode it
-/// subscribes to a log-odds point cloud instead. All parameters, publishers,
-/// subscriptions and timers are declared/wired in this file's constructor.
-///
-/// State machine: WAIT_FOR_MAP -> PLAN -> NAVIGATE -> INTEGRATE -> LOG_STEP -> DONE.
+/// @file exploration_planner_node.cpp
+/// @brief Definitions for ExplorationPlannerNode (see the header for the
+/// interface). Every parameter, publisher, subscription and timer is wired up
+/// here in the constructor — the header is declaration-only.
 
-#include <cstdint>
-#include <deque>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
+#include "explo_planner/exploration_planner_node.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -33,245 +11,32 @@
 #include <limits>
 #include <numeric>
 
-#include <Eigen/Core>
-#include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <geometry_msgs/msg/quaternion.hpp>
+#include "explo_planner/plan_map_query.hpp"
+#include "explo_planner/planner_util.hpp"
+
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <nav_msgs/msg/occupancy_grid.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
-#include <scovox_msgs/msg/scovox_map.hpp>
-#include <scovox_msgs/msg/robot_intent.hpp>
 #include <scovox/uncertainty.hpp>
 #include <scovox/voxel.hpp>
 #include <tf2/utils.h>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>  // tf2::fromMsg used by tf2::getYaw
 
-#include "explo_planner/map_cache.hpp"
-#include "explo_planner/candidate_generator.hpp"
-#include "explo_planner/fov_evaluator.hpp"
-#include "explo_planner/scoring.hpp"
-#include "explo_planner/metrics_logger.hpp"
-#include "explo_planner/cost_grid.hpp"
-#include "explo_planner/coordination.hpp"
-
 namespace explo_planner {
-
-enum class State {
-  WAIT_FOR_MAP,
-  PLAN,
-  NAVIGATE,
-  INTEGRATE,
-  LOG_STEP,
-  DONE
-};
-
-// ==================================================================
-// ExploPlannerNode — EIG-only NBV exploration planner.
-//
-// Self-contained on purpose (see file header): the class is declared and
-// defined here, with main() at the bottom. The scoring function is fixed to
-// SCovox Beta EIG; there is no planner_type parameter.
-// ==================================================================
-class ExploPlannerNode : public rclcpp::Node {
-public:
-  ExploPlannerNode();
-
-private:
-  // ----------------------------------------------------------------
-  // Map ingest
-  // ----------------------------------------------------------------
-  // Cache the latest fused map received on the dscovox topic. The grid is
-  // rebuilt from it (ROI-clipped) in loadLatestMap() at the start of each PLAN
-  // tick, so a full rebuild doesn't run on every incoming message.
-  void onScovoxMap(const scovox_msgs::msg::ScovoxMap::SharedPtr& msg);
-  // Rebuild map_cache_ from the latest cached ScovoxMap, clipped to the ROI.
-  // Returns false if no map has been received yet.
-  bool loadLatestMap();
-  void onLogOddsCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& msg);
-
-  // Trajectory-level scoring (path-integrated EIG; param-gated ablation).
-  bool scoreTrajectory(std::vector<CandidateViewpoint>& candidates);
-
-  // ----------------------------------------------------------------
-  // State machine
-  // ----------------------------------------------------------------
-  void tick();
-  void transitionTo(State s);
-  void doPlan();
-  void doNavigate();
-  void doIntegrate();
-  void doLogStep();
-
-  // PLAN helpers
-  void pruneFailedGoals();
-  bool isNearFailedGoal(const Eigen::Vector3f& pos) const;
-  double unknownFractionInRoi() const;
-  int8_t planMapCellAt(const Eigen::Vector3f& pos) const;
-  bool isCellFree(const Eigen::Vector3f& pos) const;
-  bool isCellOccupied(const Eigen::Vector3f& pos) const;
-
-  // NAVIGATE helpers
-  void failGoal(const char* reason, double elapsed);
-  void heartbeatTick();
-
-  // Pose / publishing helpers
-  void updatePoseFromTF();
-  void trackDistance();
-  static geometry_msgs::msg::Quaternion yawToQuat(float yaw);
-  void publishGoal(const CandidateViewpoint& vp);
-  void publishCandidateViz(const std::vector<CandidateViewpoint>& candidates);
-
-  // --- Parameters ---
-  std::string map_type_;
-  std::string robot_name_;
-  std::string output_csv_;
-  std::string map_frame_;
-  std::string base_frame_;
-  int    max_steps_;
-  double map_resolution_;
-  double goal_xy_tol_;
-  double goal_yaw_tol_;
-  double integrate_wait_;
-  double nav_speed_est_mps_;
-  double nav_safety_factor_;
-  double nav_min_timeout_sec_;
-  double nav_max_timeout_sec_;
-  double progress_window_sec_;
-  double progress_min_distance_m_;
-  double failed_goal_radius_m_;
-  double failed_goal_ttl_sec_;
-  double done_unknown_fraction_;
-  int    done_min_consecutive_steps_;
-  // When true (default) the planning_map is a hard startup precondition and
-  // drives the candidate free/occupied filter + cost-grid reachability. When
-  // false the planning_map is best-effort: still used whenever it is being
-  // published, but if absent the planner warns and falls back to straight-line
-  // distances (no 2D obstacle / reachability filtering), so it can run on an
-  // external map or with no planning map at all.
-  bool   require_planning_map_{true};
-  // Best-effort grace window (seconds): when require_planning_map_ is false and
-  // map + pose are ready but the planning_map hasn't arrived yet, wait this long
-  // for it before starting in straight-line fallback. Ignored when
-  // require_planning_map_ is true (then we wait for it indefinitely).
-  double planning_map_wait_sec_{5.0};
-  bool   shutdown_requested_{false};
-
-  // Utility / coordination params (cached so doPlan() doesn't re-query).
-  double utility_alpha_info_  = 1.0;
-  double utility_beta_cost_   = 1.0;
-  double cost_grid_radius_cap_m_ = 0.0;
-  bool   trajectory_scoring_   = false;
-  double trajectory_sample_spacing_m_ = 1.5;
-  bool   coord_enabled_        = false;
-  double coord_claim_radius_m_ = 0.0;
-  double coord_claim_ttl_sec_  = 5.0;
-  double coord_heartbeat_hz_   = 1.0;
-  std::string coord_intent_topic_;
-  // ROI bounds — used to constrain candidate generation, the FOV raycast and
-  // the clip applied when ingesting the fused map topic into map_cache_.
-  float roi_min_x_ = -15.0f;
-  float roi_max_x_ =  15.0f;
-  float roi_min_y_ = -15.0f;
-  float roi_max_y_ =  15.0f;
-  float roi_min_z_ =  -0.5f;
-  float roi_max_z_ =   2.0f;
-
-  // --- Components ---
-  std::unique_ptr<MapCache> map_cache_;
-  std::unique_ptr<CandidateGenerator> candidate_gen_;
-  std::unique_ptr<FovEvaluator> fov_eval_;
-  ScoreFn score_fn_;
-  std::unique_ptr<MetricsLogger> logger_;
-  std::unique_ptr<CostGrid> cost_grid_;
-  std::unique_ptr<Coordination> coord_;
-
-  // --- State ---
-  State state_ = State::WAIT_FOR_MAP;
-  int   step_  = 0;
-  bool  have_pose_ = false;
-  bool  have_map_  = false;
-  bool  have_plan_map_ = false;
-  // WAIT_FOR_MAP grace-window anchor: time map + pose first became ready, so the
-  // best-effort planning_map wait is measured from then (see planning_map_wait_sec_).
-  bool  others_ready_seen_ = false;
-  rclcpp::Time others_ready_time_;
-  Eigen::Vector3f latest_pos_ = Eigen::Vector3f::Zero();
-  float latest_yaw_ = 0.0f;
-  nav_msgs::msg::OccupancyGrid::SharedPtr latest_plan_map_;
-  CandidateViewpoint current_goal_;
-  rclcpp::Time state_enter_time_;
-  float cumulative_distance_ = 0.0f;
-  Eigen::Vector3f prev_pos_ = Eigen::Vector3f::Zero();
-  bool  first_pos_ = true;
-
-  // Recently-failed goals: (xy position, time declared failed).
-  std::deque<std::pair<Eigen::Vector3f, rclcpp::Time>> failed_goals_;
-
-  // Per-navigate-cycle state for the smart timeout.
-  double nav_budget_sec_ = 0.0;
-  rclcpp::Time progress_check_time_;
-  float progress_check_dist_ = 0.0f;
-
-  // Coverage termination streak.
-  int coverage_done_streak_ = 0;
-
-  // Per-tick utility / coord diagnostics (filled by doPlan, drained by
-  // doLogStep into the StepMetrics row).
-  float pending_mean_info_gain_       = 0.0f;
-  float pending_mean_path_cost_       = 0.0f;
-  float pending_selected_info_gain_   = 0.0f;
-  float pending_selected_path_cost_   = 0.0f;
-  int   pending_rejected_by_minpos_      = 0;
-  int   pending_rejected_by_unreachable_ = 0;
-
-  // Cached active intent so the heartbeat timer can re-publish without
-  // touching planning state.
-  scovox_msgs::msg::RobotIntent current_intent_msg_;
-  bool   have_active_intent_ = false;
-
-  // --- ROS interfaces ---
-  tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
-  // Fused-map topic subscription (dscovox mode) + the latest message received.
-  // ingested_scovox_map_ is the message currently built into map_cache_; when it
-  // still equals latest_scovox_map_ the grid is up to date and loadLatestMap()
-  // skips the (expensive) rebuild.
-  rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_sub_;
-  scovox_msgs::msg::ScovoxMap::SharedPtr latest_scovox_map_;
-  scovox_msgs::msg::ScovoxMap::SharedPtr ingested_scovox_map_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr logodds_sub_;
-  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
-  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
-  rclcpp::Publisher<scovox_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
-  rclcpp::Subscription<scovox_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
-  rclcpp::TimerBase::SharedPtr tick_timer_;
-  rclcpp::TimerBase::SharedPtr heartbeat_timer_;
-
-  // Sentinel for planMapCellAt: no map / out of bounds. Distinct from the real
-  // cell range (-1 unknown, 0..100 occupancy).
-  static constexpr int8_t kCellNoData = -2;
-};
 
 // ==================================================================
 // Construction — parameters + ROS interface wiring
 // ==================================================================
 
-ExploPlannerNode::ExploPlannerNode()
+ExplorationPlannerNode::ExplorationPlannerNode()
     : Node("explo_planner"),
       tf_buffer_(this->get_clock()),
-      tf_listener_(tf_buffer_) {
+      tf_listener_(tf_buffer_),
+      rng_(std::random_device{}()) {
   // --- Parameters ---
   auto dp = [&](auto n, auto d) {
     return this->declare_parameter<decltype(d)>(n, d);
   };
 
+  planner_type_ = dp("planner_type", std::string("eig"));
   map_type_     = dp("map_type", std::string("dscovox"));
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
@@ -319,10 +84,10 @@ ExploPlannerNode::ExploPlannerNode()
   // inside the ROI of the latched planning_map are still unknown (-1).
   // When the unknown fraction stays below `done_unknown_fraction` for
   // `done_min_consecutive_steps` planning cycles in a row we declare the
-  // map saturated and transition to DONE. EIG scores don't fall sharply as
-  // the map saturates (the FOV raycast always finds *some* unobserved voxels
-  // at the cone edge), so unknown fraction is the reliable signal here. Set
-  // done_unknown_fraction <= 0 to disable.
+  // map saturated and transition to DONE. EIG/entropy scores don't fall
+  // sharply as the map saturates (the FOV raycast always finds *some*
+  // unobserved voxels at the cone edge), so unknown fraction is the
+  // reliable signal here. Set done_unknown_fraction <= 0 to disable.
   done_unknown_fraction_ =
       dp("done_unknown_fraction", 0.05);
   done_min_consecutive_steps_ =
@@ -381,9 +146,9 @@ ExploPlannerNode::ExploPlannerNode()
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
 
-  // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
-  // info_gain for each candidate is the sum of score_fn evaluated at sampled
-  // poses along the Dijkstra path, not just the endpoint. Evaluated locally via
+  // Trajectory-level scoring (SSMI ablation). When enabled, info_gain
+  // for each candidate is the sum of score_fn evaluated at sampled poses
+  // along the Dijkstra path, not just the endpoint. Evaluated locally via
   // FovEvaluator on map_cache_ for every map_type.
   trajectory_scoring_ = dp("trajectory_scoring", false);
   trajectory_sample_spacing_m_ = dp("trajectory_sample_spacing_m", 1.5);
@@ -411,8 +176,7 @@ ExploPlannerNode::ExploPlannerNode()
   map_cache_ = std::make_unique<MapCache>(map_resolution_);
   candidate_gen_ = std::make_unique<CandidateGenerator>(ccfg);
   fov_eval_ = std::make_unique<FovEvaluator>(fcfg);
-  // Fixed SCovox Beta EIG scorer — this node has no planner_type knob.
-  score_fn_ = scoring::eig;
+  score_fn_ = scoring::create(planner_type_);
   logger_ = std::make_unique<MetricsLogger>(output_csv_);
   cost_grid_ = std::make_unique<CostGrid>();
   coord_ = std::make_unique<Coordination>(coord_enabled_, robot_name_);
@@ -524,17 +288,18 @@ ExploPlannerNode::ExploPlannerNode()
   }
 
   RCLCPP_INFO(get_logger(),
-      "EIG exploration planner ready: map=%s max_steps=%d "
+      "EIG exploration planner ready: type=%s map=%s max_steps=%d "
       "frame=%s base=%s planning_map=%s goal=%s",
-      map_type_.c_str(), max_steps_, map_frame_.c_str(), base_frame_.c_str(),
+      planner_type_.c_str(), map_type_.c_str(),
+      max_steps_, map_frame_.c_str(), base_frame_.c_str(),
       planning_map_topic.c_str(), goal_topic.c_str());
 }
 
-// ==================================================================
+// ================================================================
 // Map ingest — fused ScovoxMap topic (dscovox) / log-odds cloud (logodds)
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::onScovoxMap(
+void ExplorationPlannerNode::onScovoxMap(
     const scovox_msgs::msg::ScovoxMap::SharedPtr& msg) {
   // One-time guard: the fused voxels are consumed in their raw frame (no TF
   // applied), so a dscovox map published in a frame other than the planner's
@@ -551,7 +316,7 @@ void ExploPlannerNode::onScovoxMap(
   latest_scovox_map_ = msg;
 }
 
-bool ExploPlannerNode::loadLatestMap() {
+bool ExplorationPlannerNode::loadLatestMap() {
   if (!latest_scovox_map_) return false;
   // Rebuild only when a new message has arrived since the last ingest. onScovoxMap
   // just swaps the cached pointer, so pointer identity == unchanged snapshot;
@@ -582,17 +347,17 @@ bool ExploPlannerNode::loadLatestMap() {
   return map_cache_->voxelCount() > 0;
 }
 
-void ExploPlannerNode::onLogOddsCloud(
+void ExplorationPlannerNode::onLogOddsCloud(
     const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
   map_cache_->updateFromLogOddsCloud(*msg, map_resolution_);
   have_map_ = true;
 }
 
-// ==================================================================
-// Trajectory-level scoring (path-integrated EIG)
-// ==================================================================
+// ================================================================
+// Trajectory-level scoring (all planner types)
+// ================================================================
 
-bool ExploPlannerNode::scoreTrajectory(
+bool ExplorationPlannerNode::scoreTrajectory(
     std::vector<CandidateViewpoint>& candidates) {
   const float spacing =
       static_cast<float>(trajectory_sample_spacing_m_);
@@ -646,8 +411,12 @@ bool ExploPlannerNode::scoreTrajectory(
 
   // Evaluate each trajectory sample on the local map_cache_.
   for (const auto& s : samples) {
-    float sample_score =
-        fov_eval_->evaluate(s.vp, *map_cache_, score_fn_).total_score;
+    float sample_score;
+    if (planner_type_ == "ssmi") {
+      sample_score = fov_eval_->evaluateSSMI(s.vp, *map_cache_).total_score;
+    } else {
+      sample_score = fov_eval_->evaluate(s.vp, *map_cache_, score_fn_).total_score;
+    }
     candidates[s.parent_idx].score += sample_score;
   }
 
@@ -656,18 +425,19 @@ bool ExploPlannerNode::scoreTrajectory(
     if (c.score > 0.0f) ++traj_scored;
   }
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-      "Trajectory scoring (eig): %zu samples across %d/%zu candidates "
+      "Trajectory scoring (%s): %zu samples across %d/%zu candidates "
       "(spacing=%.1f m)",
+      planner_type_.c_str(),
       samples.size(), traj_scored, candidates.size(), spacing);
 
   return true;
 }
 
-// ==================================================================
+// ================================================================
 // State machine
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::tick() {
+void ExplorationPlannerNode::tick() {
   updatePoseFromTF();
   trackDistance();
 
@@ -755,19 +525,19 @@ void ExploPlannerNode::tick() {
   }
 }
 
-void ExploPlannerNode::transitionTo(State s) {
+void ExplorationPlannerNode::transitionTo(State s) {
   state_ = s;
   state_enter_time_ = this->now();
 }
 
-// ==================================================================
+// ================================================================
 // PLAN state
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::doPlan() {
+void ExplorationPlannerNode::doPlan() {
   auto plan_start = this->now();
 
-  pruneFailedGoals();
+  failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
   if (coord_) coord_->prune(plan_start);
 
   // dscovox mode: rebuild the local map_cache_ from the latest fused map
@@ -833,8 +603,18 @@ void ExploPlannerNode::doPlan() {
 
   // Build the bounded cost grid from the latched planning_map. ~5 ms once
   // per PLAN tick at the auto bound, then O(1) per-candidate lookups.
+  // Random planner skips the cost grid entirely (no utility math).
   bool skip_reachability = false;
-  if (latest_plan_map_) {
+  // Best-effort mode: no planning_map this tick -> fall back to straight-line
+  // distances and skip the reachability filter (there is no grid to flood).
+  // The candidate free/occupied filter below is likewise skipped when absent.
+  if (planner_type_ != "random" && !latest_plan_map_) {
+    skip_reachability = true;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "No planning_map available — using straight-line distances and "
+        "skipping reachability filtering this tick.");
+  }
+  if (planner_type_ != "random" && latest_plan_map_) {
     cost_grid_->build(*latest_plan_map_);
     cost_grid_->floodFrom(robot_pos,
                           static_cast<float>(cost_grid_radius_cap_m_));
@@ -856,36 +636,33 @@ void ExploPlannerNode::doPlan() {
           latest_plan_map_->info.origin.position.y);
       skip_reachability = true;
     }
-  } else {
-    // Best-effort mode: no planning_map this tick -> fall back to straight-line
-    // distances and skip the reachability filter (there is no grid to flood).
-    // The candidate free/occupied filter below is likewise skipped when absent.
-    skip_reachability = true;
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "No planning_map available — using straight-line distances and "
-        "skipping reachability filtering this tick.");
   }
 
   // Evaluate candidates -> populates per-candidate FOV info gain.
   //
   // trajectory_scoring (param, default false): when true, info_gain is the
-  // sum of EIG scores at poses sampled along the Dijkstra path, not just the
+  // sum of scores at poses sampled along the Dijkstra path, not just the
   // endpoint. Otherwise endpoint scoring. Both run locally via FovEvaluator
   // on map_cache_ (the fused ROI grid in dscovox mode).
-  {
+  if (planner_type_ != "random") {
     const bool use_traj = trajectory_scoring_
                           && cost_grid_ && !skip_reachability;
+
     if (use_traj) {
       if (!scoreTrajectory(candidates)) {
         RCLCPP_WARN(get_logger(),
             "Trajectory scoring failed, retrying next tick.");
         return;
       }
+    } else if (planner_type_ == "ssmi") {
+      // SSMI endpoint scoring on the local map.
+      fov_eval_->evaluateAllSSMI(candidates, *map_cache_);
     } else {
-      // Endpoint EIG scoring on the local map.
+      // Endpoint scoring on the local map.
       fov_eval_->evaluateAll(candidates, *map_cache_, score_fn_);
     }
   }
+  // Random planner: no scoring; map stats are computed locally in doLogStep.
 
   // SSMI-style denominator-normalised utility (Asgharivaskasi & Atanasov,
   // TRO 2023):
@@ -897,6 +674,7 @@ void ExploPlannerNode::doPlan() {
   // feet and matches the SSMI reference implementation.
   //
   // Unreachable candidates (inf cost) get U = −∞ and sort to the bottom.
+  // Random planner skips utility entirely (shuffled selection).
   constexpr float kCostEpsilon = 0.1f;
 
   std::vector<float> info_gain(candidates.size(), 0.0f);
@@ -904,7 +682,7 @@ void ExploPlannerNode::doPlan() {
   float sum_info = 0.0f;
   float sum_cost_finite = 0.0f;
   int   n_cost_finite = 0;
-  {
+  if (planner_type_ != "random") {
     // Single pass: collect raw info_gain + path_cost, accumulate the means,
     // and overwrite each candidate's score with the SSMI-style utility.
     // info_gain[i] is cached before the score is overwritten.
@@ -931,22 +709,26 @@ void ExploPlannerNode::doPlan() {
     }
   }
 
-  // Sort the selection order by utility descending. The cost-grid
-  // reachability filter runs after the sort as one of the candidate filters
-  // in the walk below.
+  // Build a selection order: random planner shuffles, scored planners sort
+  // by utility descending. The cost-grid reachability filter runs after
+  // the sort as one of four candidate filters in the walk below.
   std::vector<size_t> order(candidates.size());
   std::iota(order.begin(), order.end(), 0);
-  std::sort(order.begin(), order.end(),
-      [&candidates](size_t a, size_t b) {
-        // NaN-safe descending order. A bare `>` is undefined behaviour for
-        // std::sort if any score is NaN (breaks strict-weak-ordering); sort
-        // NaNs to the bottom so a degenerate score can never corrupt `order`.
-        const float sa = candidates[a].score;
-        const float sb = candidates[b].score;
-        if (std::isnan(sa)) return false;
-        if (std::isnan(sb)) return true;
-        return sa > sb;
-      });
+  if (planner_type_ == "random") {
+    std::shuffle(order.begin(), order.end(), rng_);
+  } else {
+    std::sort(order.begin(), order.end(),
+        [&candidates](size_t a, size_t b) {
+          // NaN-safe descending order. A bare `>` is undefined behaviour for
+          // std::sort if any score is NaN (breaks strict-weak-ordering); sort
+          // NaNs to the bottom so a degenerate score can never corrupt `order`.
+          const float sa = candidates[a].score;
+          const float sb = candidates[b].score;
+          if (std::isnan(sa)) return false;
+          if (std::isnan(sb)) return true;
+          return sa > sb;
+        });
+  }
 
   int rejected_map = 0;
   int rejected_blacklist = 0;
@@ -982,15 +764,19 @@ void ExploPlannerNode::doPlan() {
       }
     }
     // 2. Cost-grid reachability — catches free pockets sealed off by
-    //    inflated obstacles. Skipped when the flood barely reached
+    //    inflated obstacles. Random planner skips because it has no
+    //    cost grid built. Also skipped when the flood barely reached
     //    anything (robot trapped in inflation zone).
-    if (!skip_reachability && cost_grid_ &&
+    if (!skip_reachability && planner_type_ != "random" && cost_grid_ &&
         !cost_grid_->reachable(vp.position)) {
       ++rejected_unreachable;
       continue;
     }
     // 3. Failed-goal blacklist (existing).
-    if (isNearFailedGoal(vp.position)) { ++rejected_blacklist; continue; }
+    if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
+      ++rejected_blacklist;
+      continue;
+    }
     // 4. MinPos peer-claim check (only when coordination is enabled).
     if (coord_ && coord_->enabled()) {
       const auto* peer = coord_->claimMatching(
@@ -1026,8 +812,10 @@ void ExploPlannerNode::doPlan() {
       n_cost_finite > 0
           ? sum_cost_finite / static_cast<float>(n_cost_finite)
           : 0.0f;
-  pending_selected_info_gain_ = info_gain[selected_idx];
-  pending_selected_path_cost_ = path_cost[selected_idx];
+  pending_selected_info_gain_ =
+      (planner_type_ == "random") ? 0.0f : info_gain[selected_idx];
+  pending_selected_path_cost_ =
+      (planner_type_ == "random") ? 0.0f : path_cost[selected_idx];
   pending_rejected_by_minpos_      = rejected_minpos;
   pending_rejected_by_unreachable_ = rejected_unreachable;
 
@@ -1051,13 +839,14 @@ void ExploPlannerNode::doPlan() {
 
   // Build & publish the multi-robot intent for this goal. Always
   // published (even single-robot) for diagnostic visibility; peers only
-  // act on it when their own coord_->enabled() is true. EIG planner id = 0.
+  // act on it when their own coord_->enabled() is true.
   if (intent_pub_ && coord_) {
+    uint8_t ptype = plannerTypeId(planner_type_);
     current_intent_msg_ = coord_->buildIntent(
         current_goal_, robot_pos, plan_end,
         static_cast<float>(coord_claim_ttl_sec_),
         static_cast<float>(coord_claim_radius_m_),
-        /*planner_type_id (eig)=*/0u, map_frame_);
+        ptype, map_frame_);
     intent_pub_->publish(current_intent_msg_);
     have_active_intent_ = true;
   }
@@ -1068,11 +857,8 @@ void ExploPlannerNode::doPlan() {
   float dx = current_goal_.position.x() - robot_pos.x();
   float dy = current_goal_.position.y() - robot_pos.y();
   float dist = std::sqrt(dx * dx + dy * dy);
-  double raw_budget = (dist / std::max(nav_speed_est_mps_, 1e-3))
-                      * nav_safety_factor_;
-  nav_budget_sec_ = std::clamp(raw_budget,
-                               nav_min_timeout_sec_,
-                               nav_max_timeout_sec_);
+  nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
+                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
   // Both anchors mark NAVIGATE entry; reuse the timestamp transitionTo()
   // just stamped rather than re-reading the clock.
   progress_check_time_ = state_enter_time_;
@@ -1082,116 +868,33 @@ void ExploPlannerNode::doPlan() {
       nav_budget_sec_, dist);
 }
 
-// Drop expired entries from the failed-goal blacklist. Called once per
-// PLAN cycle so the blacklist self-cleans without extra timers.
-void ExploPlannerNode::pruneFailedGoals() {
-  auto now = this->now();
-  while (!failed_goals_.empty()) {
-    double age = (now - failed_goals_.front().second).seconds();
-    if (age > failed_goal_ttl_sec_) {
-      failed_goals_.pop_front();
-    } else {
-      break;
-    }
-  }
-}
+// Thin wrappers over the pure plan_map_query helpers: supply the latched
+// planning_map + ROI and define the no-map behaviour. The grid math itself is
+// tested in test_plan_map_query.
 
-// Returns true if `pos` falls within failed_goal_radius_m_ of any
-// non-expired blacklist entry. Used to skip the top-scoring candidate
-// when it's the same unreachable target the robot just failed to reach.
-bool ExploPlannerNode::isNearFailedGoal(const Eigen::Vector3f& pos) const {
-  const float r2 = static_cast<float>(failed_goal_radius_m_ *
-                                      failed_goal_radius_m_);
-  for (const auto& [p, _t] : failed_goals_) {
-    float dx = pos.x() - p.x();
-    float dy = pos.y() - p.y();
-    if (dx * dx + dy * dy < r2) return true;
-  }
-  return false;
-}
-
-// Fraction of cells in the ROI bounding box of the latched planning_map
-// whose value is -1 (unknown). Returns -1.0 if no map is available or
-// the ROI doesn't overlap the map. Used by the coverage termination
-// check to detect when the explored area is fully classified as
-// free/occupied — at which point further exploration adds nothing.
-double ExploPlannerNode::unknownFractionInRoi() const {
+double ExplorationPlannerNode::unknownFractionInRoi() const {
   if (!latest_plan_map_) return -1.0;
-  const auto& m = *latest_plan_map_;
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
-    return -1.0;
-
-  // Convert ROI world bounds (cached members; params never change at
-  // runtime) to grid indices, clipped to the map.
-  auto to_gx = [&](float x) {
-    return static_cast<int>(std::floor(
-        (x - m.info.origin.position.x) / m.info.resolution));
-  };
-  auto to_gy = [&](float y) {
-    return static_cast<int>(std::floor(
-        (y - m.info.origin.position.y) / m.info.resolution));
-  };
-  int gx0 = std::max(0, to_gx(roi_min_x_));
-  int gx1 = std::min(static_cast<int>(m.info.width) - 1, to_gx(roi_max_x_));
-  int gy0 = std::max(0, to_gy(roi_min_y_));
-  int gy1 = std::min(static_cast<int>(m.info.height) - 1, to_gy(roi_max_y_));
-  if (gx0 > gx1 || gy0 > gy1) return -1.0;
-
-  int total = 0, unknown = 0;
-  for (int gy = gy0; gy <= gy1; ++gy) {
-    for (int gx = gx0; gx <= gx1; ++gx) {
-      int8_t v = m.data[gy * m.info.width + gx];
-      ++total;
-      if (v < 0) ++unknown;
-    }
-  }
-  if (total == 0) return -1.0;
-  return static_cast<double>(unknown) / static_cast<double>(total);
+  return explo_planner::unknownFractionInRoi(
+      *latest_plan_map_, {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_});
 }
 
-// Look up the latched planning_map cell value at world XY. Returns the raw
-// occupancy value (-1 unknown, 0..100 cost) or kCellNoData when there is no
-// map or `pos` is out of bounds. Single source of the world->grid math
-// shared by isCellFree/isCellOccupied.
-int8_t ExploPlannerNode::planMapCellAt(const Eigen::Vector3f& pos) const {
-  if (!latest_plan_map_) return kCellNoData;
-  const auto& m = *latest_plan_map_;
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
-    return kCellNoData;
-  int gx = static_cast<int>(std::floor(
-      (pos.x() - m.info.origin.position.x) / m.info.resolution));
-  int gy = static_cast<int>(std::floor(
-      (pos.y() - m.info.origin.position.y) / m.info.resolution));
-  if (gx < 0 || gy < 0 ||
-      gx >= static_cast<int>(m.info.width) ||
-      gy >= static_cast<int>(m.info.height))
-    return kCellNoData;
-  return m.data[gy * m.info.width + gx];
+bool ExplorationPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
+  // No map: not free (matches the old kCellNoData -> v >= 0 failure).
+  return latest_plan_map_ &&
+         explo_planner::isCellFree(*latest_plan_map_, pos);
 }
 
-// Returns true iff the (x,y) of `pos` is a free cell in the latched
-// planning_map. Out-of-bounds, unknown (-1), and occupied/inflated (>=50)
-// cells are all rejected. The map is already inflated by the body radius,
-// so a single-cell check is enough — no need for a footprint sweep here.
-bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
-  int8_t v = planMapCellAt(pos);  // kCellNoData/unknown both fail v >= 0
-  return v >= 0 && v < 50;
+bool ExplorationPlannerNode::isCellOccupied(const Eigen::Vector3f& pos) const {
+  // No map: conservatively occupied (matches the old kCellNoData default).
+  return !latest_plan_map_ ||
+         explo_planner::isCellOccupied(*latest_plan_map_, pos);
 }
 
-// Returns true iff the cell is known-occupied/inflated (value >= 50).
-// Unlike isCellFree, this returns false for unknown (-1) cells, allowing
-// frontier centroid candidates to pass through unknown territory. No map /
-// out-of-bounds is treated as occupied (the conservative default).
-bool ExploPlannerNode::isCellOccupied(const Eigen::Vector3f& pos) const {
-  int8_t v = planMapCellAt(pos);
-  return v == kCellNoData || v >= 50;
-}
-
-// ==================================================================
+// ================================================================
 // NAVIGATE state
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::doNavigate() {
+void ExplorationPlannerNode::doNavigate() {
   // Abort early if the map has updated and the goal cell is now inside
   // an obstacle (or its inflation zone). This avoids wasting time
   // navigating toward goals that were valid at selection but became
@@ -1266,8 +969,8 @@ void ExploPlannerNode::doNavigate() {
 // Park the current goal in the failed-goal blacklist with a tagged reason
 // and transition out of NAVIGATE. Centralised so both timeout paths
 // (budget exceeded / no progress) share the same logging + bookkeeping.
-void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
-  failed_goals_.emplace_back(current_goal_.position, this->now());
+void ExplorationPlannerNode::failGoal(const char* reason, double elapsed) {
+  failed_goals_.add(current_goal_.position, this->now().seconds());
   RCLCPP_WARN(get_logger(),
       "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f). "
       "Blacklisted; %zu active failed-goal entries.",
@@ -1281,7 +984,7 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // Re-publish the active intent on a fixed sim-time cadence so peers
 // don't lose the claim through TTL while we're navigating to it.
 // Stamps the message with the current time so peer expiry resets.
-void ExploPlannerNode::heartbeatTick() {
+void ExplorationPlannerNode::heartbeatTick() {
   if (!coord_enabled_) return;
   if (!have_active_intent_) return;
   if (state_ != State::NAVIGATE && state_ != State::INTEGRATE) return;
@@ -1290,22 +993,22 @@ void ExploPlannerNode::heartbeatTick() {
   intent_pub_->publish(current_intent_msg_);
 }
 
-// ==================================================================
+// ================================================================
 // INTEGRATE state
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::doIntegrate() {
+void ExplorationPlannerNode::doIntegrate() {
   double elapsed = (this->now() - state_enter_time_).seconds();
   if (elapsed >= integrate_wait_) {
     transitionTo(State::LOG_STEP);
   }
 }
 
-// ==================================================================
+// ================================================================
 // LOG_STEP state
-// ==================================================================
+// ================================================================
 
-void ExploPlannerNode::doLogStep() {
+void ExplorationPlannerNode::doLogStep() {
   StepMetrics m;
   m.step = step_;
   m.sim_time_sec = this->now().seconds();
@@ -1374,15 +1077,15 @@ void ExploPlannerNode::doLogStep() {
   }
 }
 
-// ==================================================================
+// ================================================================
 // Helpers
-// ==================================================================
+// ================================================================
 
 // Look up base_frame -> map_frame via TF and cache the robot pose. Replaces
 // the odom subscription so the planner reads the same source-of-truth that
 // the rest of the nav stack uses, and so candidates/goals share the same
 // frame as the dscovox map.
-void ExploPlannerNode::updatePoseFromTF() {
+void ExplorationPlannerNode::updatePoseFromTF() {
   geometry_msgs::msg::TransformStamped tf;
   try {
     tf = tf_buffer_.lookupTransform(
@@ -1402,7 +1105,7 @@ void ExploPlannerNode::updatePoseFromTF() {
   have_pose_ = true;
 }
 
-void ExploPlannerNode::trackDistance() {
+void ExplorationPlannerNode::trackDistance() {
   if (!have_pose_) return;
   if (!first_pos_) {
     cumulative_distance_ += (latest_pos_ - prev_pos_).norm();
@@ -1413,14 +1116,14 @@ void ExploPlannerNode::trackDistance() {
 
 // Yaw-only (Z-axis) quaternion message. Shared by goal + candidate viz
 // publishing so the yaw->quat conversion lives in one place.
-geometry_msgs::msg::Quaternion ExploPlannerNode::yawToQuat(float yaw) {
+geometry_msgs::msg::Quaternion ExplorationPlannerNode::yawToQuat(float yaw) {
   geometry_msgs::msg::Quaternion q;
   q.w = std::cos(yaw * 0.5);
   q.z = std::sin(yaw * 0.5);
   return q;
 }
 
-void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
+void ExplorationPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   geometry_msgs::msg::PoseStamped goal;
   goal.header.stamp = this->now();
   goal.header.frame_id = map_frame_;
@@ -1431,7 +1134,7 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   goal_pub_->publish(goal);
 }
 
-void ExploPlannerNode::publishCandidateViz(
+void ExplorationPlannerNode::publishCandidateViz(
     const std::vector<CandidateViewpoint>& candidates) {
   if (viz_pub_->get_subscription_count() == 0) return;
 
@@ -1501,18 +1204,3 @@ void ExploPlannerNode::publishCandidateViz(
 }
 
 } // namespace explo_planner
-
-// ==================================================================
-// Entry point
-// ==================================================================
-
-int main(int argc, char** argv) {
-  rclcpp::init(argc, argv);
-  // Single-threaded executor: the planner ingests the fused map over a topic
-  // subscription (non-blocking), so there is no blocking service future to
-  // service on a second thread. All callbacks and timers run on one thread,
-  // which also makes the map-callback / state-machine interaction race-free.
-  rclcpp::spin(std::make_shared<explo_planner::ExploPlannerNode>());
-  rclcpp::shutdown();
-  return 0;
-}

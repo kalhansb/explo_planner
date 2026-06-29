@@ -14,6 +14,7 @@ find_package(scovox_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 # ==================================================================
 # Library
@@ -27,6 +28,9 @@ add_library(explo_planner_lib
   src/metrics_logger.cpp
   src/cost_grid.cpp
   src/coordination.cpp
+  src/plan_map_query.cpp
+  src/failed_goal_blacklist.cpp
+  src/planner_util.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -43,9 +47,12 @@ ament_target_dependencies(explo_planner_lib PUBLIC
 )
 
 # ==================================================================
-# Node executable
+# Node executables
 # ==================================================================
 
+# Standalone EIG planner: self-contained node + main() in one file. This is
+# the base the exploration/exploitation system is built on, hard-wired to the
+# SCovox Beta EIG scorer (no planner_type knob).
 add_executable(explo_planner_node
   src/explo_planner_node.cpp
 )
@@ -56,30 +63,32 @@ target_link_libraries(explo_planner_node
 
 ament_target_dependencies(explo_planner_node
   rclcpp geometry_msgs nav_msgs sensor_msgs
-  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros
+  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
 # Comparison node: same planner core but exposes all planner_type options
-# (eig | entropy | frontier | random | ssmi). The plain explo_planner_node
-# above is the EIG-only variant.
-add_executable(exploration_planner_comp_node
-  src/exploration_planner_comp_node.cpp
+# (eig | entropy | frontier | random | ssmi) for the experiments. The node
+# class (state machine + ROS plumbing) lives in exploration_planner_node.cpp;
+# exploration_planner_main.cpp is just main().
+add_executable(exploration_planner_node
+  src/exploration_planner_main.cpp
+  src/exploration_planner_node.cpp
 )
 
-target_link_libraries(exploration_planner_comp_node
+target_link_libraries(exploration_planner_node
   explo_planner_lib
 )
 
-ament_target_dependencies(exploration_planner_comp_node
+ament_target_dependencies(exploration_planner_node
   rclcpp geometry_msgs nav_msgs sensor_msgs
-  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros
+  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
 # ==================================================================
 # Install
 # ==================================================================
 
-install(TARGETS explo_planner_node exploration_planner_comp_node
+install(TARGETS explo_planner_node exploration_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -112,6 +121,15 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_coordination test/test_coordination.cpp)
   target_link_libraries(test_coordination explo_planner_lib)
+
+  ament_add_gtest(test_plan_map_query test/test_plan_map_query.cpp)
+  target_link_libraries(test_plan_map_query explo_planner_lib)
+
+  ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
+  target_link_libraries(test_failed_goal_blacklist explo_planner_lib)
+
+  ament_add_gtest(test_planner_util test/test_planner_util.cpp)
+  target_link_libraries(test_planner_util explo_planner_lib)
 endif()
 
 ament_package()

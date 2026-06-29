@@ -22,6 +22,18 @@ public:
   /// Rebuild grid from a ScovoxMap message (full voxel dump).
   void updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg);
 
+  /// Rebuild grid from a ScovoxMap, keeping only voxels whose position lies in
+  /// the inclusive AABB [roi_min, roi_max]. The fused-map topic carries the
+  /// whole map; the planner re-applies its ROI clip here so map_cache_ stays
+  /// bounded to the ROI as the old per-region GetRegion service made it (frontier
+  /// extraction and map-stats both walk the whole grid, so the clip matters).
+  /// Non-finite positions are dropped. NB: this clips on voxel position; the old
+  /// service clipped in coord space, so results match for resolution-aligned ROI
+  /// bounds and may differ by one voxel layer at a non-aligned min boundary.
+  void updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+                           const Eigen::Vector3f& roi_min,
+                           const Eigen::Vector3f& roi_max);
+
   /// Rebuild grid from LogOdds PointCloud2 (x,y,z,occupancy_prob).
   void updateFromLogOddsCloud(const sensor_msgs::msg::PointCloud2& msg,
                               double resolution);
