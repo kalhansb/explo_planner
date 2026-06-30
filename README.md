@@ -22,14 +22,15 @@ Each PLAN cycle the node:
    `planner_type`).
 3. **Costs each candidate** — bounded grid Dijkstra over the `planning_map`
    gives a reachable path cost.
-4. **Picks the best** — normalised utility (Burgard et al. 2005):
+4. **Picks the best** — SSMI-style information-per-distance utility
+   (Asgharivaskasi & Atanasov, TRO 2023):
 
    ```
-   U(c) = α · info_gain(c)/max_info  −  β · path_cost(c)/max_cost
+   U(c) = info_gain(c) / (ε + path_cost(c))
    ```
 
-   `α > β` explores (travel far for the best viewpoint); `α < β` exploits
-   (prefer nearby, cheaper candidates).
+   Longer paths dilute a candidate's score; unreachable candidates get
+   `U = −∞` and sort last.
 5. **Navigates** to the goal with a distance-scaled timeout, a no-progress
    watchdog, and a TTL/radius blacklist of recently-failed goals to avoid
    re-picking unreachable targets.
@@ -104,7 +105,6 @@ All parameters live in [`config/exploration_params.yaml`](config/exploration_par
 which is heavily commented. Common overrides:
 
 - `planner_type` — `eig` | `entropy` | `frontier` | `random`
-- `utility_alpha_info` / `utility_beta_cost` — explore vs. exploit balance
 - `roi_min/max_x/y` — exploration region (keep in sync with the `planning_map`)
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting

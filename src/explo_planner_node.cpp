@@ -21,10 +21,8 @@
 /// State machine: WAIT_FOR_MAP -> PLAN -> NAVIGATE -> INTEGRATE -> LOG_STEP -> DONE.
 
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <algorithm>
@@ -36,7 +34,6 @@
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -58,6 +55,9 @@
 #include "explo_planner/metrics_logger.hpp"
 #include "explo_planner/cost_grid.hpp"
 #include "explo_planner/coordination.hpp"
+#include "explo_planner/plan_map_query.hpp"
+#include "explo_planner/planner_util.hpp"
+#include "explo_planner/failed_goal_blacklist.hpp"
 
 namespace explo_planner {
 
@@ -107,11 +107,10 @@ private:
   void doIntegrate();
   void doLogStep();
 
-  // PLAN helpers
-  void pruneFailedGoals();
-  bool isNearFailedGoal(const Eigen::Vector3f& pos) const;
+  // PLAN helpers. The cell classification + ROI unknown-fraction math is pure
+  // (see plan_map_query.hpp); these members are thin wrappers that supply the
+  // latched planning_map and ROI and handle the no-map case.
   double unknownFractionInRoi() const;
-  int8_t planMapCellAt(const Eigen::Vector3f& pos) const;
   bool isCellFree(const Eigen::Vector3f& pos) const;
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
 
@@ -162,8 +161,6 @@ private:
   bool   shutdown_requested_{false};
 
   // Utility / coordination params (cached so doPlan() doesn't re-query).
-  double utility_alpha_info_  = 1.0;
-  double utility_beta_cost_   = 1.0;
   double cost_grid_radius_cap_m_ = 0.0;
   bool   trajectory_scoring_   = false;
   double trajectory_sample_spacing_m_ = 1.5;
@@ -209,8 +206,8 @@ private:
   Eigen::Vector3f prev_pos_ = Eigen::Vector3f::Zero();
   bool  first_pos_ = true;
 
-  // Recently-failed goals: (xy position, time declared failed).
-  std::deque<std::pair<Eigen::Vector3f, rclcpp::Time>> failed_goals_;
+  // Recently-failed goals (TTL + radius blacklist).
+  FailedGoalBlacklist failed_goals_;
 
   // Per-navigate-cycle state for the smart timeout.
   double nav_budget_sec_ = 0.0;
@@ -226,6 +223,7 @@ private:
   float pending_mean_path_cost_       = 0.0f;
   float pending_selected_info_gain_   = 0.0f;
   float pending_selected_path_cost_   = 0.0f;
+  float pending_plan_ms_              = 0.0f;
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
 
@@ -247,16 +245,11 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr logodds_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
   rclcpp::Publisher<scovox_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
   rclcpp::Subscription<scovox_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
-
-  // Sentinel for planMapCellAt: no map / out of bounds. Distinct from the real
-  // cell range (-1 unknown, 0..100 occupancy).
-  static constexpr int8_t kCellNoData = -2;
 };
 
 // ==================================================================
@@ -372,12 +365,6 @@ ExploPlannerNode::ExploPlannerNode()
   fcfg.roi_min_z = roi_min_z_;
   fcfg.roi_max_z = roi_max_z_;
 
-  // Normalised utility: U = α·(info/max_info) − β·(cost/max_cost).
-  // Always on (single-robot too); only the MinPos branch in doPlan is
-  // gated on coordination_enabled.
-  utility_alpha_info_ = dp("utility_alpha_info", 1.0);
-  utility_beta_cost_  = dp("utility_beta_cost",  1.0);
-
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
 
@@ -483,12 +470,6 @@ ExploPlannerNode::ExploPlannerNode()
 
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
-
-  // Direct cmd_vel for in-place rotation after reaching goal XY.
-  std::string cmd_vel_topic = dp("cmd_vel_topic",
-      std::string("/" + robot_name_ + "/cmd_vel"));
-  cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(
-      cmd_vel_topic, 10);
 
   viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "~/candidates", 10);
@@ -767,7 +748,7 @@ void ExploPlannerNode::transitionTo(State s) {
 void ExploPlannerNode::doPlan() {
   auto plan_start = this->now();
 
-  pruneFailedGoals();
+  failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
   if (coord_) coord_->prune(plan_start);
 
   // dscovox mode: rebuild the local map_cache_ from the latest fused map
@@ -990,7 +971,10 @@ void ExploPlannerNode::doPlan() {
       continue;
     }
     // 3. Failed-goal blacklist (existing).
-    if (isNearFailedGoal(vp.position)) { ++rejected_blacklist; continue; }
+    if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
+      ++rejected_blacklist;
+      continue;
+    }
     // 4. MinPos peer-claim check (only when coordination is enabled).
     if (coord_ && coord_->enabled()) {
       const auto* peer = coord_->claimMatching(
@@ -1034,6 +1018,7 @@ void ExploPlannerNode::doPlan() {
   auto plan_end = this->now();
   float plan_ms = static_cast<float>(
       (plan_end - plan_start).nanoseconds() * 1e-6);
+  pending_plan_ms_ = plan_ms;  // drained into StepMetrics by doLogStep
 
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
@@ -1068,11 +1053,8 @@ void ExploPlannerNode::doPlan() {
   float dx = current_goal_.position.x() - robot_pos.x();
   float dy = current_goal_.position.y() - robot_pos.y();
   float dist = std::sqrt(dx * dx + dy * dy);
-  double raw_budget = (dist / std::max(nav_speed_est_mps_, 1e-3))
-                      * nav_safety_factor_;
-  nav_budget_sec_ = std::clamp(raw_budget,
-                               nav_min_timeout_sec_,
-                               nav_max_timeout_sec_);
+  nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
+                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
   // Both anchors mark NAVIGATE entry; reuse the timestamp transitionTo()
   // just stamped rather than re-reading the clock.
   progress_check_time_ = state_enter_time_;
@@ -1082,109 +1064,26 @@ void ExploPlannerNode::doPlan() {
       nav_budget_sec_, dist);
 }
 
-// Drop expired entries from the failed-goal blacklist. Called once per
-// PLAN cycle so the blacklist self-cleans without extra timers.
-void ExploPlannerNode::pruneFailedGoals() {
-  auto now = this->now();
-  while (!failed_goals_.empty()) {
-    double age = (now - failed_goals_.front().second).seconds();
-    if (age > failed_goal_ttl_sec_) {
-      failed_goals_.pop_front();
-    } else {
-      break;
-    }
-  }
-}
+// Thin wrappers over the pure plan_map_query helpers: supply the latched
+// planning_map + ROI and define the no-map behaviour. The grid math itself is
+// tested in test_plan_map_query.
 
-// Returns true if `pos` falls within failed_goal_radius_m_ of any
-// non-expired blacklist entry. Used to skip the top-scoring candidate
-// when it's the same unreachable target the robot just failed to reach.
-bool ExploPlannerNode::isNearFailedGoal(const Eigen::Vector3f& pos) const {
-  const float r2 = static_cast<float>(failed_goal_radius_m_ *
-                                      failed_goal_radius_m_);
-  for (const auto& [p, _t] : failed_goals_) {
-    float dx = pos.x() - p.x();
-    float dy = pos.y() - p.y();
-    if (dx * dx + dy * dy < r2) return true;
-  }
-  return false;
-}
-
-// Fraction of cells in the ROI bounding box of the latched planning_map
-// whose value is -1 (unknown). Returns -1.0 if no map is available or
-// the ROI doesn't overlap the map. Used by the coverage termination
-// check to detect when the explored area is fully classified as
-// free/occupied — at which point further exploration adds nothing.
 double ExploPlannerNode::unknownFractionInRoi() const {
   if (!latest_plan_map_) return -1.0;
-  const auto& m = *latest_plan_map_;
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
-    return -1.0;
-
-  // Convert ROI world bounds (cached members; params never change at
-  // runtime) to grid indices, clipped to the map.
-  auto to_gx = [&](float x) {
-    return static_cast<int>(std::floor(
-        (x - m.info.origin.position.x) / m.info.resolution));
-  };
-  auto to_gy = [&](float y) {
-    return static_cast<int>(std::floor(
-        (y - m.info.origin.position.y) / m.info.resolution));
-  };
-  int gx0 = std::max(0, to_gx(roi_min_x_));
-  int gx1 = std::min(static_cast<int>(m.info.width) - 1, to_gx(roi_max_x_));
-  int gy0 = std::max(0, to_gy(roi_min_y_));
-  int gy1 = std::min(static_cast<int>(m.info.height) - 1, to_gy(roi_max_y_));
-  if (gx0 > gx1 || gy0 > gy1) return -1.0;
-
-  int total = 0, unknown = 0;
-  for (int gy = gy0; gy <= gy1; ++gy) {
-    for (int gx = gx0; gx <= gx1; ++gx) {
-      int8_t v = m.data[gy * m.info.width + gx];
-      ++total;
-      if (v < 0) ++unknown;
-    }
-  }
-  if (total == 0) return -1.0;
-  return static_cast<double>(unknown) / static_cast<double>(total);
+  return explo_planner::unknownFractionInRoi(
+      *latest_plan_map_, {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_});
 }
 
-// Look up the latched planning_map cell value at world XY. Returns the raw
-// occupancy value (-1 unknown, 0..100 cost) or kCellNoData when there is no
-// map or `pos` is out of bounds. Single source of the world->grid math
-// shared by isCellFree/isCellOccupied.
-int8_t ExploPlannerNode::planMapCellAt(const Eigen::Vector3f& pos) const {
-  if (!latest_plan_map_) return kCellNoData;
-  const auto& m = *latest_plan_map_;
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
-    return kCellNoData;
-  int gx = static_cast<int>(std::floor(
-      (pos.x() - m.info.origin.position.x) / m.info.resolution));
-  int gy = static_cast<int>(std::floor(
-      (pos.y() - m.info.origin.position.y) / m.info.resolution));
-  if (gx < 0 || gy < 0 ||
-      gx >= static_cast<int>(m.info.width) ||
-      gy >= static_cast<int>(m.info.height))
-    return kCellNoData;
-  return m.data[gy * m.info.width + gx];
-}
-
-// Returns true iff the (x,y) of `pos` is a free cell in the latched
-// planning_map. Out-of-bounds, unknown (-1), and occupied/inflated (>=50)
-// cells are all rejected. The map is already inflated by the body radius,
-// so a single-cell check is enough — no need for a footprint sweep here.
 bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
-  int8_t v = planMapCellAt(pos);  // kCellNoData/unknown both fail v >= 0
-  return v >= 0 && v < 50;
+  // No map: not free (matches the old kCellNoData -> v >= 0 failure).
+  return latest_plan_map_ &&
+         explo_planner::isCellFree(*latest_plan_map_, pos);
 }
 
-// Returns true iff the cell is known-occupied/inflated (value >= 50).
-// Unlike isCellFree, this returns false for unknown (-1) cells, allowing
-// frontier centroid candidates to pass through unknown territory. No map /
-// out-of-bounds is treated as occupied (the conservative default).
 bool ExploPlannerNode::isCellOccupied(const Eigen::Vector3f& pos) const {
-  int8_t v = planMapCellAt(pos);
-  return v == kCellNoData || v >= 50;
+  // No map: conservatively occupied (matches the old kCellNoData default).
+  return !latest_plan_map_ ||
+         explo_planner::isCellOccupied(*latest_plan_map_, pos);
 }
 
 // ==================================================================
@@ -1267,7 +1166,7 @@ void ExploPlannerNode::doNavigate() {
 // and transition out of NAVIGATE. Centralised so both timeout paths
 // (budget exceeded / no progress) share the same logging + bookkeeping.
 void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
-  failed_goals_.emplace_back(current_goal_.position, this->now());
+  failed_goals_.add(current_goal_.position, this->now().seconds());
   RCLCPP_WARN(get_logger(),
       "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f). "
       "Blacklisted; %zu active failed-goal entries.",
@@ -1311,6 +1210,7 @@ void ExploPlannerNode::doLogStep() {
   m.sim_time_sec = this->now().seconds();
   m.distance_traveled = cumulative_distance_;
   m.selected_score = current_goal_.score;
+  m.plan_time_ms = pending_plan_ms_;
 
   // Drain utility / coord diagnostics from doPlan().
   m.mean_info_gain      = pending_mean_info_gain_;

@@ -137,12 +137,6 @@ ExplorationPlannerNode::ExplorationPlannerNode()
   fcfg.roi_min_z = roi_min_z_;
   fcfg.roi_max_z = roi_max_z_;
 
-  // Normalised utility: U = α·(info/max_info) − β·(cost/max_cost).
-  // Always on (single-robot too); only the MinPos branch in doPlan is
-  // gated on coordination_enabled.
-  utility_alpha_info_ = dp("utility_alpha_info", 1.0);
-  utility_beta_cost_  = dp("utility_beta_cost",  1.0);
-
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
 
@@ -247,12 +241,6 @@ ExplorationPlannerNode::ExplorationPlannerNode()
 
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
-
-  // Direct cmd_vel for in-place rotation after reaching goal XY.
-  std::string cmd_vel_topic = dp("cmd_vel_topic",
-      std::string("/" + robot_name_ + "/cmd_vel"));
-  cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(
-      cmd_vel_topic, 10);
 
   viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "~/candidates", 10);
@@ -822,6 +810,7 @@ void ExplorationPlannerNode::doPlan() {
   auto plan_end = this->now();
   float plan_ms = static_cast<float>(
       (plan_end - plan_start).nanoseconds() * 1e-6);
+  pending_plan_ms_ = plan_ms;  // drained into StepMetrics by doLogStep
 
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
@@ -1014,6 +1003,7 @@ void ExplorationPlannerNode::doLogStep() {
   m.sim_time_sec = this->now().seconds();
   m.distance_traveled = cumulative_distance_;
   m.selected_score = current_goal_.score;
+  m.plan_time_ms = pending_plan_ms_;
 
   // Drain utility / coord diagnostics from doPlan().
   m.mean_info_gain      = pending_mean_info_gain_;

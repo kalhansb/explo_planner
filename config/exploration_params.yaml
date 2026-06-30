@@ -103,22 +103,16 @@ explo_planner:
     # ----------------------------------------------------------------
     # Utility math + multi-robot coordination
     # ----------------------------------------------------------------
-    # Normalised per-candidate utility (Burgard et al. 2005):
+    # Per-candidate utility is SSMI-style information-per-distance
+    # (Asgharivaskasi & Atanasov, TRO 2023):
     #
-    #   U(c) = α · info_gain(c)/max_info  −  β · path_cost(c)/max_cost
+    #   U(c) = info_gain(c) / (ε + path_cost(c))      ε = 0.1 m
     #
-    # Both info_gain and path_cost are divided by the per-tick candidate
-    # pool maximum, mapping each to [0, 1]. This makes α and β true
-    # relative weights independent of the raw magnitudes:
-    #
-    #   α = β = 1.0  →  equal weight to information and proximity
-    #   α > β        →  explore: travel far for the best viewpoint
-    #   α < β        →  exploit: prefer nearby, lower-cost candidates
-    #
-    # info_gain comes from FOV raycasting (EIG / entropy / frontier count);
-    # path_cost comes from CostGrid (bounded Dijkstra over planning_map).
-    utility_alpha_info: 1.0
-    utility_beta_cost: 1.0
+    # Longer paths dilute a candidate's score; unreachable candidates
+    # (infinite cost) get U = −∞ and sort last. info_gain comes from FOV
+    # raycasting (EIG / entropy / frontier count); path_cost comes from
+    # CostGrid (bounded Dijkstra over planning_map). The denominator form
+    # is parameter-free — there are no separate α/β weights.
 
     # Bounded grid Dijkstra. 0 = auto = candidate_max_radius + 2 m slack
     # (so the entire candidate disc is covered, plus a margin for diagonals).

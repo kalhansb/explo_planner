@@ -29,7 +29,6 @@
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -144,8 +143,6 @@ private:
   bool   shutdown_requested_{false};
 
   // Utility / coordination params (cached so doPlan() doesn't re-query).
-  double utility_alpha_info_  = 1.0;
-  double utility_beta_cost_   = 1.0;
   double cost_grid_radius_cap_m_ = 0.0;
   bool   trajectory_scoring_   = false;
   double trajectory_sample_spacing_m_ = 1.5;
@@ -209,6 +206,7 @@ private:
   float pending_mean_path_cost_       = 0.0f;
   float pending_selected_info_gain_   = 0.0f;
   float pending_selected_path_cost_   = 0.0f;
+  float pending_plan_ms_              = 0.0f;
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
 
@@ -230,7 +228,6 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr logodds_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
   rclcpp::Publisher<scovox_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
   rclcpp::Subscription<scovox_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
