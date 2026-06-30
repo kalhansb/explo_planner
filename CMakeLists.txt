@@ -50,9 +50,9 @@ ament_target_dependencies(explo_planner_lib PUBLIC
 # Node executables
 # ==================================================================
 
-# Standalone EIG planner: self-contained node + main() in one file. This is
-# the base the exploration/exploitation system is built on, hard-wired to the
-# SCovox Beta EIG scorer (no planner_type knob).
+# EIG NBV planner: self-contained node + main() in one file. Hard-wired to the
+# SCovox Beta expected-information-gain scorer (no planner_type knob). Multi-
+# robot MinPos coordination is built in and param-gated (coordination_enabled).
 add_executable(explo_planner_node
   src/explo_planner_node.cpp
 )
@@ -66,29 +66,11 @@ ament_target_dependencies(explo_planner_node
   visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
-# Comparison node: same planner core but exposes all planner_type options
-# (eig | entropy | frontier | random | ssmi) for the experiments. The node
-# class (state machine + ROS plumbing) lives in exploration_planner_node.cpp;
-# exploration_planner_main.cpp is just main().
-add_executable(exploration_planner_node
-  src/exploration_planner_main.cpp
-  src/exploration_planner_node.cpp
-)
-
-target_link_libraries(exploration_planner_node
-  explo_planner_lib
-)
-
-ament_target_dependencies(exploration_planner_node
-  rclcpp geometry_msgs nav_msgs sensor_msgs
-  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
-)
-
 # ==================================================================
 # Install
 # ==================================================================
 
-install(TARGETS explo_planner_node exploration_planner_node
+install(TARGETS explo_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

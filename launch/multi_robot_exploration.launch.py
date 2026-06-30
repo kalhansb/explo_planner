@@ -53,9 +53,10 @@ def launch_setup(context):
 
         nodes.append(Node(
             package="explo_planner",
-            # Comparison node: honours the planner:= arg (eig/entropy/frontier/
-            # random/ssmi). The EIG-only explo_planner_node has no planner_type.
-            executable="exploration_planner_node",
+            # EIG-only NBV planner. The `planner` arg is kept only as a CSV
+            # filename label (this node is hard-wired to EIG); multi-robot
+            # MinPos deconfliction is toggled by coordination_enabled below.
+            executable="explo_planner_node",
             namespace=robot,
             name="explo_planner",
             output="screen",
@@ -63,7 +64,6 @@ def launch_setup(context):
                 params_yaml,
                 {
                     "use_sim_time": True,
-                    "planner_type": planner,
                     "map_type": map_type,
                     "robot_name": robot,
                     "max_steps": int(max_steps),

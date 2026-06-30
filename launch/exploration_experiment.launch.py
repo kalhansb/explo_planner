@@ -12,8 +12,6 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('explo_planner')
 
     return LaunchDescription([
-        DeclareLaunchArgument('planner', default_value='eig',
-                              description='Planner type: eig, entropy, frontier, random'),
         DeclareLaunchArgument('map_type', default_value='dscovox',
                               description='Map type: dscovox or logodds'),
         DeclareLaunchArgument('robot', default_value='atlas',
@@ -35,15 +33,13 @@ def generate_launch_description():
 
         Node(
             package='explo_planner',
-            # Comparison node: honours the planner:= arg (eig/entropy/frontier/
-            # random/ssmi). The EIG-only explo_planner_node has no planner_type.
-            executable='exploration_planner_node',
+            # EIG-only NBV planner (SCovox Beta expected-information-gain).
+            executable='explo_planner_node',
             name='explo_planner',
             output='screen',
             parameters=[
                 os.path.join(pkg_dir, 'config', 'exploration_params.yaml'),
                 {
-                    'planner_type': LaunchConfiguration('planner'),
                     'map_type': LaunchConfiguration('map_type'),
                     'robot_name': LaunchConfiguration('robot'),
                     'max_steps': LaunchConfiguration('max_steps'),

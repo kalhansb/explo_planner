@@ -6,9 +6,11 @@ Next-Best-View (NBV) exploration planner for ROS 2. It selects viewpoints by
 robot toward the chosen goal through the navigation stack, and logs per-step
 metrics for experiments.
 
-The planner supports four selection strategies — `eig`, `entropy`, `frontier`,
-and `random` — so the EIG policy can be compared against baselines in ablation
-studies, in both single- and multi-robot configurations.
+It runs single- or multi-robot: each robot plans against its own fused SCovox
+view and (optionally) deconflicts viewpoints with teammates through a MinPos
+intent table. The multi-planner comparison harness (entropy / frontier / random
+/ ssmi baselines, used for the ablation studies) lives on the `experiments`
+branch; `main` ships the EIG planner only.
 
 ## How it works
 
@@ -18,8 +20,7 @@ Each PLAN cycle the node:
    around the current robot pose, filtered against the 2D inflated
    `planning_map` for free/occupied and a region-of-interest box.
 2. **Scores each candidate** — simulated FOV ray-casting over the SCovox map
-   yields an information gain (EIG / entropy / frontier count, per
-   `planner_type`).
+   yields an expected information gain (EIG) from the Beta-conjugate occupancy.
 3. **Costs each candidate** — bounded grid Dijkstra over the `planning_map`
    gives a reachable path cost.
 4. **Picks the best** — SSMI-style information-per-distance utility
@@ -47,7 +48,7 @@ The node logic is split into small, unit-tested modules:
 
 | Module | Responsibility |
 | --- | --- |
-| `exploration_planner_node` | State machine (PLAN → NAVIGATE → DONE) and ROS wiring |
+| `explo_planner_node` | State machine (PLAN → NAVIGATE → DONE) and ROS wiring |
 | `candidate_generator` | Polar-grid viewpoint candidate generation |
 | `fov_evaluator` | Simulated FOV ray-casting for viewpoint evaluation |
 | `scoring` | Viewpoint scoring (EIG / entropy / frontier) |
@@ -77,7 +78,7 @@ Single-robot experiment:
 
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
-  planner:=eig robot:=atlas max_steps:=200 \
+  robot:=atlas max_steps:=200 \
   output_csv:=/tmp/exploration_eig.csv
 ```
 
@@ -86,7 +87,7 @@ already running):
 
 ```bash
 ros2 launch explo_planner multi_robot_exploration.launch.py \
-  robots:=atlas,boreas planner:=eig coordination_enabled:=true
+  robots:=atlas,boreas coordination_enabled:=true
 ```
 
 ### Key topics
@@ -104,7 +105,6 @@ ros2 launch explo_planner multi_robot_exploration.launch.py \
 All parameters live in [`config/exploration_params.yaml`](config/exploration_params.yaml),
 which is heavily commented. Common overrides:
 
-- `planner_type` — `eig` | `entropy` | `frontier` | `random`
 - `roi_min/max_x/y` — exploration region (keep in sync with the `planning_map`)
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting

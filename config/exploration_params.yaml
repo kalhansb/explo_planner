@@ -1,7 +1,6 @@
 explo_planner:
   ros__parameters:
     use_sim_time: true
-    planner_type: "eig"          # eig | entropy | frontier | random
     map_type: "dscovox"          # dscovox | logodds
     robot_name: "atlas"
     max_steps: 200
