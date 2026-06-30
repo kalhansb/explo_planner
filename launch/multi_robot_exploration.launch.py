@@ -31,7 +31,6 @@ def launch_setup(context):
         raise RuntimeError("multi_robot_exploration: 'robots' is empty")
 
     planner = LaunchConfiguration("planner").perform(context)
-    map_type = LaunchConfiguration("map_type").perform(context)
     output_dir = LaunchConfiguration("output_dir").perform(context)
     config_id = LaunchConfiguration("config_id").perform(context)
     world = LaunchConfiguration("world").perform(context)
@@ -40,15 +39,9 @@ def launch_setup(context):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Disambiguate CSV filename by map_type so trials with the same planner
-    # but different maps (e.g. entropy:logodds vs entropy:dscovox) don't
-    # overwrite each other's results. The dscovox map is the historical
-    # default, so keep the legacy filename shape for those trials.
-    map_suffix = "" if map_type == "dscovox" else f"_{map_type}"
-
     nodes = []
     for robot in robots:
-        csv_name = f"exp7_{planner}{map_suffix}_{world}_{config_id}_{robot}.csv"
+        csv_name = f"exp7_{planner}_{world}_{config_id}_{robot}.csv"
         output_csv = os.path.join(output_dir, csv_name)
 
         nodes.append(Node(
@@ -64,7 +57,6 @@ def launch_setup(context):
                 params_yaml,
                 {
                     "use_sim_time": True,
-                    "map_type": map_type,
                     "robot_name": robot,
                     "max_steps": int(max_steps),
                     "output_csv": output_csv,
@@ -89,8 +81,6 @@ def generate_launch_description():
                               description="Comma-separated robot team list"),
         DeclareLaunchArgument("planner", default_value="eig",
                               description="Planner type: eig, entropy, frontier, random"),
-        DeclareLaunchArgument("map_type", default_value="dscovox",
-                              description="Map backend: dscovox or logodds"),
         DeclareLaunchArgument("output_dir", default_value="/tmp",
                               description="Directory for per-robot CSVs"),
         DeclareLaunchArgument("config_id", default_value="c1",

@@ -12,8 +12,6 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('explo_planner')
 
     return LaunchDescription([
-        DeclareLaunchArgument('map_type', default_value='dscovox',
-                              description='Map type: dscovox or logodds'),
         DeclareLaunchArgument('robot', default_value='atlas',
                               description='Robot name (namespace)'),
         DeclareLaunchArgument('max_steps', default_value='200',
@@ -40,7 +38,6 @@ def generate_launch_description():
             parameters=[
                 os.path.join(pkg_dir, 'config', 'exploration_params.yaml'),
                 {
-                    'map_type': LaunchConfiguration('map_type'),
                     'robot_name': LaunchConfiguration('robot'),
                     'max_steps': LaunchConfiguration('max_steps'),
                     'output_csv': LaunchConfiguration('output_csv'),

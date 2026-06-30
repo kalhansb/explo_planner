@@ -12,10 +12,9 @@
 /// cost grid, coordination, map cache, metrics) are still shared via
 /// explo_planner_lib.
 ///
-/// Map ingest is topic-based (not the old GetRegion service). In "dscovox" mode
-/// the planner SUBSCRIBES to the fused ScovoxMap topic (latched QoS) and rebuilds
-/// a local, ROI-clipped MapCache from it each PLAN tick; in "logodds" mode it
-/// subscribes to a log-odds point cloud instead. All parameters, publishers,
+/// Map ingest is topic-based (not the old GetRegion service): the planner
+/// SUBSCRIBES to the fused ScovoxMap topic (latched QoS) and rebuilds a local,
+/// ROI-clipped MapCache from it each PLAN tick. All parameters, publishers,
 /// subscriptions and timers are declared/wired in this file's constructor.
 ///
 /// State machine: WAIT_FOR_MAP -> PLAN -> NAVIGATE -> INTEGRATE -> LOG_STEP -> DONE.
@@ -37,7 +36,6 @@
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <scovox_msgs/msg/robot_intent.hpp>
@@ -92,7 +90,6 @@ private:
   // Rebuild map_cache_ from the latest cached ScovoxMap, clipped to the ROI.
   // Returns false if no map has been received yet.
   bool loadLatestMap();
-  void onLogOddsCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& msg);
 
   // Trajectory-level scoring (path-integrated EIG; param-gated ablation).
   bool scoreTrajectory(std::vector<CandidateViewpoint>& candidates);
@@ -126,7 +123,6 @@ private:
   void publishCandidateViz(const std::vector<CandidateViewpoint>& candidates);
 
   // --- Parameters ---
-  std::string map_type_;
   std::string robot_name_;
   std::string output_csv_;
   std::string map_frame_;
@@ -242,7 +238,6 @@ private:
   rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_sub_;
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_scovox_map_;
   scovox_msgs::msg::ScovoxMap::SharedPtr ingested_scovox_map_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr logodds_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
@@ -265,7 +260,6 @@ ExploPlannerNode::ExploPlannerNode()
     return this->declare_parameter<decltype(d)>(n, d);
   };
 
-  map_type_     = dp("map_type", std::string("dscovox"));
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
   output_csv_   = dp("output_csv", std::string("/tmp/exploration.csv"));
@@ -371,7 +365,7 @@ ExploPlannerNode::ExploPlannerNode()
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
   // info_gain for each candidate is the sum of score_fn evaluated at sampled
   // poses along the Dijkstra path, not just the endpoint. Evaluated locally via
-  // FovEvaluator on map_cache_ for every map_type.
+  // FovEvaluator on map_cache_.
   trajectory_scoring_ = dp("trajectory_scoring", false);
   trajectory_sample_spacing_m_ = dp("trajectory_sample_spacing_m", 1.5);
 
@@ -405,8 +399,6 @@ ExploPlannerNode::ExploPlannerNode()
   coord_ = std::make_unique<Coordination>(coord_enabled_, robot_name_);
 
   // --- ROS interfaces ---
-  std::string logodds_pc_topic = dp("logodds_pointcloud_topic",
-      std::string("/" + robot_name_ + "/log_odds_node/pointcloud"));
   std::string goal_topic = dp("goal_topic",
       std::string("/" + robot_name_ + "/goal_pose"));
   // The same OccupancyGrid the global planner consumes. We use it to
@@ -430,35 +422,25 @@ ExploPlannerNode::ExploPlannerNode()
   roi_min_y_ = ccfg.roi_min_y;
   roi_max_y_ = ccfg.roi_max_y;
 
-  if (map_type_ == "dscovox") {
-    // The dscovox mapping node fuses every robot's voxels (multi-robot
-    // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
-    // subscribe with the matching latched QoS (KeepLast(1) reliable +
-    // transient_local) so the current map is delivered immediately on connect —
-    // this replaces the old blocking GetRegion service call, and with it the
-    // MultiThreadedExecutor + dedicated callback group that call required.
-    // FOV raycasting, scoring and frontier extraction still run locally on the
-    // ROI-clipped copy rebuilt into map_cache_ each PLAN tick.
-    std::string dscovox_topic = dp("dscovox_topic", std::string(""));
-    if (dscovox_topic.empty())
-      dscovox_topic = "/" + robot_name_ + "/dscovox_node/scovox";
-    scovox_map_sub_ = create_subscription<scovox_msgs::msg::ScovoxMap>(
-        dscovox_topic,
-        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
-        [this](scovox_msgs::msg::ScovoxMap::SharedPtr msg) {
-          onScovoxMap(msg);
-        });
-    RCLCPP_INFO(get_logger(), "Subscribing to fused map (dscovox): %s",
-        dscovox_topic.c_str());
-  } else {
-    logodds_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        logodds_pc_topic, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-          onLogOddsCloud(msg);
-        });
-    RCLCPP_INFO(get_logger(), "Subscribing to log-odds cloud: %s",
-        logodds_pc_topic.c_str());
-  }
+  // The dscovox mapping node fuses every robot's voxels (multi-robot
+  // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
+  // subscribe with the matching latched QoS (KeepLast(1) reliable +
+  // transient_local) so the current map is delivered immediately on connect —
+  // this replaces the old blocking GetRegion service call, and with it the
+  // MultiThreadedExecutor + dedicated callback group that call required.
+  // FOV raycasting, scoring and frontier extraction still run locally on the
+  // ROI-clipped copy rebuilt into map_cache_ each PLAN tick.
+  std::string dscovox_topic = dp("dscovox_topic", std::string(""));
+  if (dscovox_topic.empty())
+    dscovox_topic = "/" + robot_name_ + "/dscovox_node/scovox";
+  scovox_map_sub_ = create_subscription<scovox_msgs::msg::ScovoxMap>(
+      dscovox_topic,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](scovox_msgs::msg::ScovoxMap::SharedPtr msg) {
+        onScovoxMap(msg);
+      });
+  RCLCPP_INFO(get_logger(), "Subscribing to fused map (dscovox): %s",
+      dscovox_topic.c_str());
 
   plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       planning_map_topic,
@@ -505,14 +487,14 @@ ExploPlannerNode::ExploPlannerNode()
   }
 
   RCLCPP_INFO(get_logger(),
-      "EIG exploration planner ready: map=%s max_steps=%d "
+      "EIG exploration planner ready: max_steps=%d "
       "frame=%s base=%s planning_map=%s goal=%s",
-      map_type_.c_str(), max_steps_, map_frame_.c_str(), base_frame_.c_str(),
+      max_steps_, map_frame_.c_str(), base_frame_.c_str(),
       planning_map_topic.c_str(), goal_topic.c_str());
 }
 
 // ==================================================================
-// Map ingest — fused ScovoxMap topic (dscovox) / log-odds cloud (logodds)
+// Map ingest — fused ScovoxMap topic
 // ==================================================================
 
 void ExploPlannerNode::onScovoxMap(
@@ -561,12 +543,6 @@ bool ExploPlannerNode::loadLatestMap() {
   // (message received, but nothing inside the ROI band) returns false so doPlan
   // stays in PLAN and retries instead of scoring an all-prior, degenerate map.
   return map_cache_->voxelCount() > 0;
-}
-
-void ExploPlannerNode::onLogOddsCloud(
-    const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
-  map_cache_->updateFromLogOddsCloud(*msg, map_resolution_);
-  have_map_ = true;
 }
 
 // ==================================================================
@@ -654,11 +630,10 @@ void ExploPlannerNode::tick() {
 
   switch (state_) {
     case State::WAIT_FOR_MAP:
-      // dscovox mode: once a fused map has been received on the topic, ingest
-      // it (ROI-clipped) so have_map_ flips from the in-ROI voxel count. In
-      // logodds mode the cloud callback sets have_map_ directly. Neither path
-      // blocks — the map arrives asynchronously via its subscription.
-      if (map_type_ == "dscovox" && !have_map_) {
+      // Once a fused map has been received on the topic, ingest it
+      // (ROI-clipped) so have_map_ flips from the in-ROI voxel count. The map
+      // arrives asynchronously via its subscription; this never blocks.
+      if (!have_map_) {
         loadLatestMap();  // sets have_map_ when in-ROI voxels are present
       }
       // planning_map handling:
@@ -751,11 +726,10 @@ void ExploPlannerNode::doPlan() {
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
   if (coord_) coord_->prune(plan_start);
 
-  // dscovox mode: rebuild the local map_cache_ from the latest fused map
-  // received on the topic (ROI-clipped) so frontier extraction + FOV scoring
-  // below run on fresh consensus data. In logodds mode the cloud callback
-  // keeps map_cache_ current, so there is nothing to load.
-  if (map_type_ == "dscovox" && !loadLatestMap()) {
+  // Rebuild the local map_cache_ from the latest fused map received on the
+  // topic (ROI-clipped) so frontier extraction + FOV scoring below run on
+  // fresh consensus data.
+  if (!loadLatestMap()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "No fused map received yet on the dscovox topic; retrying next tick.");
     return;
@@ -791,14 +765,12 @@ void ExploPlannerNode::doPlan() {
 
   // Generate candidates: a polar grid of viewpoints around the robot
   // (local EIG hops) PLUS frontier centroids anywhere in the ROI (long-
-  // range targets for escaping local IG maxima). In dscovox mode the 3D
-  // occupancy check is skipped (nullptr map); the 2D planning_map filter
-  // below handles it. Frontiers are extracted locally from map_cache_ (the
-  // fused grid pulled via the topic in dscovox mode, the log-odds cloud
-  // otherwise).
-  auto candidates = (map_type_ == "dscovox")
-      ? candidate_gen_->generate(robot_pos, robot_yaw, nullptr)
-      : candidate_gen_->generate(robot_pos, robot_yaw, map_cache_.get());
+  // range targets for escaping local IG maxima). The 3D occupancy check is
+  // skipped (nullptr map); the 2D planning_map filter below handles it.
+  // Frontiers are extracted locally from map_cache_ (the fused grid pulled
+  // via the topic).
+  auto candidates =
+      candidate_gen_->generate(robot_pos, robot_yaw, nullptr);
   size_t n_radial = candidates.size();
   auto frontiers = map_cache_->findFrontierCentroids(
       roi_min_z_, roi_max_z_, 5.0f);
@@ -1223,9 +1195,9 @@ void ExploPlannerNode::doLogStep() {
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
 
-  // Compute map stats locally from map_cache_ (the fused ROI grid in
-  // dscovox mode, the log-odds cloud otherwise). The dscovox node no longer
-  // computes these — scoring and stats both live in the planner now.
+  // Compute map stats locally from map_cache_ (the fused ROI grid). The
+  // dscovox node no longer computes these — scoring and stats both live in
+  // the planner now.
   m.total_observed_voxels = static_cast<int>(map_cache_->voxelCount());
   {
     float sum_eig = 0, sum_entropy = 0, sum_variance = 0;
