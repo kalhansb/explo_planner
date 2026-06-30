@@ -1,5 +1,7 @@
 #include "explo_planner/map_cache.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <scovox/uncertainty.hpp>
+#include <scovox/voxel.hpp>
 #include <unordered_map>
 #include <cmath>
 #include <limits>
@@ -197,6 +199,43 @@ std::vector<Eigen::Vector3f> MapCache::findFrontierCentroids(
     centroids.push_back(bd.sum / static_cast<float>(bd.count));
   }
   return centroids;
+}
+
+MapCache::MapStats MapCache::computeStats() const {
+  MapStats s;
+  float sum_eig = 0.0f, sum_entropy = 0.0f, sum_variance = 0.0f;
+  int frontier_count = 0, count = 0;
+
+  auto acc = grid_->createConstAccessor();
+  static const CoordT offsets[6] = {
+      {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+
+  grid_->forEachCell([&](const UnifiedVoxel& uv, const CoordT& c) {
+    scovox::Voxel sv;
+    sv.a_occ  = uv.a_occ;
+    sv.a_free = uv.a_free;
+    sum_eig      += scovox::expectedInformationGain(sv);
+    sum_variance += scovox::variance(sv);
+    sum_entropy  += scoring::entropy(uv);
+    count++;
+    // Frontier: free voxel (p_occ < 0.5) with at least one unknown (absent)
+    // 6-neighbour. Mirrors findFrontierCentroids' membership test.
+    if (uv.p_occ < 0.5f) {
+      for (const auto& off : offsets) {
+        CoordT nb{c.x + off.x, c.y + off.y, c.z + off.z};
+        if (!acc.value(nb)) { frontier_count++; break; }
+      }
+    }
+  });
+
+  s.total_voxels    = count;
+  s.frontier_voxels = frontier_count;
+  if (count > 0) {
+    s.mean_eig      = sum_eig / static_cast<float>(count);
+    s.mean_entropy  = sum_entropy / static_cast<float>(count);
+    s.mean_variance = sum_variance / static_cast<float>(count);
+  }
+  return s;
 }
 
 } // namespace explo_planner

@@ -39,8 +39,6 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <scovox_msgs/msg/robot_intent.hpp>
-#include <scovox/uncertainty.hpp>
-#include <scovox/voxel.hpp>
 #include <tf2/utils.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -138,6 +136,10 @@ private:
   double nav_max_timeout_sec_;
   double progress_window_sec_;
   double progress_min_distance_m_;
+  // Reject single-tick pose jumps larger than this (m) from cumulative_distance_:
+  // localization relocalization (NDT/EKF) corrections teleport the
+  // map->base_link TF and would otherwise be counted as travel. 0 = disabled.
+  float  max_pose_jump_m_ = 1.0f;
   double failed_goal_radius_m_;
   double failed_goal_ttl_sec_;
   double done_unknown_fraction_;
@@ -173,6 +175,11 @@ private:
   float roi_max_y_ =  15.0f;
   float roi_min_z_ =  -0.5f;
   float roi_max_z_ =   2.0f;
+  // Frontier-centroid clustering bin size (m): findFrontierCentroids bins
+  // frontier cells into cubes of this edge length and emits one centroid per
+  // bin. Larger -> fewer, coarser long-range targets. The sibling roi_*_z args
+  // to findFrontierCentroids are already params; this was the lone hardcoded one.
+  float frontier_cluster_radius_m_ = 5.0f;
 
   // --- Components ---
   std::unique_ptr<MapCache> map_cache_;
@@ -290,6 +297,10 @@ ExploPlannerNode::ExploPlannerNode()
   // out the full budget. Mirrors the navigator's progress check.
   progress_window_sec_   = dp("progress_window_sec", 6.0);
   progress_min_distance_m_ = dp("progress_min_distance_m", 0.3);
+  // Teleport guard for cumulative distance (see member doc). At the 10 Hz tick
+  // this cannot reject real motion; it filters localization discontinuities so
+  // they don't inflate distance_traveled or spoof the no-progress watchdog.
+  max_pose_jump_m_ = static_cast<float>(dp("max_pose_jump_m", 1.0));
 
   // Failed-goal blacklist. When a navigate cycle times out before reaching
   // the goal, the goal position is parked here for `failed_goal_ttl_sec`
@@ -342,6 +353,9 @@ ExploPlannerNode::ExploPlannerNode()
   // empty — no info gain, no occlusion).
   roi_min_z_ = static_cast<float>(dp("roi_min_z", -0.5));
   roi_max_z_ = static_cast<float>(dp("roi_max_z",  2.0));
+  // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
+  frontier_cluster_radius_m_ =
+      static_cast<float>(dp("frontier_cluster_radius_m", 5.0));
 
   // FOV evaluation
   FovConfig fcfg;
@@ -757,6 +771,17 @@ void ExploPlannerNode::doPlan() {
       }
     } else {
       coverage_done_streak_ = 0;
+      if (unk < 0.0) {
+        // unknownFractionInRoi() returns -1 when there is no planning_map. In
+        // best-effort mode (require_planning_map=false) with no planning_map
+        // ever published, coverage-based DONE can therefore never trigger —
+        // surface that instead of silently relying on max_steps.
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+            "Coverage termination (done_unknown_fraction=%.3f) INACTIVE: no "
+            "planning_map to measure ROI unknown-fraction; stopping only at "
+            "max_steps=%d unless a planning_map is published.",
+            done_unknown_fraction_, max_steps_);
+      }
     }
   }
 
@@ -773,7 +798,7 @@ void ExploPlannerNode::doPlan() {
       candidate_gen_->generate(robot_pos, robot_yaw, nullptr);
   size_t n_radial = candidates.size();
   auto frontiers = map_cache_->findFrontierCentroids(
-      roi_min_z_, roi_max_z_, 5.0f);
+      roi_min_z_, roi_max_z_, frontier_cluster_radius_m_);
   candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos);
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
       "Candidates: %zu radial + %zu frontier centroids = %zu total",
@@ -1195,39 +1220,16 @@ void ExploPlannerNode::doLogStep() {
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
 
-  // Compute map stats locally from map_cache_ (the fused ROI grid). The
-  // dscovox node no longer computes these — scoring and stats both live in
-  // the planner now.
-  m.total_observed_voxels = static_cast<int>(map_cache_->voxelCount());
-  {
-    float sum_eig = 0, sum_entropy = 0, sum_variance = 0;
-    int frontier_count = 0, count = 0;
-    auto acc = map_cache_->grid().createConstAccessor();
-    static const Bonxai::CoordT offsets[6] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-    map_cache_->grid().forEachCell(
-        [&](const UnifiedVoxel& uv, const Bonxai::CoordT& c) {
-          scovox::Voxel sv;
-          sv.a_occ = uv.a_occ;
-          sv.a_free = uv.a_free;
-          sum_eig += scovox::expectedInformationGain(sv);
-          sum_variance += scovox::variance(sv);
-          sum_entropy += scoring::entropy(uv);
-          count++;
-          if (uv.p_occ < 0.5f) {
-            for (const auto& off : offsets) {
-              Bonxai::CoordT nb{c.x + off.x, c.y + off.y, c.z + off.z};
-              if (!acc.value(nb)) { frontier_count++; break; }
-            }
-          }
-        });
-    m.frontier_voxels = frontier_count;
-    if (count > 0) {
-      m.mean_eig      = sum_eig / (float)count;
-      m.mean_entropy   = sum_entropy / (float)count;
-      m.mean_variance  = sum_variance / (float)count;
-    }
-  }
+  // Aggregate map stats from map_cache_ (the fused ROI grid). The dscovox node
+  // no longer computes these — scoring and stats both live in the planner now.
+  // The grid walk + frontier-neighbour logic lives in MapCache::computeStats()
+  // (shared with findFrontierCentroids, unit-testable in isolation).
+  const auto stats = map_cache_->computeStats();
+  m.total_observed_voxels = stats.total_voxels;
+  m.frontier_voxels       = stats.frontier_voxels;
+  m.mean_eig              = stats.mean_eig;
+  m.mean_entropy          = stats.mean_entropy;
+  m.mean_variance         = stats.mean_variance;
 
   logger_->logStep(m);
   RCLCPP_INFO(get_logger(),
@@ -1277,7 +1279,23 @@ void ExploPlannerNode::updatePoseFromTF() {
 void ExploPlannerNode::trackDistance() {
   if (!have_pose_) return;
   if (!first_pos_) {
-    cumulative_distance_ += (latest_pos_ - prev_pos_).norm();
+    float step = (latest_pos_ - prev_pos_).norm();
+    // Reject implausible single-tick pose jumps. Localization relocalization
+    // (NDT / EKF corrections) teleports the map->base_link TF by metres in one
+    // tick; at the 10 Hz tick this guard can't reject real motion (even a 1 m/s
+    // robot moves 0.1 m/tick), so anything above max_pose_jump_m_ is a
+    // discontinuity, not travel. Counting it would inflate distance_traveled (a
+    // headline metric) AND let a stationary-but-relocalizing robot satisfy the
+    // no-progress watchdog. prev_pos_ is still advanced so the next tick
+    // measures from the corrected pose. 0 disables the guard.
+    if (max_pose_jump_m_ > 0.0f && step > max_pose_jump_m_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Pose jump of %.2f m in one tick exceeds max_pose_jump_m=%.2f — "
+          "treating as a localization discontinuity, not travel.",
+          step, max_pose_jump_m_);
+    } else {
+      cumulative_distance_ += step;
+    }
   }
   prev_pos_ = latest_pos_;
   first_pos_ = false;

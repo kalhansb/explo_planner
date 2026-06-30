@@ -56,6 +56,21 @@ public:
   std::vector<Eigen::Vector3f> findFrontierCentroids(
       float min_z, float max_z, float cluster_radius) const;
 
+  /// Aggregate per-voxel statistics over the whole (already ROI-clipped) grid:
+  /// mean expected-information-gain, mean entropy, mean Beta variance, and the
+  /// frontier-voxel count (free voxels with >=1 unknown 6-neighbour). Walks
+  /// every active cell once. Extracted from the planner's LOG_STEP so it is
+  /// unit-testable and shares the frontier-neighbour logic with
+  /// findFrontierCentroids.
+  struct MapStats {
+    int   total_voxels    = 0;
+    int   frontier_voxels = 0;
+    float mean_eig        = 0.0f;
+    float mean_entropy    = 0.0f;
+    float mean_variance   = 0.0f;
+  };
+  MapStats computeStats() const;
+
 private:
   double resolution_;
   std::unique_ptr<Grid> grid_;

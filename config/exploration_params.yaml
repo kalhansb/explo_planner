@@ -49,6 +49,15 @@ explo_planner:
     progress_window_sec: 15.0
     progress_min_distance_m: 0.2
 
+    # Teleport guard for distance tracking. cumulative_distance_ is integrated
+    # from per-tick map->base_link TF deltas at 10 Hz; a localization
+    # relocalization (NDT/EKF correction) teleports the pose by metres in one
+    # tick. A single-tick delta above this (m) is treated as a discontinuity,
+    # not travel, so it doesn't inflate distance_traveled or spoof the
+    # no-progress watchdog. At 10 Hz this can't reject real motion (a 1 m/s
+    # robot moves 0.1 m/tick). Set 0 to disable and reproduce raw integration.
+    max_pose_jump_m: 1.0
+
     # Failed-goal blacklist. After a navigate timeout, the failed goal is
     # parked for failed_goal_ttl_sec; subsequent picks reject any candidate
     # within failed_goal_radius_m of an active entry. Prevents the planner
@@ -78,6 +87,12 @@ explo_planner:
     candidate_n_yaw: 4
     candidate_robot_z: 0.3
     candidate_occ_thresh: 0.7
+
+    # Frontier-centroid clustering bin size (m). Frontier cells (free voxels
+    # adjacent to unknown space) are binned into cubes of this edge length and
+    # one centroid per bin is emitted as a long-range candidate. Larger ->
+    # fewer, coarser frontier targets.
+    frontier_cluster_radius_m: 5.0
 
     # Region of interest (XY bounding box, map frame, metres). The planner
     # will not select candidates outside this box. KEEP IN SYNC with the
