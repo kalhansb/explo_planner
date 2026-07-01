@@ -15,7 +15,9 @@ void MetricsLogger::writeHeader() {
         << "mean_eig,mean_entropy,mean_variance,"
         << "mean_info_gain,mean_path_cost,"
         << "selected_info_gain,selected_path_cost,selected_utility,"
-        << "coord_active_peers,rejected_by_minpos,rejected_by_unreachable\n";
+        << "coord_active_peers,rejected_by_minpos,rejected_by_unreachable,"
+        << "phase,target_id,vantage_index,n_vantages_valid,"
+        << "vantage_los_clear,dwell_sec\n";
   header_written_ = true;
 }
 
@@ -38,7 +40,13 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.selected_utility << ","
         << m.coord_active_peers << ","
         << m.rejected_by_minpos << ","
-        << m.rejected_by_unreachable << "\n";
+        << m.rejected_by_unreachable << ","
+        << m.phase << ","
+        << m.target_id << ","
+        << m.vantage_index << ","
+        << m.n_vantages_valid << ","
+        << m.vantage_los_clear << ","
+        << m.dwell_sec << "\n";
   file_.flush();
 }
 

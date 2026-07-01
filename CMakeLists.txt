@@ -31,6 +31,8 @@ add_library(explo_planner_lib
   src/plan_map_query.cpp
   src/failed_goal_blacklist.cpp
   src/planner_util.cpp
+  src/target_queue.cpp
+  src/vantage_planner.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -66,11 +68,21 @@ ament_target_dependencies(explo_planner_node
   visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
+# Time-based tree-target publisher: drives the exploitation targets topic from
+# a preselected, time-scheduled list (stand-in for a future tree detector).
+add_executable(target_scheduler_node
+  src/target_scheduler_node.cpp
+)
+
+ament_target_dependencies(target_scheduler_node
+  rclcpp scovox_msgs
+)
+
 # ==================================================================
 # Install
 # ==================================================================
 
-install(TARGETS explo_planner_node
+install(TARGETS explo_planner_node target_scheduler_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -112,6 +124,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_planner_util test/test_planner_util.cpp)
   target_link_libraries(test_planner_util explo_planner_lib)
+
+  ament_add_gtest(test_target_queue test/test_target_queue.cpp)
+  target_link_libraries(test_target_queue explo_planner_lib)
+
+  ament_add_gtest(test_vantage_planner test/test_vantage_planner.cpp)
+  target_link_libraries(test_vantage_planner explo_planner_lib)
 endif()
 
 ament_package()

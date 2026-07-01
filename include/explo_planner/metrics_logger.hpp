@@ -8,6 +8,16 @@
 namespace explo_planner {
 
 struct StepMetrics {
+  // Exploitation diagnostics. Exploration steps leave these at their defaults
+  // ("explore"/-1/0); exploitation steps fill them from the active target and
+  // the dwelled vantage so a CSV row attributes itself to a phase + target.
+  std::string phase            = "explore";  // "explore" or "exploit"
+  int    target_id             = -1;   // active target id, or -1 in explore
+  int    vantage_index         = -1;   // index of the dwelled vantage, or -1
+  int    n_vantages_valid      = 0;    // valid vantages this exploit plan tick
+  int    vantage_los_clear     = 0;    // 1 if the dwelled vantage had clear LoS
+  float  dwell_sec             = 0.0f; // dwell time held at the vantage
+
   int    step                  = 0;
   double sim_time_sec          = 0.0;
   int    total_observed_voxels = 0;

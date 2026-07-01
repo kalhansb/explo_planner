@@ -145,3 +145,26 @@ explo_planner:
     coord_claim_ttl_sec: 5.0        # 5 x heartbeat; stalled peer releases ~5 s
     coord_intent_topic: "/exploration/intents"
     coord_heartbeat_hz: 1.0
+
+    # ----------------------------------------------------------------
+    # Perceptive exploitation
+    # ----------------------------------------------------------------
+    # When a tree target arrives on targets_topic the planner switches
+    # EXPLORE -> EXPLOIT and circles the trunk at n_vantages occlusion-free
+    # vantage points (3 => ~120 deg apart), dwelling exploit_dwell_sec at each
+    # so the rosbag captures overlapping RGB-D/LiDAR views (fusion is offline).
+    # A target is "successfully exploited" once min_vantages_required clear-LoS
+    # vantages are dwelled; it reverts to EXPLORE when the queue empties. The
+    # topic is shared, so a future tree detector publishes the same TreeTarget
+    # message with no planner change. Set exploitation_enabled: false for pure
+    # exploration (the overlay then never subscribes or activates).
+    exploitation_enabled: true
+    targets_topic: "/exploration/targets"
+    n_vantages: 3                   # viewpoints per trunk (3 => 120 deg apart)
+    min_vantages_required: 3        # clear-LoS dwells for a "successful" target
+    vantage_standoff_m: 2.0         # standoff added to trunk radius (m), then
+                                    # clamped to [fov_min_range+r, fov_max_range]
+    vantage_start_angle_deg: 0.0    # angle of the first vantage around the trunk
+    exploit_dwell_sec: 8.0          # hold time at each vantage (s)
+    target_dedup_radius_m: 1.5      # re-reported trees within this are ignored
+    vantage_visited_tol_m: 0.75     # proximity that counts a vantage "dwelled"

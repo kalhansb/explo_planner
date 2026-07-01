@@ -1,0 +1,24 @@
+# Preselected tree-target schedule for target_scheduler_node.
+#
+# Each target is released on targets_topic when its target_release_sec (relative
+# to scheduler start, in sim time) elapses. The arrays are indexed in parallel:
+# target i = (target_ids[i], target_x[i], target_y[i], target_z[i],
+#             target_radius[i], target_height[i], target_release_sec[i]).
+# Stand-in for a future tree detector, which would publish the same TreeTarget
+# message on the same topic instead.
+#
+# Keep centres inside the planner ROI (roi_*_x/y in exploration_params.yaml) and
+# in the planner's map_frame. radius <= 0 => use the default standoff only.
+target_scheduler:
+  ros__parameters:
+    use_sim_time: true
+    targets_topic: "/exploration/targets"
+    frame_id: "map"
+
+    target_ids:         [1,     2]
+    target_x:           [5.0,  -4.0]
+    target_y:           [3.0,  -6.0]
+    target_z:           [0.0,   0.0]
+    target_radius:      [0.3,   0.4]
+    target_height:      [8.0,  10.0]
+    target_release_sec: [20.0,  90.0]

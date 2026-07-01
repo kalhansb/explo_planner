@@ -14,6 +14,7 @@ struct CandidateViewpoint {
   float yaw   = 0.0f;
   float score = 0.0f;
   bool  is_frontier = false;  ///< True for frontier centroid candidates
+  bool  is_vantage  = false;  ///< True for exploitation vantage points around a target
 };
 
 struct CandidateConfig {
