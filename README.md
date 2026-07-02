@@ -140,6 +140,37 @@ ros2 launch explo_planner exploitation_experiment.launch.py \
   targets_file:=<pkg>/config/targets.yaml
 ```
 
+### Real-robot trials (Docker)
+
+The planner has no container of its own — build and run it in an overlay
+workspace inside the running `scovox` container (image `scovox:jazzy`, the
+sibling repo's `compose.yaml`; it provides ROS 2 Jazzy plus the
+`scovox_core`/`scovox_msgs` dependencies at `/scovox/install`):
+
+```bash
+cd ../scovox && docker compose up -d && cd -
+docker exec scovox bash -c 'rm -rf /tmp/explo_ws/src/explo_planner && mkdir -p /tmp/explo_ws/src'
+docker cp . scovox:/tmp/explo_ws/src/explo_planner   # always onto a fresh dir, never an existing one
+docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash \
+  && cd /tmp/explo_ws && colcon build --packages-select explo_planner --cmake-args -DCMAKE_BUILD_TYPE=Release'
+```
+
+Prerequisites on the robot: the `map → odom → base_link` TF tree from the
+sibling `hmr_localisation` NDT localizer, per-robot SCovox + DSCovox mapping
+(scovox README, "Multi-robot mapping"), and a nav stack listening on
+`goal_topic`. Then, per robot:
+
+```bash
+docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash \
+  && source /tmp/explo_ws/install/setup.bash \
+  && ros2 launch explo_planner exploration_experiment.launch.py robot:=atlas'
+```
+
+All tuning lives in [`config/exploration_params.yaml`](config/exploration_params.yaml)
+(loaded by every launch file) — set `use_sim_time: false` there for hardware,
+and keep `roi_min_z`/`roi_max_z` inside the multi-robot share z-band (see the
+KEEP-IN-SYNC comment in the yaml).
+
 ### Key topics
 
 | Direction | Topic | Purpose |

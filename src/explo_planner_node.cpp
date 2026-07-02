@@ -218,6 +218,27 @@ private:
   float roi_max_y_ =  15.0f;
   float roi_min_z_ =  -0.5f;
   float roi_max_z_ =   2.0f;
+  // Terrain-relative (3D) mode. When true:
+  //  - roi_min_z_/roi_max_z_ are interpreted RELATIVE to the robot's current
+  //    z: the fused-map ingest clip, frontier extraction and the FOV ray
+  //    z-clip all use [robot_z + roi_min_z_, robot_z + roi_max_z_], re-banded
+  //    as the robot climbs/descends (see loadLatestMap);
+  //  - candidates are snapped to local ground + candidate_z_clearance
+  //    (CandidateGenerator terrain mode), so published goals carry a real 3D
+  //    z. Nav2 consumes only (x, y, yaw) from the goal — the z rides along
+  //    for 3D consumers/RViz, or is zeroed when flatten_goal_z_ is set.
+  // When false, all z handling is the legacy absolute flat-world behaviour.
+  bool  terrain_relative_z_ = false;
+  // Effective (absolute) z band currently ingested into map_cache_. Equal to
+  // roi_min_z_/roi_max_z_ in flat mode; robot-centred in terrain mode.
+  float eff_roi_min_z_ = 0.0f;
+  float eff_roi_max_z_ = 0.0f;
+  // Robot z the current map_cache_ ingest band was centred on (terrain mode).
+  // NaN until the first ingest; used to re-band after vertical travel.
+  float ingest_ref_z_ = std::numeric_limits<float>::quiet_NaN();
+  // Zero the z of the published goal PoseStamped (strict-2D nav consumers).
+  // Markers/logs keep the true 3D z either way.
+  bool  flatten_goal_z_ = false;
   // Frontier-centroid clustering bin size (m): findFrontierCentroids bins
   // frontier cells into cubes of this edge length and emits one centroid per
   // bin. Larger -> fewer, coarser long-range targets. The sibling roi_*_z args
@@ -438,6 +459,21 @@ ExploPlannerNode::ExploPlannerNode()
   // empty — no info gain, no occlusion).
   roi_min_z_ = static_cast<float>(dp("roi_min_z", -0.5));
   roi_max_z_ = static_cast<float>(dp("roi_max_z",  2.0));
+
+  // Terrain-relative (3D) mode — see the member doc. Off by default: flat
+  // mode is bit-for-bit the legacy behaviour.
+  terrain_relative_z_ = dp("terrain_relative_z", false);
+  ccfg.terrain_relative    = terrain_relative_z_;
+  ccfg.z_clearance         = static_cast<float>(dp("candidate_z_clearance", 0.5));
+  ccfg.ground_search_below = static_cast<float>(dp("ground_search_below_m", 4.0));
+  ccfg.ground_search_above = static_cast<float>(dp("ground_search_above_m", 1.0));
+  ccfg.ground_stack_max_m  = static_cast<float>(dp("ground_stack_max_m", 0.6));
+  flatten_goal_z_          = dp("flatten_goal_z", false);
+  // Until the first ingest the effective band equals the configured one
+  // (flat mode keeps it that way permanently).
+  eff_roi_min_z_ = roi_min_z_;
+  eff_roi_max_z_ = roi_max_z_;
+
   // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
   frontier_cluster_radius_m_ =
       static_cast<float>(dp("frontier_cluster_radius_m", 5.0));
@@ -561,7 +597,16 @@ ExploPlannerNode::ExploPlannerNode()
     // (vcfg.robot_z). map_cache_ is clipped to [roi_min_z_, roi_max_z_], so if
     // the sightline sits outside that band there are no voxels to hit and the
     // occlusion check silently passes everything. Warn if misconfigured.
-    if (exploitation_enabled_ &&
+    // Terrain mode: the band is robot-relative, so this absolute comparison
+    // is meaningless — skip it (the vantage planner itself remains
+    // flat-world; exploitation on hilly terrain is not terrain-adapted yet).
+    if (exploitation_enabled_ && terrain_relative_z_) {
+      RCLCPP_WARN(get_logger(),
+          "Exploitation is enabled with terrain_relative_z=true, but the "
+          "vantage planner still places sightlines at the fixed absolute "
+          "candidate_robot_z=%.2f (not terrain-adapted).", vcfg.robot_z);
+    }
+    if (exploitation_enabled_ && !terrain_relative_z_ &&
         (vcfg.robot_z < roi_min_z_ || vcfg.robot_z > roi_max_z_)) {
       RCLCPP_WARN(get_logger(),
           "Vantage sightline height candidate_robot_z=%.2f is outside the map "
@@ -682,6 +727,18 @@ ExploPlannerNode::ExploPlannerNode()
       "frame=%s base=%s planning_map=%s goal=%s",
       max_steps_, map_frame_.c_str(), base_frame_.c_str(),
       planning_map_topic.c_str(), goal_topic.c_str());
+  if (terrain_relative_z_) {
+    RCLCPP_INFO(get_logger(),
+        "Terrain-relative z ON: map z-band [%+.1f, %+.1f] m about the robot, "
+        "candidates at ground + %.2f m (ground search -%.1f/+%.1f m, stack "
+        "cap %.2f m), goal z %s.",
+        static_cast<double>(roi_min_z_), static_cast<double>(roi_max_z_),
+        static_cast<double>(ccfg.z_clearance),
+        static_cast<double>(ccfg.ground_search_below),
+        static_cast<double>(ccfg.ground_search_above),
+        static_cast<double>(ccfg.ground_stack_max_m),
+        flatten_goal_z_ ? "flattened to 0 (strict-2D nav)" : "3D (nav2 ignores z)");
+  }
 }
 
 // ==================================================================
@@ -707,21 +764,46 @@ void ExploPlannerNode::onScovoxMap(
 
 bool ExploPlannerNode::loadLatestMap() {
   if (!latest_scovox_map_) return false;
-  // Rebuild only when a new message has arrived since the last ingest. onScovoxMap
-  // just swaps the cached pointer, so pointer identity == unchanged snapshot;
-  // repeated PLAN / WAIT_FOR_MAP ticks on the same map reuse the existing grid
-  // instead of reallocating it.
-  if (latest_scovox_map_ != ingested_scovox_map_) {
+  // Terrain mode: the ingest z-band follows the robot. Re-banding forces a
+  // grid rebuild even for the same map message, but only after meaningful
+  // vertical travel — the hysteresis keeps the 10 Hz PLAN retry ticks from
+  // rebuilding a large grid every tick while the robot idles.
+  bool reband = false;
+  float band_lo = roi_min_z_, band_hi = roi_max_z_;
+  if (terrain_relative_z_) {
+    const float ref_z = have_pose_ ? latest_pos_.z() : 0.0f;
+    // 1/4 of the band half-width, clamped to [0.5, 2] m: tight bands re-band
+    // sooner, wide bands tolerate more drift before paying a rebuild.
+    const float hysteresis = std::clamp(
+        0.25f * 0.5f * (roi_max_z_ - roi_min_z_), 0.5f, 2.0f);
+    const float drift = std::isfinite(ingest_ref_z_)
+        ? std::abs(ref_z - ingest_ref_z_)
+        : std::numeric_limits<float>::infinity();
+    const float band_ref = (drift > hysteresis) ? ref_z : ingest_ref_z_;
+    reband = (drift > hysteresis);
+    band_lo = band_ref + roi_min_z_;
+    band_hi = band_ref + roi_max_z_;
+  }
+  // Rebuild when a new message has arrived since the last ingest (onScovoxMap
+  // just swaps the cached pointer, so pointer identity == unchanged snapshot)
+  // or when terrain mode moved the band; otherwise repeated PLAN /
+  // WAIT_FOR_MAP ticks reuse the existing grid instead of reallocating it.
+  if (latest_scovox_map_ != ingested_scovox_map_ || reband) {
     // The topic carries the whole fused map; clipping here keeps map_cache_
     // bounded to the ROI as the old per-region GetRegion service did, so frontier
     // extraction and the doLogStep map stats (both walk the whole grid) stay
-    // bounded. The [roi_min_z_, roi_max_z_] band defines one consistent
-    // observation volume that is also what FovEvaluator clips rays to.
+    // bounded. The [band_lo, band_hi] z-band defines one consistent
+    // observation volume that is also what FovEvaluator clips rays to
+    // (doPlan re-syncs the evaluator from eff_roi_*_z_ each tick).
     map_cache_->updateFromScovoxMap(
         *latest_scovox_map_,
-        Eigen::Vector3f(roi_min_x_, roi_min_y_, roi_min_z_),
-        Eigen::Vector3f(roi_max_x_, roi_max_y_, roi_max_z_));
+        Eigen::Vector3f(roi_min_x_, roi_min_y_, band_lo),
+        Eigen::Vector3f(roi_max_x_, roi_max_y_, band_hi));
     ingested_scovox_map_ = latest_scovox_map_;
+    eff_roi_min_z_ = band_lo;
+    eff_roi_max_z_ = band_hi;
+    if (terrain_relative_z_)
+      ingest_ref_z_ = band_lo - roi_min_z_;
     // have_map_ gates the WAIT_FOR_MAP -> PLAN transition; set it from the
     // post-clip count (matching the old service, which returned only in-ROI
     // voxels). Monotonic: once set it stays true.
@@ -987,18 +1069,30 @@ void ExploPlannerNode::doPlan() {
   auto robot_pos = latest_pos_;
   float robot_yaw = latest_yaw_;
 
+  // Terrain mode: loadLatestMap() may have re-banded the map z-slab around
+  // the robot; keep the FOV ray z-clip in lock-step so rays leaving the
+  // ingested band are clipped, not scored against absent voxels.
+  if (terrain_relative_z_)
+    fov_eval_->setRoiZ(eff_roi_min_z_, eff_roi_max_z_);
+
   // Generate candidates: a polar grid of viewpoints around the robot
   // (local EIG hops) PLUS frontier centroids anywhere in the ROI (long-
-  // range targets for escaping local IG maxima). The 3D occupancy check is
-  // skipped (nullptr map); the 2D planning_map filter below handles it.
-  // Frontiers are extracted locally from map_cache_ (the fused grid pulled
-  // via the topic).
+  // range targets for escaping local IG maxima). Flat mode passes a nullptr
+  // map (3D occupancy check skipped; the 2D planning_map filter below
+  // handles it); terrain mode passes map_cache_ so candidates snap to the
+  // local ground + clearance (and get the 3D occupancy check at that
+  // height). Frontiers are extracted locally from map_cache_ (the fused
+  // grid pulled via the topic), over the effective (robot-relative in
+  // terrain mode) z band.
+  const MapCache* terrain_map =
+      terrain_relative_z_ ? map_cache_.get() : nullptr;
   auto candidates =
-      candidate_gen_->generate(robot_pos, robot_yaw, nullptr);
+      candidate_gen_->generate(robot_pos, robot_yaw, terrain_map);
   size_t n_radial = candidates.size();
   auto frontiers = map_cache_->findFrontierCentroids(
-      roi_min_z_, roi_max_z_, frontier_cluster_radius_m_);
-  candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos);
+      eff_roi_min_z_, eff_roi_max_z_, frontier_cluster_radius_m_);
+  candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos,
+                                        terrain_map);
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
       "Candidates: %zu radial + %zu frontier centroids = %zu total",
       n_radial, candidates.size() - n_radial, candidates.size());
@@ -1989,7 +2083,11 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   goal.header.frame_id = map_frame_;
   goal.pose.position.x = vp.position.x();
   goal.pose.position.y = vp.position.y();
-  goal.pose.position.z = vp.position.z();
+  // Nav2's 2D planners consume only (x, y, yaw) and ignore z, so the true
+  // 3D waypoint z rides along by default (terrain mode makes it the ground
+  // + clearance elevation). flatten_goal_z zeroes it for consumers that
+  // choke on a non-zero z; markers/logs keep the 3D value either way.
+  goal.pose.position.z = flatten_goal_z_ ? 0.0 : vp.position.z();
   goal.pose.orientation = yawToQuat(vp.yaw);
   goal_pub_->publish(goal);
 }

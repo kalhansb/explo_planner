@@ -201,6 +201,46 @@ std::vector<Eigen::Vector3f> MapCache::findFrontierCentroids(
   return centroids;
 }
 
+float MapCache::groundZAt(float x, float y, float z_low, float z_high,
+                          float occ_thresh, float stack_max_m) const {
+  constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+  if (!(z_high > z_low) || !std::isfinite(x) || !std::isfinite(y) ||
+      !std::isfinite(z_low) || !std::isfinite(z_high))
+    return kNaN;
+
+  const float res = static_cast<float>(resolution_);
+  auto acc = grid_->createConstAccessor();
+
+  // Work in coord space so the scan can't skip or repeat cells through
+  // float rounding. Coords are voxel corners: coordToPos(c).z == c.z * res.
+  const auto c_lo = grid_->posToCoord(
+      static_cast<double>(x), static_cast<double>(y),
+      static_cast<double>(z_low));
+  const auto c_hi = grid_->posToCoord(
+      static_cast<double>(x), static_cast<double>(y),
+      static_cast<double>(z_high));
+
+  auto occupied = [&](int32_t cz) {
+    const UnifiedVoxel* v = acc.value(CoordT{c_lo.x, c_lo.y, cz});
+    return v && v->p_occ >= occ_thresh;
+  };
+
+  // Bottom-up: the lowest occupied voxel anchors the ground (canopy and
+  // overhangs sit higher and are never reached).
+  for (int32_t cz = c_lo.z; cz <= c_hi.z; ++cz) {
+    if (!occupied(cz)) continue;
+    // Walk up the contiguous occupied stack, capped at stack_max_m so a
+    // wall/trunk column doesn't lift the ground to its top.
+    const int32_t max_up = std::max(
+        0, static_cast<int>(std::floor(stack_max_m / res)));
+    int32_t top = cz;
+    while (top < cz + max_up && occupied(top + 1)) ++top;
+    // Top face of the top stack voxel = the ground surface elevation.
+    return static_cast<float>(top + 1) * res;
+  }
+  return kNaN;
+}
+
 MapCache::MapStats MapCache::computeStats() const {
   MapStats s;
   float sum_eig = 0.0f, sum_entropy = 0.0f, sum_variance = 0.0f;

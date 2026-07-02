@@ -56,6 +56,19 @@ public:
   std::vector<Eigen::Vector3f> findFrontierCentroids(
       float min_z, float max_z, float cluster_radius) const;
 
+  /// Estimate the ground elevation at world (x, y): the z of the top FACE of
+  /// the ground voxel stack in that column. The search scans the column from
+  /// z_low upward to z_high; the FIRST (lowest) occupied voxel
+  /// (p_occ >= occ_thresh) anchors the ground, then the walk continues up
+  /// through contiguous occupied voxels for at most stack_max_m (absorbs the
+  /// residual vertical measurement smear without climbing walls/trunks) and
+  /// the top face of the last stack voxel is returned. Lowest-first anchoring
+  /// makes the estimate robust to canopy/overhangs higher in the column.
+  /// Returns NaN when the window contains no occupied voxel (unobserved or
+  /// free-only column).
+  float groundZAt(float x, float y, float z_low, float z_high,
+                  float occ_thresh, float stack_max_m) const;
+
   /// Aggregate per-voxel statistics over the whole (already ROI-clipped) grid:
   /// mean expected-information-gain, mean entropy, mean Beta variance, and the
   /// frontier-voxel count (free voxels with >=1 unknown 6-neighbour). Walks

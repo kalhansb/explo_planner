@@ -27,6 +27,18 @@ struct CandidateConfig {
   float occ_thresh  = 0.7f;   ///< Reject candidates with p_occ above this
   float ground_z    = 0.15f;  ///< Voxels at or below this height are ground (ignored for occupancy check)
   bool  enable_polar = true;  ///< When false, generate() returns empty (frontier-only mode)
+  /// Terrain-relative (3D) mode. When true AND a map is provided, each
+  /// candidate's z is set to the local ground elevation (MapCache::groundZAt,
+  /// searched in a window around the reference z: the robot z for polar
+  /// candidates, the centroid z for frontier candidates) plus z_clearance.
+  /// Columns with no detected ground fall back to the reference z unchanged.
+  /// When false (default) the legacy flat-world behaviour is preserved
+  /// bit-for-bit: every candidate sits at the fixed absolute robot_z.
+  bool  terrain_relative     = false;
+  float z_clearance          = 0.5f;  ///< Candidate height above detected ground (m)
+  float ground_search_below  = 4.0f;  ///< Ground search window below the reference z (m)
+  float ground_search_above  = 1.0f;  ///< Ground search window above the reference z (m)
+  float ground_stack_max_m   = 0.6f;  ///< Contiguous occupied-stack walk cap (vertical smear)
   /// Hard XY bounding box on candidate positions (map frame, metres). The
   /// generator drops any candidate (radial or frontier) whose centre falls
   /// outside [roi_min_x, roi_max_x] x [roi_min_y, roi_max_y]. Set the dscovox
@@ -51,14 +63,23 @@ public:
       float robot_yaw,
       const MapCache* map = nullptr) const;
 
-  /// Inject frontier centroids as additional candidates.
+  /// Inject frontier centroids as additional candidates. In flat mode the
+  /// centroid z is flattened to robot_z; in terrain-relative mode (with a
+  /// map) the candidate is snapped to ground + z_clearance, searched around
+  /// the centroid's own z, falling back to the centroid z when no ground is
+  /// found (frontiers naturally border unobserved columns).
   void addFrontierCandidates(
       std::vector<CandidateViewpoint>& candidates,
       const std::vector<Eigen::Vector3f>& frontier_centroids,
-      const Eigen::Vector3f& robot_pos) const;
+      const Eigen::Vector3f& robot_pos,
+      const MapCache* map = nullptr) const;
 
 private:
   CandidateConfig cfg_;
+
+  /// Terrain z for a candidate at (x, y): ground + z_clearance, searching the
+  /// window around z_ref; z_ref when no ground is found.
+  float terrainZ(float x, float y, float z_ref, const MapCache& map) const;
 };
 
 } // namespace explo_planner

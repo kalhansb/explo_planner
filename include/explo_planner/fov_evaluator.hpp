@@ -45,6 +45,16 @@ class FovEvaluator {
 public:
   explicit FovEvaluator(const FovConfig& cfg);
 
+  /// Re-band the vertical ray clip. Terrain-relative mode moves the map z-slab
+  /// with the robot each PLAN tick; the ray clip must track it so out-of-band
+  /// space stays "empty" (no score, no occlusion) rather than reading absent
+  /// voxels as the max-uncertainty prior. Ray directions only depend on the
+  /// FOV so no recompute is needed.
+  void setRoiZ(float roi_min_z, float roi_max_z) {
+    cfg_.roi_min_z = roi_min_z;
+    cfg_.roi_max_z = roi_max_z;
+  }
+
   /// Evaluate a single candidate viewpoint against the map.
   EvalResult evaluate(
       const CandidateViewpoint& vp,
