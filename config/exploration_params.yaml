@@ -104,6 +104,18 @@ explo_planner:
     roi_min_y: -30.0
     roi_max_y:  30.0
 
+    # Vertical ROI band (map frame, metres): candidate goals are clamped to
+    # z in [roi_min_z, roi_max_z]. Values here mirror the code defaults
+    # (explo_planner_node.cpp). KEEP IN SYNC with the multi-robot shared-map
+    # z-band — scovox_node share_roi_z_min/share_roi_z_max (sender wire
+    # filter) and dscovox_node share_roi_z_min/share_roi_z_max (receiver
+    # ingest clip): when that band is enabled it must be a SUPERSET of this
+    # planner band, otherwise free voxels near the band edge never reach the
+    # fused map and read as unknown here (starved candidates / phantom
+    # frontiers at the boundary).
+    roi_min_z: -0.5
+    roi_max_z: 2.0
+
     # FOV evaluation (matches simulated RGBD: 320x240, 60deg HFOV)
     fov_hfov: 1.047              # 60 degrees
     fov_vfov: 0.785              # ~45 degrees (from 320x240 aspect)
