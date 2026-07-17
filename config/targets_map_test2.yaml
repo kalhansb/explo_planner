@@ -1,0 +1,42 @@
+# Tree-target schedule for the map-test-2 bag (dscovox exploitation run).
+#
+# Companion to doc/dscovox_exploitation_run.md. Unlike config/targets.yaml
+# (generic placeholders), these are REAL trunks measured out of the ground-truth
+# map hmr_localisation/gt_map/gt_map.ply, and each release time is set so the
+# target lands while the bag walk is passing that trunk.
+#
+# How these were chosen (the run is bag replay: NOTHING drives to the vantages,
+# so the trunks have to be picked to suit the *absolute* z knobs — exploitation
+# is not terrain-adapted, see the doc's Caveats):
+#   * ground_z <= -1.4  — scovox projects the planning_map over the ABSOLUTE
+#     band [-1, 2]; on higher ground the ground plane itself lands in the band,
+#     marks every cell occupied and every vantage is rejected as not-free.
+#   * sightline clearance — the LoS ray marches at the absolute
+#     candidate_robot_z (0.3), which must sit ~2 m above the local ground and
+#     well under the canopy to actually strike the trunk.
+#   * open ring — with vantage_start_angle_deg: 30 the three vantages
+#     (30/150/270 deg, standoff = radius + 2.0 m) land in free, LoS-clear cells.
+#     Both the angle and these centres were solved together; changing one
+#     without re-checking the other will start rejecting vantages.
+#
+#   id  centre (x, y)   ground_z  radius  closest approach   ring @ start=30
+#   1   ( 5.43, -8.10)   -1.70     0.25   4.9 m at t=151 s   2/3 free, 2/3 LoS
+#   2   (15.93, 16.57)   -2.65     0.27   5.4 m at t=219 s   3/3 free, 2/3 LoS
+#
+# Release times are in SIM seconds from the scheduler's origin, which it latches
+# on its first tick with a live /clock (~bag start). The bag's first localized
+# pose lands ~2.6 s after that, so these are (trajectory time + ~2.6 s), set a
+# few seconds BEFORE closest approach so the planner engages on the way in.
+target_scheduler:
+  ros__parameters:
+    use_sim_time: true
+    targets_topic: "/exploration/targets"
+    frame_id: "map"
+
+    target_ids:         [1,      2]
+    target_x:           [5.43,  15.93]
+    target_y:           [-8.10, 16.57]
+    target_z:           [-1.70, -2.65]   # trunk base (local ground) in map frame
+    target_radius:      [0.25,   0.27]
+    target_height:      [9.0,    8.0]    # informational
+    target_release_sec: [143.0, 215.0]

@@ -1790,6 +1790,23 @@ void ExploPlannerNode::doExploitPlan() {
     return;
   }
 
+  // Hard per-target wall-clock bound. This sits ABOVE all vantage-selection
+  // logic on purpose: a target can keep producing a "selectable" vantage every
+  // tick (e.g. the blacklist TTL re-offers vantages faster than the nav budget
+  // can exhaust the ring) and spin here forever, never reaching the give-up
+  // path further down. Bounding it here makes exploitation of one trunk
+  // provably terminate, so the phase always reverts to EXPLORE.
+  if (exploit_target_timeout_sec_ > 0.0) {
+    const double waited = this->now().seconds() - exploit_target_started_sec_;
+    if (waited >= exploit_target_timeout_sec_) {
+      RCLCPP_WARN(get_logger(),
+          "Target %u: exploitation timeout after %.0fs (limit %.0fs) -> PARTIAL.",
+          tgt->id, waited, exploit_target_timeout_sec_);
+      finishActiveTarget(/*success=*/false);
+      return;
+    }
+  }
+
   const auto robot_pos = latest_pos_;
 
   // Generate the fixed angular vantage set around the trunk.
@@ -1864,25 +1881,9 @@ void ExploPlannerNode::doExploitPlan() {
         tgt->id, n_valid, rej_roi, rej_map, rej_unreach, rej_los,
         rej_visited, rej_blk);
 
-    // Quota already met -> success regardless.
-    if (tgt->clear_los_dwells >= min_vantages_required_) {
-      finishActiveTarget(/*success=*/true);
-      return;
-    }
-
-    // Give-up timer: a target whose surroundings stay unmapped/unreachable must
-    // not block exploration forever. Close it PARTIAL once the timeout elapses.
-    const double waited = this->now().seconds() - exploit_target_started_sec_;
-    if (exploit_target_timeout_sec_ > 0.0 &&
-        waited >= exploit_target_timeout_sec_) {
-      RCLCPP_WARN(get_logger(),
-          "Target %u: no selectable vantage after %.0fs (timeout %.0fs) -> "
-          "PARTIAL.", tgt->id, waited, exploit_target_timeout_sec_);
-      finishActiveTarget(/*success=*/false);
-      return;
-    }
-
-    // Otherwise drive *toward* the trunk: head for the nearest reachable point
+    // Quota-met and the per-target timeout are both handled unconditionally at
+    // the top of this function, so neither can apply here. Drive *toward* the
+    // trunk instead: head for the nearest reachable point
     // on the line to it so the area maps en route and a vantage can pass on a
     // later tick. Re-planning (not dwelling) resumes on arrival.
     Eigen::Vector3f approach;
@@ -1921,6 +1922,7 @@ void ExploPlannerNode::doExploitPlan() {
     // abandon the target — the map may still grow (other robots, late sensor
     // returns). Hold in EXPLOIT_PLAN and retry; the give-up timer above is what
     // eventually closes a genuinely unreachable target PARTIAL.
+    const double waited = this->now().seconds() - exploit_target_started_sec_;
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Target %u: no vantage and no reachable approach yet (waited %.0fs / "
         "%.0fs) — retrying.",
