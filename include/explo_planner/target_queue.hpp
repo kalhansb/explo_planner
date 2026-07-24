@@ -32,15 +32,25 @@ struct Target {
   enum class Status : uint8_t { PENDING, ACTIVE, DONE };
   Status status = Status::PENDING;
 
-  /// XY positions of vantages already dwelled at for this target. Vantages are
+  /// XY positions of vantages already dwelled at for this target — local
+  /// dwells plus canonical ring positions merged from peers. Vantages are
   /// re-generated every plan tick, so "already visited" is tracked by proximity
   /// to these recorded positions (see isVantageVisited) rather than by a
   /// transient per-tick index. Z is ignored in the comparison.
   std::vector<Eigen::Vector3f> visited_vantages;
 
-  /// Count of dwelled vantages that had a clear line of sight to the trunk.
-  /// The success criterion is reached once this hits min_vantages_required.
+  /// Count of clear-LoS dwells credited to this target — the TEAM union, not
+  /// just local dwells (peer dwells merge in via mergePeerDwells). The success
+  /// criterion is reached once this hits min_vantages_required.
   int clear_los_dwells = 0;
+
+  /// Bitmask of vantage indices dwelled with clear LoS (bit i = ring index i).
+  /// The ring is deterministic from (center, radius), so indices are globally
+  /// meaningful across robots; this is what gets broadcast in RobotIntent and
+  /// what makes local + peer credit idempotent to merge (an index counts once
+  /// no matter how many robots dwell it or how often the mask is re-received).
+  /// Indices >= 32 fall back to the plain counter (no team sharing).
+  uint32_t clear_mask = 0;
 };
 
 class TargetQueue {
@@ -72,8 +82,22 @@ public:
   void markActiveDone();
 
   /// Record that the robot dwelled at a vantage of the ACTIVE target.
-  /// `los_clear` increments the clear-LoS dwell count used for success.
-  void recordVantageDwell(const Eigen::Vector3f& vantage_xy, bool los_clear);
+  /// `vantage_index` is the deterministic ring index of the vantage (< 32 for
+  /// team credit sharing; -1 / out-of-range falls back to counter-only).
+  /// A clear-LoS dwell on an index already credited (e.g. merged from a peer
+  /// that dwelled it first) does not double-count.
+  void recordVantageDwell(const Eigen::Vector3f& vantage_xy, bool los_clear,
+                          int vantage_index = -1);
+
+  /// Merge a peer's clear-LoS dwelled vantage-index mask into the target with
+  /// `target_id` (team quota: the union of everyone's dwells counts toward
+  /// success). `ring` is the locally generated vantage ring for that target —
+  /// canonical positions for newly credited indices are appended to
+  /// visited_vantages so isVantageVisited() skips angles a peer already
+  /// captured. Idempotent; returns true iff any new index was credited.
+  /// No-op on DONE or unknown targets.
+  bool mergePeerDwells(uint32_t target_id, uint32_t peer_mask,
+                       const std::vector<Eigen::Vector3f>& ring);
 
   /// True iff a (freshly generated) vantage at `vantage_xy` is within
   /// `visited_tol_m` (XY) of a vantage already dwelled at for the ACTIVE

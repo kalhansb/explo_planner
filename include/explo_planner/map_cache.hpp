@@ -84,6 +84,22 @@ public:
   };
   MapStats computeStats() const;
 
+  /// Fraction of x/y columns inside [min_x, max_x] x [min_y, max_y] that
+  /// contain NO observed voxel — a 2.5D "area coverage" measure over the
+  /// (already z-clipped) fused 3D map. A column counts as observed when any
+  /// grid cell (free OR occupied) projects into it, so trunk columns and
+  /// swept free space both count as covered; only never-seen ground-plane
+  /// cells raise the fraction. This deliberately ignores volumetric unknowns
+  /// (trunk interiors, canopy shadow are never observed and would put a
+  /// permanent floor under a 3D unknown fraction), matching the semantics of
+  /// the 2D planning_map unknown fraction used for coverage termination.
+  /// Bounds are mapped to coord space with the same floor() convention as
+  /// voxel ingest. Returns a value in [0, 1]; an empty grid gives 1.0.
+  /// Returns -1.0 on a degenerate box (max <= min) or non-finite bounds —
+  /// the caller's "cannot measure" convention.
+  double unknownColumnFraction(float min_x, float max_x,
+                               float min_y, float max_y) const;
+
 private:
   double resolution_;
   std::unique_ptr<Grid> grid_;

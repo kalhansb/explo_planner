@@ -86,11 +86,41 @@ void TargetQueue::markActiveDone() {
 }
 
 void TargetQueue::recordVantageDwell(const Eigen::Vector3f& vantage_xy,
-                                     bool los_clear) {
+                                     bool los_clear, int vantage_index) {
   Target* t = active();
   if (!t) return;
   t->visited_vantages.push_back(vantage_xy);
-  if (los_clear) ++t->clear_los_dwells;
+  if (!los_clear) return;
+  if (vantage_index >= 0 && vantage_index < 32) {
+    const uint32_t bit = 1u << vantage_index;
+    if (t->clear_mask & bit) return;  // already credited (peer dwelled it)
+    t->clear_mask |= bit;
+  }
+  // Out-of-range indices keep the pre-mask counter-only behaviour: they
+  // count locally but are invisible to the team-credit mask.
+  ++t->clear_los_dwells;
+}
+
+bool TargetQueue::mergePeerDwells(uint32_t target_id, uint32_t peer_mask,
+                                  const std::vector<Eigen::Vector3f>& ring) {
+  for (auto& t : targets_) {
+    if (t.id != target_id) continue;
+    if (t.status == Target::Status::DONE) return false;
+    uint32_t newly = peer_mask & ~t.clear_mask;
+    if (!newly) return false;
+    t.clear_mask |= newly;
+    for (int i = 0; i < 32 && newly; ++i) {
+      const uint32_t bit = 1u << i;
+      if (!(newly & bit)) continue;
+      newly &= ~bit;
+      ++t.clear_los_dwells;
+      // Record the canonical ring pose so isVantageVisited() skips the angle.
+      if (static_cast<size_t>(i) < ring.size())
+        t.visited_vantages.push_back(ring[i]);
+    }
+    return true;
+  }
+  return false;  // unknown target id (not yet ingested locally)
 }
 
 bool TargetQueue::isVantageVisited(const Eigen::Vector3f& vantage_xy,

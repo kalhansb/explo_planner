@@ -33,6 +33,7 @@ add_library(explo_planner_lib
   src/planner_util.cpp
   src/target_queue.cpp
   src/vantage_planner.cpp
+  src/tree_detector.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -78,11 +79,27 @@ ament_target_dependencies(target_scheduler_node
   rclcpp scovox_msgs
 )
 
+# Live tree detector: segments trees out of the fused dscovox map and publishes
+# the under-informed ones as TreeTarget — the real detector target_scheduler_node
+# stands in for. Drop-in on the same targets topic.
+add_executable(tree_detector_node
+  src/tree_detector_node.cpp
+)
+
+target_link_libraries(tree_detector_node
+  explo_planner_lib
+)
+
+ament_target_dependencies(tree_detector_node
+  rclcpp scovox_msgs
+)
+
 # ==================================================================
 # Install
 # ==================================================================
 
-install(TARGETS explo_planner_node target_scheduler_node
+install(TARGETS
+  explo_planner_node target_scheduler_node tree_detector_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -107,6 +124,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_candidate_generator test/test_candidate_generator.cpp)
   target_link_libraries(test_candidate_generator explo_planner_lib)
 
+  ament_add_gtest(test_map_cache test/test_map_cache.cpp)
+  target_link_libraries(test_map_cache explo_planner_lib)
+
   ament_add_gtest(test_fov_evaluator test/test_fov_evaluator.cpp)
   target_link_libraries(test_fov_evaluator explo_planner_lib)
 
@@ -130,6 +150,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_vantage_planner test/test_vantage_planner.cpp)
   target_link_libraries(test_vantage_planner explo_planner_lib)
+
+  ament_add_gtest(test_tree_detector test/test_tree_detector.cpp)
+  target_link_libraries(test_tree_detector explo_planner_lib)
 endif()
 
 ament_package()

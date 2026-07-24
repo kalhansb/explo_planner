@@ -65,13 +65,43 @@ explo_planner:
     failed_goal_radius_m: 2.0
     failed_goal_ttl_sec: 60.0
 
-    # Coverage-based termination. Once the unknown fraction in the ROI of
-    # the planning_map drops below done_unknown_fraction for
-    # done_min_consecutive_steps PLAN cycles in a row, the planner declares
-    # the map saturated and transitions to DONE. Set done_unknown_fraction
-    # <= 0 to disable (then only max_steps stops the planner).
+    # Coverage-based termination. Once the unknown fraction in the ROI drops
+    # below done_unknown_fraction for done_min_consecutive_steps PLAN cycles
+    # in a row, the planner declares the map saturated and transitions to
+    # DONE. Set done_unknown_fraction <= 0 to disable (then only max_steps
+    # stops the planner).
     done_unknown_fraction: 0.05
     done_min_consecutive_steps: 3
+    # Where that unknown fraction is measured:
+    #   planning_map — 2D unknown (-1) cells of the latched planning_map
+    #                  (legacy). INACTIVE when no planning_map is published.
+    #   scovox       — 2.5D column coverage of the fused 3D map: fraction of
+    #                  ROI-footprint x/y columns with NO observed voxel in the
+    #                  ingested z band. Works with no planning_map (the field
+    #                  config). NB: in flat mode the ingest band is the
+    #                  absolute [roi_min_z, roi_max_z] — on terrain outside
+    #                  it the map cache stays empty and coverage reads 100 %
+    #                  unknown (never done); set a per-area z band or
+    #                  terrain_relative_z there.
+    #   auto         — planning_map when one has been received, else scovox.
+    # The two sources measure different quantities; re-calibrate
+    # done_unknown_fraction when switching (calibrate scovox on an R0 bag
+    # replay: watch where the logged fraction plateaus).
+    # Pinned to scovox for field trials: we do not publish a planning_map, so
+    # "auto" would resolve to scovox anyway — but pinning it removes the one
+    # risk of "auto" (a stray/late planning_map switching the source mid-run and
+    # mixing two differently-calibrated metrics in the same coverage-done
+    # streak; see doc/limitations.md). Set back to "auto" for sim runs that do
+    # publish a planning_map and want the 2D measure.
+    done_coverage_source: "scovox"
+    # What DONE does:
+    #   shutdown — stop the node (legacy sim-experiment behaviour).
+    #   idle     — keep spinning; targets released after coverage-done still
+    #              pull the planner into the exploit sub-loop and it returns
+    #              to idle when the queue drains. Use for field runs where
+    #              the target scheduler releases lists at the coverage-done
+    #              cue (a shutdown would race the release).
+    done_action: "shutdown"
 
     # Candidate generation
     # Polar enabled: with frontier-only mode the planner exhausted reachable
@@ -157,6 +187,11 @@ explo_planner:
     coord_claim_ttl_sec: 5.0        # 5 x heartbeat; stalled peer releases ~5 s
     coord_intent_topic: "/exploration/intents"
     coord_heartbeat_hz: 1.0
+    # EXPLOIT claims use a separate, much smaller MinPos disc: vantages on one
+    # trunk sit only ~(radius + standoff) apart, so the exploration-scale disc
+    # would swallow the whole ring and veto the tree instead of splitting the
+    # angles across the team. 0 = auto = vantage_visited_tol_m.
+    coord_vantage_claim_radius_m: 0.0
 
     # ----------------------------------------------------------------
     # Perceptive exploitation
@@ -166,7 +201,11 @@ explo_planner:
     # vantage points (3 => ~120 deg apart), dwelling exploit_dwell_sec at each
     # so the rosbag captures overlapping RGB-D/LiDAR views (fusion is offline).
     # A target is "successfully exploited" once min_vantages_required clear-LoS
-    # vantages are dwelled; it reverts to EXPLORE when the queue empties. The
+    # vantages are dwelled — a TEAM quota when coordination_enabled: robots on
+    # the same trunk broadcast which ring angles they captured (dwelled_mask on
+    # their intents) and the union counts, so the ring is covered once,
+    # cooperatively, and the trunk closes for everyone. It reverts to EXPLORE
+    # when the queue empties. The
     # topic is shared, so a future tree detector publishes the same TreeTarget
     # message with no planner change. Set exploitation_enabled: false for pure
     # exploration (the overlay then never subscribes or activates).

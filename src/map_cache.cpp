@@ -3,7 +3,9 @@
 #include <scovox/uncertainty.hpp>
 #include <scovox/voxel.hpp>
 #include <unordered_map>
+#include <unordered_set>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 namespace explo_planner {
@@ -239,6 +241,44 @@ float MapCache::groundZAt(float x, float y, float z_low, float z_high,
     return static_cast<float>(top + 1) * res;
   }
   return kNaN;
+}
+
+double MapCache::unknownColumnFraction(float min_x, float max_x,
+                                       float min_y, float max_y) const {
+  if (!std::isfinite(min_x) || !std::isfinite(max_x) ||
+      !std::isfinite(min_y) || !std::isfinite(max_y) ||
+      !(max_x > min_x) || !(max_y > min_y))
+    return -1.0;
+
+  // Work in coord space so the column count and the membership test share the
+  // same floor() convention as voxel ingest (posToCoord). Inclusive bounds:
+  // a voxel exactly on the max edge lands in the last column, mirroring the
+  // inclusive AABB clip in updateFromScovoxMap.
+  const auto c_min = grid_->posToCoord(
+      static_cast<double>(min_x), static_cast<double>(min_y), 0.0);
+  const auto c_max = grid_->posToCoord(
+      static_cast<double>(max_x), static_cast<double>(max_y), 0.0);
+  const int64_t nx = static_cast<int64_t>(c_max.x) - c_min.x + 1;
+  const int64_t ny = static_cast<int64_t>(c_max.y) - c_min.y + 1;
+  const int64_t total = nx * ny;
+  if (total <= 0) return -1.0;
+
+  // One walk over active cells, projecting each to its (x, y) column. The
+  // shift-or pack (x zero-extended into the high 32 bits, y into the low 32)
+  // is bijective for 32-bit coords, so distinct columns never collide. The
+  // shift runs on uint64_t: left-shifting a negative signed value (any column
+  // west of the origin, c.x < 0) is undefined behaviour in C++17.
+  std::unordered_set<uint64_t> observed;
+  grid_->forEachCell([&](const UnifiedVoxel&, const CoordT& c) {
+    if (c.x < c_min.x || c.x > c_max.x || c.y < c_min.y || c.y > c_max.y)
+      return;
+    observed.insert(
+        (static_cast<uint64_t>(static_cast<uint32_t>(c.x)) << 32) |
+        static_cast<uint32_t>(c.y));
+  });
+
+  return 1.0 - static_cast<double>(observed.size()) /
+                   static_cast<double>(total);
 }
 
 MapCache::MapStats MapCache::computeStats() const {

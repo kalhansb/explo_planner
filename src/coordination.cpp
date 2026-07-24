@@ -9,7 +9,8 @@ namespace explo_planner {
 Coordination::Coordination(bool enabled, std::string self_id)
     : enabled_(enabled), self_id_(std::move(self_id)) {}
 
-void Coordination::onIntent(const scovox_msgs::msg::RobotIntent& msg) {
+void Coordination::onIntent(const scovox_msgs::msg::RobotIntent& msg,
+                            const rclcpp::Time& now_local) {
   // Drop self-broadcasts. Producers publish their own intent so peers can
   // see it; we read every intent on the topic and need to filter our own.
   if (msg.robot_id == self_id_) return;
@@ -26,11 +27,18 @@ void Coordination::onIntent(const scovox_msgs::msg::RobotIntent& msg) {
       static_cast<float>(msg.robot_pos.z));
   claim.radius_m = msg.claim_radius_m;
   claim.planner_type = msg.planner_type;
+  claim.exploit = msg.exploit;
+  claim.target_id = msg.target_id;
+  claim.dwelled_mask = msg.dwelled_mask;
 
-  // Expiry = stamp + ttl. The stamp is sim time on the producer; we trust
-  // it because every robot in this experiment shares the same sim clock.
-  rclcpp::Time stamp(msg.header.stamp);
-  claim.expiry = stamp + rclcpp::Duration::from_seconds(msg.ttl_sec);
+  // Expiry = LOCAL receipt time + ttl, so prune(now) compares two timestamps
+  // from the SAME clock. Building expiry from the producer's header.stamp
+  // breaks on real robots: fleet clocks are not synchronised (offsets of
+  // hours have been observed in the field), so a peer clock ahead of ours
+  // made its claims immortal and a peer behind by > ttl made them expire on
+  // arrival — both silently. The TTL semantic is "how long since we last
+  // HEARD this peer", which only needs the local clock.
+  claim.expiry = now_local + rclcpp::Duration::from_seconds(msg.ttl_sec);
 
   // Latest-per-peer replacement. If we already have a claim from this
   // robot_id, overwrite it; otherwise append. Linear scan is fine for
@@ -98,6 +106,14 @@ bool Coordination::selfWinsAgainst(const Eigen::Vector3f& self_pos,
   return self_id < peer.robot_id;
 }
 
+uint32_t Coordination::peerDwellUnion(uint32_t target_id) const {
+  uint32_t mask = 0;
+  for (const auto& c : claims_) {
+    if (c.exploit && c.target_id == target_id) mask |= c.dwelled_mask;
+  }
+  return mask;
+}
+
 scovox_msgs::msg::RobotIntent Coordination::buildIntent(
     const CandidateViewpoint& goal,
     const Eigen::Vector3f& self_pos,
@@ -105,7 +121,10 @@ scovox_msgs::msg::RobotIntent Coordination::buildIntent(
     float ttl_sec,
     float claim_radius_m,
     uint8_t planner_type_id,
-    const std::string& map_frame) const {
+    const std::string& map_frame,
+    bool exploit,
+    uint32_t target_id,
+    uint32_t dwelled_mask) const {
   scovox_msgs::msg::RobotIntent msg;
   msg.header.stamp = now;
   msg.header.frame_id = map_frame;
@@ -123,6 +142,9 @@ scovox_msgs::msg::RobotIntent Coordination::buildIntent(
   msg.claim_radius_m = claim_radius_m;
   msg.ttl_sec = ttl_sec;
   msg.planner_type = planner_type_id;
+  msg.exploit = exploit;
+  msg.target_id = target_id;
+  msg.dwelled_mask = dwelled_mask;
   return msg;
 }
 

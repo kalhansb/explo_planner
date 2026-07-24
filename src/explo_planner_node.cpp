@@ -127,6 +127,10 @@ private:
   // doExploitDwell holds at it; finishActiveTarget closes a target and routes
   // back to the queue or to exploration. inRoi is the shared ROI box test.
   void onTreeTarget(const scovox_msgs::msg::TreeTarget::SharedPtr& msg);
+  // Team quota: fold a peer's exploit intent (clear-LoS dwelled vantage mask
+  // on its target) into the local target queue the moment it arrives, so
+  // credit is never lost to claim TTL while this robot is mid-hop/dwell.
+  void onPeerExploitIntent(const scovox_msgs::msg::RobotIntent& msg);
   void doExploitPlan();
   void doExploitDwell();
   void finishActiveTarget(bool success);
@@ -149,6 +153,10 @@ private:
   // (see plan_map_query.hpp); these members are thin wrappers that supply the
   // latched planning_map and ROI and handle the no-map case.
   double unknownFractionInRoi() const;
+  // Coverage unknown fraction for termination, dispatched per
+  // done_coverage_source_. Sets *source to the label of the source actually
+  // used ("planning_map" / "scovox"); returns -1 when it cannot measure.
+  double coverageUnknownFraction(const char** source) const;
   bool isCellFree(const Eigen::Vector3f& pos) const;
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
 
@@ -187,6 +195,19 @@ private:
   double failed_goal_ttl_sec_;
   double done_unknown_fraction_;
   int    done_min_consecutive_steps_;
+  // Where the coverage-termination unknown fraction is measured:
+  //  - "planning_map": 2D unknown cells in the latched planning_map (legacy).
+  //    Returns -1 (check INACTIVE) when no planning_map is published.
+  //  - "scovox": 2.5D column coverage of the ROI footprint on the fused 3D
+  //    map in map_cache_ (MapCache::unknownColumnFraction) — works with no
+  //    planning_map at all.
+  //  - "auto" (default): planning_map when one has been received, else scovox.
+  std::string done_coverage_source_{"auto"};
+  // What DONE does: "shutdown" (legacy) stops the node; "idle" keeps it
+  // spinning so targets released after coverage-done still pull the planner
+  // into the exploit sub-loop (field flow: targets are released at the
+  // coverage-done cue, which would otherwise race the shutdown).
+  std::string done_action_{"shutdown"};
   // When true (default) the planning_map is a hard startup precondition and
   // drives the candidate free/occupied filter + cost-grid reachability. When
   // false the planning_map is best-effort: still used whenever it is being
@@ -210,6 +231,11 @@ private:
   double coord_claim_ttl_sec_  = 5.0;
   double coord_heartbeat_hz_   = 1.0;
   std::string coord_intent_topic_;
+  // MinPos match radius for EXPLOIT vantage claims. Vantages on one trunk sit
+  // only ~(radius + standoff) apart, so the exploration-scale claim disc
+  // (fov_max_range) would swallow the whole ring and veto the tree outright
+  // instead of assigning different angles. 0 = auto = vantage_visited_tol_m.
+  double coord_vantage_claim_radius_m_ = 0.0;
   // ROI bounds — used to constrain candidate generation, the FOV raycast and
   // the clip applied when ingesting the fused map topic into map_cache_.
   float roi_min_x_ = -15.0f;
@@ -419,18 +445,44 @@ ExploPlannerNode::ExploPlannerNode()
   failed_goal_ttl_sec_ =
       dp("failed_goal_ttl_sec", 60.0);
 
-  // Coverage-based termination. Each PLAN tick we count how many cells
-  // inside the ROI of the latched planning_map are still unknown (-1).
-  // When the unknown fraction stays below `done_unknown_fraction` for
-  // `done_min_consecutive_steps` planning cycles in a row we declare the
-  // map saturated and transition to DONE. EIG scores don't fall sharply as
-  // the map saturates (the FOV raycast always finds *some* unobserved voxels
-  // at the cone edge), so unknown fraction is the reliable signal here. Set
-  // done_unknown_fraction <= 0 to disable.
+  // Coverage-based termination. Each PLAN tick we measure the unknown
+  // fraction of the ROI (source per done_coverage_source below). When it
+  // stays below `done_unknown_fraction` for `done_min_consecutive_steps`
+  // planning cycles in a row we declare the map saturated and transition to
+  // DONE. EIG scores don't fall sharply as the map saturates (the FOV raycast
+  // always finds *some* unobserved voxels at the cone edge), so unknown
+  // fraction is the reliable signal here. Set done_unknown_fraction <= 0 to
+  // disable.
   done_unknown_fraction_ =
       dp("done_unknown_fraction", 0.05);
   done_min_consecutive_steps_ =
       dp("done_min_consecutive_steps", 3);
+  // Measurement source: "planning_map" (legacy 2D; INACTIVE when none is
+  // published), "scovox" (2.5D column coverage of the fused 3D map — works
+  // without a planning_map), or "auto" (planning_map if present, else
+  // scovox). NB the two sources measure different things — the 2D grid
+  // counts nav-grid cells, the column measure counts ROI-footprint columns
+  // with >= 1 observed voxel in the z band — so re-calibrate
+  // done_unknown_fraction when switching.
+  done_coverage_source_ = dp("done_coverage_source", std::string("auto"));
+  if (done_coverage_source_ != "auto" &&
+      done_coverage_source_ != "planning_map" &&
+      done_coverage_source_ != "scovox") {
+    RCLCPP_WARN(get_logger(),
+        "Unknown done_coverage_source '%s' — falling back to 'auto'.",
+        done_coverage_source_.c_str());
+    done_coverage_source_ = "auto";
+  }
+  // DONE behaviour: "shutdown" (legacy) or "idle" (stay up; late targets are
+  // still exploited — required when targets are released at the
+  // coverage-done cue, which would otherwise race the shutdown).
+  done_action_ = dp("done_action", std::string("shutdown"));
+  if (done_action_ != "shutdown" && done_action_ != "idle") {
+    RCLCPP_WARN(get_logger(),
+        "Unknown done_action '%s' — falling back to 'shutdown'.",
+        done_action_.c_str());
+    done_action_ = "shutdown";
+  }
 
   // Candidate generation
   CandidateConfig ccfg;
@@ -513,6 +565,7 @@ ExploPlannerNode::ExploPlannerNode()
   coord_intent_topic_    = dp("coord_intent_topic",
                               std::string("/exploration/intents"));
   coord_heartbeat_hz_    = dp("coord_heartbeat_hz", 1.0);
+  coord_vantage_claim_radius_m_ = dp("coord_vantage_claim_radius_m", 0.0);
 
   // Exploitation. When enabled the planner ingests tree targets off
   // targets_topic and circles each at n_vantages occlusion-free vantage points
@@ -558,6 +611,12 @@ ExploPlannerNode::ExploPlannerNode()
         "is attainable.", min_vantages_required_, n_vantages, n_vantages);
     min_vantages_required_ = n_vantages;
   }
+  if (coord_enabled_ && n_vantages > 32) {
+    RCLCPP_WARN(get_logger(),
+        "n_vantages=%d > 32 — the team dwell-credit mask covers indices 0..31 "
+        "only; higher angles are dwelled but their credit is not shared with "
+        "peers.", n_vantages);
+  }
 
   // Auto-resolve "0 means auto" knobs now that the source values are
   // declared. Cache them so the doPlan tick path doesn't re-query.
@@ -566,6 +625,12 @@ ExploPlannerNode::ExploPlannerNode()
   }
   if (coord_claim_radius_m_ <= 0.0) {
     coord_claim_radius_m_ = fcfg.max_range;
+  }
+  // Per-vantage claim disc for exploit MinPos: defaults to the same tolerance
+  // that counts a vantage "dwelled", so a claim reserves exactly one angle of
+  // the ring rather than the whole tree.
+  if (coord_vantage_claim_radius_m_ <= 0.0) {
+    coord_vantage_claim_radius_m_ = vantage_visited_tol_m_;
   }
 
   // --- Components ---
@@ -686,7 +751,12 @@ ExploPlannerNode::ExploPlannerNode()
     intent_sub_ = create_subscription<scovox_msgs::msg::RobotIntent>(
         coord_intent_topic_, qos,
         [this](scovox_msgs::msg::RobotIntent::SharedPtr msg) {
-          if (coord_) coord_->onIntent(*msg);
+          if (coord_) coord_->onIntent(*msg, this->now());
+          // Team quota: merge a peer's dwell credit into the local queue
+          // immediately (not only on the next EXPLOIT_PLAN tick) so credit
+          // broadcast just before the peer releases its claim can't be lost
+          // to the claim TTL while this robot is mid-hop or mid-dwell.
+          onPeerExploitIntent(*msg);
         });
   }
 
@@ -982,6 +1052,30 @@ void ExploPlannerNode::tick() {
       break;
 
     case State::DONE:
+      // done_action == "idle": stay alive so targets released after
+      // coverage-done still pull the planner into the exploit sub-loop
+      // (field flow: the scheduler releases targets AT the coverage-done cue,
+      // which would race a shutdown). hasPending() includes a still-ACTIVE
+      // target and activate() resumes it, so an exploitation interrupted by
+      // the step budget also continues here, vantage by vantage, until the
+      // queue drains. When the queue empties the exploit sub-loop reverts to
+      // EXPLORE -> PLAN, whose coverage check immediately lands back in DONE
+      // (streak already at threshold) unless the map regressed.
+      if (done_action_ == "idle") {
+        if (exploitation_enabled_ && target_queue_.hasPending()) {
+          target_queue_.activate();
+          phase_ = Phase::EXPLOIT;
+          RCLCPP_INFO(get_logger(),
+              "Target arrived while DONE-idle (%zu pending) -> EXPLOIT.",
+              target_queue_.pendingCount());
+          transitionTo(State::EXPLOIT_PLAN);
+        } else {
+          RCLCPP_INFO_ONCE(get_logger(),
+              "Exploration finished; idling (done_action=idle). Planner "
+              "stays up and will exploit any targets that arrive.");
+        }
+        break;
+      }
       if (!shutdown_requested_) {
         shutdown_requested_ = true;
         RCLCPP_INFO(get_logger(),
@@ -1002,6 +1096,17 @@ void ExploPlannerNode::transitionTo(State s) {
 // ==================================================================
 
 void ExploPlannerNode::doPlan() {
+  // Step budget: never start a new exploration step past max_steps_. Only
+  // reachable with done_action=idle — the exploit sub-loop drains its queue
+  // past the budget (deliberate, see State::DONE) and its empty-queue revert
+  // lands here; without this it would sneak one stray exploration hop per
+  // drain. In shutdown mode LOG_STEP routes to DONE before PLAN ever runs
+  // with a spent budget, so legacy behaviour is untouched.
+  if (step_ >= max_steps_) {
+    transitionTo(State::DONE);
+    return;
+  }
+
   auto plan_start = this->now();
 
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
@@ -1035,12 +1140,13 @@ void ExploPlannerNode::doPlan() {
   // Requires N consecutive low-unknown ticks to avoid premature DONE
   // from a momentary measurement gap.
   if (done_unknown_fraction_ > 0.0) {
-    double unk = unknownFractionInRoi();
+    const char* cov_src = "";
+    double unk = coverageUnknownFraction(&cov_src);
     if (unk >= 0.0 && unk < done_unknown_fraction_) {
       ++coverage_done_streak_;
       RCLCPP_INFO(get_logger(),
-          "Step %d: ROI unknown fraction %.3f < %.3f (streak %d/%d)",
-          step_, unk, done_unknown_fraction_,
+          "Step %d: ROI unknown fraction %.3f < %.3f (source=%s, streak %d/%d)",
+          step_, unk, done_unknown_fraction_, cov_src,
           coverage_done_streak_, done_min_consecutive_steps_);
       if (coverage_done_streak_ >= done_min_consecutive_steps_) {
         RCLCPP_INFO(get_logger(),
@@ -1053,15 +1159,16 @@ void ExploPlannerNode::doPlan() {
     } else {
       coverage_done_streak_ = 0;
       if (unk < 0.0) {
-        // unknownFractionInRoi() returns -1 when there is no planning_map. In
-        // best-effort mode (require_planning_map=false) with no planning_map
-        // ever published, coverage-based DONE can therefore never trigger —
-        // surface that instead of silently relying on max_steps.
+        // -1 = the selected source cannot measure: done_coverage_source
+        // "planning_map" with no planning_map published, or a degenerate ROI
+        // box. ("auto" falls back to the scovox column measure, which always
+        // yields a value once the fused map is loaded, so it only lands here
+        // on a bad ROI.) Surface it instead of silently relying on max_steps.
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-            "Coverage termination (done_unknown_fraction=%.3f) INACTIVE: no "
-            "planning_map to measure ROI unknown-fraction; stopping only at "
-            "max_steps=%d unless a planning_map is published.",
-            done_unknown_fraction_, max_steps_);
+            "Coverage termination (done_unknown_fraction=%.3f) INACTIVE: "
+            "source '%s' cannot measure the ROI unknown fraction (no "
+            "planning_map / degenerate ROI); stopping only at max_steps=%d.",
+            done_unknown_fraction_, cov_src, max_steps_);
       }
     }
   }
@@ -1364,6 +1471,25 @@ double ExploPlannerNode::unknownFractionInRoi() const {
       *latest_plan_map_, {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_});
 }
 
+double ExploPlannerNode::coverageUnknownFraction(const char** source) const {
+  const bool use_plan_map =
+      done_coverage_source_ == "planning_map" ||
+      (done_coverage_source_ == "auto" && latest_plan_map_ != nullptr);
+  if (use_plan_map) {
+    *source = "planning_map";
+    return unknownFractionInRoi();
+  }
+  // scovox source: 2.5D column coverage of the ROI footprint, measured on the
+  // fused 3D map already ingested (ROI + z-band clipped) into map_cache_ by
+  // loadLatestMap() this tick. NB in flat mode the ingest band is the absolute
+  // [roi_min_z, roi_max_z]: on terrain outside that band the cache stays empty
+  // and this reads 1.0 (never done) — set a per-area z band or
+  // terrain_relative_z when the ground leaves the default band.
+  *source = "scovox";
+  return map_cache_->unknownColumnFraction(roi_min_x_, roi_max_x_,
+                                           roi_min_y_, roi_max_y_);
+}
+
 bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
   // No map: not free (matches the old kCellNoData -> v >= 0 failure).
   return latest_plan_map_ &&
@@ -1640,6 +1766,39 @@ void ExploPlannerNode::onTreeTarget(
   }
 }
 
+void ExploPlannerNode::onPeerExploitIntent(
+    const scovox_msgs::msg::RobotIntent& msg) {
+  if (!coord_enabled_ || !exploitation_enabled_) return;
+  if (!msg.exploit || msg.dwelled_mask == 0u) return;
+  if (msg.robot_id == robot_name_) return;  // echo of our own broadcast
+
+  // Find the peer's target in the local queue. Both robots ingest the same
+  // global targets topic, so ids agree; if the TreeTarget hasn't arrived here
+  // yet (ordering race) the merge silently no-ops and the per-tick merge in
+  // doExploitPlan catches up while the peer's claim is still alive.
+  const Target* local = nullptr;
+  for (const auto& t : target_queue_.targets()) {
+    if (t.id == msg.target_id) { local = &t; break; }
+  }
+  if (!local || local->status == Target::Status::DONE) return;
+
+  // Ring indices are only meaningful on the identical ring, so regenerate it
+  // from the locally stored (center, radius) — same inputs on every robot.
+  const auto vantages =
+      vantage_planner_->generateVantages(local->center, local->radius);
+  std::vector<Eigen::Vector3f> ring;
+  ring.reserve(vantages.size());
+  for (const auto& v : vantages) ring.push_back(v.position);
+
+  if (target_queue_.mergePeerDwells(msg.target_id, msg.dwelled_mask, ring)) {
+    RCLCPP_INFO(get_logger(),
+        "Merged peer '%s' dwell credit on target %u (mask=0x%x): team "
+        "clear-LoS dwells now %d/%d.",
+        msg.robot_id.c_str(), msg.target_id, msg.dwelled_mask,
+        local->clear_los_dwells, min_vantages_required_);
+  }
+}
+
 bool ExploPlannerNode::inRoi(const Eigen::Vector3f& pos) const {
   return pos.x() >= roi_min_x_ && pos.x() <= roi_max_x_ &&
          pos.y() >= roi_min_y_ && pos.y() <= roi_max_y_;
@@ -1715,15 +1874,21 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
 void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
   publishGoal(current_goal_);
 
-  // Publish the goal as an intent too, so multi-robot vantage deconfliction
-  // (MinPos) can later assign different angles on the same tree with no new
-  // selection code.
+  // Publish the goal as an exploit intent: peers on the same trunk consult it
+  // in their vantage loop (MinPos, per-vantage radius) to take a different
+  // angle, and the dwelled_mask carries this robot's clear-LoS credit for the
+  // team quota. claim_radius_m ships the per-vantage disc so the claim's
+  // stored radius matches its exploit semantics.
   if (intent_pub_ && coord_) {
+    const Target* t = target_queue_.active();
     current_intent_msg_ = coord_->buildIntent(
         current_goal_, robot_pos, this->now(),
         static_cast<float>(coord_claim_ttl_sec_),
-        static_cast<float>(coord_claim_radius_m_),
-        /*planner_type_id (eig)=*/0u, map_frame_);
+        static_cast<float>(coord_vantage_claim_radius_m_),
+        /*planner_type_id (eig)=*/0u, map_frame_,
+        /*exploit=*/true,
+        /*target_id=*/t ? t->id : 0u,
+        /*dwelled_mask=*/t ? t->clear_mask : 0u);
     intent_pub_->publish(current_intent_msg_);
     have_active_intent_ = true;
   }
@@ -1743,26 +1908,12 @@ void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
 void ExploPlannerNode::doExploitPlan() {
   auto plan_start = this->now();
 
-  // The LoS ray-march reads the fused grid; refresh it (cheap when unchanged).
-  if (!loadLatestMap()) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "EXPLOIT_PLAN: no fused map yet; retrying next tick.");
-    return;
-  }
-
-  // Vantage validation (free-cell + reachability) and the approach fallback all
-  // need the 2D planning_map. Without it we'd be selecting vantages on
-  // straight-line guesses with no obstacle/reachability check, so wait for it
-  // rather than drive blind toward the trunk.
-  if (!latest_plan_map_) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "EXPLOIT_PLAN: no planning_map yet; waiting before selecting vantages.");
-    return;
-  }
-
-  // Age out stale blacklist entries (same TTL as exploration) so a vantage that
-  // failed earlier can be retried once its entry expires.
-  failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+  // NOTE the ordering here: target bookkeeping, the team-quota merge and the
+  // per-target timeout all run BEFORE the fused-map / planning_map waits
+  // further down. None of them need a map, and putting them first means a map
+  // that never arrives cannot pin the planner in EXPLOIT_PLAN — a peer
+  // completing the ring or the wall-clock timeout still closes the target and
+  // reverts to EXPLORE.
 
   // Ensure we have an active target (the doPlan / mid-hop hooks activate one;
   // after a target finishes we promote the next here).
@@ -1784,18 +1935,51 @@ void ExploPlannerNode::doExploitPlan() {
     exploit_target_timing_      = true;
   }
 
-  // Already enough clear-LoS vantages dwelled -> success.
+  // Generate the fixed angular vantage set around the trunk. Deterministic
+  // from (center, radius), so ring index k names the same pose on every
+  // robot — generated before the quota check because the peer-credit merge
+  // below needs the canonical ring positions.
+  auto vantages = vantage_planner_->generateVantages(tgt->center, tgt->radius);
+
+  // Team quota: fold peers' clear-LoS dwell masks (carried on their exploit
+  // intents) into this target before checking success. The event-driven merge
+  // in onPeerExploitIntent normally gets there first; this per-tick pass
+  // catches the ordering race where a peer's intent arrived before the
+  // TreeTarget was ingested locally.
+  if (coord_ && coord_->enabled()) {
+    coord_->prune(plan_start);
+    const uint32_t peer_mask = coord_->peerDwellUnion(tgt->id);
+    if (peer_mask != 0u) {
+      std::vector<Eigen::Vector3f> ring;
+      ring.reserve(vantages.size());
+      for (const auto& v : vantages) ring.push_back(v.position);
+      if (target_queue_.mergePeerDwells(tgt->id, peer_mask, ring)) {
+        RCLCPP_INFO(get_logger(),
+            "Target %u: merged peer dwell credit (mask=0x%x) -> team "
+            "clear-LoS dwells %d/%d.",
+            tgt->id, peer_mask, tgt->clear_los_dwells,
+            min_vantages_required_);
+      }
+    }
+  }
+
+  // Already enough clear-LoS vantages dwelled (team union when coordination
+  // is on) -> success for the whole trunk.
   if (tgt->clear_los_dwells >= min_vantages_required_) {
     finishActiveTarget(/*success=*/true);
     return;
   }
 
   // Hard per-target wall-clock bound. This sits ABOVE all vantage-selection
-  // logic on purpose: a target can keep producing a "selectable" vantage every
-  // tick (e.g. the blacklist TTL re-offers vantages faster than the nav budget
-  // can exhaust the ring) and spin here forever, never reaching the give-up
-  // path further down. Bounding it here makes exploitation of one trunk
-  // provably terminate, so the phase always reverts to EXPLORE.
+  // logic AND above the map waits below on purpose:
+  //   * a target can keep producing a "selectable" vantage every tick (e.g.
+  //     the blacklist TTL re-offers vantages faster than the nav budget can
+  //     exhaust the ring) and spin here forever, never reaching the give-up
+  //     path further down;
+  //   * a map that never arrives (field runs publish NO planning_map) would
+  //     otherwise pin the planner in the early returns below with no escape.
+  // Bounding it here makes exploitation of one trunk provably terminate, so
+  // the phase always reverts to EXPLORE.
   if (exploit_target_timeout_sec_ > 0.0) {
     const double waited = this->now().seconds() - exploit_target_started_sec_;
     if (waited >= exploit_target_timeout_sec_) {
@@ -1807,10 +1991,33 @@ void ExploPlannerNode::doExploitPlan() {
     }
   }
 
-  const auto robot_pos = latest_pos_;
+  // The LoS ray-march reads the fused grid; refresh it (cheap when unchanged).
+  if (!loadLatestMap()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "EXPLOIT_PLAN: no fused map yet; retrying next tick.");
+    return;
+  }
 
-  // Generate the fixed angular vantage set around the trunk.
-  auto vantages = vantage_planner_->generateVantages(tgt->center, tgt->radius);
+  // Vantage validation (free-cell + reachability) and the approach fallback all
+  // need the 2D planning_map. Without it we'd be selecting vantages on
+  // straight-line guesses with no obstacle/reachability check, so wait for it
+  // rather than drive blind toward the trunk. The wait is BOUNDED: the
+  // per-target timeout above keeps ticking while we sit here, so a config that
+  // never publishes a planning_map times the target out PARTIAL instead of
+  // hanging in EXPLOIT_PLAN forever.
+  if (!latest_plan_map_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "EXPLOIT_PLAN: no planning_map yet; waiting before selecting vantages "
+        "(gives up PARTIAL at exploit_target_timeout_sec=%.0fs).",
+        exploit_target_timeout_sec_);
+    return;
+  }
+
+  // Age out stale blacklist entries (same TTL as exploration) so a vantage that
+  // failed earlier can be retried once its entry expires.
+  failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+
+  const auto robot_pos = latest_pos_;
 
   // Build the cost grid for reachability + nearest-vantage ordering. Unlike
   // exploration (a bounded local flood), exploitation may have to drive across
@@ -1830,7 +2037,7 @@ void ExploPlannerNode::doExploitPlan() {
   float best_cost = std::numeric_limits<float>::infinity();
   int   n_valid   = 0;
   int rej_roi = 0, rej_map = 0, rej_unreach = 0, rej_los = 0,
-      rej_visited = 0, rej_blk = 0;
+      rej_visited = 0, rej_blk = 0, rej_minpos = 0;
 
   for (size_t i = 0; i < vantages.size(); ++i) {
     const auto& v = vantages[i];
@@ -1868,6 +2075,20 @@ void ExploPlannerNode::doExploitPlan() {
       ++rej_blk;
       continue;
     }
+    // MinPos per-vantage deconfliction: yield an angle a peer currently
+    // claims (in-flight or mid-dwell) when the peer is closer. Uses the small
+    // per-vantage disc, NOT the exploration-scale coord_claim_radius_m — one
+    // fov-range disc would swallow the whole ring and veto the tree outright
+    // instead of splitting the angles across the team.
+    if (coord_ && coord_->enabled()) {
+      const auto* peer = coord_->claimMatching(
+          v.position, static_cast<float>(coord_vantage_claim_radius_m_));
+      if (peer && !coord_->selfWinsAgainst(robot_pos, v.position, *peer,
+                                           robot_name_)) {
+        ++rej_minpos;
+        continue;
+      }
+    }
     if (cost < best_cost) {
       best_cost = cost;
       best_idx  = static_cast<int>(i);
@@ -1877,9 +2098,9 @@ void ExploPlannerNode::doExploitPlan() {
   if (best_idx < 0) {
     RCLCPP_INFO(get_logger(),
         "Target %u: no selectable vantage (valid=%d roi=%d map=%d unreach=%d "
-        "los=%d visited=%d blk=%d).",
+        "los=%d visited=%d blk=%d minpos=%d).",
         tgt->id, n_valid, rej_roi, rej_map, rej_unreach, rej_los,
-        rej_visited, rej_blk);
+        rej_visited, rej_blk, rej_minpos);
 
     // Quota-met and the per-target timeout are both handled unconditionally at
     // the top of this function, so neither can apply here. Drive *toward* the
@@ -1907,7 +2128,7 @@ void ExploPlannerNode::doExploitPlan() {
       pending_mean_path_cost_          = 0.0f;
       pending_selected_info_gain_      = 0.0f;
       pending_selected_path_cost_      = 0.0f;
-      pending_rejected_by_minpos_      = 0;
+      pending_rejected_by_minpos_      = rej_minpos;
       pending_rejected_by_unreachable_ = rej_unreach;
 
       RCLCPP_INFO(get_logger(),
@@ -1953,7 +2174,7 @@ void ExploPlannerNode::doExploitPlan() {
   pending_mean_path_cost_          = best_cost;
   pending_selected_info_gain_      = 0.0f;
   pending_selected_path_cost_      = best_cost;
-  pending_rejected_by_minpos_      = 0;
+  pending_rejected_by_minpos_      = rej_minpos;
   pending_rejected_by_unreachable_ = rej_unreach;
 
   RCLCPP_INFO(get_logger(),
@@ -2001,8 +2222,21 @@ void ExploPlannerNode::doExploitDwell() {
   pending_exploit_los_clear_ = los_clear ? 1 : 0;
 
   // Record it on the active target and stage the dwell time for LOG_STEP.
-  target_queue_.recordVantageDwell(current_goal_.position, los_clear);
+  // The ring index makes the credit shareable: peers merge it by index into
+  // their own copy of this target (team quota).
+  target_queue_.recordVantageDwell(current_goal_.position, los_clear,
+                                   current_vantage_index_);
   pending_exploit_dwell_sec_ = static_cast<float>(elapsed);
+
+  // Broadcast the updated team-credit mask immediately (don't wait for the
+  // next selection or heartbeat) so a peer picking its next angle right now
+  // already sees this dwell — and so the credit lands before this robot
+  // could release the claim on target completion.
+  if (intent_pub_ && coord_ && have_active_intent_ && t) {
+    current_intent_msg_.dwelled_mask = t->clear_mask;
+    current_intent_msg_.header.stamp = this->now();
+    intent_pub_->publish(current_intent_msg_);
+  }
 
   // Reaching + dwelling a vantage is progress: reset the per-target give-up
   // timer so the timeout only fires on a genuine no-progress stall.
