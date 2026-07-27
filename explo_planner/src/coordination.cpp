@@ -9,7 +9,7 @@ namespace explo_planner {
 Coordination::Coordination(bool enabled, std::string self_id)
     : enabled_(enabled), self_id_(std::move(self_id)) {}
 
-void Coordination::onIntent(const scovox_msgs::msg::RobotIntent& msg,
+void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
                             const rclcpp::Time& now_local) {
   // Drop self-broadcasts. Producers publish their own intent so peers can
   // see it; we read every intent on the topic and need to filter our own.
@@ -114,7 +114,7 @@ uint32_t Coordination::peerDwellUnion(uint32_t target_id) const {
   return mask;
 }
 
-scovox_msgs::msg::RobotIntent Coordination::buildIntent(
+explo_planner_msgs::msg::RobotIntent Coordination::buildIntent(
     const CandidateViewpoint& goal,
     const Eigen::Vector3f& self_pos,
     const rclcpp::Time& now,
@@ -125,7 +125,7 @@ scovox_msgs::msg::RobotIntent Coordination::buildIntent(
     bool exploit,
     uint32_t target_id,
     uint32_t dwelled_mask) const {
-  scovox_msgs::msg::RobotIntent msg;
+  explo_planner_msgs::msg::RobotIntent msg;
   msg.header.stamp = now;
   msg.header.frame_id = map_frame;
   msg.robot_id = self_id_;

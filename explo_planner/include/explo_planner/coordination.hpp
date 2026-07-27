@@ -25,7 +25,7 @@
 #include <vector>
 
 #include <rclcpp/time.hpp>
-#include <scovox_msgs/msg/robot_intent.hpp>
+#include <explo_planner_msgs/msg/robot_intent.hpp>
 
 namespace explo_planner {
 
@@ -61,7 +61,7 @@ public:
   /// been observed), and an expiry built from the peer's stamp but pruned
   /// against local now() makes claims immortal when the peer's clock is
   /// ahead and stillborn when it is behind by more than the TTL.
-  void onIntent(const scovox_msgs::msg::RobotIntent& msg,
+  void onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
                 const rclcpp::Time& now_local);
 
   /// Drop expired claims. Called once per PLAN tick from the planner.
@@ -100,7 +100,7 @@ public:
   /// from `now` and `header.frame_id` from `map_frame`; planner_type_id
   /// is the 0..3 enum from RobotIntent.msg. The trailing exploit fields
   /// default to the exploration claim shape (exploit=false, zeros).
-  scovox_msgs::msg::RobotIntent buildIntent(const CandidateViewpoint& goal,
+  explo_planner_msgs::msg::RobotIntent buildIntent(const CandidateViewpoint& goal,
                                             const Eigen::Vector3f& self_pos,
                                             const rclcpp::Time& now,
                                             float ttl_sec,

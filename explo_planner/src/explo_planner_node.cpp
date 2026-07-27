@@ -46,8 +46,8 @@
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
-#include <scovox_msgs/msg/robot_intent.hpp>
-#include <scovox_msgs/msg/tree_target.hpp>
+#include <explo_planner_msgs/msg/robot_intent.hpp>
+#include <explo_planner_msgs/msg/tree_target.hpp>
 #include <tf2/utils.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -126,11 +126,11 @@ private:
   // doExploitPlan generates + validates + selects the next vantage;
   // doExploitDwell holds at it; finishActiveTarget closes a target and routes
   // back to the queue or to exploration. inRoi is the shared ROI box test.
-  void onTreeTarget(const scovox_msgs::msg::TreeTarget::SharedPtr& msg);
+  void onTreeTarget(const explo_planner_msgs::msg::TreeTarget::SharedPtr& msg);
   // Team quota: fold a peer's exploit intent (clear-LoS dwelled vantage mask
   // on its target) into the local target queue the moment it arrives, so
   // credit is never lost to claim TTL while this robot is mid-hop/dwell.
-  void onPeerExploitIntent(const scovox_msgs::msg::RobotIntent& msg);
+  void onPeerExploitIntent(const explo_planner_msgs::msg::RobotIntent& msg);
   void doExploitPlan();
   void doExploitDwell();
   void finishActiveTarget(bool success);
@@ -361,7 +361,7 @@ private:
 
   // Cached active intent so the heartbeat timer can re-publish without
   // touching planning state.
-  scovox_msgs::msg::RobotIntent current_intent_msg_;
+  explo_planner_msgs::msg::RobotIntent current_intent_msg_;
   bool   have_active_intent_ = false;
 
   // --- ROS interfaces ---
@@ -377,11 +377,11 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
-  rclcpp::Publisher<scovox_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
-  rclcpp::Subscription<scovox_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
+  rclcpp::Publisher<explo_planner_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
+  rclcpp::Subscription<explo_planner_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
   // Shared tree-target topic. The time-based scheduler publishes here today; a
   // detector can publish the same message later with no planner change.
-  rclcpp::Subscription<scovox_msgs::msg::TreeTarget>::SharedPtr target_sub_;
+  rclcpp::Subscription<explo_planner_msgs::msg::TreeTarget>::SharedPtr target_sub_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
 };
@@ -746,11 +746,11 @@ ExploPlannerNode::ExploPlannerNode()
   //     Self-broadcasts are filtered by Coordination::onIntent.
   {
     auto qos = rclcpp::QoS(rclcpp::KeepLast(8)).reliable();
-    intent_pub_ = create_publisher<scovox_msgs::msg::RobotIntent>(
+    intent_pub_ = create_publisher<explo_planner_msgs::msg::RobotIntent>(
         coord_intent_topic_, qos);
-    intent_sub_ = create_subscription<scovox_msgs::msg::RobotIntent>(
+    intent_sub_ = create_subscription<explo_planner_msgs::msg::RobotIntent>(
         coord_intent_topic_, qos,
-        [this](scovox_msgs::msg::RobotIntent::SharedPtr msg) {
+        [this](explo_planner_msgs::msg::RobotIntent::SharedPtr msg) {
           if (coord_) coord_->onIntent(*msg, this->now());
           // Team quota: merge a peer's dwell credit into the local queue
           // immediately (not only on the next EXPLOIT_PLAN tick) so credit
@@ -765,9 +765,9 @@ ExploPlannerNode::ExploPlannerNode()
   //     still receives all of them. Inert unless exploitation_enabled_.
   if (exploitation_enabled_) {
     auto tqos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local();
-    target_sub_ = create_subscription<scovox_msgs::msg::TreeTarget>(
+    target_sub_ = create_subscription<explo_planner_msgs::msg::TreeTarget>(
         targets_topic, tqos,
-        [this](scovox_msgs::msg::TreeTarget::SharedPtr msg) {
+        [this](explo_planner_msgs::msg::TreeTarget::SharedPtr msg) {
           onTreeTarget(msg);
         });
     RCLCPP_INFO(get_logger(),
@@ -1729,11 +1729,11 @@ void ExploPlannerNode::doLogStep() {
 // ==================================================================
 
 void ExploPlannerNode::onTreeTarget(
-    const scovox_msgs::msg::TreeTarget::SharedPtr& msg) {
+    const explo_planner_msgs::msg::TreeTarget::SharedPtr& msg) {
   // STATUS_DONE is a completion broadcast (reserved for a future peer/detector
   // marking a tree already inspected), not a request to inspect — never queue
   // it for circling.
-  if (msg->status == scovox_msgs::msg::TreeTarget::STATUS_DONE) {
+  if (msg->status == explo_planner_msgs::msg::TreeTarget::STATUS_DONE) {
     RCLCPP_DEBUG(get_logger(),
         "Tree target id=%u arrived STATUS_DONE — not queued.", msg->target_id);
     return;
@@ -1767,7 +1767,7 @@ void ExploPlannerNode::onTreeTarget(
 }
 
 void ExploPlannerNode::onPeerExploitIntent(
-    const scovox_msgs::msg::RobotIntent& msg) {
+    const explo_planner_msgs::msg::RobotIntent& msg) {
   if (!coord_enabled_ || !exploitation_enabled_) return;
   if (!msg.exploit || msg.dwelled_mask == 0u) return;
   if (msg.robot_id == robot_name_) return;  // echo of our own broadcast

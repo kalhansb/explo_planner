@@ -55,7 +55,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
-#include <scovox_msgs/msg/tree_target.hpp>
+#include <explo_planner_msgs/msg/tree_target.hpp>
 
 #include "explo_planner/tree_detector.hpp"
 
@@ -88,7 +88,7 @@ public:
     // Latched + deep history so a planner that subscribes after the first
     // targets were emitted still receives them all. Matches target_scheduler QoS.
     auto qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local();
-    pub_ = create_publisher<scovox_msgs::msg::TreeTarget>(targets_topic_, qos);
+    pub_ = create_publisher<explo_planner_msgs::msg::TreeTarget>(targets_topic_, qos);
 
     timer_ = rclcpp::create_timer(
         this, get_clock(),
@@ -265,7 +265,7 @@ private:
 
   void publishTarget(const Track& t, const TreeDetection& d,
                      const rclcpp::Time& now) {
-    scovox_msgs::msg::TreeTarget msg;
+    explo_planner_msgs::msg::TreeTarget msg;
     msg.header.stamp = now;
     msg.header.frame_id = frame_id_;
     msg.target_id = t.id;
@@ -275,7 +275,7 @@ private:
     msg.radius = t.radius;
     msg.height = t.height;
     msg.discovered_by = robot_name_;
-    msg.status = scovox_msgs::msg::TreeTarget::STATUS_PENDING;
+    msg.status = explo_planner_msgs::msg::TreeTarget::STATUS_PENDING;
     pub_->publish(msg);
 
     RCLCPP_INFO(get_logger(),
@@ -300,7 +300,7 @@ private:
 
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_map_;
   rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr map_sub_;
-  rclcpp::Publisher<scovox_msgs::msg::TreeTarget>::SharedPtr pub_;
+  rclcpp::Publisher<explo_planner_msgs::msg::TreeTarget>::SharedPtr pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

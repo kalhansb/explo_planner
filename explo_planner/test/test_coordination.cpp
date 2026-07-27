@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <rclcpp/rclcpp.hpp>
-#include <scovox_msgs/msg/robot_intent.hpp>
+#include <explo_planner_msgs/msg/robot_intent.hpp>
 
 #include "explo_planner/coordination.hpp"
 
@@ -9,7 +9,7 @@ using namespace explo_planner;
 
 namespace {
 
-scovox_msgs::msg::RobotIntent makeIntent(const std::string& robot_id,
+explo_planner_msgs::msg::RobotIntent makeIntent(const std::string& robot_id,
                                           float gx, float gy,
                                           float rx, float ry,
                                           double stamp_sec,
@@ -18,7 +18,7 @@ scovox_msgs::msg::RobotIntent makeIntent(const std::string& robot_id,
                                           bool exploit = false,
                                           uint32_t target_id = 0,
                                           uint32_t dwelled_mask = 0) {
-  scovox_msgs::msg::RobotIntent msg;
+  explo_planner_msgs::msg::RobotIntent msg;
   msg.header.stamp = rclcpp::Time(static_cast<int64_t>(stamp_sec * 1e9),
                                    RCL_ROS_TIME);
   msg.header.frame_id = "map";

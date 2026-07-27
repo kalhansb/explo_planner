@@ -11,6 +11,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(scovox_core REQUIRED)
 find_package(scovox_msgs REQUIRED)
+find_package(explo_planner_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -46,7 +47,7 @@ target_link_libraries(explo_planner_lib
 )
 
 ament_target_dependencies(explo_planner_lib PUBLIC
-  rclcpp sensor_msgs nav_msgs scovox_core scovox_msgs
+  rclcpp sensor_msgs nav_msgs scovox_core scovox_msgs explo_planner_msgs
 )
 
 # ==================================================================
@@ -66,7 +67,8 @@ target_link_libraries(explo_planner_node
 
 ament_target_dependencies(explo_planner_node
   rclcpp geometry_msgs nav_msgs sensor_msgs
-  visualization_msgs scovox_core scovox_msgs tf2 tf2_ros tf2_geometry_msgs
+  visualization_msgs scovox_core scovox_msgs explo_planner_msgs
+  tf2 tf2_ros tf2_geometry_msgs
 )
 
 # Time-based tree-target publisher: drives the exploitation targets topic from
@@ -76,7 +78,7 @@ add_executable(target_scheduler_node
 )
 
 ament_target_dependencies(target_scheduler_node
-  rclcpp scovox_msgs
+  rclcpp explo_planner_msgs
 )
 
 # Live tree detector: segments trees out of the fused dscovox map and publishes
@@ -91,7 +93,7 @@ target_link_libraries(tree_detector_node
 )
 
 ament_target_dependencies(tree_detector_node
-  rclcpp scovox_msgs
+  rclcpp scovox_msgs explo_planner_msgs
 )
 
 # ==================================================================

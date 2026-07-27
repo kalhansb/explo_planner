@@ -29,7 +29,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <scovox_msgs/msg/tree_target.hpp>
+#include <explo_planner_msgs/msg/tree_target.hpp>
 
 namespace explo_planner {
 
@@ -89,7 +89,7 @@ public:
     // Latched + deep history so a planner that subscribes after several targets
     // were already released still receives them all. Matches the planner QoS.
     auto qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local();
-    pub_ = create_publisher<scovox_msgs::msg::TreeTarget>(topic_, qos);
+    pub_ = create_publisher<explo_planner_msgs::msg::TreeTarget>(topic_, qos);
 
     // NB: start_time_ is latched on the first tick where the clock is valid,
     // NOT here. Under use_sim_time the clock reads 0 in the constructor (no
@@ -125,7 +125,7 @@ private:
       if (published_[i]) continue;
       if (elapsed < release_[i]) continue;
 
-      scovox_msgs::msg::TreeTarget msg;
+      explo_planner_msgs::msg::TreeTarget msg;
       msg.header.stamp = this->now();
       msg.header.frame_id = frame_id_;
       msg.target_id = static_cast<uint32_t>(ids_[i]);
@@ -135,7 +135,7 @@ private:
       msg.radius = static_cast<float>(radii_[i]);
       msg.height = static_cast<float>(heights_[i]);
       msg.discovered_by = "schedule";
-      msg.status = scovox_msgs::msg::TreeTarget::STATUS_PENDING;
+      msg.status = explo_planner_msgs::msg::TreeTarget::STATUS_PENDING;
       pub_->publish(msg);
       published_[i] = true;
 
@@ -156,7 +156,7 @@ private:
 
   rclcpp::Time start_time_;
   bool start_latched_ = false;  // schedule origin latched on first valid-clock tick
-  rclcpp::Publisher<scovox_msgs::msg::TreeTarget>::SharedPtr pub_;
+  rclcpp::Publisher<explo_planner_msgs::msg::TreeTarget>::SharedPtr pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

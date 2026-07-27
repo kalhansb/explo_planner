@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>explo_planner_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    Message definitions owned by the exploration planner: TreeTarget (a tree to
+    be perceptively exploited) and RobotIntent (a multi-robot exploration /
+    exploitation claim for MinPos deconfliction). Split out of scovox_msgs so
+    the planner's wire types live with the planner.
+  </description>
+  <maintainer email="kalhan@todo.todo">kalhan</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+</package>

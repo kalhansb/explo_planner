@@ -52,7 +52,7 @@ exploration when the target's vantages are covered. Sensor fusion of the
 captured data is **offline** — the planner only positions and dwells.
 
 Targets arrive on a shared topic (`targets_topic`, default
-`/exploration/targets`) as `scovox_msgs/TreeTarget` messages. There is **no live
+`/exploration/targets`) as `explo_planner_msgs/TreeTarget` messages. There is **no live
 tree detection**: today a small time-based `target_scheduler_node` publishes a
 preselected list on a schedule, but a real detector can publish the identical
 message on the same topic later with no planner change.
