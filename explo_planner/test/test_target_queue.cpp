@@ -223,3 +223,36 @@ TEST(TargetQueue, MergePeerDwellsUnknownOrDoneNoOp) {
   EXPECT_EQ(q.targets().front().clear_mask, 0u);
   EXPECT_EQ(q.targets().front().clear_los_dwells, 0);
 }
+
+// deactivate() stands exploitation down WITHOUT closing the target: the
+// rendezvous barrier uses it so the exploit claim stops being broadcast while
+// the robot drives home, and the target is picked back up afterwards. Contrast
+// with markActiveDone(), which retires the target permanently.
+TEST(TargetQueue, DeactivateDemotesToPendingWithoutClosing) {
+  TargetQueue q;
+  q.ingest(1, P(0, 0), 0.3f, 0.0f, kDedup);
+  Target* a = q.activate();
+  ASSERT_NE(a, nullptr);
+  a->clear_mask = 0b01u;  // partial progress must survive the stand-down
+  a->clear_los_dwells = 1;
+
+  q.deactivate();
+  EXPECT_EQ(q.active(), nullptr);
+  EXPECT_TRUE(q.hasPending());
+  EXPECT_EQ(q.pendingCount(), 1u);
+
+  Target* again = q.activate();
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(again->id, 1u);
+  EXPECT_EQ(again->clear_mask, 0b01u);
+  EXPECT_EQ(again->clear_los_dwells, 1);
+}
+
+// deactivate() with nothing active is a safe no-op.
+TEST(TargetQueue, DeactivateWithNoActiveTargetIsSafe) {
+  TargetQueue q;
+  q.ingest(1, P(0, 0), 0.3f, 0.0f, kDedup);
+  q.deactivate();
+  EXPECT_EQ(q.pendingCount(), 1u);
+  EXPECT_NE(q.activate(), nullptr);
+}

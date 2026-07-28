@@ -74,6 +74,12 @@ public:
       const Eigen::Vector3f& robot_pos,
       const MapCache* map = nullptr) const;
 
+  /// Read-only access to the configuration (mirrors VantagePlanner::config()).
+  /// The exploitation path needs the terrain-mode ground-search window and
+  /// clearance to place vantages on the local ground the same way exploration
+  /// candidates are placed.
+  const CandidateConfig& config() const { return cfg_; }
+
 private:
   CandidateConfig cfg_;
 

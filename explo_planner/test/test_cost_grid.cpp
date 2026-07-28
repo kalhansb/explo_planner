@@ -220,3 +220,42 @@ TEST(CostGrid, PerformanceSmokeCheck) {
   EXPECT_GT(cg.reachedCellCount(), 1000u);
   EXPECT_LT(cg.reachedCellCount(), 6000u);
 }
+
+// 11. An unbounded flood (radius_cap_m <= 0) must reach cells whose PATH cost
+//     exceeds the grid's straight-line diagonal. The old implementation
+//     silently clamped the "no bound" case to diag + 1, so a serpentine
+//     corridor — a walked distance far longer than the diagonal — read as
+//     unreachable and the exploitation planner rejected drivable vantages.
+TEST(CostGrid, UnboundedFloodExceedsGridDiagonal) {
+  // 20 x 20 at 1 m: diagonal is hypot(20,20) = 28.3 m, so the old cap was
+  // ~29.3 m. Block every odd row except a single gap that alternates between
+  // the two ends, forcing a snake that traverses ~19 m per open row.
+  auto grid = makeGrid(20, 20, 1.0f);
+  for (int gy = 1; gy < 20; gy += 2) {
+    const int gap = ((gy / 2) % 2 == 0) ? 19 : 0;
+    for (int gx = 0; gx < 20; ++gx)
+      if (gx != gap) block(grid, gx, gy);
+  }
+
+  CostGrid cg;
+  cg.build(grid);
+  cg.floodFrom(cellCenter(grid, 0, 0), /*radius_cap_m (unbounded)=*/0.0f);
+
+  const auto far = cellCenter(grid, 0, 18);
+  const float diag = std::hypot(20.0f, 20.0f) * 1.0f;
+  ASSERT_TRUE(cg.reachable(far));
+  // The whole point: the walked cost is well past the diagonal clamp.
+  EXPECT_GT(cg.costTo(far), diag + 1.0f);
+}
+
+// 12. A POSITIVE cap is still honoured — the fix removed the implicit diagonal
+//     clamp, not the caller's explicit bound.
+TEST(CostGrid, PositiveCapStillBoundsTheFlood) {
+  auto grid = makeGrid(20, 20, 1.0f);
+  CostGrid cg;
+  cg.build(grid);
+  cg.floodFrom(cellCenter(grid, 0, 0), /*radius_cap_m=*/3.0f);
+
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 2, 0)));    // 2 m out
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 15, 15))); // way past the cap
+}

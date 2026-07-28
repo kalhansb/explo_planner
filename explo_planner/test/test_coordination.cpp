@@ -314,3 +314,42 @@ TEST(Coordination, ExploitFieldsRoundTrip) {
   EXPECT_EQ(explore.target_id, 0u);
   EXPECT_EQ(explore.dwelled_mask, 0u);
 }
+
+// 14. claimMatching sizes each claim's exclusion disc by the radius the
+//     CLAIMER advertised, not by the receiver's own match radius. The radius
+//     is phase-dependent (exploration ~8-10 m, one exploit vantage ~0.75 m),
+//     so evaluating every claim at the receiver's scale made an exploring
+//     robot veto a whole 8 m disc around a peer that was merely dwelling at a
+//     trunk.
+TEST(Coordination, ClaimMatchingUsesTheClaimersRadius) {
+  Coordination c(true, "atlas");
+  Coordination::Claim p;
+  p.robot_id = "rama";
+  p.goal_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  p.robot_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  p.radius_m = 0.75f;  // exploit-scale: one vantage angle around a trunk
+  p.expiry = rclcpp::Time(static_cast<int64_t>(1000e9), RCL_ROS_TIME);
+  c.injectClaimForTest(p);
+
+  // 3 m away is far outside the peer's own 0.75 m claim, even though the
+  // caller asks with an exploration-scale 8 m match radius.
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 8.0f), nullptr);
+  // Inside the peer's advertised disc it still matches.
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(0.5f, 0.0f, 0.0f), 8.0f), nullptr);
+}
+
+// 15. radius_m <= 0 means the peer advertised nothing usable (older node), so
+//     fall back to the receiver's own match radius rather than never matching.
+TEST(Coordination, ClaimMatchingFallsBackWhenRadiusUnset) {
+  Coordination c(true, "atlas");
+  Coordination::Claim p;
+  p.robot_id = "rama";
+  p.goal_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  p.robot_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  p.radius_m = 0.0f;
+  p.expiry = rclcpp::Time(static_cast<int64_t>(1000e9), RCL_ROS_TIME);
+  c.injectClaimForTest(p);
+
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 8.0f), nullptr);
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 1.0f), nullptr);
+}

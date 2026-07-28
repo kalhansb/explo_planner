@@ -194,21 +194,36 @@ private:
         ++it;
     }
 
+    // At most one detection may claim a given track per scan. Without this,
+    // two trunks closer together than match_radius_ both resolved to the SAME
+    // nearest track: `confirm` incremented twice inside a single scan (so
+    // confirm_ticks=2 was satisfied after one scan rather than two in a row,
+    // defeating the consecutive-confirmation requirement) and the second trunk
+    // was silently absorbed into the first track's centre/radius estimate
+    // instead of getting its own track and its own emitted target. Index-
+    // aligned with tracks_; push_back below keeps both in step.
+    std::vector<char> claimed(tracks_.size(), 0);
+
     for (const auto& d : dets) {
-      // Match to the nearest existing track within match_radius_ (XY). Done for
-      // well-observed detections too, so a track whose tree now reads adequately
-      // covered can have its consecutive-under-informed streak reset below.
+      // Match to the nearest unclaimed track within match_radius_ (XY). Done
+      // for well-observed detections too, so a track whose tree now reads
+      // adequately covered can have its consecutive-under-informed streak
+      // reset below.
       Track* best = nullptr;
+      size_t best_i = 0;
       float best_d2 = static_cast<float>(match_radius_ * match_radius_);
-      for (auto& t : tracks_) {
-        const float dx = t.center.x() - d.center.x();
-        const float dy = t.center.y() - d.center.y();
+      for (size_t i = 0; i < tracks_.size(); ++i) {
+        if (claimed[i]) continue;
+        const float dx = tracks_[i].center.x() - d.center.x();
+        const float dy = tracks_[i].center.y() - d.center.y();
         const float d2 = dx * dx + dy * dy;
         if (d2 <= best_d2) {
           best_d2 = d2;
-          best = &t;
+          best = &tracks_[i];
+          best_i = i;
         }
       }
+      if (best) claimed[best_i] = 1;
 
       if (!d.under_informed) {
         // A well-observed read breaks the confirmation streak: reset the
@@ -228,6 +243,7 @@ private:
       if (!best) {
         tracks_.push_back(Track{cellId(d.center), d.center, d.radius, d.height, 1,
                                 false, now});
+        claimed.push_back(1);  // brand-new track: already taken this scan
         continue;
       }
 

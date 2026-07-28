@@ -1,9 +1,25 @@
 #include "explo_planner/metrics_logger.hpp"
 
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+
 namespace explo_planner {
 
 MetricsLogger::MetricsLogger(const std::string& csv_path)
-    : file_(csv_path, std::ios::out | std::ios::trunc) {}
+    : file_(csv_path, std::ios::out | std::ios::trunc) {
+  // Fail loudly. std::ofstream does not throw by default, so an unwritable
+  // output_csv (missing parent directory, read-only mount, bad permissions)
+  // used to leave every subsequent `file_ << ...` a silent no-op: the run
+  // completed, the node logged "Step N logged" for every step, and the
+  // experiment produced no data at all. There is nothing to salvage from a
+  // metrics run whose metrics cannot be written, so refuse to start.
+  if (!file_.is_open()) {
+    throw std::runtime_error(
+        "MetricsLogger: cannot open output CSV '" + csv_path + "': " +
+        std::strerror(errno));
+  }
+}
 
 MetricsLogger::~MetricsLogger() {
   if (file_.is_open()) file_.close();

@@ -4,6 +4,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 import os
 from ament_index_python.packages import get_package_share_directory
 
@@ -14,6 +15,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('robot', default_value='atlas',
                               description='Robot name (namespace)'),
+        # Defaults false (hardware). The planner's 10 Hz tick runs off the node
+        # clock, so use_sim_time:=true with no /clock publisher leaves the timer
+        # dead and the planner silently idle. Sim/bag runs must pass true.
+        DeclareLaunchArgument('use_sim_time', default_value='false',
+                              description='Use /clock (sim/bag runs only)'),
         DeclareLaunchArgument('max_steps', default_value='200',
                               description='Maximum NBV steps'),
         DeclareLaunchArgument('output_csv', default_value='/tmp/exploration.csv',
@@ -39,13 +45,23 @@ def generate_launch_description():
                 os.path.join(pkg_dir, 'config', 'exploration_params.yaml'),
                 {
                     'robot_name': LaunchConfiguration('robot'),
-                    'max_steps': LaunchConfiguration('max_steps'),
+                    'use_sim_time': ParameterValue(
+                        LaunchConfiguration('use_sim_time'), value_type=bool),
+                    # A bare LaunchConfiguration evaluates to a *string*. The node
+                    # declares these as int/bool/double, so passing them raw makes
+                    # declare_parameter throw InvalidParameterTypeException at
+                    # startup. ParameterValue(..., value_type=...) coerces first.
+                    'max_steps': ParameterValue(
+                        LaunchConfiguration('max_steps'), value_type=int),
                     'output_csv': LaunchConfiguration('output_csv'),
                     'dscovox_topic': LaunchConfiguration('dscovox_topic'),
                     'map_frame': LaunchConfiguration('map_frame'),
                     'base_frame': LaunchConfiguration('base_frame'),
-                    'trajectory_scoring': LaunchConfiguration('trajectory_scoring'),
-                    'trajectory_sample_spacing_m': LaunchConfiguration('trajectory_sample_spacing_m'),
+                    'trajectory_scoring': ParameterValue(
+                        LaunchConfiguration('trajectory_scoring'), value_type=bool),
+                    'trajectory_sample_spacing_m': ParameterValue(
+                        LaunchConfiguration('trajectory_sample_spacing_m'),
+                        value_type=float),
                 },
             ],
         ),

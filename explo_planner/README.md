@@ -196,9 +196,29 @@ docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/i
 ```
 
 All tuning lives in [`config/exploration_params.yaml`](config/exploration_params.yaml)
-(loaded by every launch file) — set `use_sim_time: false` there for hardware,
-and keep `roi_min_z`/`roi_max_z` inside the multi-robot share z-band (see the
-KEEP-IN-SYNC comment in the yaml).
+(loaded by every launch file). It now ships **field defaults**: `use_sim_time:
+false`, `done_action: idle`, `terrain_relative_z: true`, `coordination_enabled:
+true`, and the forest-AO ROI. Sim and bag runs must pass `use_sim_time:=true`
+(every launch file declares the argument, and it overrides the yaml) — with
+`true` and no `/clock` publisher the planner's 10 Hz tick timer never fires and
+the node sits silently idle. Keep `roi_min_z`/`roi_max_z` inside the multi-robot
+share z-band; note that with `terrain_relative_z: true` they are **relative to
+the robot's z**, so the absolute share band must be a superset of everywhere
+that window can sit (see the KEEP-IN-SYNC comment in the yaml).
+
+Two settings must be matched to the navigator on each platform:
+
+- `goal_xy_tolerance` / `goal_yaw_tolerance` must be strictly **looser** than
+  nav2's goal checker (shipped defaults: 0.25 / 0.25). If they are tighter, nav2
+  stops inside its own tolerance but outside the planner's, the planner never
+  registers arrival, and it blacklists a goal the robot is standing on. The node
+  warns at startup if either is at or below nav2's default.
+- `goal_republish_sec` throttles the keep-alive re-send of an unchanged goal.
+  Nav2 turns every `goal_pose` message into a fresh `NavigateToPose` goal, so an
+  unthrottled re-send makes `GoalUpdated` fire continuously, which halts the
+  recovery subtree while still consuming `RecoveryNode`'s retries — transient
+  failures become aborts instead of recoveries. Set `0` for publish-on-change
+  only once nav2 bringup is reliable enough not to need the keep-alive.
 
 ### Key topics
 

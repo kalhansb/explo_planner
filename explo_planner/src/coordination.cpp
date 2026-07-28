@@ -63,12 +63,23 @@ void Coordination::prune(const rclcpp::Time& now) {
 const Coordination::Claim* Coordination::claimMatching(
     const Eigen::Vector3f& candidate_xy, float match_radius_m) const {
   if (claims_.empty()) return nullptr;
-  const float r2 = match_radius_m * match_radius_m;
 
   const Claim* best = nullptr;
   float best_d2 = std::numeric_limits<float>::infinity();
 
   for (const auto& c : claims_) {
+    // Test against the radius the CLAIMER advertised, not our own. The claim
+    // radius is the size of the region that peer is occupying, and it is
+    // phase-dependent: an exploration claim is ~8-10 m ("I'm driving to this
+    // area"), an exploit vantage claim is ~0.75 m ("I'm holding this one angle
+    // around a trunk"). Evaluating every claim at the receiver's own scale
+    // meant an exploring robot vetoed an 8 m disc around a peer that was
+    // merely dwelling at a tree, and an exploiting robot under-vetoed a peer's
+    // exploration goal. radius_m <= 0 means the peer sent nothing usable
+    // (older node), so fall back to our own notion of "same goal".
+    const float r = (c.radius_m > 0.0f) ? c.radius_m : match_radius_m;
+    const float r2 = r * r;
+
     float dx = c.goal_pos.x() - candidate_xy.x();
     float dy = c.goal_pos.y() - candidate_xy.y();
     float d2 = dx * dx + dy * dy;

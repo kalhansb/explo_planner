@@ -7,12 +7,33 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
+#include <string>
 
 namespace explo_planner {
 
+namespace {
+
+// A non-positive (or non-finite) voxel size makes Bonxai's inv_resolution inf
+// or NaN, and every posToCoord then does a float->int32 cast on a non-finite
+// value — undefined behaviour that shows up as garbage coordinates rather than
+// as a crash. CostGrid::build() already refuses a degenerate grid; do the same
+// here instead of building an unusable cache. Config error, so fail at
+// construction with a message naming the value.
+double checkedResolution(double resolution, const char* where) {
+  if (!(resolution > 0.0) || !std::isfinite(resolution)) {
+    throw std::invalid_argument(
+        std::string("MapCache: ") + where + " requires a finite positive voxel "
+        "resolution, got " + std::to_string(resolution));
+  }
+  return resolution;
+}
+
+}  // namespace
+
 MapCache::MapCache(double resolution)
-    : resolution_(resolution),
-      grid_(std::make_unique<Grid>(resolution)) {}
+    : resolution_(checkedResolution(resolution, "constructor")),
+      grid_(std::make_unique<Grid>(resolution_)) {}
 
 void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
   // Unbounded: ingest every voxel. ±inf bounds make the clip a no-op.
@@ -44,6 +65,15 @@ void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
         y < roi_min.y() || y > roi_max.y() ||
         z < roi_min.z() || z > roi_max.z())
       continue;
+    // Drop non-finite Beta parameters too. p_occ is derived from them, and a
+    // NaN a_occ/a_free silently produced a NaN p_occ that propagated into the
+    // per-voxel scorers and the aggregate metrics (mean_eig / mean_entropy)
+    // for the rest of the run — the ratio test below cannot catch it, since
+    // every comparison against NaN is false and lands on the 0.5f branch only
+    // for the sum, not for the division.
+    if (!std::isfinite(vx.a_occ) || !std::isfinite(vx.a_free) ||
+        vx.a_occ < 0.0f || vx.a_free < 0.0f)
+      continue;
     UnifiedVoxel uv;
     uv.a_occ    = vx.a_occ;
     uv.a_free   = vx.a_free;
@@ -61,8 +91,8 @@ void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
 
 void MapCache::updateFromLogOddsCloud(
     const sensor_msgs::msg::PointCloud2& msg, double resolution) {
-  grid_ = std::make_unique<Grid>(resolution);
-  resolution_ = resolution;
+  resolution_ = checkedResolution(resolution, "updateFromLogOddsCloud");
+  grid_ = std::make_unique<Grid>(resolution_);
 
   sensor_msgs::PointCloud2ConstIterator<float> ix(msg, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iy(msg, "y");
@@ -76,6 +106,10 @@ void MapCache::updateFromLogOddsCloud(
     if (!std::isfinite(*ix) || !std::isfinite(*iy) || !std::isfinite(*iz))
       continue;
     float p = *ip;
+    // std::clamp passes NaN straight through (every comparison against NaN is
+    // false), so guard explicitly before the clamp — otherwise log(NaN) makes
+    // a_occ/a_free NaN and poisons the scorers.
+    if (!std::isfinite(p)) continue;
     // Clamp to avoid log(0)
     p = std::clamp(p, 0.001f, 0.999f);
 

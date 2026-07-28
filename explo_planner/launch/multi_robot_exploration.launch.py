@@ -35,6 +35,8 @@ def launch_setup(context):
     config_id = LaunchConfiguration("config_id").perform(context)
     world = LaunchConfiguration("world").perform(context)
     max_steps = LaunchConfiguration("max_steps").perform(context)
+    use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() \
+        in ("true", "1", "yes", "on")
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
@@ -61,7 +63,7 @@ def launch_setup(context):
             parameters=[
                 params_yaml,
                 {
-                    "use_sim_time": True,
+                    "use_sim_time": use_sim_time,
                     "robot_name": robot,
                     "max_steps": int(max_steps),
                     "output_csv": output_csv,
@@ -93,6 +95,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("robots", default_value="atlas,rama",
                               description="Comma-separated robot team list"),
+        # Defaults false (hardware). The planner's 10 Hz tick runs off the node
+        # clock, so use_sim_time:=true with no /clock publisher leaves the timer
+        # dead and every planner silently idle. Gazebo/bag runs must pass true.
+        DeclareLaunchArgument("use_sim_time", default_value="false",
+                              description="Use /clock (sim/bag runs only)"),
         DeclareLaunchArgument("planner", default_value="eig",
                               description="Planner type: eig, entropy, frontier, random"),
         DeclareLaunchArgument("output_dir", default_value="/tmp",

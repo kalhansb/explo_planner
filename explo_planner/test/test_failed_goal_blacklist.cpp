@@ -70,3 +70,30 @@ TEST(FailedGoalBlacklist, MultipleEntries) {
   EXPECT_TRUE(bl.isNear(p(0.0f, 19.5f), 1.0));
   EXPECT_FALSE(bl.isNear(p(10.0f, 10.0f), 1.0));
 }
+
+// prune() must not assume insertion order implies age order. Under sim time a
+// bag restart or a /clock step backwards stamps a fresh entry with an OLDER
+// timestamp than the one already queued behind it; the old pop-front-until-
+// fresh loop hit the newer entry first, broke, and left the expired one
+// blacklisting its goal forever.
+TEST(FailedGoalBlacklist, PrunesExpiredEntriesOutOfTimestampOrder) {
+  FailedGoalBlacklist bl;
+  bl.add(p(0, 0), /*now_sec=*/1000.0);  // recent, must survive
+  bl.add(p(50, 0), /*now_sec=*/10.0);   // clock jumped back: stamped far older
+
+  bl.prune(/*now_sec=*/1005.0, /*ttl_sec=*/60.0);
+
+  EXPECT_EQ(bl.size(), 1u);
+  EXPECT_TRUE(bl.isNear(p(0, 0), 1.0));    // 5 s old
+  EXPECT_FALSE(bl.isNear(p(50, 0), 1.0));  // 995 s old
+}
+
+// An entry stamped in the future (age < 0, e.g. a peer-driven clock step
+// forward between add and prune) counts as fresh, not as expired.
+TEST(FailedGoalBlacklist, FutureStampedEntryIsNotPruned) {
+  FailedGoalBlacklist bl;
+  bl.add(p(3, 3), /*now_sec=*/500.0);
+  bl.prune(/*now_sec=*/100.0, /*ttl_sec=*/60.0);
+  EXPECT_EQ(bl.size(), 1u);
+  EXPECT_TRUE(bl.isNear(p(3, 3), 1.0));
+}

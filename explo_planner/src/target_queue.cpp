@@ -85,6 +85,13 @@ void TargetQueue::markActiveDone() {
   active_idx_ = -1;
 }
 
+void TargetQueue::deactivate() {
+  if (Target* t = active()) {
+    t->status = Target::Status::PENDING;
+  }
+  active_idx_ = -1;
+}
+
 void TargetQueue::recordVantageDwell(const Eigen::Vector3f& vantage_xy,
                                      bool los_clear, int vantage_index) {
   Target* t = active();

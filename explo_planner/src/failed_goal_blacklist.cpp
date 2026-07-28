@@ -3,6 +3,8 @@
 
 #include "explo_planner/failed_goal_blacklist.hpp"
 
+#include <algorithm>
+
 namespace explo_planner {
 
 void FailedGoalBlacklist::add(const Eigen::Vector3f& pos, double now_sec) {
@@ -10,14 +12,18 @@ void FailedGoalBlacklist::add(const Eigen::Vector3f& pos, double now_sec) {
 }
 
 void FailedGoalBlacklist::prune(double now_sec, double ttl_sec) {
-  while (!entries_.empty()) {
-    double age = now_sec - entries_.front().second;
-    if (age > ttl_sec) {
-      entries_.pop_front();
-    } else {
-      break;
-    }
-  }
+  // Full scan rather than a pop-front-until-fresh loop. The early-break form
+  // assumed insertion order implies age order, which holds only for a
+  // monotonic clock — under sim time a bag restart or a /clock step backwards
+  // stamps a fresh entry with an *older* timestamp than the one behind it, and
+  // the break then left every expired entry after it blacklisting goals
+  // forever. Entries stamped in the future (age < 0) are treated as fresh.
+  entries_.erase(
+      std::remove_if(entries_.begin(), entries_.end(),
+                     [now_sec, ttl_sec](const auto& e) {
+                       return now_sec - e.second > ttl_sec;
+                     }),
+      entries_.end());
 }
 
 bool FailedGoalBlacklist::isNear(const Eigen::Vector3f& pos,

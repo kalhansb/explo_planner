@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <queue>
 #include <utility>
 
@@ -91,14 +92,17 @@ void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m) {
   }
   cost_[idx(sx, sy)] = 0.0f;
 
-  // Effective radius cap. Negative / zero / NaN means "no bound" — we still
-  // clamp to the grid diagonal so the loop terminates trivially.
-  const float diag_m =
-      std::hypot(static_cast<float>(dims_x_), static_cast<float>(dims_y_)) *
-      resolution_;
+  // Effective radius cap. Negative / zero / NaN means "no bound" — genuinely
+  // unbounded, i.e. +inf. Do NOT clamp to the grid diagonal: a Dijkstra path
+  // length is a *walked* distance and routinely exceeds the straight-line
+  // diagonal (serpentine corridors, U-shaped rooms), so a diagonal clamp made
+  // reachable cells report kInfCost and the exploitation planner rejected
+  // genuinely drivable vantages as unreachable. Termination does not depend on
+  // the cap — the grid is finite and each cell is relaxed to a strictly
+  // decreasing cost.
   float cap = radius_cap_m;
-  if (!(cap > 0.0f) || cap > diag_m) {
-    cap = diag_m + 1.0f;
+  if (!(cap > 0.0f)) {
+    cap = std::numeric_limits<float>::infinity();
   }
 
   using Node = std::pair<float, int>;  // (cost, flat index)

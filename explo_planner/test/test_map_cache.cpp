@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "explo_planner/map_cache.hpp"
 #include <scovox_msgs/msg/scovox_map.hpp>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace explo_planner;
@@ -104,4 +107,51 @@ TEST(MapCacheColumnFraction, DegenerateBoxReturnsMinusOne) {
   MapCache map = makeMap({{0.5f, 0.5f, 0.5f}});
   EXPECT_DOUBLE_EQ(map.unknownColumnFraction(1.0f, 0.0f, 0.0f, 1.0f), -1.0);
   EXPECT_DOUBLE_EQ(map.unknownColumnFraction(0.5f, 0.5f, 0.0f, 1.0f), -1.0);
+}
+
+// A non-positive / non-finite voxel size makes Bonxai's inv_resolution inf or
+// NaN and every posToCoord then casts a non-finite float to int32 — UB that
+// surfaces as garbage coordinates, not a crash. Refuse it at construction the
+// way CostGrid::build() refuses a degenerate grid.
+TEST(MapCacheIngest, RejectsNonPositiveResolution) {
+  EXPECT_THROW(MapCache(0.0), std::invalid_argument);
+  EXPECT_THROW(MapCache(-0.1), std::invalid_argument);
+  EXPECT_THROW(MapCache(std::numeric_limits<double>::quiet_NaN()),
+               std::invalid_argument);
+  EXPECT_NO_THROW(MapCache(0.1));
+}
+
+// Positions are already screened for NaN/inf; the Beta parameters were not.
+// A non-finite a_occ/a_free yields a NaN p_occ (the sum test cannot catch it —
+// every comparison against NaN is false, and the division happens anyway),
+// which propagates into the per-voxel scorers and the aggregate metrics.
+TEST(MapCacheIngest, DropsVoxelsWithNonFiniteBetaParameters) {
+  scovox_msgs::msg::ScovoxMap msg;
+  msg.resolution = 0.1f;
+  auto add = [&msg](float x, float a_occ, float a_free) {
+    scovox_msgs::msg::ScovoxVoxel v;
+    v.position.x = x;
+    v.position.y = 0.0f;
+    v.position.z = 0.0f;
+    v.a_occ = a_occ;
+    v.a_free = a_free;
+    msg.voxels.push_back(v);
+  };
+  const float kNan = std::numeric_limits<float>::quiet_NaN();
+  add(0.05f, 10.0f, 1.0f);   // good
+  add(0.15f, kNan,  1.0f);   // NaN a_occ
+  add(0.25f, 1.0f,  kNan);   // NaN a_free
+  add(0.35f, std::numeric_limits<float>::infinity(), 1.0f);
+  add(0.45f, -1.0f, 1.0f);   // negative Beta parameter
+
+  MapCache map(0.1);
+  map.updateFromScovoxMap(msg);
+
+  // Only the well-formed voxel is ingested; the rest read as unobserved.
+  EXPECT_TRUE(map.getVoxel(Eigen::Vector3f(0.05f, 0.0f, 0.0f)).observed);
+  for (float x : {0.15f, 0.25f, 0.35f, 0.45f}) {
+    const auto v = map.getVoxel(Eigen::Vector3f(x, 0.0f, 0.0f));
+    EXPECT_FALSE(v.observed) << "x=" << x;
+    EXPECT_TRUE(std::isfinite(v.p_occ)) << "x=" << x;
+  }
 }

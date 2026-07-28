@@ -16,7 +16,11 @@ float eig(const UnifiedVoxel& v) {
 
 float entropy(const UnifiedVoxel& v) {
   const float p = v.p_occ;
-  if (p < 1e-7f || p > 1.0f - 1e-7f) return 0.0f;
+  // Negated comparisons so NaN also takes the early return: every `<`/`>` test
+  // against NaN is false, so the original `p < eps || p > 1-eps` form let a NaN
+  // p_occ through and returned NaN, which then poisoned the accumulated score
+  // (and mean_entropy in the metrics CSV) for the whole ray.
+  if (!(p > 1e-7f) || !(p < 1.0f - 1e-7f)) return 0.0f;
   return -p * std::log(p) - (1.0f - p) * std::log(1.0f - p);
 }
 

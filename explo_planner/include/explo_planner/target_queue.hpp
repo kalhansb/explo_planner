@@ -81,6 +81,13 @@ public:
   /// Mark the ACTIVE target DONE and clear the active slot. No-op if none.
   void markActiveDone();
 
+  /// Demote the ACTIVE target back to PENDING and clear the active slot.
+  /// Unlike markActiveDone() this does NOT close the target — it stands
+  /// exploitation down so a higher-priority behaviour (the rendezvous barrier)
+  /// can run without the target being lost or its exploit claim left live.
+  /// The next activate() picks the same target up again. No-op if none.
+  void deactivate();
+
   /// Record that the robot dwelled at a vantage of the ACTIVE target.
   /// `vantage_index` is the deterministic ring index of the vantage (< 32 for
   /// team credit sharing; -1 / out-of-range falls back to counter-only).

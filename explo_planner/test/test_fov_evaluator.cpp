@@ -121,3 +121,76 @@ TEST(FovEvaluator, ZBandClipsRays) {
   EXPECT_LT(r_banded.total_score, r_wide.total_score);
   EXPECT_GT(r_banded.total_score, 0.0f);
 }
+
+// Both ends of a ray are ROI-clipped, not just the far one. A candidate sitting
+// on an ROI face and firing outward has its ROI exit at t = 0, i.e. BEFORE the
+// sensor's min_range: such a ray observes nothing and must contribute nothing.
+// Previously only the far end was clamped, so the walk started at
+// position + dir*min_range — outside the box and PAST the clamped far end — and
+// the iterator ran backwards through voxels the map never ingests, scoring each
+// as the Beta(1,1) max-uncertainty prior. That inflated info gain precisely at
+// the ROI boundary, biasing the planner toward the edge of its own region.
+TEST(FovEvaluator, RaysLeavingTheRoiInsideTheDeadZoneScoreNothing) {
+  FovConfig cfg;
+  cfg.h_rays = 8;
+  cfg.v_rays = 1;
+  cfg.hfov = 3.0f;   // ~172 deg: every ray still has a +x component
+  cfg.vfov = 0.1f;
+  cfg.min_range = 0.3f;
+  cfg.max_range = 5.0f;
+  cfg.roi_min_x = -10.0f;
+  cfg.roi_max_x = 0.0f;    // candidate sits exactly on the +x face
+  cfg.roi_min_y = -10.0f;
+  cfg.roi_max_y = 10.0f;
+  cfg.roi_min_z = -1.0f;
+  cfg.roi_max_z = 1.0f;
+  FovEvaluator eval(cfg);
+
+  MapCache map(0.1);  // empty: any traversed voxel reads as the prior
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+
+  vp.yaw = 0.0f;  // facing +x, straight out of the ROI
+  auto outward = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_EQ(outward.total_ray_voxels, 0);
+  EXPECT_EQ(outward.unknown_count, 0);
+  EXPECT_FLOAT_EQ(outward.total_score, 0.0f);
+
+  // Positive control: the same viewpoint facing INTO the ROI still scores.
+  vp.yaw = static_cast<float>(M_PI);
+  auto inward = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_GT(inward.total_ray_voxels, 0);
+  EXPECT_GT(inward.total_score, 0.0f);
+}
+
+// The far end is still clipped at the ROI face, so a ray fired along the box
+// from well inside stops at the boundary rather than running to max_range.
+TEST(FovEvaluator, FarEndStillClippedAtTheRoiFace) {
+  FovConfig cfg;
+  cfg.h_rays = 1;
+  cfg.v_rays = 1;
+  cfg.hfov = 0.05f;
+  cfg.vfov = 0.05f;
+  cfg.min_range = 0.3f;
+  cfg.max_range = 10.0f;
+  cfg.roi_min_x = -10.0f;
+  cfg.roi_min_y = -10.0f;
+  cfg.roi_max_y = 10.0f;
+  cfg.roi_min_z = -1.0f;
+  cfg.roi_max_z = 1.0f;
+
+  cfg.roi_max_x = 9.0f;
+  FovEvaluator far_eval(cfg);
+  cfg.roi_max_x = 2.0f;
+  FovEvaluator near_eval(cfg);
+
+  MapCache map(0.1);
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  vp.yaw = 0.0f;
+
+  auto r_far  = far_eval.evaluate(vp, map, scoring::eig);
+  auto r_near = near_eval.evaluate(vp, map, scoring::eig);
+  EXPECT_GT(r_far.total_ray_voxels, r_near.total_ray_voxels);
+  EXPECT_GT(r_near.total_ray_voxels, 0);
+}

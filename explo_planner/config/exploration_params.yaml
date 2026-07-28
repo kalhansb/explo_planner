@@ -1,6 +1,18 @@
-explo_planner:
+# Namespace wildcard. A bare `explo_planner:` key only matches a node whose
+# FULLY-QUALIFIED name is `/explo_planner`, i.e. one launched at the root
+# namespace. multi_robot_exploration.launch.py launches with namespace=<robot>,
+# giving `/atlas/explo_planner` — under the bare key every parameter below was
+# silently dropped and the node fell back to its C++ defaults (ROI ±15 instead
+# of ±30, nav speed 0.5 instead of 0.15, ...) with no warning. `/**` matches the
+# node in any namespace, so single- and multi-robot launches both load this file.
+/**:
   ros__parameters:
-    use_sim_time: true
+    # FIELD DEFAULT: false. The node's 10 Hz tick timer runs off the node
+    # clock, so with use_sim_time: true and no /clock publisher the timer never
+    # fires and the planner does nothing at all — silently, with no warning.
+    # Sim/bag runs must pass use_sim_time:=true to the launch file (all three
+    # launch files declare the argument and it overrides this value).
+    use_sim_time: false
     robot_name: "atlas"
     max_steps: 200
     output_csv: "/tmp/exploration_eig.csv"
@@ -25,8 +37,46 @@ explo_planner:
     use_planning_map: false
 
     # Navigation
-    goal_xy_tolerance: 0.3
-    goal_yaw_tolerance: 0.2
+    #
+    # ARRIVAL GATE — must be strictly LOOSER than the navigator's own goal
+    # checker. nav2's shipped general_goal_checker defaults are xy 0.25 /
+    # yaw 0.25 with stateful: true, so once XY latches the controller rotates
+    # only until yaw is inside 0.25 and then stops — frequently in
+    # (0.20, 0.25], i.e. just outside a 0.2 gate. The planner then never sees
+    # arrival, holds for goal_rotate_timeout_sec, and failGoal("budget-rotate")
+    # blacklists the goal the robot is standing on (a failed_goal_radius_m disc
+    # around its own position for failed_goal_ttl_sec). On a vantage that burns
+    # one of three, and three burns closes the target PARTIAL with no capture.
+    # The node warns at startup if either value is <= nav2's default.
+    # Set these from the actual goal_checker params on each platform.
+    goal_xy_tolerance: 0.4
+    goal_yaw_tolerance: 0.4
+    # Deadline for the in-place rotation after the XY goal is reached, timed
+    # from arrival. Separate from the nav_* travel budget on purpose: sharing
+    # that budget failed (and blacklisted) goals the robot was already
+    # standing on whenever it arrived near the end of its travel allowance.
+    goal_rotate_timeout_sec: 15.0
+    # Keep-alive interval (s) for re-sending an UNCHANGED goal pose. A changed
+    # pose always publishes immediately, and so does the first goal after a
+    # subscriber appears (a goal published while the navigator is down is
+    # dropped silently — there is no action feedback to notice it with).
+    #
+    # This used to be unthrottled at the 10 Hz tick rate, which is actively
+    # harmful with nav2: bt_navigator turns every goal_pose message into a new
+    # NavigateToPose goal, preempting the running one and rewriting the BT
+    # blackboard "goal". GoalUpdated — the first child of the RecoveryFallback
+    # in the default navigate_to_pose_w_replanning_and_recovery tree — then
+    # returns SUCCESS, which halts the recovery RoundRobin before
+    # Spin/Wait/BackUp can finish while still counting as a completed recovery
+    # against RecoveryNode's number_of_retries="6". At 10 Hz that exhausted all
+    # six retries in under a second, turning any transient planning or control
+    # failure into an immediate nav2 ABORT instead of a recovery.
+    #
+    # 5.0 s lets the costmap-clearing sequence and Spin complete; Wait(5) and
+    # BackUp(~6 s) may still be cut once. Set 0 for publish-on-change only —
+    # strictly the best setting for recoveries, once nav2 bringup is known
+    # reliable enough not to need the keep-alive.
+    goal_republish_sec: 5.0
     integrate_wait: 2.0
 
     # Smart navigate timeout. Total budget per NAVIGATE cycle is computed
@@ -98,7 +148,9 @@ explo_planner:
     #              to idle when the queue drains. Use for field runs where
     #              the target scheduler releases lists at the coverage-done
     #              cue (a shutdown would race the release).
-    done_action: "shutdown"
+    # FIELD DEFAULT: idle. A shutdown at coverage-done races the target
+    # scheduler's release cue and kills the exploitation phase outright.
+    done_action: "idle"
 
     # Candidate generation
     # Polar enabled: with frontier-only mode the planner exhausted reachable
@@ -125,11 +177,23 @@ explo_planner:
     # will not select candidates outside this box. KEEP IN SYNC with the
     # dscovox planning_map size + origin in simple_nav_3d.launch.py so the
     # global planner is constrained to the same area.
-    # Default: 60x60 m centred at the world origin.
-    roi_min_x: -30.0
-    roi_max_x:  30.0
-    roi_min_y: -30.0
-    roi_max_y:  30.0
+    #
+    # FIELD (forest inspection AO, doc/experiment_script_forest_inspection.md
+    # §2): the plantation rows run at 24.82° to map x, so the 140x60 m AO is
+    # rotated. The planner ROI is axis-aligned and there is no roi_yaw yet
+    # (open item 2), so this is §2's prescribed fallback — the AO's axis-aligned
+    # bounding box. Out-of-AO cells must be painted lethal in the nav2 costmap,
+    # and note the coverage-done measure shares this box, so never-visited
+    # out-of-AO columns put a permanent floor under the unknown fraction:
+    # calibrate done_unknown_fraction above that floor at RS (open item 5).
+    #
+    # Phase 1 (SA-1 + SA-2, u in [-40, 60]) has a tighter bounding box —
+    # x [-51.4, 64.6], y [-38.7, 57.7] — use it to cut wasted candidates and
+    # lower the coverage floor if phase 2 is not run the same day.
+    roi_min_x: -51.3
+    roi_max_x: 100.9
+    roi_min_y: -38.7
+    roi_max_y:  74.5
 
     # Vertical ROI band (map frame, metres): candidate goals are clamped to
     # z in [roi_min_z, roi_max_z]. Values here mirror the code defaults
@@ -140,8 +204,42 @@ explo_planner:
     # planner band, otherwise free voxels near the band edge never reach the
     # fused map and read as unknown here (starved candidates / phantom
     # frontiers at the boundary).
-    roi_min_z: -0.5
-    roi_max_z: 2.0
+    #
+    # WITH terrain_relative_z: true (below) THIS BAND IS RELATIVE TO THE
+    # ROBOT'S OWN z, not absolute — it rides with the robot, which is what makes
+    # the AO's ~14 m of relief workable. Do NOT put the absolute -10 … +7 span
+    # from the field script §5 here: that would be a 17 m robot-relative slab.
+    # The absolute span belongs on the scovox_node / dscovox_node
+    # share_roi_z_min/share_roi_z_max wire+ingest filters, which are absolute
+    # and must remain a SUPERSET of everywhere this band can sit (i.e. cover the
+    # AO's full +5.3 … -8.6 ground range plus this band) — otherwise free voxels
+    # near the edge never reach the fused map and read as unknown here
+    # (starved candidates / phantom frontiers at the boundary).
+    #
+    # Values below are the ones proven in the terrain-mode bag run
+    # (scovox/config/exploration_fused_bag.yaml): enough below to catch ground
+    # on a downslope, enough above for canopy and overhangs. The band floor must
+    # stay deeper than ground_search_below_m plus the re-band hysteresis
+    # (0.25 * half-width, clamped to [0.5, 2] m) or ground search reaches
+    # outside the ingested slab.
+    roi_min_z: -5.0
+    roi_max_z:  4.0
+
+    # ---- Terrain-relative (3D) mode ----
+    # REQUIRED in the field (script §11 open item 4): the AO spans ~14 m of
+    # relief, so an absolute candidate_robot_z and absolute z clamping misplace
+    # candidates and their EIG raycasts wherever the ground leaves the band.
+    # With this on, the map z-band rides with the robot (above), candidates snap
+    # to local ground + candidate_z_clearance, and the 3D occupancy check runs
+    # at that height — in flat mode the generator is handed a nullptr map and
+    # that check is skipped entirely, leaving goal feasibility wholly to nav2.
+    # Exploitation vantage sightlines also snap to local ground (exploitZAt);
+    # the ring geometry itself is still flat-world (single standoff circle).
+    terrain_relative_z: true
+    candidate_z_clearance: 0.3      # candidate/vantage height above local ground
+    ground_search_below_m: 4.0      # ground search window below the reference z
+    ground_search_above_m: 1.0      # ... and above
+    ground_stack_max_m: 0.6         # max occupied stack still treated as ground
 
     # FOV evaluation (matches simulated RGBD: 320x240, 60deg HFOV)
     fov_hfov: 1.047              # 60 degrees
@@ -175,7 +273,10 @@ explo_planner:
     # Multi-robot coordination. When false the MinPos branch is skipped and
     # single-robot behaviour is bit-for-bit preserved (the utility math
     # above still runs in single-robot mode).
-    coordination_enabled: false
+    # FIELD DEFAULT: true (script §5 — phase 1 runs two robots). Harmless on a
+    # single robot: the intent table is simply empty, and rendezvous stays inert
+    # while rendezvous_expected_peers is 0.
+    coordination_enabled: true
 
     # MinPos parameters. claim_radius is the disc each robot reserves around
     # its currently-selected goal; ttl is how long an unrefreshed claim

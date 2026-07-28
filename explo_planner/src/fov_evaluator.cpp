@@ -6,6 +6,48 @@
 
 namespace explo_planner {
 
+namespace {
+
+// Clip the observable segment of one ray — the span from the sensor's minimum
+// range out to max_range — against the XYZ ROI box.
+//
+// Both endpoints must be clipped, not just the far one. Clipping only the far
+// end (the old behaviour) left `ray_start` at vp.position + dir*min_range,
+// which for a candidate sitting within min_range of an ROI face and firing
+// outward lands OUTSIDE the box and PAST the clamped far end. RayIterator then
+// walked backwards from out-of-ROI space, and because map_cache_ only ingests
+// voxels inside the ROI every one of those cells missed and was scored as the
+// Beta(1,1) max-uncertainty prior — inflating info gain precisely at the ROI
+// boundary, the bias the z/xy clip exists to prevent.
+//
+// Returns false when the ROI exit lies at or before min_range: the ray has no
+// observable voxel inside the box at all and must be skipped, not walked.
+// This also covers an origin that is already outside the ROI (t_exit <= 0).
+bool clipRayToRoi(const Eigen::Vector3f& origin,
+                  const Eigen::Vector3f& world_dir,
+                  const FovConfig& cfg,
+                  Eigen::Vector3f& ray_start,
+                  Eigen::Vector3f& ray_end) {
+  // world_dir is unit length, so t is a distance in metres along the ray.
+  float t_exit = cfg.max_range;
+  const float o[3] = {origin.x(), origin.y(), origin.z()};
+  const float d[3] = {world_dir.x(), world_dir.y(), world_dir.z()};
+  const float lo[3] = {cfg.roi_min_x, cfg.roi_min_y, cfg.roi_min_z};
+  const float hi[3] = {cfg.roi_max_x, cfg.roi_max_y, cfg.roi_max_z};
+  for (int i = 0; i < 3; ++i) {
+    if (d[i] > 0.0f)      t_exit = std::min(t_exit, (hi[i] - o[i]) / d[i]);
+    else if (d[i] < 0.0f) t_exit = std::min(t_exit, (lo[i] - o[i]) / d[i]);
+  }
+
+  if (!(t_exit > cfg.min_range)) return false;
+
+  ray_start = origin + world_dir * cfg.min_range;
+  ray_end   = origin + world_dir * t_exit;
+  return true;
+}
+
+}  // namespace
+
 FovEvaluator::FovEvaluator(const FovConfig& cfg) : cfg_(cfg) {
   precomputeRays();
 }
@@ -52,35 +94,15 @@ EvalResult FovEvaluator::evaluate(
         sy * dir.x() + cy * dir.y(),
         dir.z());
 
-    Eigen::Vector3f ray_end = vp.position + world_dir * cfg_.max_range;
-
-    // Clamp ray_end to the XYZ ROI.  Origin is inside the ROI
-    // (CandidateGenerator filters it), so we only need the exit-t. The z
+    // Clip the observable span [min_range, max_range] to the XYZ ROI. The z
     // clamp keeps the raycast volume consistent with the band map_cache_
     // holds, so out-of-band space is treated as empty (no contribution, no
     // occlusion) rather than as max-uncertainty prior voxels.
-    {
-      Eigen::Vector3f d = ray_end - vp.position;
-      float t_exit = 1.0f;
-      if (d.x() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_x - vp.position.x()) / d.x());
-      else if (d.x() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_x - vp.position.x()) / d.x());
-      if (d.y() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_y - vp.position.y()) / d.y());
-      else if (d.y() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_y - vp.position.y()) / d.y());
-      if (d.z() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_z - vp.position.z()) / d.z());
-      else if (d.z() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_z - vp.position.z()) / d.z());
-      if (t_exit < 1.0f)
-        ray_end = vp.position + d * std::max(t_exit, 0.0f);
-    }
+    Eigen::Vector3f ray_start, ray_end;
+    if (!clipRayToRoi(vp.position, world_dir, cfg_, ray_start, ray_end))
+      continue;  // ROI exits inside the sensor dead zone — nothing observable
 
-    // Start the ray at the sensor's minimum range: voxels inside the dead
-    // zone the real depth sensor cannot observe must not be scored.
-    auto c_origin = map.posToCoord(vp.position + world_dir * cfg_.min_range);
+    auto c_origin = map.posToCoord(ray_start);
     auto c_end    = map.posToCoord(ray_end);
 
     scovox::RayIterator(c_origin, c_end,
@@ -133,36 +155,19 @@ EvalResult FovEvaluator::evaluateSSMI(
         sy * dir.x() + cy * dir.y(),
         dir.z());
 
-    Eigen::Vector3f ray_end = vp.position + world_dir * cfg_.max_range;
+    // Clip the observable span [min_range, max_range] to the XYZ ROI (same as
+    // evaluate).
+    Eigen::Vector3f ray_start, ray_end;
+    if (!clipRayToRoi(vp.position, world_dir, cfg_, ray_start, ray_end))
+      continue;  // ROI exits inside the sensor dead zone — nothing observable
 
-    // Clamp ray_end to the XYZ ROI (same as evaluate).
-    {
-      Eigen::Vector3f d = ray_end - vp.position;
-      float t_exit = 1.0f;
-      if (d.x() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_x - vp.position.x()) / d.x());
-      else if (d.x() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_x - vp.position.x()) / d.x());
-      if (d.y() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_y - vp.position.y()) / d.y());
-      else if (d.y() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_y - vp.position.y()) / d.y());
-      if (d.z() > 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_max_z - vp.position.z()) / d.z());
-      else if (d.z() < 0.0f)
-        t_exit = std::min(t_exit, (cfg_.roi_min_z - vp.position.z()) / d.z());
-      if (t_exit < 1.0f)
-        ray_end = vp.position + d * std::max(t_exit, 0.0f);
-    }
-
-    // Start the ray at the sensor's minimum range: voxels inside the dead
-    // zone the real depth sensor cannot observe must not be scored.
-    auto c_origin = map.posToCoord(vp.position + world_dir * cfg_.min_range);
+    auto c_origin = map.posToCoord(ray_start);
     auto c_end    = map.posToCoord(ray_end);
 
     // Per-ray state for SSMI marginalisation.
     float reach = 1.0f;        // P(ray reaches current voxel)
     float free_kl_acc = 0.0f;  // accumulated KL from free observations
+    bool  occluded = false;    // ray terminated early on an occupied voxel
 
     scovox::RayIterator(c_origin, c_end,
         [&](const Bonxai::CoordT& c) -> bool {
@@ -200,13 +205,22 @@ EvalResult FovEvaluator::evaluateSSMI(
           reach *= (1.0f - p);
 
           // Hard occlusion stop (same threshold as evaluate).
-          if (ptr && ptr->p_occ >= cfg_.occ_stop) return false;
+          if (ptr && ptr->p_occ >= cfg_.occ_stop) {
+            occluded = true;
+            return false;
+          }
           return true;
         });
 
-    // "No hit" event: ray passes through all voxels, every cell
-    // receives a free observation.
-    result.total_score += reach * free_kl_acc;
+    // "No hit" event: the ray passes through every voxel on its span and each
+    // cell receives a free observation. Only valid when the walk actually ran
+    // to c_end. On the occlusion-stop path the iteration was TRUNCATED, so the
+    // residual `reach` is not "passed through cleanly" — it is the unmodelled
+    // mass beyond the occluder, and the cells that would carry it were never
+    // visited. Adding the term there credited a ray that demonstrably hit an
+    // occupied voxel with the full free-observation KL of everything in front
+    // of it, biasing the score toward staring at occluders.
+    if (!occluded) result.total_score += reach * free_kl_acc;
   }
   return result;
 }
