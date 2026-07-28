@@ -36,8 +36,13 @@ def launch_setup(context):
     world = LaunchConfiguration("world").perform(context)
     max_steps = LaunchConfiguration("max_steps").perform(context)
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
+    rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
+    rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # Rendezvous barrier: each robot waits for its (team size - 1) teammates.
+    expected_peers = max(len(robots) - 1, 0)
 
     nodes = []
     for robot in robots:
@@ -68,6 +73,15 @@ def launch_setup(context):
                     # intents on /exploration/intents.
                     "coordination_enabled":
                         coordination_enabled.lower() in ("true", "1", "yes", "on"),
+                    # Rendezvous reconnection: on exhausting its goals a robot
+                    # returns to its last-connected anchor and waits until the
+                    # whole team is back in comms. expected_peers is the team
+                    # size minus this robot; 0 = wait forever (STAY until all
+                    # connected).
+                    "rendezvous_enabled":
+                        rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
+                    "rendezvous_expected_peers": expected_peers,
+                    "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
                 },
             ],
         ))
@@ -91,5 +105,12 @@ def generate_launch_description():
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
+        DeclareLaunchArgument("rendezvous_enabled", default_value="true",
+                              description="Return to the last-connected anchor and "
+                                          "wait for the whole team when exploration "
+                                          "goals are exhausted (default on; set "
+                                          "false for independent finish-and-stop)"),
+        DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
+                              description="Barrier give-up seconds (0 = wait forever)"),
         OpaqueFunction(function=launch_setup),
     ])

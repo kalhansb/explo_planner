@@ -18,4 +18,25 @@ uint8_t plannerTypeId(const std::string& planner_type);
 double navBudgetSec(double dist_m, double speed_est_mps, double safety_factor,
                     double min_sec, double max_sec);
 
+// --- Rendezvous barrier (see explo_planner_node.cpp) ---
+// A robot that exhausts its exploration goals returns to its last-connected
+// anchor and holds there until the whole team is back in comms. These three
+// pure predicates encode the decisions; the node supplies the live counts.
+
+/// True when the whole team is currently in comms range: `expected` > 0 and at
+/// least `expected` unexpired peer claims are held. Doubles as the barrier
+/// release test and the "safe to declare DONE" test.
+bool teamComplete(int active_peers, int expected_peers);
+
+/// Decision at exploration exhaustion: return to the anchor and wait for the
+/// team (true), or finish now (false). Returns true only when the feature is
+/// on, a comms anchor has been recorded, and the team is NOT already complete
+/// (if it is, we are synced and can finish straight away).
+bool shouldRendezvous(bool rendezvous_enabled, bool have_anchor,
+                      int active_peers, int expected_peers);
+
+/// Barrier give-up test: with `max_wait_sec` <= 0 the robot waits forever
+/// (always false); otherwise true once `waited_sec` >= `max_wait_sec`.
+bool rendezvousWaitExpired(double waited_sec, double max_wait_sec);
+
 } // namespace explo_planner

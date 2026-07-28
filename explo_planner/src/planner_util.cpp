@@ -22,4 +22,18 @@ double navBudgetSec(double dist_m, double speed_est_mps, double safety_factor,
   return std::clamp(raw, min_sec, max_sec);
 }
 
+bool teamComplete(int active_peers, int expected_peers) {
+  return expected_peers > 0 && active_peers >= expected_peers;
+}
+
+bool shouldRendezvous(bool rendezvous_enabled, bool have_anchor,
+                      int active_peers, int expected_peers) {
+  if (!rendezvous_enabled || expected_peers <= 0 || !have_anchor) return false;
+  return !teamComplete(active_peers, expected_peers);
+}
+
+bool rendezvousWaitExpired(double waited_sec, double max_wait_sec) {
+  return max_wait_sec > 0.0 && waited_sec >= max_wait_sec;
+}
+
 } // namespace explo_planner

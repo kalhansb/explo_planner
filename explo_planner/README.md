@@ -42,6 +42,33 @@ Multi-robot coordination (optional) uses a MinPos intent table so teammates
 deconflict their selected viewpoints. Each robot plans against its own fused
 SCovox view — there is no central merger.
 
+### Rendezvous reconnection (multi-robot, default on)
+
+A robot that loses comms keeps exploring on its own rather than halting. When it
+exhausts its exploration goals (the coverage termination above) it does **not**
+stop while a teammate is still out of range: it drives back to its
+**last-connected anchor** — the pose where it last heard a teammate, which sits
+inside the router's coverage bubble — and **holds there until the whole team is
+back in comms**, then re-plans against the now-merged map. If new frontiers
+appeared it disperses again (MinPos splits them); if not, the whole team reaches
+`DONE` together. A robot can therefore only finish when the full team is present
+and the merged map is saturated, so nobody quits while a teammate is still
+exploring.
+
+This is `rendezvous_enabled` and it defaults **on**, but it only *activates*
+where it is meaningful: `coordination_enabled` must be on (the barrier waits on
+peer claims) and `rendezvous_expected_peers` must be positive. Single-robot runs
+and one-robot teams are therefore unaffected — it stays inert, and behaviour is
+bit-for-bit the finish-and-stop of before. Set `rendezvous_enabled:=false` to
+force that independent finish even in a multi-robot run.
+
+The anchor needs no configuration — it is recorded automatically from incoming
+peer intents. The barrier waits for `rendezvous_expected_peers` teammates (the
+multi-robot launch sets this from the team size). By default the wait is
+unbounded (STAY until all connected); set `rendezvous_max_wait_sec > 0` as a
+field escape hatch so a robot whose teammate died doesn't hold the anchor
+forever. `max_steps` still ends a run directly, independent of the barrier.
+
 ## Perceptive exploitation
 
 On top of exploration the planner runs an **exploitation** overlay (forest
@@ -191,6 +218,8 @@ which is heavily commented. Common overrides:
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting
 - `coordination_enabled` — turn multi-robot MinPos on/off
+- `rendezvous_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
+  — return-to-anchor-and-wait reconnection (see "Rendezvous reconnection")
 - `exploitation_enabled` — turn the exploitation overlay on/off
 - `n_vantages` / `min_vantages_required` / `vantage_standoff_m` /
   `exploit_dwell_sec` — vantage geometry and dwell behaviour
