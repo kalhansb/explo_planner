@@ -48,7 +48,7 @@ hold without approaching) instead of driving in. Reserve the `computeApproachGoa
 fallback for the genuine "no vantage reachable/mapped yet" case
 (`rej_unreach` / `rej_map` dominate, `n_valid == 0`).
 
-## 2. `done_coverage_source: "auto"` can mix two metrics in one coverage streak
+## 2. `done_coverage_source: "auto"` mixed-metric coverage streak (closed by the map-less refactor)
 
 **Where:** `coverageUnknownFraction` and the `coverage_done_streak_` accumulation
 in [`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp) (~L1146); config
@@ -57,37 +57,40 @@ key `done_coverage_source` in
 
 **Scenario.** Coverage-based termination fires once the ROI unknown fraction
 stays below `done_unknown_fraction` for `done_min_consecutive_steps` PLAN cycles
-in a row. In `done_coverage_source: "auto"` the measure is scovox 2.5D column
-coverage while no planning_map has been received, then switches to the
-planning_map 2D unknown fraction once one arrives. `coverage_done_streak_` is
-**not** reset on that switch, so a streak can span both metrics.
+in a row. In `done_coverage_source: "auto"` the measure is the planning_map 2D
+unknown fraction whenever a planning_map is present, and scovox 2.5D column
+coverage otherwise. `coverage_done_streak_` is **not** reset if that resolution
+changes, so a streak that switched sources mid-run would mix two differently-
+calibrated metrics.
 
-**Current behaviour.** With `require_planning_map: false` and `auto`, if a
-(latched/late/external) planning_map arrives mid-run after the scovox measure
-has already banked one or more low-unknown ticks, the remaining ticks are
-measured with the planning_map metric. The "N consecutive low-unknown steps"
-gate can therefore be satisfied by a streak whose ticks were not all measured
-the same way — and the two sources are calibrated differently (a fraction that
-means "done" for one need not for the other), so DONE can trigger on a mix.
+**Current behaviour.** The resolved source can no longer change mid-run, so a
+streak can never mix metrics. With `use_planning_map: false` (the default) the
+planning_map is never subscribed: `latest_plan_map_` stays null for the whole run
+and `auto` is scovox throughout. With `use_planning_map: true` the planning_map is
+a hard startup precondition (WAIT_FOR_MAP blocks until it arrives), so
+`latest_plan_map_` is non-null from the first PLAN tick and `auto` is the
+planning_map metric throughout. The old best-effort mode — start map-less, bank
+scovox ticks, then adopt a late planning_map mid-streak — was the only path that
+could switch the source under a live streak, and removing it closed this issue.
 
-**Why it is acceptable today / how it is avoided.**
+**Why it stays closed.**
 
-- Field trials do not publish a planning_map, so `auto` resolves to scovox for
-  the entire run and the source never switches — the mixed streak cannot occur.
-- The config now **pins `done_coverage_source: "scovox"`** (rather than `auto`)
-  precisely so there is no source-switching path at all: the streak is always a
-  single-source scovox streak. This closes the issue for field use.
-- The failure only re-appears if someone sets the source back to `auto` *and* a
-  planning_map can appear part-way through a run.
+- The mid-run source switch is gone with the best-effort path: the source is fixed
+  for the whole run, so the streak is single-source for **either** value of
+  `use_planning_map` and any `done_coverage_source`.
+- The planning_map is also off by default (`use_planning_map: false`), so `auto`
+  resolves to scovox for the entire run in every shipped config.
+- The config additionally **pins `done_coverage_source: "scovox"`**, bypassing the
+  `auto` resolution entirely. Belt and suspenders.
 
-**Cost.** Only in the `auto` + late-planning_map combination: a premature or
-mis-calibrated DONE (the map declared saturated on a streak that mixed a scovox
-measure with a planning_map measure).
+**Cost.** None under the current code — the mixed-metric streak is unreachable.
+The historical concern was a premature or mis-calibrated DONE (the map declared
+saturated on a streak that mixed a scovox measure with a planning_map measure).
 
-**Possible fix.** Reset `coverage_done_streak_ = 0` whenever the resolved
-coverage source changes from the previous tick (track the last-used source and
-zero the streak on a transition), so every counted streak is single-source even
-in `auto`.
+**Possible fix (latent robustness).** If a best-effort late-adoption mode is ever
+reintroduced, reset `coverage_done_streak_ = 0` whenever the resolved coverage
+source changes between ticks, so every counted streak stays single-source even in
+`auto`.
 
 ## 3. Team dwell-credit assumes an identical vantage ring on every robot
 

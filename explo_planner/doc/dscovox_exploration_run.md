@@ -94,7 +94,7 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
 Reuses the bag-tuned param set
 ([../../scovox/config/exploration_fused_bag.yaml](../../scovox/config/exploration_fused_bag.yaml),
 bind-mounted live), overriding only the map topic to the merger. `base_frame:
-base_link` and `require_planning_map: false` in that yaml already fit — the merger
+base_link` and `use_planning_map: false` in that yaml already fit — the merger
 publishes no `planning_map`, and terrain-3D mode does not need one.
 
 ```bash

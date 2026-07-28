@@ -13,19 +13,16 @@ explo_planner:
     base_frame: ""   # empty -> defaults to <robot_name>/base_link
 
     # 2D inflated OccupancyGrid used for the candidate free/occupied filter,
-    # cost-grid reachability and path cost. By default it is a hard startup
-    # precondition. Set require_planning_map: false to make it best-effort —
-    # the planner then starts without it, warns, and falls back to straight-
-    # line distances (no 2D obstacle/reachability filtering), while still
-    # using the map whenever it IS published (incl. an external one on
-    # planning_map_topic).
+    # cost-grid reachability and path cost. Master switch, OFF by default: the
+    # planner does not subscribe to it and does not consult a 2D map in either
+    # exploration OR exploitation — costs are straight-line, there is no 2D
+    # obstacle/reachability filtering, and obstacle avoidance is delegated to
+    # the downstream navigator (the dscovox merger publishes no planning_map).
+    # Set use_planning_map: true — and point planning_map_topic at a publisher
+    # (e.g. the scovox_node) — to restore 2D filtering as a hard startup
+    # precondition in both phases.
     # planning_map_topic: "/<robot>/dscovox_node/planning_map"  # default
-    require_planning_map: true
-    # Best-effort grace window (s): when require_planning_map is false, how long
-    # to keep waiting for a late (latched) planning_map after map + pose are
-    # ready before starting in straight-line fallback. Ignored when
-    # require_planning_map is true.
-    planning_map_wait_sec: 5.0
+    use_planning_map: false
 
     # Navigation
     goal_xy_tolerance: 0.3

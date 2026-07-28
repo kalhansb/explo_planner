@@ -17,12 +17,14 @@ branch; `main` ships the EIG planner only.
 Each PLAN cycle the node:
 
 1. **Generates candidates** — a polar grid of viewpoints (radius × ring × yaw)
-   around the current robot pose, filtered against the 2D inflated
-   `planning_map` for free/occupied and a region-of-interest box.
+   around the current robot pose, filtered against a region-of-interest box and,
+   when `use_planning_map: true`, the 2D inflated `planning_map` for free/occupied.
 2. **Scores each candidate** — simulated FOV ray-casting over the SCovox map
    yields an expected information gain (EIG) from the Beta-conjugate occupancy.
 3. **Costs each candidate** — bounded grid Dijkstra over the `planning_map`
-   gives a reachable path cost.
+   gives a reachable path cost. With the planning_map disabled (the default,
+   `use_planning_map: false`) the cost is straight-line distance and there is no
+   2D reachability/obstacle filtering — avoidance is left to the nav stack.
 4. **Picks the best** — SSMI-style information-per-distance utility
    (Asgharivaskasi & Atanasov, TRO 2023):
 
@@ -203,7 +205,7 @@ KEEP-IN-SYNC comment in the yaml).
 | Direction | Topic | Purpose |
 | --- | --- | --- |
 | sub | `/<robot>/dscovox_node/scovox` | SCovox Beta-conjugate occupancy map |
-| sub | `/<robot>/dscovox_node/planning_map` | 2D inflated grid for filtering / cost |
+| sub | `/<robot>/dscovox_node/planning_map` | 2D inflated grid for filtering / cost (only when `use_planning_map: true`) |
 | sub | `/exploration/targets` | Tree targets to exploit (`TreeTarget`; shared) |
 | pub | `goal_topic` | Selected NBV / vantage goal pose for the nav stack |
 | pub | `~/candidates` | Candidate / vantage markers (RViz) |
@@ -214,6 +216,9 @@ KEEP-IN-SYNC comment in the yaml).
 All parameters live in [`config/exploration_params.yaml`](config/exploration_params.yaml),
 which is heavily commented. Common overrides:
 
+- `use_planning_map` — enable the 2D `planning_map` (free/occupied filter +
+  cost-grid reachability) in both exploration and exploitation. **Off by default**;
+  when off the planner never subscribes to it and runs on straight-line costs.
 - `roi_min/max_x/y` — exploration region (keep in sync with the `planning_map`)
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting

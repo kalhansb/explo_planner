@@ -223,18 +223,15 @@ private:
   // into the exploit sub-loop (field flow: targets are released at the
   // coverage-done cue, which would otherwise race the shutdown).
   std::string done_action_{"shutdown"};
-  // When true (default) the planning_map is a hard startup precondition and
-  // drives the candidate free/occupied filter + cost-grid reachability. When
-  // false the planning_map is best-effort: still used whenever it is being
-  // published, but if absent the planner warns and falls back to straight-line
-  // distances (no 2D obstacle / reachability filtering), so it can run on an
-  // external map or with no planning map at all.
-  bool   require_planning_map_{true};
-  // Best-effort grace window (seconds): when require_planning_map_ is false and
-  // map + pose are ready but the planning_map hasn't arrived yet, wait this long
-  // for it before starting in straight-line fallback. Ignored when
-  // require_planning_map_ is true (then we wait for it indefinitely).
-  double planning_map_wait_sec_{5.0};
+  // Master switch for the 2D planning_map. When true it is subscribed, treated
+  // as a hard startup precondition, and drives the candidate free/occupied
+  // filter + cost-grid reachability in BOTH exploration and exploitation. When
+  // false (default) the planner never subscribes to it and never consults it in
+  // either phase: costs fall back to straight-line distances, there is no 2D
+  // obstacle / reachability filtering, and obstacle avoidance is delegated to
+  // the downstream navigator. Off by default so the planner runs on the fused
+  // 3D map alone (the dscovox merger publishes no planning_map).
+  bool   use_planning_map_{false};
   bool   shutdown_requested_{false};
 
   // Utility / coordination params (cached so doPlan() doesn't re-query).
@@ -349,10 +346,6 @@ private:
   bool  have_pose_ = false;
   bool  have_map_  = false;
   bool  have_plan_map_ = false;
-  // WAIT_FOR_MAP grace-window anchor: time map + pose first became ready, so the
-  // best-effort planning_map wait is measured from then (see planning_map_wait_sec_).
-  bool  others_ready_seen_ = false;
-  rclcpp::Time others_ready_time_;
   Eigen::Vector3f latest_pos_ = Eigen::Vector3f::Zero();
   float latest_yaw_ = 0.0f;
   nav_msgs::msg::OccupancyGrid::SharedPtr latest_plan_map_;
@@ -748,15 +741,13 @@ ExploPlannerNode::ExploPlannerNode()
   // before publishing them as goals.
   std::string planning_map_topic = dp("planning_map_topic",
       std::string("/" + robot_name_ + "/dscovox_node/planning_map"));
-  // Best-effort planning_map: when false the planner does not block on it at
-  // startup and gracefully falls back to straight-line distances when none is
-  // available (warning each tick). It is still used whenever it is published,
-  // so an external occupancy map fed on planning_map_topic works too.
-  require_planning_map_ = dp("require_planning_map", true);
-  // Best-effort grace window: how long to wait for a late (latched) planning_map
-  // after map + pose are ready before starting in straight-line fallback. Only
-  // applies when require_planning_map is false.
-  planning_map_wait_sec_ = dp("planning_map_wait_sec", 5.0);
+  // Master switch for the 2D planning_map (default OFF). When false the planner
+  // never subscribes to planning_map_topic and never consults a 2D map in
+  // exploration or exploitation — straight-line costs, no obstacle/reachability
+  // filtering. Set true (and point planning_map_topic at a publisher, e.g. the
+  // scovox_node) to restore 2D free-cell + reachability filtering as a hard
+  // startup precondition.
+  use_planning_map_ = dp("use_planning_map", false);
 
   // Cache ROI bounds for the fused-map ingest clip (loadLatestMap()).
   roi_min_x_ = ccfg.roi_min_x;
@@ -784,13 +775,20 @@ ExploPlannerNode::ExploPlannerNode()
   RCLCPP_INFO(get_logger(), "Subscribing to fused map (dscovox): %s",
       dscovox_topic.c_str());
 
-  plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-      planning_map_topic,
-      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
-      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-        latest_plan_map_ = msg;
-        have_plan_map_ = true;
-      });
+  // Only subscribe when the planning_map is enabled. Leaving the subscription
+  // uncreated guarantees latest_plan_map_ stays null for the whole run, so
+  // every planning_map use site (all guarded on latest_plan_map_) takes its
+  // map-less path — the planner cannot consult a 2D map even if one is being
+  // published on the topic.
+  if (use_planning_map_) {
+    plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        planning_map_topic,
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+        [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+          latest_plan_map_ = msg;
+          have_plan_map_ = true;
+        });
+  }
 
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
@@ -864,7 +862,8 @@ ExploPlannerNode::ExploPlannerNode()
       "EIG exploration planner ready: max_steps=%d "
       "frame=%s base=%s planning_map=%s goal=%s",
       max_steps_, map_frame_.c_str(), base_frame_.c_str(),
-      planning_map_topic.c_str(), goal_topic.c_str());
+      use_planning_map_ ? planning_map_topic.c_str() : "(disabled)",
+      goal_topic.c_str());
   if (terrain_relative_z_) {
     RCLCPP_INFO(get_logger(),
         "Terrain-relative z ON: map z-band [%+.1f, %+.1f] m about the robot, "
@@ -1048,49 +1047,33 @@ void ExploPlannerNode::tick() {
         loadLatestMap();  // sets have_map_ when in-ROI voxels are present
       }
       // planning_map handling:
-      //  - require_planning_map_ == true  -> hard precondition; wait for it.
-      //  - require_planning_map_ == false -> best-effort: once map + pose are
-      //    in, wait up to planning_map_wait_sec_ for the (latched) planning_map
-      //    to arrive before starting in straight-line fallback. The grace
-      //    window catches a slightly-late planning_map before the first
-      //    fallback PLAN tick; it is still adopted later if it arrives after.
+      //  - use_planning_map_ == true  -> hard precondition; wait for it.
+      //  - use_planning_map_ == false -> not subscribed; start as soon as the
+      //    fused map + pose are ready and run map-less (straight-line costs, no
+      //    2D obstacle/reachability filtering, in both exploration and exploit).
       {
-        bool start = false;
-        if (have_map_ && have_pose_) {
-          // Anchor the grace window at the moment map + pose first arrived (not
-          // node start), so it measures the wait for the planning_map itself.
-          if (!others_ready_seen_) {
-            others_ready_time_ = this->now();
-            others_ready_seen_ = true;
-          }
-          if (have_plan_map_) {
-            start = true;
-          } else if (!require_planning_map_ &&
-                     (this->now() - others_ready_time_).seconds() >=
-                         planning_map_wait_sec_) {
-            start = true;
-          }
-        }
+        const bool start = have_map_ && have_pose_ &&
+                           (!use_planning_map_ || have_plan_map_);
         if (start) {
-          if (have_plan_map_) {
+          if (use_planning_map_) {
             RCLCPP_INFO(get_logger(),
                 "Map, planning_map and pose received. Starting exploration.");
           } else {
-            RCLCPP_WARN(get_logger(),
-                "Starting WITHOUT a planning_map after a %.1fs grace wait "
-                "(require_planning_map=false): no 2D obstacle/reachability "
-                "filtering — falling back to straight-line distances. Will "
-                "use the planning_map if it arrives.", planning_map_wait_sec_);
+            RCLCPP_INFO(get_logger(),
+                "Map and pose received; planning_map disabled "
+                "(use_planning_map=false) — straight-line costs, no 2D "
+                "obstacle/reachability filtering. Starting exploration.");
           }
           transitionTo(State::PLAN);
         } else {
           // Name the missing precondition so a stuck startup (wrong topic /
           // namespace / QoS, dead mapper, no TF) is diagnosable instead of a
-          // silent indefinite wait. In best-effort mode this also covers the
-          // grace window while waiting for a late planning_map.
+          // silent indefinite wait.
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
               "Waiting to start: map=%d pose=%d planning_map=%d (0 = not yet "
-              "received).", have_map_, have_pose_, have_plan_map_);
+              "received; planning_map %s).",
+              have_map_, have_pose_, have_plan_map_,
+              use_planning_map_ ? "required" : "disabled");
         }
       }
       break;
@@ -2098,7 +2081,9 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
     Eigen::Vector3f p(center.x() + ux * d, center.y() + uy * d, robot_z);
     if (!inRoi(p)) continue;
     if (latest_plan_map_ && !isCellFree(p)) continue;
-    if (!cost_grid_->reachable(p)) continue;
+    // Reachability only when a planning_map/cost grid exists; with no map,
+    // accept the straight-line point (same fallback as the vantage loop).
+    if (latest_plan_map_ && !cost_grid_->reachable(p)) continue;
     if (failed_goals_.isNear(p, failed_goal_radius_m_)) continue;
     out = p;
     return true;  // closest-to-trunk reachable point on the ray
@@ -2233,14 +2218,16 @@ void ExploPlannerNode::doExploitPlan() {
     return;
   }
 
-  // Vantage validation (free-cell + reachability) and the approach fallback all
-  // need the 2D planning_map. Without it we'd be selecting vantages on
-  // straight-line guesses with no obstacle/reachability check, so wait for it
-  // rather than drive blind toward the trunk. The wait is BOUNDED: the
-  // per-target timeout above keeps ticking while we sit here, so a config that
-  // never publishes a planning_map times the target out PARTIAL instead of
-  // hanging in EXPLOIT_PLAN forever.
-  if (!latest_plan_map_) {
+  // Vantage validation (free-cell + reachability) and the approach fallback use
+  // the 2D planning_map when it is enabled. With use_planning_map=false there is
+  // never a map: vantages are then validated on straight-line geometry (no
+  // obstacle/reachability check — avoidance is delegated to the navigator,
+  // mirroring exploration's map-less fallback), so we do NOT wait here.
+  // When the map IS enabled but has not arrived yet, wait rather than drive
+  // blind toward the trunk. The wait is BOUNDED: the per-target timeout above
+  // keeps ticking, so a mis-wired planning_map times the target out PARTIAL
+  // instead of hanging in EXPLOIT_PLAN forever.
+  if (use_planning_map_ && !latest_plan_map_) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "EXPLOIT_PLAN: no planning_map yet; waiting before selecting vantages "
         "(gives up PARTIAL at exploit_target_timeout_sec=%.0fs).",
@@ -2254,16 +2241,21 @@ void ExploPlannerNode::doExploitPlan() {
 
   const auto robot_pos = latest_pos_;
 
-  // Build the cost grid for reachability + nearest-vantage ordering. Unlike
-  // exploration (a bounded local flood), exploitation may have to drive across
-  // the map to reach the trunk, so the flood is UNBOUNDED (cap <= 0) — a target
-  // released while the robot is far away must still resolve as reachable as long
-  // as a known-free path exists. ~5 ms once per vantage, infrequent. (The
-  // planning_map is guaranteed present here — see the early return above.)
-  cost_grid_->build(*latest_plan_map_);
-  cost_grid_->floodFrom(robot_pos, /*radius_cap_m (unbounded)=*/0.0f);
-  constexpr size_t kMinReachedForFilter = 10;
-  const bool have_cost = cost_grid_->reachedCellCount() >= kMinReachedForFilter;
+  // Build the cost grid for reachability + nearest-vantage ordering, but only
+  // when a planning_map is available. Unlike exploration (a bounded local
+  // flood), exploitation may have to drive across the map to reach the trunk,
+  // so the flood is UNBOUNDED (cap <= 0) — a target released while the robot is
+  // far away must still resolve as reachable as long as a known-free path
+  // exists. ~5 ms once per vantage, infrequent. With use_planning_map=false
+  // there is no obstacle layer to flood: have_cost stays false and every
+  // vantage is ordered by straight-line distance with no reachability filter.
+  bool have_cost = false;
+  if (latest_plan_map_) {
+    cost_grid_->build(*latest_plan_map_);
+    cost_grid_->floodFrom(robot_pos, /*radius_cap_m (unbounded)=*/0.0f);
+    constexpr size_t kMinReachedForFilter = 10;
+    have_cost = cost_grid_->reachedCellCount() >= kMinReachedForFilter;
+  }
 
   // Validate every vantage; pick the nearest (by path cost) that is valid,
   // unvisited and not blacklisted. Validation = ROI + free-cell + reachable +
@@ -2277,7 +2269,9 @@ void ExploPlannerNode::doExploitPlan() {
   for (size_t i = 0; i < vantages.size(); ++i) {
     const auto& v = vantages[i];
     if (!inRoi(v.position)) { ++rej_roi; continue; }
-    if (!isCellFree(v.position)) { ++rej_map; continue; }
+    // Free-cell check only when a planning_map is present; without one
+    // isCellFree() is conservatively false and would reject every vantage.
+    if (latest_plan_map_ && !isCellFree(v.position)) { ++rej_map; continue; }
 
     float cost;
     if (have_cost) {
@@ -2343,7 +2337,11 @@ void ExploPlannerNode::doExploitPlan() {
     // on the line to it so the area maps en route and a vantage can pass on a
     // later tick. Re-planning (not dwelling) resumes on arrival.
     Eigen::Vector3f approach;
-    if (have_cost &&
+    // Approach when we have a usable cost grid, OR when the planning_map is
+    // disabled (no grid to have — computeApproachGoal then uses straight-line
+    // geometry). The remaining case (map enabled but flood reached too little,
+    // robot trapped in inflation) still skips the approach as before.
+    if ((have_cost || !latest_plan_map_) &&
         computeApproachGoal(tgt->center, tgt->radius, robot_pos, approach)) {
       current_is_approach_   = true;
       current_vantage_index_ = -1;
