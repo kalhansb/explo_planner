@@ -20,7 +20,9 @@ public:
   explicit MapCache(double resolution);
 
   /// Rebuild grid from a ScovoxMap message (full voxel dump).
-  void updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg);
+  /// @return false (grid left untouched) if msg.resolution is unusable — see
+  ///         the ROI overload.
+  bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg);
 
   /// Rebuild grid from a ScovoxMap, keeping only voxels whose position lies in
   /// the inclusive AABB [roi_min, roi_max]. The fused-map topic carries the
@@ -30,7 +32,18 @@ public:
   /// Non-finite positions are dropped. NB: this clips on voxel position; the old
   /// service clipped in coord space, so results match for resolution-aligned ROI
   /// bounds and may differ by one voxel layer at a non-aligned min boundary.
-  void updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+  ///
+  /// @return true if the grid was rebuilt. false means msg.resolution was
+  ///         positive but not finite (+inf), which would make Bonxai's
+  ///         inv_resolution zero and every posToCoord a float->int32 cast of a
+  ///         non-finite value — UB that surfaces as garbage coordinates, not a
+  ///         crash. Unlike the constructor and updateFromLogOddsCloud, which
+  ///         throw on a bad resolution because that is a config error, this
+  ///         value arrives over the wire mid-run: the previous grid is kept and
+  ///         the message is dropped, so one malformed publish cannot take the
+  ///         node down in the field. Callers should log it (throttled) and
+  ///         treat it as "no new map this tick".
+  bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                            const Eigen::Vector3f& roi_min,
                            const Eigen::Vector3f& roi_max);
 

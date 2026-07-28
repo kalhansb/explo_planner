@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <rclcpp/rclcpp.hpp>
 #include <explo_planner_msgs/msg/robot_intent.hpp>
 
@@ -352,4 +354,108 @@ TEST(Coordination, ClaimMatchingFallsBackWhenRadiusUnset) {
 
   EXPECT_NE(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 8.0f), nullptr);
   EXPECT_EQ(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 1.0f), nullptr);
+}
+
+// ==================================================================
+// Peer-advertised scalars are bounded before they enter the claim table
+// ==================================================================
+// claimMatching() deliberately evaluates each claim at the radius its CLAIMER
+// advertised, because the disc size is phase-dependent (~10 m while exploring,
+// ~0.75 m while holding one vantage angle around a trunk). That is correct, but
+// it means two numbers straight off the wire decide how much of our candidate
+// set a peer can veto and for how long. Unbounded, either one is a
+// denial-of-service on our own planner from a single malformed or
+// version-skewed publish.
+
+TEST(Coordination, HugePeerRadiusIsBoundedByOurOwnExplorationDisc) {
+  // 5 m bound = what this planner considers the largest legitimate claim.
+  Coordination c(true, "atlas", /*max_claim_radius_m=*/5.0f);
+  c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0,
+                        /*ttl=*/5.0f, /*radius=*/1000.0f),
+             at(100.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);
+
+  // Inside the bound: still contested, so deconfliction keeps working.
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(3.0f, 0.0f, 0.0f), 1.0f), nullptr);
+  // Beyond the bound: the 1000 m disc the peer asked for is gone. Without the
+  // clamp this candidate 200 m away was vetoed by a peer standing at the origin.
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(200.0f, 0.0f, 0.0f), 1.0f), nullptr);
+}
+
+TEST(Coordination, InfinitePeerRadiusVetoesNothingBeyondOurOwnMatchRadius) {
+  // The specific wire value that defeated the old code: +inf passed the
+  // `radius_m > 0` test, so r2 was infinite and EVERY candidate matched — the
+  // robot yielded every goal to that peer and stopped exploring, silently.
+  // Now it is treated as "peer sent nothing usable" (0), which claimMatching
+  // already handles by falling back to our own match radius.
+  Coordination c(true, "atlas", /*max_claim_radius_m=*/5.0f);
+  const float kInf = std::numeric_limits<float>::infinity();
+  c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0,
+                        /*ttl=*/5.0f, /*radius=*/kInf),
+             at(100.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);
+
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(1.0f, 0.0f, 0.0f), 2.0f), nullptr);
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(50.0f, 0.0f, 0.0f), 2.0f), nullptr);
+
+  // NaN takes the same path.
+  Coordination c2(true, "atlas", 5.0f);
+  c2.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0, 5.0f,
+                         std::numeric_limits<float>::quiet_NaN()),
+              at(100.0));
+  EXPECT_EQ(c2.claimMatching(Eigen::Vector3f(50.0f, 0.0f, 0.0f), 2.0f), nullptr);
+}
+
+TEST(Coordination, SaneRadiusIsPassedThroughUnchanged) {
+  // The clamp must not disturb a same-version peer: an exploration claim at the
+  // shared disc size, and the much smaller exploit vantage claim, both survive
+  // intact. (Regression guard — a bound that quietly shrank real claims would
+  // break MinPos deconfliction rather than protect it.)
+  Coordination c(true, "atlas", /*max_claim_radius_m=*/10.0f);
+  c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0, 5.0f,
+                        /*radius=*/10.0f),
+             at(100.0));
+  const auto* claim = c.claimMatching(Eigen::Vector3f(9.0f, 0.0f, 0.0f), 0.5f);
+  ASSERT_NE(claim, nullptr);
+  EXPECT_FLOAT_EQ(claim->radius_m, 10.0f);
+
+  Coordination v(true, "atlas", /*max_claim_radius_m=*/10.0f);
+  v.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0, 5.0f,
+                        /*radius=*/0.75f, /*exploit=*/true, /*target_id=*/7u),
+             at(100.0));
+  const auto* vc = v.claimMatching(Eigen::Vector3f(0.5f, 0.0f, 0.0f), 0.75f);
+  ASSERT_NE(vc, nullptr);
+  EXPECT_FLOAT_EQ(vc->radius_m, 0.75f);
+}
+
+TEST(Coordination, HugePeerTtlCannotMakeAClaimImmortal) {
+  // Same failure one field over: prune() compares expiry against the local
+  // clock, so a peer advertising a huge ttl_sec produced a claim nothing could
+  // ever expire — a permanent veto over a disc of the map with no recovery
+  // short of restarting the node. Capped at kMaxClaimTtlSec.
+  Coordination c(true, "atlas");
+  c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0,
+                        /*ttl=*/1.0e9f),
+             at(100.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);
+  c.prune(at(100.0 + Coordination::kMaxClaimTtlSec - 1.0));
+  EXPECT_EQ(c.activePeerCount(), 1u);   // still inside the cap
+  c.prune(at(100.0 + Coordination::kMaxClaimTtlSec + 1.0));
+  EXPECT_EQ(c.activePeerCount(), 0u);   // and gone once past it
+}
+
+TEST(Coordination, NonFiniteTtlExpiresOnTheNextPrune) {
+  // A TTL we cannot read must fail SAFE — expire at once rather than persist.
+  // Also keeps a non-finite value out of Duration::from_seconds(), and a wild
+  // magnitude out of its int64 nanosecond count.
+  for (float ttl : {std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::quiet_NaN(),
+                    -1.0e9f}) {
+    Coordination c(true, "atlas");
+    c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0, ttl),
+               at(100.0));
+    c.prune(at(100.0));
+    EXPECT_EQ(c.activePeerCount(), 0u) << "ttl=" << ttl;
+  }
 }

@@ -194,3 +194,91 @@ TEST(FovEvaluator, FarEndStillClippedAtTheRoiFace) {
   EXPECT_GT(r_far.total_ray_voxels, r_near.total_ray_voxels);
   EXPECT_GT(r_near.total_ray_voxels, 0);
 }
+
+// An origin OUTSIDE the ROI on an axis the ray is PARALLEL to must contribute
+// nothing. The old exit-only clip skipped any axis with d[i] == 0 entirely, so
+// it read "parallel to this slab" as "unconstrained by this slab" and walked the
+// full max_range through space the map never ingested — every cell scoring the
+// Beta(1,1) max-uncertainty prior, which is maximal.
+//
+// This is reachable in the shipped terrain-mode config, not a synthetic case:
+// addFrontierCandidates snaps a candidate to ground + z_clearance with the
+// ground search referenced to the CENTROID's own z, so a candidate can land up
+// to (ground_search_above + z_clearance) = 1.3 m above the ingested band. Rays
+// from a UGV camera are near-horizontal, i.e. d.z ~ 0. The planner would then
+// score its own blind spot above the band as the most informative place to go.
+TEST(FovEvaluator, OriginAboveTheBandWithHorizontalRaysScoresNothing) {
+  FovConfig cfg;
+  cfg.h_rays = 4;
+  cfg.v_rays = 1;      // single ray row at pitch 0 exactly -> d.z == 0
+  cfg.hfov = 1.0f;
+  cfg.vfov = 0.05f;
+  cfg.min_range = 0.3f;
+  cfg.max_range = 5.0f;
+  cfg.roi_min_x = -10.0f;
+  cfg.roi_max_x =  10.0f;
+  cfg.roi_min_y = -10.0f;
+  cfg.roi_max_y =  10.0f;
+  cfg.roi_min_z = -1.0f;
+  cfg.roi_max_z =  1.0f;
+  FovEvaluator eval(cfg);
+
+  MapCache map(0.1);   // empty: every traversed voxel reads as the prior
+  CandidateViewpoint vp;
+  vp.yaw = 0.0f;
+
+  vp.position = Eigen::Vector3f(0.0f, 0.0f, 2.0f);   // 1 m above the band top
+  auto above = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_EQ(above.total_ray_voxels, 0);
+  EXPECT_FLOAT_EQ(above.total_score, 0.0f);
+
+  vp.position = Eigen::Vector3f(0.0f, 0.0f, -2.0f);  // and below the floor
+  auto below = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_EQ(below.total_ray_voxels, 0);
+  EXPECT_FLOAT_EQ(below.total_score, 0.0f);
+
+  // Positive control: the identical viewpoint inside the band still scores, so
+  // the test is detecting the out-of-band case and not a broken config.
+  vp.position = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  auto inside = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_GT(inside.total_ray_voxels, 0);
+  EXPECT_GT(inside.total_score, 0.0f);
+}
+
+// The NEAR end is clipped to the ROI entry, not just held at min_range: an
+// origin outside the box firing back into it starts its walk at the box face,
+// so the out-of-box lead-in is never traversed.
+TEST(FovEvaluator, NearEndIsClippedAtTheRoiEntryFace) {
+  FovConfig cfg;
+  cfg.h_rays = 1;
+  cfg.v_rays = 1;
+  cfg.hfov = 0.05f;    // single ray, exactly +x after the yaw rotation
+  cfg.vfov = 0.05f;
+  cfg.min_range = 0.3f;
+  cfg.max_range = 10.0f;
+  cfg.roi_min_y = -10.0f;
+  cfg.roi_max_y =  10.0f;
+  cfg.roi_min_z = -1.0f;
+  cfg.roi_max_z =  1.0f;
+  cfg.roi_max_x =  5.0f;
+
+  MapCache map(0.1);
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(-3.0f, 0.0f, 0.0f);   // 3 m outside the -x face
+  vp.yaw = 0.0f;                                       // firing back in
+
+  // Box starts at x = 0, so only the span [0, 5] is observable: ~50 voxels.
+  cfg.roi_min_x = 0.0f;
+  auto clipped = FovEvaluator(cfg).evaluate(vp, map, scoring::eig);
+  // Same geometry with the origin INSIDE the box: the walk starts at min_range
+  // and covers the full [-2.7, 5] span instead, ~77 voxels.
+  cfg.roi_min_x = -10.0f;
+  auto unclipped = FovEvaluator(cfg).evaluate(vp, map, scoring::eig);
+
+  EXPECT_GT(clipped.total_ray_voxels, 0);
+  EXPECT_LT(clipped.total_ray_voxels, unclipped.total_ray_voxels);
+  // Pin the entry face rather than just the ordering: the 3 m lead-in outside
+  // the box (30 voxels) must be absent, not merely fewer.
+  EXPECT_GE(clipped.total_ray_voxels, 45);
+  EXPECT_LE(clipped.total_ray_voxels, 55);
+}

@@ -218,11 +218,24 @@
     #
     # Values below are the ones proven in the terrain-mode bag run
     # (scovox/config/exploration_fused_bag.yaml): enough below to catch ground
-    # on a downslope, enough above for canopy and overhangs. The band floor must
-    # stay deeper than ground_search_below_m plus the re-band hysteresis
-    # (0.25 * half-width, clamped to [0.5, 2] m) or ground search reaches
-    # outside the ingested slab.
-    roi_min_z: -5.0
+    # on a downslope, enough above for canopy and overhangs.
+    #
+    # INVARIANT — the band must contain the whole ground-search window from
+    # anywhere the robot can sit before a re-band. Ground search runs over
+    # [z_robot - ground_search_below_m, z_robot + ground_search_above_m], and
+    # z_robot drifts up to one hysteresis step from the band reference before
+    # loadLatestMap() re-bands, where
+    #   hysteresis = clamp(0.25 * 0.5 * (roi_max_z - roi_min_z), 0.5, 2.0)
+    # so both of these must hold:
+    #   -roi_min_z >= ground_search_below_m + hysteresis
+    #    roi_max_z >= ground_search_above_m + hysteresis
+    # Here hysteresis = 0.125 * 9.5 = 1.1875, so the floor needs 5.1875 (have
+    # 5.5) and the ceiling needs 2.1875 (have 4.0). The previous -5.0 was
+    # 0.125 m short: on a downslope, ground search reached below the ingested
+    # slab, found no voxel, and groundZAt returned NaN — which the exploitation
+    # path used to paper over by standing the vantage at the robot's own
+    # altitude (see exploitZAt).
+    roi_min_z: -5.5
     roi_max_z:  4.0
 
     # ---- Terrain-relative (3D) mode ----
@@ -269,6 +282,18 @@
     # ~5 k cells flooded at the auto bound -> well under 1 ms per PLAN tick;
     # set this >> map size to fall through to a full unbounded flood (~5 ms).
     cost_grid_radius_cap_m: 0.0
+
+    # SSMI ablation: when true, a candidate's info_gain is the sum of the score
+    # function over poses sampled every trajectory_sample_spacing_m along its
+    # Dijkstra path, not just the endpoint. OFF for field trials — it multiplies
+    # the per-candidate raycast cost by the path length in samples, and with 96
+    # polar candidates per PLAN tick that is the one setting that can push a tick
+    # past the 10 Hz budget.
+    # NB exploration_experiment.launch.py declares both as launch arguments and
+    # always passes them, so its defaults (false / 1.5) win over these two lines;
+    # the values here are what the exploitation and multi-robot launches use.
+    trajectory_scoring: false
+    trajectory_sample_spacing_m: 1.5
 
     # Multi-robot coordination. When false the MinPos branch is skipped and
     # single-robot behaviour is bit-for-bit preserved (the utility math
@@ -329,7 +354,11 @@
     min_vantages_required: 3        # clear-LoS dwells for a "successful" target
     vantage_standoff_m: 2.0         # standoff added to trunk radius (m), then
                                     # clamped to [fov_min_range+r, fov_max_range]
-    vantage_start_angle_deg: 0.0    # angle of the first vantage around the trunk
+    # Angle of the first vantage around the trunk. 30 deg per field script §5:
+    # the plantation rows run at 24.82 deg to map x, so a 0 deg start puts the
+    # first vantage of every 120 deg ring straight down a row — the two other
+    # vantages then land in the neighbouring canopy and fail LoS together.
+    vantage_start_angle_deg: 30.0
     exploit_dwell_sec: 8.0          # hold time at each vantage (s)
     target_dedup_radius_m: 1.5      # re-reported trees within this are ignored
     vantage_visited_tol_m: 0.75     # proximity that counts a vantage "dwelled"

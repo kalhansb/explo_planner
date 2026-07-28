@@ -6,8 +6,10 @@
 
 namespace explo_planner {
 
-Coordination::Coordination(bool enabled, std::string self_id)
-    : enabled_(enabled), self_id_(std::move(self_id)) {}
+Coordination::Coordination(bool enabled, std::string self_id,
+                           float max_claim_radius_m)
+    : enabled_(enabled), self_id_(std::move(self_id)),
+      max_claim_radius_m_(max_claim_radius_m) {}
 
 void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
                             const rclcpp::Time& now_local) {
@@ -25,7 +27,22 @@ void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
       static_cast<float>(msg.robot_pos.x),
       static_cast<float>(msg.robot_pos.y),
       static_cast<float>(msg.robot_pos.z));
-  claim.radius_m = msg.claim_radius_m;
+  // Bound the peer-advertised radius. claimMatching() deliberately tests each
+  // claim at the radius its CLAIMER advertised (the disc sizes are
+  // phase-dependent — ~10 m exploring, ~0.75 m holding one vantage angle), which
+  // means an unbounded value straight off the wire lets one peer veto an
+  // arbitrarily large region of our candidate set: +inf makes r2 infinite and
+  // EVERY candidate match, so the robot yields every goal to that peer and stops
+  // exploring entirely. Non-finite or non-positive becomes 0, which
+  // claimMatching already reads as "peer sent nothing usable, use our own notion
+  // of the same goal"; anything larger than our own exploration disc is clamped
+  // to it. A same-version peer is never affected — its radius is either
+  // coord_claim_radius_m or the smaller vantage disc.
+  claim.radius_m = std::isfinite(msg.claim_radius_m) && msg.claim_radius_m > 0.0f
+      ? msg.claim_radius_m
+      : 0.0f;
+  if (std::isfinite(max_claim_radius_m_) && max_claim_radius_m_ > 0.0f)
+    claim.radius_m = std::min(claim.radius_m, max_claim_radius_m_);
   claim.planner_type = msg.planner_type;
   claim.exploit = msg.exploit;
   claim.target_id = msg.target_id;
@@ -38,7 +55,17 @@ void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
   // made its claims immortal and a peer behind by > ttl made them expire on
   // arrival — both silently. The TTL semantic is "how long since we last
   // HEARD this peer", which only needs the local clock.
-  claim.expiry = now_local + rclcpp::Duration::from_seconds(msg.ttl_sec);
+  //
+  // ttl_sec is peer-advertised too, and unbounded it is the same failure one
+  // field over: a claim prune() can never expire is a permanent veto. Clamp into
+  // [0, kMaxClaimTtlSec]. 0 makes expiry == now_local, so prune() drops the
+  // claim on the very next tick — the safe direction for a peer whose TTL we
+  // cannot read. Both ends matter: from_seconds() overflows its int64 nanosecond
+  // count on a wild magnitude, and non-finite must not reach it at all.
+  const float ttl = std::isfinite(msg.ttl_sec)
+      ? std::clamp(msg.ttl_sec, 0.0f, kMaxClaimTtlSec)
+      : 0.0f;
+  claim.expiry = now_local + rclcpp::Duration::from_seconds(ttl);
 
   // Latest-per-peer replacement. If we already have a claim from this
   // robot_id, overwrite it; otherwise append. Linear scan is fine for

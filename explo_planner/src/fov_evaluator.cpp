@@ -9,39 +9,65 @@ namespace explo_planner {
 namespace {
 
 // Clip the observable segment of one ray — the span from the sensor's minimum
-// range out to max_range — against the XYZ ROI box.
+// range out to max_range — against the XYZ ROI box. Standard slab method:
+// intersect the per-axis entry/exit intervals with [min_range, max_range] and
+// keep what survives.
 //
-// Both endpoints must be clipped, not just the far one. Clipping only the far
-// end (the old behaviour) left `ray_start` at vp.position + dir*min_range,
-// which for a candidate sitting within min_range of an ROI face and firing
-// outward lands OUTSIDE the box and PAST the clamped far end. RayIterator then
-// walked backwards from out-of-ROI space, and because map_cache_ only ingests
-// voxels inside the ROI every one of those cells missed and was scored as the
-// Beta(1,1) max-uncertainty prior — inflating info gain precisely at the ROI
-// boundary, the bias the z/xy clip exists to prevent.
+// BOTH ends need clipping, and the entry end for two distinct reasons:
 //
-// Returns false when the ROI exit lies at or before min_range: the ray has no
-// observable voxel inside the box at all and must be skipped, not walked.
-// This also covers an origin that is already outside the ROI (t_exit <= 0).
+//  1. A candidate within min_range of an ROI face, firing outward, has its ROI
+//     exit BEFORE min_range. Clamping only the far end left `ray_start` at
+//     origin + dir*min_range — outside the box and PAST the clamped far end —
+//     so RayIterator walked backwards through cells map_cache_ never ingests,
+//     scoring each as the Beta(1,1) max-uncertainty prior and inflating info
+//     gain exactly at the ROI boundary. Caught by the (t_exit > t_enter) test.
+//
+//  2. An origin already OUTSIDE the box on some axis, firing back toward it.
+//     In terrain mode this is reachable in the shipped config: a frontier
+//     candidate is snapped to ground + z_clearance searched around the
+//     CENTROID's z, so it can land up to (ground_search_above + z_clearance)
+//     above the ingested band. Every near-horizontal ray from there has
+//     d.z ~ 0, so an exit-only clip skipped the z axis entirely (see 3 below)
+//     and walked the full max_range through un-ingested space at the prior —
+//     the same boundary bias, one axis over. CandidateGenerator now clamps
+//     candidate z into the band as well, so this is belt-and-braces.
+//
+//  3. d[i] == 0 means the ray is parallel to that pair of faces and never
+//     crosses either: the axis contributes no bound, and the ray is entirely
+//     in or entirely out according to the origin alone. Skipping the axis (the
+//     old behaviour) silently treated "entirely out" as "unconstrained".
+//
+// Returns false when nothing observable survives, in which case the ray must be
+// skipped rather than walked.
 bool clipRayToRoi(const Eigen::Vector3f& origin,
                   const Eigen::Vector3f& world_dir,
                   const FovConfig& cfg,
                   Eigen::Vector3f& ray_start,
                   Eigen::Vector3f& ray_end) {
   // world_dir is unit length, so t is a distance in metres along the ray.
-  float t_exit = cfg.max_range;
+  float t_enter = cfg.min_range;
+  float t_exit  = cfg.max_range;
   const float o[3] = {origin.x(), origin.y(), origin.z()};
   const float d[3] = {world_dir.x(), world_dir.y(), world_dir.z()};
   const float lo[3] = {cfg.roi_min_x, cfg.roi_min_y, cfg.roi_min_z};
   const float hi[3] = {cfg.roi_max_x, cfg.roi_max_y, cfg.roi_max_z};
   for (int i = 0; i < 3; ++i) {
-    if (d[i] > 0.0f)      t_exit = std::min(t_exit, (hi[i] - o[i]) / d[i]);
-    else if (d[i] < 0.0f) t_exit = std::min(t_exit, (lo[i] - o[i]) / d[i]);
+    if (d[i] > 0.0f) {
+      t_enter = std::max(t_enter, (lo[i] - o[i]) / d[i]);
+      t_exit  = std::min(t_exit,  (hi[i] - o[i]) / d[i]);
+    } else if (d[i] < 0.0f) {
+      t_enter = std::max(t_enter, (hi[i] - o[i]) / d[i]);
+      t_exit  = std::min(t_exit,  (lo[i] - o[i]) / d[i]);
+    } else if (o[i] < lo[i] || o[i] > hi[i]) {
+      return false;  // parallel to this slab and outside it: never enters
+    }
   }
 
-  if (!(t_exit > cfg.min_range)) return false;
+  // Empty span: the ROI exit lands at or before the entry, so there is no
+  // observable voxel inside the box on this ray at all.
+  if (!(t_exit > t_enter)) return false;
 
-  ray_start = origin + world_dir * cfg.min_range;
+  ray_start = origin + world_dir * t_enter;
   ray_end   = origin + world_dir * t_exit;
   return true;
 }

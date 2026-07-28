@@ -637,6 +637,36 @@ ExploPlannerNode::ExploPlannerNode()
   // (flat mode keeps it that way permanently).
   eff_roi_min_z_ = roi_min_z_;
   eff_roi_max_z_ = roi_max_z_;
+  // Candidate z clamp: same band the map is ingested over, so a terrain-snapped
+  // candidate can't sit in space the map holds nothing for. doPlan re-points it
+  // at the effective band each tick in terrain mode, exactly as it does the FOV
+  // ray clip.
+  ccfg.roi_min_z  = eff_roi_min_z_;
+  ccfg.roi_max_z  = eff_roi_max_z_;
+
+  // The band-floor invariant the yaml documents: ground search must stay inside
+  // the ingested slab from anywhere the robot can sit before loadLatestMap()
+  // re-bands. Violated, groundZAt returns NaN on a downslope and every
+  // terrain-mode consumer degrades — silently, since NaN reads as "no ground
+  // here" and not as "the band is misconfigured". Check it at startup rather
+  // than leaving it to a comment.
+  if (terrain_relative_z_) {
+    const float hyst =
+        std::clamp(0.25f * 0.5f * (roi_max_z_ - roi_min_z_), 0.5f, 2.0f);
+    const float need_below = ccfg.ground_search_below + hyst;
+    const float need_above = ccfg.ground_search_above + hyst;
+    if (-roi_min_z_ < need_below || roi_max_z_ < need_above) {
+      RCLCPP_WARN(get_logger(),
+          "terrain_relative_z: ROI z band [%.2f, %.2f] is too tight for the "
+          "ground search window (below %.2f / above %.2f) plus the re-band "
+          "hysteresis %.3f — needs roi_min_z <= %.3f and roi_max_z >= %.3f. "
+          "Ground search will reach outside the ingested slab on slopes, "
+          "groundZAt returns NaN, and vantages get rejected for want of a "
+          "ground height.",
+          roi_min_z_, roi_max_z_, ccfg.ground_search_below,
+          ccfg.ground_search_above, hyst, -need_below, need_above);
+    }
+  }
 
   // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
   frontier_cluster_radius_m_ =
@@ -771,7 +801,12 @@ ExploPlannerNode::ExploPlannerNode()
   score_fn_ = scoring::eig;
   logger_ = std::make_unique<MetricsLogger>(output_csv_);
   cost_grid_ = std::make_unique<CostGrid>();
-  coord_ = std::make_unique<Coordination>(coord_enabled_, robot_name_);
+  // Bound peer-advertised claim radii by our own exploration disc — the largest
+  // claim this planner considers legitimate. Resolved above, so the auto
+  // (= fov_max_range) case is already a concrete number here.
+  coord_ = std::make_unique<Coordination>(
+      coord_enabled_, robot_name_,
+      static_cast<float>(coord_claim_radius_m_));
 
   // Vantage planner. Geometry from the exploit params; sensor envelope + the
   // LoS occupancy threshold reuse the same FOV config as exploration so a
@@ -1015,10 +1050,20 @@ bool ExploPlannerNode::loadLatestMap() {
     // bounded. The [band_lo, band_hi] z-band defines one consistent
     // observation volume that is also what FovEvaluator clips rays to
     // (doPlan re-syncs the evaluator from eff_roi_*_z_ each tick).
-    map_cache_->updateFromScovoxMap(
-        *latest_scovox_map_,
-        Eigen::Vector3f(roi_min_x_, roi_min_y_, band_lo),
-        Eigen::Vector3f(roi_max_x_, roi_max_y_, band_hi));
+    if (!map_cache_->updateFromScovoxMap(
+            *latest_scovox_map_,
+            Eigen::Vector3f(roi_min_x_, roi_min_y_, band_lo),
+            Eigen::Vector3f(roi_max_x_, roi_max_y_, band_hi))) {
+      // Unusable resolution on the wire (see MapCache::updateFromScovoxMap).
+      // The previous grid is intact, so keep planning on it; do NOT latch
+      // ingested_scovox_map_, so a later good publish still triggers a rebuild.
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Fused map rejected: msg.resolution=%.6g is not a usable voxel size. "
+          "Keeping the previous grid (%zu voxels). Check the scovox/dscovox "
+          "publisher.",
+          latest_scovox_map_->resolution, map_cache_->voxelCount());
+      return map_cache_->voxelCount() > 0;
+    }
     ingested_scovox_map_ = latest_scovox_map_;
     eff_roi_min_z_ = band_lo;
     eff_roi_max_z_ = band_hi;
@@ -1325,9 +1370,14 @@ void ExploPlannerNode::doPlan() {
 
   // Terrain mode: loadLatestMap() may have re-banded the map z-slab around
   // the robot; keep the FOV ray z-clip in lock-step so rays leaving the
-  // ingested band are clipped, not scored against absent voxels.
-  if (terrain_relative_z_)
+  // ingested band are clipped, not scored against absent voxels. The candidate
+  // z clamp rides the same band — a candidate above it would put its own FOV
+  // origin outside the ingested volume, where every ray scores the maximal
+  // Beta(1,1) prior.
+  if (terrain_relative_z_) {
     fov_eval_->setRoiZ(eff_roi_min_z_, eff_roi_max_z_);
+    candidate_gen_->setRoiZ(eff_roi_min_z_, eff_roi_max_z_);
+  }
 
   // Generate candidates: a polar grid of viewpoints around the robot
   // (local EIG hops) PLUS frontier centroids anywhere in the ROI (long-
@@ -2237,7 +2287,13 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
   for (float d = start_d; d <= robot_dist - min_progress; d += step) {
     const float px = center.x() + ux * d;
     const float py = center.y() + uy * d;
-    Eigen::Vector3f p(px, py, exploitZAt(px, py));
+    // An approach waypoint's z is inert downstream (see exploitZAt), so an
+    // unmapped column falls back to the robot's own altitude rather than
+    // dropping the point — the whole purpose of the march is to go map ground
+    // we have no height for yet.
+    float pz = exploitZAt(px, py);
+    if (!std::isfinite(pz)) pz = robot_pos.z();
+    Eigen::Vector3f p(px, py, pz);
     if (!inRoi(p)) continue;
     if (latest_plan_map_ && !isCellFree(p)) continue;
     // Reachability only when a planning_map/cost grid exists; with no map,
@@ -2262,8 +2318,26 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
 // would find no voxels at all and pass every angle trivially: vantages accepted
 // with no visibility check, and `vantage_los_clear` logged as a meaningless 1.
 // Snapping to local ground + the candidate clearance keeps the sightline in the
-// observed volume, the same way exploration candidates are placed. Falls back to
-// the robot's own z where no ground is found.
+// observed volume, the same way exploration candidates are placed.
+//
+// Returns NaN in terrain mode when no ground is found under (x, y), and the
+// CALLER decides — because the two consumers need opposite things and the old
+// shared "fall back to the robot's own z" was wrong for one of them:
+//
+//   - A vantage's z IS the measurement. lineOfSightClear() marches its ray at
+//     exactly this height, so standing the ray at the robot's altitude over a
+//     column whose ground is unknown re-creates the very bug this function was
+//     added to fix, one level up: the ray leaves the observed volume, finds no
+//     occluders, and the angle passes with a meaningless vantage_los_clear=1.
+//     The vantage must be REJECTED instead (rej_noground), and the target left
+//     open — its own give-up timer closes it PARTIAL, which is the honest
+//     outcome for a trunk we could never see.
+//   - An approach waypoint's z is inert: it feeds inRoi (XY-only), isCellFree
+//     and reachable (both 2D), the failed-goal disc (XY) and then a nav2 goal,
+//     which is a 2D navigator. So the robot's own z is a fine stand-in there,
+//     and rejecting would be actively harmful — the approach march exists to
+//     go MAP the unmapped ground, so refusing to drive anywhere the ground is
+//     unmapped deadlocks exactly the case it is for.
 float ExploPlannerNode::exploitZAt(float x, float y) const {
   const float flat_z = vantage_planner_->config().robot_z;
   if (!terrain_relative_z_ || !map_cache_) return flat_z;
@@ -2272,7 +2346,12 @@ float ExploPlannerNode::exploitZAt(float x, float y) const {
   const float gz = map_cache_->groundZAt(
       x, y, z_ref - c.ground_search_below, z_ref + c.ground_search_above,
       c.occ_thresh, c.ground_stack_max_m);
-  return std::isfinite(gz) ? gz + c.z_clearance : z_ref;
+  if (!std::isfinite(gz)) return std::numeric_limits<float>::quiet_NaN();
+  // Same band clamp exploration candidates get (CandidateConfig::roi_min_z):
+  // the LoS ray has to march inside the ingested volume to mean anything.
+  const float z = gz + c.z_clearance;
+  if (!(eff_roi_max_z_ >= eff_roi_min_z_)) return z;
+  return std::clamp(z, eff_roi_min_z_, eff_roi_max_z_);
 }
 
 void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
@@ -2475,10 +2554,17 @@ void ExploPlannerNode::doExploitPlan() {
   float best_cost = std::numeric_limits<float>::infinity();
   int   n_valid   = 0;
   int rej_roi = 0, rej_map = 0, rej_unreach = 0, rej_los = 0,
-      rej_visited = 0, rej_blk = 0, rej_minpos = 0;
+      rej_visited = 0, rej_blk = 0, rej_minpos = 0, rej_noground = 0;
 
   for (size_t i = 0; i < vantages.size(); ++i) {
     const auto& v = vantages[i];
+    // Terrain mode with no ground under this angle: exploitZAt returned NaN and
+    // there is no honest height to march the LoS ray at. Reject rather than
+    // guess — see exploitZAt. Counted separately from rej_roi because in the
+    // field the two mean completely different things ("outside the AO box" vs
+    // "this column is not mapped yet"), and inRoi is XY-only so it would not
+    // catch a NaN z anyway.
+    if (!std::isfinite(v.position.z())) { ++rej_noground; continue; }
     if (!inRoi(v.position)) { ++rej_roi; continue; }
     // Free-cell check only when a planning_map is present; without one
     // isCellFree() is conservatively false and would reject every vantage.
@@ -2537,9 +2623,9 @@ void ExploPlannerNode::doExploitPlan() {
 
   if (best_idx < 0) {
     RCLCPP_INFO(get_logger(),
-        "Target %u: no selectable vantage (valid=%d roi=%d map=%d unreach=%d "
-        "los=%d visited=%d blk=%d minpos=%d).",
-        tgt->id, n_valid, rej_roi, rej_map, rej_unreach, rej_los,
+        "Target %u: no selectable vantage (valid=%d noground=%d roi=%d map=%d "
+        "unreach=%d los=%d visited=%d blk=%d minpos=%d).",
+        tgt->id, n_valid, rej_noground, rej_roi, rej_map, rej_unreach, rej_los,
         rej_visited, rej_blk, rej_minpos);
 
     // Quota-met and the per-target timeout are both handled unconditionally at
@@ -2646,10 +2732,23 @@ void ExploPlannerNode::doExploitDwell() {
     return;
   }
 
-  // Keep-alive re-send so the controller holds the vantage pose. Throttled:
-  // re-sending at the tick rate made nav2 re-navigate an already-satisfied
-  // goal, which jittered the platform through the capture window.
-  republishGoal(current_goal_);
+  // NO goal re-send during the dwell. The dwell is only ever entered from
+  // NAVIGATE *after* arrival, so nav2 has already reported the goal reached and
+  // the controller has stopped — there is nothing to keep alive, and every
+  // re-send is a fresh NavigateToPose that preempts nothing and re-drives a
+  // goal the robot is standing on.
+  //
+  // Throttling it was not enough. goal_republish_sec 5.0 against
+  // exploit_dwell_sec 8.0 puts exactly one re-navigation at t~5 s of every
+  // capture — the midpoint — and the widened goal_yaw_tolerance (0.4, needed so
+  // the planner's arrival gate stays looser than nav2's 0.25 checker) means the
+  // pose nav2 stopped at can be up to 0.4 rad off the vantage yaw, so the
+  // re-send is a real rotation, not a no-op. controller_server::computeControl()
+  // also calls computeAndPublishVelocity() BEFORE isGoalReached(), so even an
+  // exactly-satisfied goal emits at least one velocity command. That is a
+  // rotation through the middle of the RGB-D/LiDAR capture the dwell exists to
+  // take, i.e. motion blur and a viewpoint shift in the one window where the
+  // platform is supposed to be still.
   if (elapsed < exploit_dwell_sec_) return;
 
   // Dwell complete. Re-confirm line-of-sight from the pose we actually settled
@@ -2786,11 +2885,16 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   have_last_goal_pub_ = true;
 }
 
-// Keep-alive re-send used by the states that hold a goal across ticks
-// (NAVIGATE, RETURN_NAV, EXPLOIT_DWELL). Publishes when the pose changed, when
-// a subscriber has just appeared, or when goal_republish_sec_ has elapsed —
-// never at the tick rate. See goal_republish_sec_ for why the old unthrottled
-// 10 Hz re-send actively provoked nav2 aborts.
+// Keep-alive re-send used by the states that are still DRIVING toward a goal
+// across ticks (NAVIGATE, RETURN_NAV). Publishes when the pose changed, when a
+// subscriber has just appeared, or when goal_republish_sec_ has elapsed — never
+// at the tick rate. See goal_republish_sec_ for why the old unthrottled 10 Hz
+// re-send actively provoked nav2 aborts.
+//
+// Deliberately NOT called from EXPLOIT_DWELL: that state is entered only after
+// nav2 has reported arrival, so there is no in-flight goal to keep alive and a
+// re-send just re-drives a satisfied goal through the capture window. See
+// doExploitDwell().
 void ExploPlannerNode::republishGoal(const CandidateViewpoint& vp) {
   const bool has_sub = goal_pub_->get_subscription_count() > 0;
   const bool sub_appeared = has_sub && !goal_had_subscriber_;

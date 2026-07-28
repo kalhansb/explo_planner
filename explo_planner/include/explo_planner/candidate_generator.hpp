@@ -48,6 +48,18 @@ struct CandidateConfig {
   float roi_max_x   =  1e9f;
   float roi_min_y   = -1e9f;
   float roi_max_y   =  1e9f;
+  /// Vertical band a terrain-snapped candidate z is clamped into (map frame,
+  /// metres, ABSOLUTE — the node pushes the effective robot-relative band each
+  /// PLAN tick via setRoiZ). This is the band MapCache actually ingested, so a
+  /// candidate outside it is a viewpoint whose FOV origin sits in space the map
+  /// holds nothing for: every ray from there walks un-ingested cells and scores
+  /// them as the Beta(1,1) prior, which is maximal — the planner would chase
+  /// its own blind spot. Reachable in terrain mode because ground search is
+  /// referenced to the CENTROID's z for frontier candidates, so ground +
+  /// z_clearance can land above the band. Defaults are wide enough to be inert
+  /// in flat mode, where candidates sit at the fixed absolute robot_z.
+  float roi_min_z   = -1e9f;
+  float roi_max_z   =  1e9f;
 };
 
 class CandidateGenerator {
@@ -79,6 +91,15 @@ public:
   /// clearance to place vantages on the local ground the same way exploration
   /// candidates are placed.
   const CandidateConfig& config() const { return cfg_; }
+
+  /// Re-point the candidate z clamp at the map's current ingest band. In
+  /// terrain-relative mode that band rides with the robot, so the node calls
+  /// this each PLAN tick alongside FovEvaluator::setRoiZ() to keep the
+  /// candidate clamp and the ray clip describing the same volume.
+  void setRoiZ(float roi_min_z, float roi_max_z) {
+    cfg_.roi_min_z = roi_min_z;
+    cfg_.roi_max_z = roi_max_z;
+  }
 
 private:
   CandidateConfig cfg_;

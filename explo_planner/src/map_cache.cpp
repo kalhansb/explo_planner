@@ -35,19 +35,26 @@ MapCache::MapCache(double resolution)
     : resolution_(checkedResolution(resolution, "constructor")),
       grid_(std::make_unique<Grid>(resolution_)) {}
 
-void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
+bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
   // Unbounded: ingest every voxel. ±inf bounds make the clip a no-op.
   constexpr float kInf = std::numeric_limits<float>::infinity();
-  updateFromScovoxMap(msg,
-                      Eigen::Vector3f(-kInf, -kInf, -kInf),
-                      Eigen::Vector3f( kInf,  kInf,  kInf));
+  return updateFromScovoxMap(msg,
+                             Eigen::Vector3f(-kInf, -kInf, -kInf),
+                             Eigen::Vector3f( kInf,  kInf,  kInf));
 }
 
-void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                                    const Eigen::Vector3f& roi_min,
                                    const Eigen::Vector3f& roi_max) {
-  double res = msg.resolution > 0.0f ? static_cast<double>(msg.resolution)
-                                     : resolution_;
+  // msg.resolution comes off the wire, so validate it here rather than trusting
+  // it into the Grid constructor. `> 0.0f` is already false for NaN and for a
+  // non-positive value (both fall back to the last known-good resolution), but
+  // it is TRUE for +inf — which is the case that reaches Bonxai and makes every
+  // subsequent posToCoord undefined behaviour. See the header for why this
+  // rejects the message instead of throwing like the constructor does.
+  const double res = msg.resolution > 0.0f ? static_cast<double>(msg.resolution)
+                                           : resolution_;
+  if (!(res > 0.0) || !std::isfinite(res)) return false;
   grid_ = std::make_unique<Grid>(res);
   resolution_ = res;
 
@@ -87,6 +94,7 @@ void MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
         static_cast<double>(vx.position.z));
     acc.setValue(coord, uv);
   }
+  return true;
 }
 
 void MapCache::updateFromLogOddsCloud(

@@ -1,5 +1,6 @@
 #include "explo_planner/candidate_generator.hpp"
 #include "explo_planner/map_cache.hpp"
+#include <algorithm>
 #include <cmath>
 
 namespace explo_planner {
@@ -110,7 +111,16 @@ float CandidateGenerator::terrainZ(float x, float y, float z_ref,
       z_ref - cfg_.ground_search_below,
       z_ref + cfg_.ground_search_above,
       cfg_.occ_thresh, cfg_.ground_stack_max_m);
-  return std::isfinite(gz) ? gz + cfg_.z_clearance : z_ref;
+  const float z = std::isfinite(gz) ? gz + cfg_.z_clearance : z_ref;
+  // Keep the candidate inside the band the map was actually ingested over — see
+  // CandidateConfig::roi_min_z. ground + z_clearance can escape it upward
+  // because the frontier path references the search window to the centroid's
+  // own z, not the robot's. Clamp rather than reject: the clamped point is
+  // still the best viewpoint for that column and its rays now walk ingested
+  // space, whereas dropping it loses a long-range frontier target outright.
+  // Guard the degenerate band (std::clamp is UB when hi < lo).
+  if (!(cfg_.roi_max_z >= cfg_.roi_min_z)) return z;
+  return std::clamp(z, cfg_.roi_min_z, cfg_.roi_max_z);
 }
 
 } // namespace explo_planner

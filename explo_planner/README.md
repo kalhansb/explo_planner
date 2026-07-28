@@ -239,7 +239,17 @@ which is heavily commented. Common overrides:
 - `use_planning_map` — enable the 2D `planning_map` (free/occupied filter +
   cost-grid reachability) in both exploration and exploitation. **Off by default**;
   when off the planner never subscribes to it and runs on straight-line costs.
-- `roi_min/max_x/y` — exploration region (keep in sync with the `planning_map`)
+- `roi_min/max_x/y` — exploration region. Also the box the coverage-done
+  measure is taken over, so unreachable columns inside it put a permanent floor
+  under `done_unknown_fraction`. Only needs keeping in sync with the
+  `planning_map` when `use_planning_map` is on — it is off by default, and the
+  dscovox merger publishes no `planning_map`. All three launch files take
+  `roi:=full|phase1` to swap in the tighter phase-1 AO box
+  ([`launch/roi_presets.py`](launch/roi_presets.py)).
+- `roi_min/max_z` — vertical band, **robot-relative** when
+  `terrain_relative_z` is on. It must stay wide enough to contain the whole
+  ground-search window plus the re-band hysteresis; the node warns at startup
+  if it does not (see the invariant in the yaml).
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting
 - `coordination_enabled` — turn multi-robot MinPos on/off

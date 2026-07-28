@@ -13,12 +13,16 @@ default /<robot>/dscovox_node/scovox -- there is no central merger.
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+sys.path.insert(0, os.path.dirname(__file__))
+from roi_presets import ROI_PRESET_HELP, roi_overrides  # noqa: E402
 
 
 def launch_setup(context):
@@ -40,6 +44,8 @@ def launch_setup(context):
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
+    # {} for the default 'full' box, so exploration_params.yaml is authoritative.
+    roi = roi_overrides(LaunchConfiguration("roi").perform(context))
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -84,6 +90,8 @@ def launch_setup(context):
                         rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
+                    # Empty for roi:=full, so the yaml box stands.
+                    **roi,
                 },
             ],
         ))
@@ -112,6 +120,8 @@ def generate_launch_description():
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
+        DeclareLaunchArgument("roi", default_value="full",
+                              description=ROI_PRESET_HELP),
         DeclareLaunchArgument("rendezvous_enabled", default_value="true",
                               description="Return to the last-connected anchor and "
                                           "wait for the whole team when exploration "

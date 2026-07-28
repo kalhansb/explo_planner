@@ -233,3 +233,90 @@ TEST(CandidateGenerator, FlatModeKeepsFixedZ) {
   for (const auto& c : candidates)
     EXPECT_NEAR(c.position.z(), 0.3f, 1e-4f);
 }
+
+// Terrain-snapped candidate z is clamped into the map's ingest band.
+//
+// The frontier path references the ground search to the CENTROID's own z (a
+// distant frontier can sit metres above the robot), so ground + z_clearance can
+// land above the band the map was ingested over — by up to
+// ground_search_above + z_clearance. A candidate there has its FOV origin
+// outside the observed volume, where every ray walks un-ingested cells and
+// scores them as the Beta(1,1) prior, which is maximal: the planner would rank
+// its own blind spot as the most informative place to go.
+TEST(CandidateGenerator, TerrainCandidateZIsClampedIntoTheIngestBand) {
+  // Ground at ~2.1 (top face of the voxel whose centre is 2.05).
+  auto map = makeOccupiedMap({{5.0f, 5.0f, 2.05f}});
+
+  CandidateConfig cfg;
+  cfg.terrain_relative     = true;
+  cfg.z_clearance          = 0.3f;
+  cfg.ground_search_below  = 4.0f;
+  cfg.ground_search_above  = 1.0f;
+  cfg.enable_polar         = false;   // frontier candidates only
+  const std::vector<Eigen::Vector3f> centroids{{5.0f, 5.0f, 2.0f}};
+  const Eigen::Vector3f robot(0.0f, 0.0f, 0.0f);
+
+  // Unclamped (default +/-1e9 band): ground 2.1 + clearance 0.3 = 2.4.
+  {
+    CandidateGenerator gen(cfg);
+    std::vector<CandidateViewpoint> out;
+    gen.addFrontierCandidates(out, centroids, robot, &map);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_NEAR(out[0].position.z(), 2.4f, 1e-4f);
+  }
+
+  // Band top at 1.0: the same candidate is pulled down onto it, not left at 2.4.
+  {
+    CandidateConfig tight = cfg;
+    tight.roi_min_z = -1.0f;
+    tight.roi_max_z =  1.0f;
+    CandidateGenerator gen(tight);
+    std::vector<CandidateViewpoint> out;
+    gen.addFrontierCandidates(out, centroids, robot, &map);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_NEAR(out[0].position.z(), 1.0f, 1e-4f);
+  }
+
+  // setRoiZ re-points the clamp at runtime — the node calls it every PLAN tick
+  // because in terrain mode the ingest band rides with the robot.
+  {
+    CandidateGenerator gen(cfg);
+    gen.setRoiZ(-1.0f, 1.5f);
+    std::vector<CandidateViewpoint> out;
+    gen.addFrontierCandidates(out, centroids, robot, &map);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_NEAR(out[0].position.z(), 1.5f, 1e-4f);
+  }
+
+  // A degenerate (inverted) band must not clamp at all — std::clamp is UB when
+  // hi < lo, so the guard has to short-circuit before it.
+  {
+    CandidateConfig inverted = cfg;
+    inverted.roi_min_z =  1.0f;
+    inverted.roi_max_z = -1.0f;
+    CandidateGenerator gen(inverted);
+    std::vector<CandidateViewpoint> out;
+    gen.addFrontierCandidates(out, centroids, robot, &map);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_NEAR(out[0].position.z(), 2.4f, 1e-4f);
+  }
+}
+
+// Flat mode is unaffected: candidates sit at the fixed absolute robot_z and the
+// band clamp never runs (it exists for the terrain-snapped z only).
+TEST(CandidateGenerator, FlatModeIgnoresTheZBand) {
+  auto map = makeOccupiedMap({{5.0f, 5.0f, 2.05f}});
+  CandidateConfig cfg;
+  cfg.terrain_relative = false;
+  cfg.robot_z          = 0.3f;
+  cfg.enable_polar     = false;
+  cfg.roi_min_z        = -1.0f;
+  cfg.roi_max_z        =  1.0f;
+  CandidateGenerator gen(cfg);
+
+  std::vector<CandidateViewpoint> out;
+  gen.addFrontierCandidates(out, {{5.0f, 5.0f, 2.0f}}, Eigen::Vector3f::Zero(),
+                            &map);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_FLOAT_EQ(out[0].position.z(), 0.3f);
+}

@@ -49,7 +49,22 @@ public:
     uint32_t dwelled_mask = 0;
   };
 
-  Coordination(bool enabled, std::string self_id);
+  /// Largest TTL (seconds) any peer may claim, however large a value it
+  /// advertises. A claim's TTL means "how long since we last HEARD this peer",
+  /// and the heartbeat is ~1 Hz, so anything past a minute means the peer is
+  /// gone. Without a cap an intent carrying +inf (or a garbage float from a
+  /// version-skewed publisher) produced a claim that prune() could never expire
+  /// — a permanent veto over a disc of the map, with no way to clear it short of
+  /// restarting the node.
+  static constexpr float kMaxClaimTtlSec = 60.0f;
+
+  /// @param max_claim_radius_m Upper bound applied to every peer-advertised
+  ///        claim radius (see onIntent). Pass the local
+  ///        `coord_claim_radius_m` — the exploration-scale disc — since that is
+  ///        the largest claim this planner itself considers legitimate. <= 0 or
+  ///        non-finite disables the bound (test/legacy default).
+  Coordination(bool enabled, std::string self_id,
+               float max_claim_radius_m = 0.0f);
 
   /// Process an incoming intent, stamped with the LOCAL receipt time
   /// `now_local` (the caller's node clock). Drops messages whose robot_id
@@ -129,6 +144,7 @@ public:
 private:
   bool enabled_;
   std::string self_id_;
+  float max_claim_radius_m_ = 0.0f;  ///< 0 = unbounded (see constructor).
   std::vector<Claim> claims_;  ///< Latest-per-peer, pruned by expiry.
 };
 
