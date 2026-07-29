@@ -7,6 +7,18 @@
 ///        node turns each under-informed trunk into a TreeTarget, so this is the
 ///        real detector the time-based target_scheduler_node stands in for.
 ///
+/// Two segmentation front-ends share one fit + scoring back-end:
+///   * semantic (use_semantics = true, fused LiDAR+RGB-D maps): voxels are
+///     gated on the vegetation class, so ground/walls/rocks never enter;
+///   * geometric (use_semantics = false, LiDAR-only maps whose semantic
+///     records are empty): terrain is estimated and removed (else the ground
+///     plane connects every tree into one component), stems are clustered in a
+///     height slice above local ground (trees separate at stem level even when
+///     canopies touch), and the class gate is replaced by trunk-shape gates
+///     (PCA linearity + verticality). Thin man-made verticals (posts, poles)
+///     can pass the shape gates — geometric mode is a fallback for maps with
+///     no semantics, not a replacement.
+///
 /// Deliberately ROS-free: it consumes a flat vector of SemVoxel (the node builds
 /// those from a ScovoxMap) and returns TreeDetection structs, so the whole
 /// segment + score pipeline is unit-tested against synthetic voxels
@@ -25,7 +37,8 @@ namespace explo_planner {
 /// One occupied voxel with the semantics the detector needs. The node builds
 /// these from a ScovoxMap voxel: best_class = argmax over semantic_evidence,
 /// class_conf = best_evidence / (sum_evidence + a_unk), evidence = a_occ+a_free,
-/// p_occ = a_occ / (a_occ + a_free).
+/// p_occ = a_occ / (a_occ + a_free). In geometric mode (LiDAR-only maps) the
+/// semantic records are empty: best_class / class_conf stay 0 and are ignored.
 struct SemVoxel {
   Eigen::Vector3f pos = Eigen::Vector3f::Zero();  ///< voxel centre, map frame.
   float    p_occ      = 0.5f;   ///< a_occ / (a_occ + a_free).
@@ -38,10 +51,16 @@ struct SemVoxel {
 /// three info metrics are in [0, 1]; info_deficit combines them so that higher
 /// means "less observed / needs circling".
 struct TreeDetection {
-  Eigen::Vector3f center = Eigen::Vector3f::Zero();  ///< trunk axis XY, base z.
+  Eigen::Vector3f center = Eigen::Vector3f::Zero();  ///< trunk axis XY, base z
+                         ///< (geometric mode: >= terrain + ground_margin_m, so
+                         ///< ~0.4 m above the true base at defaults).
   float radius = 0.0f;   ///< estimated trunk radius (m).
-  float height = 0.0f;   ///< observed vertical extent (m).
-  int   trunk_voxels = 0;///< occupied vegetation voxels in the trunk band.
+  float height = 0.0f;   ///< observed vertical extent above base z (m); in
+                         ///< geometric mode the stripped ground margin is not
+                         ///< included, so min_height effectively gates
+                         ///< min_height + ground_margin_m of true tree height.
+  int   trunk_voxels = 0;///< occupied voxels in the trunk band (semantic mode:
+                         ///< vegetation-class) / stem slice (geometric mode).
 
   float angular_coverage      = 0.0f;  ///< filled azimuth sectors / K.
   float mean_entropy          = 0.0f;  ///< mean occupancy entropy, /ln2.
@@ -54,6 +73,15 @@ struct TreeDetection {
 struct TreeDetectorConfig {
   double voxel_size = 0.15;   ///< grid resolution (m); neighbour-hash quantum.
 
+  // --- Mode ---
+  // true  => semantic front-end (veg_class / min_class_conf gates, trunk band
+  //          relative to each cluster's base).
+  // false => geometric front-end for LiDAR-only maps: occupancy-only gate plus
+  //          the "Geometric mode" knobs below; veg_class / min_class_conf /
+  //          trunk_band_* are ignored. Scoring and the info-deficit predicate
+  //          are identical in both modes.
+  bool use_semantics = true;
+
   // --- Segmentation / gating ---
   uint16_t veg_class      = 5;      ///< vegetation/tree semantic id (palette).
   float    occ_thresh     = 0.6f;   ///< p_occ >= this => an occupied surface voxel.
@@ -65,6 +93,33 @@ struct TreeDetectorConfig {
   int      min_trunk_voxels = 8;    ///< reject clusters thinner than this.
   float    min_height     = 1.5f;   ///< reject clusters shorter than this (m).
   float    max_radius     = 1.0f;   ///< reject fat blobs (walls / hedges) (m).
+
+  // --- Geometric mode (use_semantics == false) only ---
+  // Terrain: min occupied z per XY cell, median-filtered over the 3x3 cell
+  // neighbourhood, bilinearly interpolated at query positions. Known
+  // limitations: (a) grades beyond ~2*ground_margin_m/terrain_cell_m (~38 deg
+  // at defaults) still leak ground voxels past the margin gate; (b) cells that
+  // only ever saw canopy (never the ground under it) over-estimate terrain and
+  // may cost the tree its lowest voxels; (c) two stems whose surfaces fall
+  // within cluster_tol_m merge into one slice cluster that can fail the
+  // linearity gate, dropping both (semantic mode returns one merged detection
+  // instead); (d) a tree fragment separated from its stem by a map gap wider
+  // than cluster_tol_m is not attached and goes uncounted.
+  float terrain_cell_m  = 1.0f;   ///< XY cell of the min-z terrain grid (m).
+  float ground_margin_m = 0.4f;   ///< drop voxels closer than this to terrain (m).
+  float stem_slice_lo   = 0.5f;   ///< stem clustering slice above terrain (m);
+  float stem_slice_hi   = 3.0f;   ///< clustering only here splits touching canopies.
+  float attach_radius_m = 2.0f;   ///< canopy/lower-trunk voxels join a stem of
+                                  ///< their connected component within this XY
+                                  ///< radius of its axis.
+  float min_linearity   = 0.55f;  ///< PCA (l_max-l_mid)/l_max: rejects isotropic
+                                  ///< blobs (bushes). NOT what rejects walls — a
+                                  ///< wall longer than its in-slice height reads
+                                  ///< linear along its length; the tilt gate
+                                  ///< below is what catches it.
+  float max_tilt_deg    = 30.0f;  ///< stem principal axis max tilt from vertical
+                                  ///< (this gate rejects walls, logs, ground
+                                  ///< ribbons: their axis is horizontal).
 
   // --- Coverage / information ---
   // 8 sectors (45 deg). Kept coarse on purpose: a thin trunk only presents

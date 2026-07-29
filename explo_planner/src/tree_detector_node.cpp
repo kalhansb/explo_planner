@@ -43,7 +43,14 @@
 ///   track_match_radius_m  (double) XY radius to match a detection to a track.
 ///   track_timeout_sec     (double) drop a track unseen this long (re-arms id).
 ///   id_cell_m             (double) XY grid (m) the position-derived id snaps to.
-///   plus the TreeDetectorConfig knobs (veg_class, occ_thresh, deficit_thresh…).
+///   use_semantics         (bool)   false => geometric mode for LiDAR-only maps
+///                                  (empty semantic records): terrain removal +
+///                                  stem-shape gates replace the class gate.
+///   targets_qos_depth     (int)    latched history depth on the targets topic;
+///                                  must exceed the targets a run can emit.
+///   plus the TreeDetectorConfig knobs (veg_class, occ_thresh, deficit_thresh…
+///   and, in geometric mode, terrain_cell_m, ground_margin_m, stem_slice_lo/hi,
+///   attach_radius_m, min_linearity, max_tilt_deg).
 
 #include <algorithm>
 #include <chrono>
@@ -86,8 +93,15 @@ public:
         [this](scovox_msgs::msg::ScovoxMap::SharedPtr msg) { latest_map_ = msg; });
 
     // Latched + deep history so a planner that subscribes after the first
-    // targets were emitted still receives them all. Matches target_scheduler QoS.
-    auto qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local();
+    // targets were emitted still receives them all. The depth must exceed the
+    // number of targets a run can emit: geometric mode nominates every
+    // vertical structure in the map, not just a preselected handful, so the
+    // old fixed KeepLast(50) could silently drop early targets for
+    // late-joining planners.
+    const int qos_depth = static_cast<int>(
+        declare_parameter<int>("targets_qos_depth", 500));
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(std::max(1, qos_depth)))
+                   .reliable().transient_local();
     pub_ = create_publisher<explo_planner_msgs::msg::TreeTarget>(targets_topic_, qos);
 
     timer_ = rclcpp::create_timer(
@@ -97,8 +111,9 @@ public:
         [this] { scan(); });
 
     RCLCPP_INFO(get_logger(),
-        "Tree detector ready: map=%s targets=%s (frame=%s), "
+        "Tree detector ready (%s mode): map=%s targets=%s (frame=%s), "
         "deficit_thresh=%.2f confirm_ticks=%d.",
+        det_.config().use_semantics ? "semantic" : "geometric",
         map_topic.c_str(), targets_topic_.c_str(), frame_id_.c_str(),
         det_.config().deficit_thresh, confirm_ticks_);
   }
@@ -135,15 +150,41 @@ private:
     c.w_entropy       = declare_parameter<double>("w_entropy", c.w_entropy);
     c.w_vertical      = declare_parameter<double>("w_vertical", c.w_vertical);
     c.deficit_thresh  = declare_parameter<double>("deficit_thresh", c.deficit_thresh);
+    c.use_semantics   = declare_parameter<bool>("use_semantics", c.use_semantics);
+    c.terrain_cell_m  = declare_parameter<double>("terrain_cell_m", c.terrain_cell_m);
+    c.ground_margin_m = declare_parameter<double>("ground_margin_m", c.ground_margin_m);
+    c.stem_slice_lo   = declare_parameter<double>("stem_slice_lo", c.stem_slice_lo);
+    c.stem_slice_hi   = declare_parameter<double>("stem_slice_hi", c.stem_slice_hi);
+    c.attach_radius_m = declare_parameter<double>("attach_radius_m", c.attach_radius_m);
+    c.min_linearity   = declare_parameter<double>("min_linearity", c.min_linearity);
+    c.max_tilt_deg    = declare_parameter<double>("max_tilt_deg", c.max_tilt_deg);
     return c;
   }
 
-  /// Convert the latest ScovoxMap into the detector's SemVoxel input. Only
-  /// vegetation-class voxels are forwarded (the dominant reduction); the
-  /// detector applies the occupancy / confidence gates.
+  /// Convert the latest ScovoxMap into the detector's SemVoxel input. Semantic
+  /// mode forwards only vegetation-class voxels (the dominant reduction) and
+  /// the detector applies the occupancy / confidence gates. Geometric mode
+  /// (LiDAR-only maps: semantic records empty, so the veg pre-filter would
+  /// silently drop everything) forwards every likely-occupied voxel instead —
+  /// the detector's terrain removal + shape gates do the reduction there.
   std::vector<SemVoxel> buildInput(const scovox_msgs::msg::ScovoxMap& m) const {
     std::vector<SemVoxel> in;
     in.reserve(m.voxels.size() / 4 + 1);
+
+    if (!det_.config().use_semantics) {
+      for (const auto& v : m.voxels) {
+        const float N = v.a_occ + v.a_free;
+        const float p = (N > 0.0f) ? v.a_occ / N : 0.5f;
+        if (p < det_.config().occ_thresh) continue;  // skip the free-space bulk
+        SemVoxel sv;
+        sv.pos = Eigen::Vector3f(v.position.x, v.position.y, v.position.z);
+        sv.p_occ = p;
+        sv.evidence = N;
+        in.push_back(sv);  // best_class / class_conf stay 0: unused in this mode
+      }
+      return in;
+    }
+
     const uint16_t veg = det_.config().veg_class;
     for (const auto& v : m.voxels) {
       // Best semantic class = argmax evidence; confidence includes a_unk in the
@@ -184,7 +225,20 @@ private:
       det_ = TreeDetector(c);
     }
 
-    const auto dets = det_.detect(buildInput(*latest_map_));
+    const auto input = buildInput(*latest_map_);
+    const auto dets = det_.detect(input);
+
+    // Heartbeat so a mode/topic misconfiguration (e.g. semantic mode on a
+    // LiDAR-only map, where every voxel is dropped) is visible instead of the
+    // node just never emitting anything.
+    size_t needy = 0;
+    for (const auto& d : dets) needy += d.under_informed ? 1 : 0;
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+        "scan (%s mode): %zu map voxels -> %zu candidate voxels -> %zu trees "
+        "(%zu under-informed), %zu tracks.",
+        det_.config().use_semantics ? "semantic" : "geometric",
+        latest_map_->voxels.size(), input.size(), dets.size(), needy,
+        tracks_.size());
 
     // Age out stale tracks (re-arms their id for a genuinely new tree later).
     for (auto it = tracks_.begin(); it != tracks_.end();) {

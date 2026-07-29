@@ -63,6 +63,35 @@ std::vector<float> allAzimuths() {
   return a;
 }
 
+// Geometric-mode config: a LiDAR-only map with empty semantic records.
+TreeDetectorConfig geomCfg() {
+  TreeDetectorConfig c = defaultCfg();
+  c.use_semantics = false;
+  return c;
+}
+
+// Erase semantic labels from every voxel, as a LiDAR-only ScovoxMap yields
+// (best_class / class_conf stay at their zero defaults).
+void stripSemantics(std::vector<SemVoxel>& vox) {
+  for (auto& v : vox) {
+    v.best_class = 0;
+    v.class_conf = 0.0f;
+  }
+}
+
+// Flat plane of unlabeled occupied ground voxels spanning [x0,x1] x [y0,y1].
+void addGround(std::vector<SemVoxel>& out, float x0, float x1, float y0,
+               float y1, float z = 0.0f, float voxel = 0.2f) {
+  for (float x = x0; x <= x1; x += voxel)
+    for (float y = y0; y <= y1; y += voxel) {
+      SemVoxel v;
+      v.pos = Eigen::Vector3f(x, y, z);
+      v.p_occ = 0.9f;
+      v.evidence = 20.0f;
+      out.push_back(v);
+    }
+}
+
 }  // namespace
 
 TEST(TreeDetector, EmptyInputYieldsNothing) {
@@ -137,6 +166,159 @@ TEST(TreeDetector, IgnoresNonVegetation) {
 TEST(TreeDetector, RejectsShortCluster) {
   std::vector<SemVoxel> vox;
   addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 0.4f, allAzimuths());  // 0.4 m tall
+  TreeDetector det(defaultCfg());
+  EXPECT_TRUE(det.detect(vox).empty());
+}
+
+// ============================ Geometric mode ============================
+// LiDAR-only maps carry no semantics, so these scenes have best_class = 0
+// everywhere and include the ground plane the semantic gate used to remove.
+
+// An unlabeled trunk standing on unlabeled ground is found from shape alone:
+// terrain removal strips the plane, the stem-slice cluster passes the PCA
+// gates, and the attach step recovers base/height above the ground margin.
+TEST(TreeDetectorGeometric, DetectsUnlabeledTrunkOnGround) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -3.0f, 3.0f, -3.0f, 3.0f);
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.4f, 2.8f, allAzimuths());
+  stripSemantics(vox);
+  TreeDetector det(geomCfg());
+  auto d = det.detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_NEAR(d[0].center.x(), 0.0f, 0.2f);
+  EXPECT_NEAR(d[0].center.y(), 0.0f, 0.2f);
+  EXPECT_NEAR(d[0].center.z(), 0.4f, 0.25f);  // base ~ ground_margin_m up
+  EXPECT_NEAR(d[0].radius, 0.4f, 0.15f);
+  EXPECT_GT(d[0].height, 1.8f);
+  // r=0.4 quantises to enough distinct ring cells to fill most sectors (same
+  // geometry the semantic WellCoveredTrunk test asserts > 0.85 on).
+  EXPECT_GT(d[0].angular_coverage, 0.75f);
+  EXPECT_FALSE(d[0].under_informed);
+}
+
+// The shared ground plane must NOT merge two trunks. stem_slice_lo is zeroed
+// so the clustering slice would include any ground the margin gate failed to
+// strip: this passes only if terrain removal actually removes the plane (with
+// the default slice, ground below stem_slice_lo never reached the clusterer
+// and the test could not fail even with terrain removal ablated).
+TEST(TreeDetectorGeometric, GroundDoesNotMergeTrunks) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -2.0f, 6.0f, -2.0f, 2.0f);
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.8f, allAzimuths());
+  addTrunk(vox, 4.0f, 0.0f, 0.0f, 0.3f, 2.8f, allAzimuths());
+  stripSemantics(vox);
+  TreeDetectorConfig c = geomCfg();
+  c.stem_slice_lo = 0.0f;  // terrain removal, not the slice, must exclude ground
+  TreeDetector det(c);
+  EXPECT_EQ(det.detect(vox).size(), 2u);
+}
+
+// Terrain interpolation keeps ground out on a 27 deg slope (grade 0.5). With
+// a piecewise-constant terrain lookup, ground leaked past the margin gate at
+// grades above ~ground_margin/terrain_cell (~22 deg): bases dropped below the
+// true ground and steeper slopes fused trunks with ground ribbons.
+TEST(TreeDetectorGeometric, HandlesSlopedTerrain) {
+  std::vector<SemVoxel> vox;
+  const float grade = 0.5f;
+  for (float x = -3.0f; x <= 7.0f; x += 0.2f)
+    for (float y = -2.0f; y <= 2.0f; y += 0.2f) {
+      SemVoxel v;
+      v.pos = Eigen::Vector3f(x, y, grade * x);
+      v.p_occ = 0.9f;
+      v.evidence = 20.0f;
+      vox.push_back(v);
+    }
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.4f, 2.8f, allAzimuths());  // ground z ~ 0
+  addTrunk(vox, 4.0f, 0.0f, 2.0f, 0.4f, 2.8f, allAzimuths());  // ground z ~ 2
+  stripSemantics(vox);
+  TreeDetector det(geomCfg());
+  auto d = det.detect(vox);
+  ASSERT_EQ(d.size(), 2u);
+  // Bases stay within [local ground, ground + margin]. The min-z terrain
+  // estimate sits ~grade*cell/2 below true ground, so downslope-side trunk
+  // voxels right at the base can survive the margin gate (base = ground
+  // exactly) — what must never happen is a base BELOW local ground (the old
+  // piecewise-constant lookup reported -0.5 here) or ground voxels attaching.
+  std::vector<float> zs = {d[0].center.z(), d[1].center.z()};
+  std::sort(zs.begin(), zs.end());
+  EXPECT_GE(zs[0], -0.05f);
+  EXPECT_LE(zs[0], 0.45f);
+  EXPECT_GE(zs[1], 1.95f);
+  EXPECT_LE(zs[1], 2.45f);
+}
+
+// A wall slab: linearity does NOT reject it (a wall longer than its in-slice
+// height reads linear along its length) and its median radius sits exactly AT
+// max_radius (1.0, not >), so the verticality gate is the sole rejector.
+// The second config ablates that gate (and moves the radius knife-edge out of
+// the way) to pin the rejection on verticality specifically.
+TEST(TreeDetectorGeometric, RejectsWallByShape) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -3.0f, 3.0f, -2.0f, 2.0f);
+  for (float x = -2.0f; x <= 2.0f; x += 0.2f)
+    for (float z = 0.0f; z <= 2.4f; z += 0.2f) {
+      SemVoxel v;
+      v.pos = Eigen::Vector3f(x, 0.0f, z);
+      v.p_occ = 0.9f;
+      v.evidence = 20.0f;
+      vox.push_back(v);
+    }
+  stripSemantics(vox);
+  TreeDetector det(geomCfg());
+  EXPECT_TRUE(det.detect(vox).empty());
+
+  TreeDetectorConfig no_tilt = geomCfg();
+  no_tilt.max_tilt_deg = 90.0f;  // ablate the verticality gate
+  no_tilt.max_radius = 1.5f;     // and the radius knife-edge (median |x| ~= 1.0)
+  EXPECT_FALSE(TreeDetector(no_tilt).detect(vox).empty());
+}
+
+// Structure with no occupancy connection to a stem must NOT donate voxels to
+// it, even inside attach_radius_m: nearest-axis-only attachment previously let
+// a floating cluster (or a shape-rejected wall) inflate height / vertical
+// completeness and flip under_informed.
+TEST(TreeDetectorGeometric, DoesNotAttachUnconnectedStructure) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -3.0f, 3.0f, -3.0f, 3.0f);
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.4f, 2.8f, allAzimuths());
+  // Disconnected blob at z ~ 8, XY offset 1.5 m (inside the 2.0 attach radius).
+  for (float x = 1.3f; x <= 1.7f; x += 0.2f)
+    for (float y = -0.2f; y <= 0.2f; y += 0.2f)
+      for (float z = 8.0f; z <= 8.6f; z += 0.2f) {
+        SemVoxel v;
+        v.pos = Eigen::Vector3f(x, y, z);
+        v.p_occ = 0.9f;
+        v.evidence = 20.0f;
+        vox.push_back(v);
+      }
+  stripSemantics(vox);
+  TreeDetector det(geomCfg());
+  auto d = det.detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_LT(d[0].height, 3.0f);  // ~2.4 real; 8+ if the blob were attached
+}
+
+// The information scoring is mode-independent: a trunk seen from one side only
+// still reads under-informed in geometric mode.
+TEST(TreeDetectorGeometric, OneSidedTrunkStillUnderInformed) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -3.0f, 3.0f, -3.0f, 3.0f);
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.8f, {0.0f, 30.0f, 60.0f});
+  stripSemantics(vox);
+  TreeDetector det(geomCfg());
+  auto d = det.detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_LT(d[0].angular_coverage, 0.4f);
+  EXPECT_TRUE(d[0].under_informed);
+}
+
+// Default (semantic) mode on the same unlabeled scene finds nothing — the
+// documented LiDAR-only trap that use_semantics=false exists to fix.
+TEST(TreeDetectorGeometric, SemanticModeIgnoresUnlabeledScene) {
+  std::vector<SemVoxel> vox;
+  addGround(vox, -3.0f, 3.0f, -3.0f, 3.0f);
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.8f, allAzimuths());
+  stripSemantics(vox);
   TreeDetector det(defaultCfg());
   EXPECT_TRUE(det.detect(vox).empty());
 }
