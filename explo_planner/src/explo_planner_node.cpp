@@ -28,6 +28,7 @@
 /// targets (or exploitation_enabled=false) behaviour is pure exploration.
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,10 +41,15 @@
 
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <action_msgs/srv/cancel_goal.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <explo_planner_msgs/msg/robot_intent.hpp>
@@ -63,6 +69,7 @@
 #include "explo_planner/plan_map_query.hpp"
 #include "explo_planner/planner_util.hpp"
 #include "explo_planner/failed_goal_blacklist.hpp"
+#include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
 #include "explo_planner/vantage_planner.hpp"
 
@@ -85,7 +92,12 @@ enum class State {
   // (RETURN_SYNC) until the whole team is back in comms, then re-plans against
   // the merged map. Gated by rendezvous_enabled_; see the rendezvous_* params.
   RETURN_NAV,
-  RETURN_SYNC
+  RETURN_SYNC,
+  // Coordinated proximity stop (multi-robot). A DRIVING robot that has lost
+  // right-of-way to a nearby moving teammate cancels its nav goal and parks
+  // here until the peer clears off or parks, then resumes the same goal.
+  // Entered only from NAVIGATE / RETURN_NAV; see checkProximityHold().
+  PROXIMITY_HOLD
 };
 
 // Top-level behaviour mode. NAVIGATE / INTEGRATE / LOG_STEP are shared between
@@ -180,6 +192,19 @@ private:
   // NAVIGATE helpers
   void failGoal(const char* reason, double elapsed);
   void heartbeatTick();
+
+  // Coordinated proximity stop. checkProximityHold runs each tick while a nav
+  // goal is in flight (NAVIGATE / RETURN_NAV) and enters PROXIMITY_HOLD when
+  // the guard says a higher-priority teammate is moving nearby; returns true
+  // when it transitioned. doProximityHold holds until the guard releases,
+  // then resumes the interrupted drive on the same goal.
+  bool checkProximityHold();
+  void enterProximityHold(const ProximityGuard::Decision& d);
+  void doProximityHold();
+  /// Latched operator-facing hold state ("hold peer=... dist=..." / "clear
+  /// reason=..."), so a field laptop can see WHO is yielding and why without
+  /// grepping planner logs.
+  void publishProxState(const std::string& state);
 
   // Pose / publishing helpers
   void updatePoseFromTF();
@@ -292,6 +317,15 @@ private:
   // until all connected). A positive value is an escape hatch for field trials
   // so a robot whose teammate died doesn't hold the anchor indefinitely.
   double rendezvous_max_wait_sec_  = 0.0;
+
+  // --- Proximity stop (coordinated yield) params ---
+  // Thresholds/staleness live in the guard's Config; these are the node-side
+  // knobs. max_hold <= 0 = unbounded (the guard's parked-peer and stale-data
+  // releases already break every mutual-wait cycle; a positive value is a
+  // field escape hatch that resumes the drive even with the peer still near).
+  bool   proximity_stop_enabled_ = true;
+  double proximity_max_hold_sec_ = 0.0;
+  std::string proximity_nav_cancel_action_;
   // ROI bounds — used to constrain candidate generation, the FOV raycast and
   // the clip applied when ingesting the fused map topic into map_cache_.
   float roi_min_x_ = -15.0f;
@@ -350,6 +384,7 @@ private:
   std::unique_ptr<MetricsLogger> logger_;
   std::unique_ptr<CostGrid> cost_grid_;
   std::unique_ptr<Coordination> coord_;
+  std::unique_ptr<ProximityGuard> prox_guard_;
   std::unique_ptr<VantagePlanner> vantage_planner_;
   TargetQueue target_queue_;
 
@@ -418,6 +453,22 @@ private:
   Eigen::Vector3f last_connected_anchor_ = Eigen::Vector3f::Zero();
   bool  have_anchor_ = false;
 
+  // Proximity-hold bookkeeping: the driving state to resume into (NAVIGATE or
+  // RETURN_NAV — current_goal_ is left untouched across the hold), cumulative
+  // hold count / held seconds (CSV columns, so post-hoc analysis can correlate
+  // holds with the trajectory), and the drive seconds already consumed on the
+  // current goal when the hold began — the resume backdates state_enter_time_
+  // by it so the nav budget CONTINUES instead of restarting, keeping one
+  // goal's total drive time bounded across repeated holds.
+  State  prox_resume_state_    = State::NAVIGATE;
+  int    prox_hold_count_      = 0;
+  double prox_hold_total_sec_  = 0.0;
+  double prox_nav_elapsed_sec_ = 0.0;
+  // Messages seen across ALL peer pose subs — while 0 with subs configured, a
+  // throttled warning says so (a typo'd topic is otherwise indistinguishable
+  // from "peer far away").
+  size_t peer_pose_msg_count_  = 0;
+
   // Per-tick utility / coord diagnostics (filled by doPlan, drained by
   // doLogStep into the StepMetrics row).
   float pending_mean_info_gain_       = 0.0f;
@@ -470,6 +521,18 @@ private:
   // Shared tree-target topic. The time-based scheduler publishes here today; a
   // detector can publish the same message later with no planner change.
   rclcpp::Subscription<explo_planner_msgs::msg::TreeTarget>::SharedPtr target_sub_;
+  // Proximity guard inputs + actuation. The pose subs are the peers'
+  // localiser outputs (map frame, ~10 Hz) — much fresher than the 1 Hz intent
+  // heartbeat that also feeds the guard. The action client exists ONLY to
+  // cancel the in-flight NavigateToPose on hold entry: ceasing to publish
+  // goal_pose does not stop nav2, the last accepted goal runs to completion.
+  std::vector<rclcpp::Subscription<
+      geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr> peer_pose_subs_;
+  rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
+      nav_cancel_client_;
+  // Latched (transient_local) hold-state string for the operator: see
+  // publishProxState().
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr prox_state_pub_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
 };
@@ -727,6 +790,37 @@ ExploPlannerNode::ExploPlannerNode()
     rendezvous_enabled_ = false;
   }
 
+  // Proximity stop (coordinated yield). ON by default and deliberately NOT
+  // tied to coordination_enabled: the guard is inert until it actually tracks
+  // a peer (intents from teammates, or the pose topics below), so single-robot
+  // runs are bit-for-bit unaffected. Caveat: with coordination_enabled=false
+  // the 1 Hz intent heartbeat is also off, so the guard NEEDS the pose topics
+  // to see anything — the wiring below warns when that leaves it blind. See
+  // the yaml section for the field rationale (documented panic line:
+  // robot-robot < 1.5 m closing).
+  proximity_stop_enabled_ = dp("proximity_stop_enabled", true);
+  ProximityGuard::Config pcfg;
+  pcfg.enabled        = proximity_stop_enabled_;
+  pcfg.hold_dist_m    = static_cast<float>(dp("proximity_hold_dist_m", 5.0));
+  pcfg.resume_dist_m  = static_cast<float>(dp("proximity_resume_dist_m", 6.0));
+  pcfg.pose_stale_sec = static_cast<float>(dp("proximity_pose_stale_sec", 3.0));
+  pcfg.peer_static_sec =
+      static_cast<float>(dp("proximity_peer_static_sec", 10.0));
+  pcfg.parked_keep_dist_m =
+      static_cast<float>(dp("proximity_parked_keep_dist_m", 1.5));
+  pcfg.peer_static_move_m =
+      static_cast<float>(dp("proximity_peer_static_move_m", 0.3));
+  pcfg.hold_release_stale_sec =
+      static_cast<float>(dp("proximity_hold_release_stale_sec", 10.0));
+  proximity_max_hold_sec_ = dp("proximity_max_hold_sec", 120.0);
+  if (pcfg.resume_dist_m < pcfg.hold_dist_m) {
+    RCLCPP_WARN(get_logger(),
+        "proximity_resume_dist_m=%.2f < proximity_hold_dist_m=%.2f inverts "
+        "the hysteresis band — raising resume to %.2f.",
+        pcfg.resume_dist_m, pcfg.hold_dist_m, pcfg.hold_dist_m);
+  }
+  prox_guard_ = std::make_unique<ProximityGuard>(pcfg, robot_name_);
+
   // Exploitation. When enabled the planner ingests tree targets off
   // targets_topic and circles each at n_vantages occlusion-free vantage points
   // (default 3 => ~120 deg apart), dwelling exploit_dwell_sec at each. A target
@@ -936,12 +1030,116 @@ ExploPlannerNode::ExploPlannerNode()
             last_connected_anchor_ = latest_pos_;
             have_anchor_ = true;
           }
+          // Proximity guard: the peer's advertised live pose (refreshed by
+          // its 1 Hz heartbeat). Coarse but always available in multi-robot
+          // runs; the dedicated pose topics below refine it when configured.
+          if (prox_guard_ && msg->robot_id != robot_name_) {
+            prox_guard_->onPeerPose(
+                msg->robot_id,
+                Eigen::Vector3f(static_cast<float>(msg->robot_pos.x),
+                                static_cast<float>(msg->robot_pos.y),
+                                static_cast<float>(msg->robot_pos.z)),
+                this->now());
+          }
           // Team quota: merge a peer's dwell credit into the local queue
           // immediately (not only on the next EXPLOIT_PLAN tick) so credit
           // broadcast just before the peer releases its claim can't be lost
           // to the claim TTL while this robot is mid-hop or mid-dwell.
           onPeerExploitIntent(*msg);
         });
+  }
+
+  // --- Proximity-stop wiring: peer localiser poses + the nav2 cancel client.
+  if (proximity_stop_enabled_) {
+    // "<robot_name>:<topic>" entries, e.g. "curt:/curt/pcl_pose". These are
+    // the peers' localiser poses: already map-frame, ~10 Hz, and independent
+    // of the peer's planner state — the intent heartbeat alone is 1 Hz and
+    // goes silent in several states, which at 0.8 m/s closing speeds leaves
+    // metre-scale pose lag. With nothing configured the guard runs on
+    // intents alone (the sim launches, where no localiser runs).
+    const auto entries =
+        dp("proximity_peer_pose_topics", std::vector<std::string>{});
+    for (const auto& e : entries) {
+      const auto sep = e.find(':');
+      if (sep == 0 || sep == std::string::npos || sep + 1 >= e.size()) {
+        RCLCPP_WARN(get_logger(),
+            "proximity_peer_pose_topics entry '%s' is not "
+            "'<robot_name>:<topic>' — skipped.", e.c_str());
+        continue;
+      }
+      const std::string peer  = e.substr(0, sep);
+      const std::string topic = e.substr(sep + 1);
+      if (peer == robot_name_) continue;  // own localiser: not a peer
+      peer_pose_subs_.push_back(
+          create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+              topic, rclcpp::QoS(rclcpp::KeepLast(5)).reliable(),
+              [this, peer](
+                  geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr m) {
+                // Consumed in map_frame_ without reframing, same convention
+                // as the fused map and tree targets.
+                if (!m->header.frame_id.empty() &&
+                    m->header.frame_id != map_frame_) {
+                  RCLCPP_WARN_ONCE(get_logger(),
+                      "Peer pose for '%s' arrives in frame '%s' != map_frame "
+                      "'%s' — used without reframing.",
+                      peer.c_str(), m->header.frame_id.c_str(),
+                      map_frame_.c_str());
+                }
+                ++peer_pose_msg_count_;
+                prox_guard_->onPeerPose(
+                    peer,
+                    Eigen::Vector3f(
+                        static_cast<float>(m->pose.pose.position.x),
+                        static_cast<float>(m->pose.pose.position.y),
+                        static_cast<float>(m->pose.pose.position.z)),
+                    this->now());
+              }));
+      RCLCPP_INFO(get_logger(),
+          "Proximity stop: tracking peer '%s' via %s", peer.c_str(),
+          topic.c_str());
+    }
+
+    // NavigateToPose client used purely for async_cancel_all_goals() on hold
+    // entry. bt_navigator turns every goal_pose into a NavigateToPose goal it
+    // sends itself; cancel-all from this client cancels that goal too. Never
+    // used to SEND goals — the goal_pose topic remains the only command path.
+    proximity_nav_cancel_action_ =
+        dp("proximity_nav_cancel_action", std::string(""));
+    if (proximity_nav_cancel_action_.empty())
+      proximity_nav_cancel_action_ = "/" + robot_name_ + "/navigate_to_pose";
+    nav_cancel_client_ =
+        rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
+            this, proximity_nav_cancel_action_);
+    RCLCPP_INFO(get_logger(),
+        "Proximity stop enabled: hold < %.1f m, resume > %.1f m, cancel via "
+        "'%s' (%zu peer pose topic(s); intents always feed the guard).",
+        pcfg.hold_dist_m, pcfg.resume_dist_m,
+        proximity_nav_cancel_action_.c_str(), peer_pose_subs_.size());
+
+    // Misconfiguration is otherwise SILENT — the guard just never holds, and
+    // in the field that is indistinguishable from working. Say what it is
+    // actually running on.
+    if (!coord_enabled_ && peer_pose_subs_.empty()) {
+      RCLCPP_WARN(get_logger(),
+          "Proximity stop is enabled but coordination_enabled=false and no "
+          "proximity_peer_pose_topics are set: without the 1 Hz intent "
+          "heartbeat the guard only hears peers at plan time — older than "
+          "pose_stale_sec by the next hop, so it will NEVER hold. Wire the "
+          "peer pose topics or enable coordination.");
+    } else if (peer_pose_subs_.empty()) {
+      RCLCPP_WARN(get_logger(),
+          "Proximity stop: no peer pose topics configured — running on the "
+          "1 Hz intent heartbeat alone (up to ~1.6 m of unseen closing "
+          "between updates at 2x0.8 m/s). Expected in sim; on hardware set "
+          "proximity_peer_pose_topics to the peers' localiser poses.");
+    }
+
+    // Latched so a field laptop's `ros2 topic echo` shows the CURRENT state
+    // immediately, not only the next transition.
+    prox_state_pub_ = create_publisher<std_msgs::msg::String>(
+        "proximity_hold_state",
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    publishProxState("clear");
   }
 
   // --- Tree-target subscription. Latched (transient_local) + a deep history so
@@ -1166,6 +1364,28 @@ void ExploPlannerNode::tick() {
   updatePoseFromTF();
   trackDistance();
 
+  // A configured-but-silent peer pose topic (typo'd name, localiser down) is
+  // indistinguishable from "peer far away" to the guard — keep saying so
+  // until the first message lands.
+  if (proximity_stop_enabled_ && !peer_pose_subs_.empty() &&
+      peer_pose_msg_count_ == 0) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+        "Proximity stop: %zu peer pose topic(s) configured but nothing "
+        "received on any of them yet — the guard cannot see those peers.",
+        peer_pose_subs_.size());
+  }
+
+  // Coordinated proximity stop: while a nav goal is in flight, yield to a
+  // higher-priority teammate moving nearby. Checked at the full 10 Hz tick
+  // rate, before the state dispatch, so the hold pre-empts everything the
+  // driving states would otherwise do this tick. The stationary states are
+  // deliberately exempt — a dwelling/integrating/planning robot is already
+  // still, and the moving peer's costmap treats it as an ordinary obstacle.
+  if ((state_ == State::NAVIGATE || state_ == State::RETURN_NAV) &&
+      checkProximityHold()) {
+    return;
+  }
+
   switch (state_) {
     case State::WAIT_FOR_MAP:
       // Once a fused map has been received on the topic, ingest it
@@ -1236,6 +1456,10 @@ void ExploPlannerNode::tick() {
 
     case State::RETURN_SYNC:
       doReturnSync();
+      break;
+
+    case State::PROXIMITY_HOLD:
+      doProximityHold();
       break;
 
     case State::DONE:
@@ -2046,10 +2270,14 @@ void ExploPlannerNode::heartbeatTick() {
   // EXPLOIT states, and the RETURN states. The dwell in particular can outlast
   // the claim TTL, so a peer would otherwise poach the vantage angle
   // mid-capture; in RETURN the beacon is what lets teammates arriving at the
-  // rendezvous count us and release the barrier.
+  // rendezvous count us and release the barrier. PROXIMITY_HOLD keeps beating
+  // too: the interrupted goal is resumed after the hold, so its claim must
+  // survive, and the beacon (with the live robot_pos refreshed below) is what
+  // feeds the right-of-way peer's view of us while we sit in its way.
   if (state_ != State::NAVIGATE && state_ != State::INTEGRATE &&
       state_ != State::EXPLOIT_PLAN && state_ != State::EXPLOIT_DWELL &&
-      state_ != State::RETURN_NAV && state_ != State::RETURN_SYNC) {
+      state_ != State::RETURN_NAV && state_ != State::RETURN_SYNC &&
+      state_ != State::PROXIMITY_HOLD) {
     return;
   }
   if (!intent_pub_) return;
@@ -2067,6 +2295,150 @@ void ExploPlannerNode::heartbeatTick() {
   current_intent_msg_.robot_pos.y = latest_pos_.y();
   current_intent_msg_.robot_pos.z = latest_pos_.z();
   intent_pub_->publish(current_intent_msg_);
+}
+
+// ==================================================================
+// Proximity stop (coordinated yield)
+// ==================================================================
+//
+// While driving (NAVIGATE / RETURN_NAV), yield to a higher-priority teammate
+// moving nearby: cancel the in-flight nav2 goal, hold still, and resume the
+// same goal once the teammate has cleared off (hysteresis) or parked. Right of
+// way is the lexicographically SMALLER robot_name — the same total order as
+// the MinPos tiebreak — computed from ids alone, so both robots always agree
+// on who yields: exactly one of any pair stops, never both (standoff) and
+// never neither (race). See ProximityGuard for the freshness/parked rules.
+//
+// This is a best-effort COORDINATION layer, not a certified safety function:
+// it needs live peer pose data (intents at 1 Hz + the optional localiser
+// topics at ~10 Hz), both planners alive, and a nav2 that honours the cancel.
+// The right-of-way robot does NOT stop — its costmap sees the held robot as an
+// ordinary obstacle — and the crewed 1.5 m panic stop from the experiment
+// script remains the hard backstop.
+
+bool ExploPlannerNode::checkProximityHold() {
+  if (!prox_guard_ || !prox_guard_->enabled() || !have_pose_) return false;
+  const auto d =
+      prox_guard_->evaluate(latest_pos_, this->now(), /*holding=*/false);
+  if (!d.hold) return false;
+  enterProximityHold(d);
+  return true;
+}
+
+void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
+  prox_resume_state_ = state_;
+  // Bank the drive time already spent on this goal: the resume backdates
+  // state_enter_time_ by it, so the nav budget continues rather than
+  // restarting — without this, every hold refunded the FULL budget and
+  // repeated holds on a crossing route left one goal's drive time unbounded.
+  prox_nav_elapsed_sec_ = (this->now() - state_enter_time_).seconds();
+  ++prox_hold_count_;
+  RCLCPP_WARN(get_logger(),
+      "Proximity hold #%d: yielding to '%s' at %.2f m (< %.2f m). Cancelling "
+      "the nav goal; resuming beyond %.2f m or when the peer parks.",
+      prox_hold_count_, d.peer_id.c_str(), d.dist_m,
+      prox_guard_->config().hold_dist_m, prox_guard_->config().resume_dist_m);
+
+  // Stop the platform. Ceasing to publish goal_pose does NOT stop nav2 — the
+  // last accepted NavigateToPose goal runs to completion — so the in-flight
+  // goal is cancelled through the action interface (bt_navigator's server
+  // honours cancel-all from any client, including for the goals it sent
+  // itself off the goal_pose topic). The cancel is fire-and-forget on the
+  // wire, so a brake goal at the robot's own pose goes out AS WELL: a lost or
+  // rejected cancel must not leave nav2 driving while the planner believes it
+  // holds, and whichever order bt_navigator processes the pair, the robot
+  // ends with either no goal or a zero-travel goal. The cancel response is
+  // checked async below purely to say out loud when it did not land.
+  // current_goal_ is left untouched; the resume re-publishes it fresh.
+  if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
+    nav_cancel_client_->async_cancel_all_goals(
+        [this](auto resp) {
+          if (!resp ||
+              resp->return_code !=
+                  action_msgs::srv::CancelGoal::Response::ERROR_NONE) {
+            RCLCPP_WARN(get_logger(),
+                "Proximity hold: nav goal cancel returned code %d — the "
+                "brake goal is the only thing stopping the robot.",
+                resp ? static_cast<int>(resp->return_code) : -1);
+          } else {
+            RCLCPP_INFO(get_logger(),
+                "Proximity hold: nav cancel accepted (%zu goal(s) "
+                "cancelling).", resp->goals_canceling.size());
+          }
+        });
+  } else {
+    RCLCPP_WARN(get_logger(),
+        "Proximity hold: action server '%s' unavailable for cancel — the "
+        "brake goal is the only stop command.",
+        proximity_nav_cancel_action_.c_str());
+  }
+  CandidateViewpoint brake;
+  brake.position = latest_pos_;
+  brake.yaw = latest_yaw_;
+  publishGoal(brake);
+
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "hold peer=%s dist=%.2f n=%d",
+                d.peer_id.c_str(), d.dist_m, prox_hold_count_);
+  publishProxState(buf);
+  transitionTo(State::PROXIMITY_HOLD);
+}
+
+void ExploPlannerNode::doProximityHold() {
+  const auto now = this->now();
+  const double held = (now - state_enter_time_).seconds();
+  const auto d = prox_guard_->evaluate(latest_pos_, now, /*holding=*/true);
+
+  const bool timed_out =
+      proximity_max_hold_sec_ > 0.0 && held >= proximity_max_hold_sec_;
+  if (d.hold && !timed_out) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Proximity hold: '%s' at %.2f m (resume > %.2f m); held %.0fs.",
+        d.peer_id.c_str(), d.dist_m, prox_guard_->config().resume_dist_m,
+        held);
+    return;
+  }
+  // The escape-hatch warning only applies when the peer is genuinely still
+  // near — when the timeout lands on the same tick the guard releases, the
+  // ordinary release below tells the story.
+  if (timed_out && d.hold) {
+    RCLCPP_WARN(get_logger(),
+        "Proximity hold: max_hold_sec=%.0f reached with '%s' still at %.2f m "
+        "— resuming anyway (escape hatch).",
+        proximity_max_hold_sec_, d.peer_id.c_str(), d.dist_m);
+  }
+
+  // Resume the interrupted drive on the SAME goal. The re-publish is
+  // mandatory — the cancel consumed nav2's goal, so only a fresh goal_pose
+  // restarts it. state_enter_time_ is backdated by the drive time the goal
+  // had already consumed, so the nav budget CONTINUES across the hold; the
+  // progress window starts fresh (held time is not lack of progress). The
+  // exploit give-up timer gets the held time back for the same reason: a
+  // hold is not target stall.
+  if (exploit_target_timing_) exploit_target_started_sec_ += held;
+  prox_hold_total_sec_ += held;
+  const char* why = d.hold ? "max-hold" : d.note.c_str();
+  RCLCPP_INFO(get_logger(),
+      "Proximity hold released after %.1fs [%s: '%s' at %.2f m] -> resuming "
+      "drive to (%.2f, %.2f).",
+      held, why, d.peer_id.c_str(), d.dist_m,
+      current_goal_.position.x(), current_goal_.position.y());
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "clear reason=%s held=%.1f", why, held);
+  publishProxState(buf);
+  transitionTo(prox_resume_state_);
+  state_enter_time_ =
+      now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
+  progress_check_time_ = now;
+  progress_check_dist_ = cumulative_distance_;
+  publishGoal(current_goal_);
+}
+
+void ExploPlannerNode::publishProxState(const std::string& state) {
+  if (!prox_state_pub_) return;
+  std_msgs::msg::String m;
+  m.data = state;
+  prox_state_pub_->publish(m);
 }
 
 // ==================================================================
@@ -2102,6 +2474,11 @@ void ExploPlannerNode::doLogStep() {
                                   : 0;
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
+
+  // Cumulative proximity-hold columns. LOG_STEP is never reached mid-hold
+  // (holds only interrupt driving states), so these are always settled.
+  m.prox_hold_count     = prox_hold_count_;
+  m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
 
   // Exploitation columns. Left at the "explore"/-1/0 defaults for exploration
   // rows; filled from the dwelled vantage for exploitation rows.

@@ -333,6 +333,77 @@
     rendezvous_max_wait_sec: 0.0
 
     # ----------------------------------------------------------------
+    # Proximity stop (coordinated yield)
+    # ----------------------------------------------------------------
+    # While DRIVING (NAVIGATE / RETURN_NAV), yield to a teammate moving
+    # nearby: cancel the in-flight nav2 goal (action cancel — the planner
+    # never touches nav2 config), hold still, and resume the same goal once
+    # the peer has cleared off (hysteresis) or parked. Right of way is the
+    # lexicographically SMALLER robot_name — the same total order as the
+    # MinPos tiebreak — so exactly one robot of any pair yields: never both
+    # stopped (standoff), never both driving (race). Field team: "bunker" <
+    # "curt", so curt yields. Stationary states (dwell, integrate, plan) are
+    # exempt: an already-still robot is an ordinary costmap obstacle for the
+    # peer driving past it.
+    # Peer poses come from the 1 Hz intent heartbeat plus any topics listed
+    # in proximity_peer_pose_topics. On hardware, configure the localiser
+    # poses there — intents alone are too coarse for safety-of-life margins
+    # (two robots closing at 2x0.8 m/s move 1.6 m between heartbeats).
+    # This layer is best-effort COORDINATION, not a certified safety stop: it
+    # needs live peer data, both planners up, and nav2 honouring the cancel.
+    # The crewed 1.5 m panic stop (experiment script §8) stays the backstop.
+    # Single-robot runs: no peer is ever tracked, so the guard is inert.
+    proximity_stop_enabled: true
+    # hold_dist is sized against the REACTION budget, not just the panic
+    # line: peer pose age (~0.1 s on a 10 Hz localiser topic, up to 1 s on
+    # intents alone) + the 10 Hz tick + cancel propagation through
+    # bt_navigator + braking is >1 s, and only the yielding robot stops —
+    # the pair keeps closing at the peer's ~0.8 m/s throughout the stop.
+    # From 5 m that leaves ~2 m of margin above the 1.5 m panic line; the
+    # old 3 m default (2x the panic line on paper) was consumed entirely by
+    # that latency at 2x0.8 m/s head-on closing.
+    proximity_hold_dist_m: 5.0     # yield below this
+    proximity_resume_dist_m: 6.0   # resume beyond this (hysteresis)
+    # Freshness gates, asymmetric on purpose. Data older than pose_stale_sec
+    # cannot START a hold (never brake on a ghost); an active hold with no
+    # data for hold_release_stale_sec RELEASES (peer presumed gone/far —
+    # comms got a fair chance to recover first).
+    proximity_pose_stale_sec: 3.0
+    proximity_hold_release_stale_sec: 10.0
+    # A peer that moved < peer_static_move_m in peer_static_sec is "parked"
+    # and not held against — a parked robot is a static obstacle the
+    # navigator avoids on its own, and holding against one deadlocks (e.g. a
+    # teammate waiting at its rendezvous anchor, or a dead planner). Kept
+    # ABOVE exploit_dwell_sec (8 s) so a mid-capture dwell is waited out
+    # rather than driven past.
+    proximity_peer_static_sec: 10.0
+    proximity_peer_static_move_m: 0.3
+    # ...but a peer parked INSIDE this floor keeps the hold: "it stopped" is
+    # no licence to drive even closer than the panic line, and the costmap —
+    # the one component this feature cannot configure — should not be the
+    # only thing between two robots at 1.2 m. Matches the documented panic
+    # threshold. Inside it the hold runs until the peer moves off or
+    # max_hold_sec fires.
+    proximity_parked_keep_dist_m: 1.5
+    # Hold-time escape hatch (seconds; 0 = unbounded). The parked/stale
+    # releases break most wait cycles on their own, but a DEAD teammate
+    # parked inside parked_keep_dist_m would otherwise hold forever — after
+    # this long the drive resumes anyway, loudly.
+    proximity_max_hold_sec: 120.0
+    # Extra peer pose sources, "<robot_name>:<topic>" (map frame, any rate).
+    # On hardware point these at the peers' localiser poses (~10 Hz), e.g.
+    #   bunker:  proximity_peer_pose_topics: ["curt:/curt/pcl_pose"]
+    #   curt:    proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]
+    # (a shared list naming every robot works too — each planner skips its
+    # own entry). Unset (the default) = intents only; the planner WARNs at
+    # startup in that mode, and keeps warning while a configured topic has
+    # delivered nothing.
+    #proximity_peer_pose_topics: [""]
+    # NavigateToPose action used for the cancel. "" = auto =
+    # /<robot_name>/navigate_to_pose (matches the goal_topic convention).
+    proximity_nav_cancel_action: ""
+
+    # ----------------------------------------------------------------
     # Perceptive exploitation
     # ----------------------------------------------------------------
     # When a tree target arrives on targets_topic the planner switches

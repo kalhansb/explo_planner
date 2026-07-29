@@ -71,6 +71,59 @@ unbounded (STAY until all connected); set `rendezvous_max_wait_sec > 0` as a
 field escape hatch so a robot whose teammate died doesn't hold the anchor
 forever. `max_steps` still ends a run directly, independent of the barrier.
 
+### Coordinated proximity stop (multi-robot, default on)
+
+MinPos deconflicts *goals*, not *paths*: two robots' commanded routes can still
+cross (the forest trial's routes cross with 0.0 m closest approach). While a nav
+goal is in flight, the planner therefore watches its teammates' live poses and
+**yields when a higher-priority teammate is moving nearby**: it cancels the
+in-flight Nav2 goal through the `NavigateToPose` action interface (no nav2
+configuration is touched) **and** publishes a brake goal at its own pose — the
+cancel is verified only through its async response, so the zero-travel goal
+covers a cancel that is lost or rejected — then parks in a `PROXIMITY_HOLD`
+state and resumes the same goal once the peer has cleared off or parked.
+
+Right of way is the **lexicographically smaller `robot_name`** — the same total
+order as the MinPos tiebreak. It is computed from ids alone, so both robots of a
+pair always agree on who yields: exactly one stops, never both (standoff) and
+never neither (race). The hold enters below `proximity_hold_dist_m` (5 m) and
+releases beyond `proximity_resume_dist_m` (6 m, hysteresis). The 5 m is sized
+against the **reaction budget**, not just the documented 1.5 m panic line: pose
+age + tick + cancel propagation + braking exceeds a second while the pair keeps
+closing at the peer's speed, which consumed the whole margin of the earlier 3 m
+default at field closing speeds. A peer that has stopped moving for
+`proximity_peer_static_sec` is treated as **parked** and released — a stationary
+robot is an ordinary costmap obstacle for the navigator, and holding against one
+would deadlock (e.g. a teammate waiting at its rendezvous anchor) — **unless it
+sits inside `proximity_parked_keep_dist_m`** (1.5 m): a peer parked closer than
+the panic line keeps the hold until it moves off or `proximity_max_hold_sec`
+(120 s) forces a loud resume. Stationary planner states (dwell, integrate, plan)
+are exempt from holding for the same reason.
+
+Peer poses come from the 1 Hz intent heartbeat automatically, plus any
+`proximity_peer_pose_topics` entries (`"<robot>:<topic>"`). **On hardware, point
+those at the peers' localiser poses** (e.g. `curt:/curt/pcl_pose`, map frame,
+~10 Hz): the heartbeat alone leaves metre-scale pose lag at field closing
+speeds. Misconfiguration does not stay silent: the planner warns at startup when
+no pose topics are set, warns repeatedly while a configured topic has delivered
+nothing, and warns when `coordination_enabled=false` leaves the guard with no
+input at all (no heartbeat and no pose topics). The guard is inert in
+single-robot runs (no peer is ever tracked).
+
+For the operator and post-hoc analysis: the latched topic
+`/<robot>/proximity_hold_state` carries the current state
+(`hold peer=... dist=...` / `clear reason=... held=...`, reasons
+`clear|parked|stale|max-hold`),
+and the per-step CSV gains cumulative `prox_hold_count` / `prox_hold_total_sec`
+columns so holds can be correlated with the trajectory. Held time does not
+refund the nav budget: the resume continues the goal's drive-time clock where
+the hold interrupted it, so repeated holds cannot grant one goal unbounded time.
+
+This is best-effort **coordination, not a certified safety stop**: it needs live
+peer data, both planners alive, and Nav2 honouring the cancel; the right-of-way
+robot keeps driving and relies on its costmap to skirt the held robot. The
+crewed 1.5 m panic-stop procedure remains the hard backstop in the field.
+
 ## Perceptive exploitation
 
 On top of exploration the planner runs an **exploitation** overlay (forest
@@ -121,6 +174,7 @@ The node logic is split into small, unit-tested modules:
 | `map_cache` | Read-only Bonxai grid rebuilt from ROS map messages |
 | `failed_goal_blacklist` | TTL + radius blacklist of recently-failed goals |
 | `coordination` | Multi-robot intent table + MinPos deconfliction |
+| `proximity_guard` | Coordinated proximity-stop arbiter (yield/hold/resume decisions) |
 | `target_queue` | Tree-target queue (ingest/dedup/lifecycle) for exploitation |
 | `vantage_planner` | Vantage-point generation + line-of-sight occlusion test |
 | `metrics_logger` | Per-step CSV metric logging |

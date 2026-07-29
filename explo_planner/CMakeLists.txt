@@ -16,6 +16,9 @@ find_package(Eigen3 REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(nav2_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # ==================================================================
 # Library
@@ -29,6 +32,7 @@ add_library(explo_planner_lib
   src/metrics_logger.cpp
   src/cost_grid.cpp
   src/coordination.cpp
+  src/proximity_guard.cpp
   src/plan_map_query.cpp
   src/failed_goal_blacklist.cpp
   src/planner_util.cpp
@@ -68,7 +72,7 @@ target_link_libraries(explo_planner_node
 ament_target_dependencies(explo_planner_node
   rclcpp geometry_msgs nav_msgs sensor_msgs
   visualization_msgs scovox_core scovox_msgs explo_planner_msgs
-  tf2 tf2_ros tf2_geometry_msgs
+  tf2 tf2_ros tf2_geometry_msgs rclcpp_action nav2_msgs std_msgs
 )
 
 # Time-based tree-target publisher: drives the exploitation targets topic from
@@ -137,6 +141,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_coordination test/test_coordination.cpp)
   target_link_libraries(test_coordination explo_planner_lib)
+
+  ament_add_gtest(test_proximity_guard test/test_proximity_guard.cpp)
+  target_link_libraries(test_proximity_guard explo_planner_lib)
 
   ament_add_gtest(test_plan_map_query test/test_plan_map_query.cpp)
   target_link_libraries(test_plan_map_query explo_planner_lib)

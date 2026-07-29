@@ -44,6 +44,7 @@ def launch_setup(context):
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
+    proximity_stop_enabled = LaunchConfiguration("proximity_stop_enabled").perform(context)
     # {} for the default 'full' box, so exploration_params.yaml is authoritative.
     roi = roi_overrides(LaunchConfiguration("roi").perform(context))
 
@@ -90,6 +91,13 @@ def launch_setup(context):
                         rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
+                    # Coordinated proximity stop: yield (cancel the nav goal,
+                    # hold) when a lex-smaller teammate is moving nearby. In
+                    # sim the guard runs off the 1 Hz intent heartbeats; on
+                    # hardware add the peers' localiser topics via
+                    # proximity_peer_pose_topics in the yaml.
+                    "proximity_stop_enabled":
+                        proximity_stop_enabled.lower() in ("true", "1", "yes", "on"),
                     # Empty for roi:=full, so the yaml box stands.
                     **roi,
                 },
@@ -129,5 +137,10 @@ def generate_launch_description():
                                           "false for independent finish-and-stop)"),
         DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
                               description="Barrier give-up seconds (0 = wait forever)"),
+        DeclareLaunchArgument("proximity_stop_enabled", default_value="true",
+                              description="Coordinated proximity stop: the "
+                                          "lex-larger robot of a close pair "
+                                          "cancels its nav goal and holds "
+                                          "until the peer clears or parks"),
         OpaqueFunction(function=launch_setup),
     ])

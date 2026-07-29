@@ -43,6 +43,13 @@ struct StepMetrics {
   int    coord_active_peers       = 0;
   int    rejected_by_minpos       = 0;
   int    rejected_by_unreachable  = 0;
+
+  // Coordinated proximity stop, CUMULATIVE across the run (like
+  // distance_traveled): holds entered so far and total seconds spent held.
+  // Per-step deltas come from differencing consecutive rows; without these
+  // columns the only record of the yields was planner stdout.
+  int    prox_hold_count          = 0;
+  float  prox_hold_total_sec      = 0.0f;
 };
 
 class MetricsLogger {
