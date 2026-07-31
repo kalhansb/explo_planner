@@ -102,13 +102,14 @@ are exempt from holding for the same reason.
 
 Peer poses come from the 1 Hz intent heartbeat automatically, plus any
 `proximity_peer_pose_topics` entries (`"<robot>:<topic>"`). **On hardware, point
-those at the peers' localiser poses** (e.g. `curt:/curt/pcl_pose`, map frame,
-~10 Hz): the heartbeat alone leaves metre-scale pose lag at field closing
-speeds. Misconfiguration does not stay silent: the planner warns at startup when
-no pose topics are set, warns repeatedly while a configured topic has delivered
-nothing, and warns when `coordination_enabled=false` leaves the guard with no
-input at all (no heartbeat and no pose topics). The guard is inert in
-single-robot runs (no peer is ever tracked).
+those at the peers' localiser robot pose** (map frame, ~10 Hz, whatever that
+topic is called on the platform): the heartbeat alone leaves metre-scale pose
+lag at field closing speeds. Misconfiguration does not stay silent: the planner
+warns at startup when no pose topics are set, warns repeatedly while a
+configured topic has delivered nothing, and warns when
+`coordination_enabled=false` leaves the guard with no input at all (no heartbeat
+and no pose topics). The guard is inert in single-robot runs (no peer is ever
+tracked).
 
 For the operator and post-hoc analysis: the latched topic
 `/<robot>/proximity_hold_state` carries the current state

@@ -66,7 +66,7 @@ Five programs per robot, identical on both:
  │ 5. explo_planner               │      │ 5. explo_planner               │
  └───────────────┬────────────────┘      └───────────────┬────────────────┘
                  └──── /exploration/intents (shared) ────┘
-                 └──── peer /pcl_pose (shared) ──────────┘
+                 └──── peer robot pose (shared) ─────────┘
 ```
 
 | # | Program | Package | Role |
@@ -78,8 +78,8 @@ Five programs per robot, identical on both:
 | 5 | `explo_planner_node` | explo_planner | Viewpoint/vantage selection, coordination, metrics. |
 
 Only three things cross the mesh: each robot's `scovox_bin` delta stream,
-`/exploration/intents`, and the peers' `/pcl_pose`. Everything else — raw
-LiDAR, IMU, RGB-D — stays in the robot's own bag.
+`/exploration/intents`, and each peer's **robot pose** from its localiser.
+Everything else — raw LiDAR, IMU, RGB-D — stays in the robot's own bag.
 
 ---
 
@@ -201,8 +201,9 @@ the same base + overlay idiom SCovox uses:
     targets_topic: "/exploration/targets/curt"
     # Rendezvous is INERT at the shipped 0. Team size minus this robot.
     rendezvous_expected_peers: 1
-    # Peer localiser pose (~10 Hz). Intents alone are too coarse to brake on.
-    proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]
+    # Peer robot pose from its localiser (~10 Hz), whatever that topic is
+    # called on the platform. Intents alone are too coarse to brake on.
+    proximity_peer_pose_topics: ["bunker:/bunker/robot_pose"]
 ```
 
 ### Must differ between the two robots
@@ -212,7 +213,7 @@ the same base + overlay idiom SCovox uses:
 | `robot_name` | `bunker` | `curt` | Drives every default topic name **and** right of way (§3.2). |
 | `output_csv` | `/tmp/<run>_bunker.csv` | `/tmp/<run>_curt.csv` | No per-run metrics. |
 | `targets_topic` | `/exploration/targets/bunker` | `/exploration/targets/curt` | Both robots ingest both target lists and double-book the queue. |
-| `proximity_peer_pose_topics` | `["curt:/curt/pcl_pose"]` | `["bunker:/bunker/pcl_pose"]` | Guard falls back to the 1 Hz heartbeat; metre-scale pose lag at closing speed. The planner **warns at startup** in this mode. |
+| `proximity_peer_pose_topics` | `["curt:<curt robot pose>"]` | `["bunker:<bunker robot pose>"]` | Guard falls back to the 1 Hz heartbeat; metre-scale pose lag at closing speed. The planner **warns at startup** in this mode. Use whatever pose topic the localiser publishes on that platform. |
 | SCovox `integration_frame` | `bunker_map` | `curt_map` | Two robots mapping in one frame collapse into a single source and overwrite each other. Each needs an identity static TF from `map`. |
 
 ### Must be identical on both robots
@@ -249,8 +250,8 @@ Run each step on **both** robots. All commands run inside the containers with
 the workspace sourced.
 
 **1. Localiser** — NDT against the shared GT map, plus the EKF.
-Wait for the log to settle on `Activating end` before continuing. Verify
-`/<r>/pcl_pose` lands within **0.5 m** of the marked staging pose.
+Wait for the log to settle on `Activating end` before continuing. Verify the
+published robot pose lands within **0.5 m** of the marked staging pose.
 
 **2. Identity static TF** — bridges the robot's unique map frame to `map`:
 ```bash
@@ -309,7 +310,7 @@ Terrain-relative z ON: map z-band [-5.5, +4.0] m about the robot, …
 Exploitation enabled: subscribing to tree targets on /exploration/targets/bunker
     (n_vantages=3, min_required=3, dwell=8.0s)
 Proximity stop enabled: hold < 5.0 m, resume > 6.0 m, cancel via …
-Proximity stop: tracking peer 'curt' via /curt/pcl_pose
+Proximity stop: tracking peer 'curt' via <curt robot pose topic>
 ```
 
 Any of these means a per-robot setting did not take:
