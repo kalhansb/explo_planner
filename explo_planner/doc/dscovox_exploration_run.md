@@ -30,9 +30,23 @@ cd ~/Projects/hmr_explo_ws/hmr_explo/ws/src
 `scovox_core` + `scovox_msgs`). The overlay binary persists across stop/start;
 build once (~20 s).
 
+Two dependencies the `scovox:jazzy` image does not supply:
+
+- **`nav2_msgs`** — a hard dependency of `explo_planner` (the coordinated
+  proximity stop cancels Nav2 goals through the action client). Without it CMake
+  stops at `find_package(nav2_msgs REQUIRED)`. The `apt-get` below is one-off per
+  container, but lives in the writable layer: a `docker compose up` that
+  **recreates** the container loses it along with `/tmp/ovl`.
+- **`explo_planner_msgs`** — a sibling package inside the same tar, so the build
+  needs `--packages-up-to explo_planner`. With `--packages-select` colcon skips
+  it and the build fails on `find_package(explo_planner_msgs REQUIRED)`.
+
 ```bash
 docker compose -f hmr_localisation/compose.yaml up -d
 docker compose -f scovox/compose.yaml up -d
+
+docker compose -f scovox/compose.yaml exec -T scovox bash -lc \
+  'apt-get update && apt-get install -y ros-jazzy-nav2-msgs'
 
 # rebuild scovox_mapping if its src changed (safe to skip otherwise)
 docker compose -f scovox/compose.yaml exec scovox bash -lc '
@@ -48,7 +62,7 @@ tar --exclude=.git --exclude=build --exclude=install --exclude=log \
 
 docker compose -f scovox/compose.yaml exec -T scovox bash -lc '
   source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash &&
-  cd /tmp/ovl && colcon build --packages-select explo_planner \
+  cd /tmp/ovl && colcon build --packages-up-to explo_planner \
     --cmake-args -DCMAKE_BUILD_TYPE=Release
 '
 ```
