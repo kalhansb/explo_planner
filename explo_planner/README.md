@@ -227,8 +227,9 @@ ros2 launch explo_planner exploitation_experiment.launch.py \
 
 For a full two-robot field trial — bring-up order, per-robot configuration,
 what to watch, panic stops and data offload — see
-[doc/field_trial_manual.md](doc/field_trial_manual.md). The build and launch
-essentials are below.
+`doc/field_trial_manual.md` in the hmr_explo workspace (the trial spans the
+localiser, mapping, nav and planner, so the manual sits above this package).
+The build and launch essentials are below.
 
 The planner has no container of its own — build and run it in an overlay
 workspace inside the running `scovox` container (image `scovox:jazzy`, the
