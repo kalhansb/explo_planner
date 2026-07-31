@@ -431,5 +431,16 @@
     # vantages then land in the neighbouring canopy and fail LoS together.
     vantage_start_angle_deg: 30.0
     exploit_dwell_sec: 8.0          # hold time at each vantage (s)
+    # Per-target give-up budget (s): wall-clock on ONE trunk since the last
+    # progress event — activation, approach-waypoint arrival, or a completed
+    # dwell each re-arm it, and proximity-hold time is refunded. When it
+    # expires the target closes PARTIAL and the planner moves on, so one bad
+    # tree cannot eat the battery. Keep it ABOVE nav_max_timeout_sec (180):
+    # failed hops deliberately keep charging the timer (that is what makes a
+    # genuinely unreachable ring terminate), so a smaller value closes every
+    # tree PARTIAL after its FIRST failed vantage approach with no retry.
+    # 300 = one worst-case failed hop + 120 s to re-select and reach another
+    # angle; two consecutive failed hops on the same trunk still give up.
+    exploit_target_timeout_sec: 300.0
     target_dedup_radius_m: 1.5      # re-reported trees within this are ignored
     vantage_visited_tol_m: 0.75     # proximity that counts a vantage "dwelled"

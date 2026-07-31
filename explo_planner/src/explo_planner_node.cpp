@@ -371,10 +371,14 @@ private:
   // Proximity tolerance for "this vantage was already dwelled". Well below the
   // chord between adjacent vantages so it never aliases two distinct vantages.
   double vantage_visited_tol_m_  = 0.75;
-  // Per-target give-up timeout (s): when an active target has no selectable
-  // vantage for this long (surroundings unmapped/unreachable) it closes PARTIAL
-  // and exploration resumes. <=0 disables.
-  double exploit_target_timeout_sec_ = 120.0;
+  // Per-target give-up budget (s): wall-clock on one trunk since the last
+  // progress event (activation, approach arrival, completed dwell). When it
+  // expires the target closes PARTIAL and exploration resumes. <=0 disables.
+  // Must stay ABOVE nav_max_timeout_sec: failed hops keep charging it (that is
+  // the termination guarantee for unreachable rings), so a smaller value gives
+  // up after the FIRST failed hop with no retry. 300 = one worst-case failed
+  // hop (180) + 120 to re-select and reach another angle.
+  double exploit_target_timeout_sec_ = 300.0;
 
   // --- Components ---
   std::unique_ptr<MapCache> map_cache_;
@@ -400,7 +404,11 @@ private:
   // dwelling.
   bool  current_is_approach_       = false;
   // Per-target give-up timer: the active target id we started timing and when
-  // (sim seconds). Reset whenever a different target becomes active.
+  // (sim seconds). Latched when a target becomes active; re-armed on every
+  // progress event (approach-waypoint arrival, completed dwell); refunded for
+  // proximity-hold time; cleared on rendezvous stand-down so a re-activated
+  // target starts fresh. Failed navigation hops deliberately keep charging it
+  // — that is what makes an unreachable ring terminate PARTIAL.
   uint32_t exploit_target_started_id_  = 0;
   double   exploit_target_started_sec_ = 0.0;
   bool     exploit_target_timing_      = false;
@@ -844,7 +852,7 @@ ExploPlannerNode::ExploPlannerNode()
   // Give-up timer: if an active target has no selectable vantage for this long
   // (e.g. its surroundings stay unmapped / unreachable), close it PARTIAL and
   // revert rather than blocking exploration forever. <=0 disables the timeout.
-  exploit_target_timeout_sec_ = dp("exploit_target_timeout_sec", 120.0);
+  exploit_target_timeout_sec_ = dp("exploit_target_timeout_sec", 300.0);
   std::string targets_topic = dp("targets_topic",
                                  std::string("/exploration/targets"));
 
@@ -1989,7 +1997,16 @@ void ExploPlannerNode::doNavigate() {
         if (current_is_approach_) {
           // Reached an approach waypoint (not a vantage): re-plan from here so
           // the now-better-mapped surroundings can yield a selectable vantage.
-          // Keep the claim — we are still working this target.
+          // Keep the claim — we are still working this target. Arriving IS
+          // progress on the target, so re-arm the give-up timer exactly like a
+          // completed dwell does — otherwise the drive toward a distant trunk
+          // (~18 m at 0.15 m/s eats a 120 s budget) closes the target PARTIAL
+          // before the ring is ever tried. Termination is preserved: each
+          // approach must land meaningfully NEARER the trunk than the last
+          // (computeApproachGoal returns false otherwise), so the resets are
+          // finite and the hold-and-retry path still runs down the timer.
+          if (exploit_target_timing_)
+            exploit_target_started_sec_ = this->now().seconds();
           RCLCPP_INFO(get_logger(),
               "Reached approach waypoint for target %d (dist=%.2f) -> "
               "re-planning vantages.", pending_exploit_target_id_, dist);
@@ -2134,6 +2151,13 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
         target_queue_.pendingCount());
     target_queue_.deactivate();
     phase_ = Phase::EXPLORE;
+    // Stop the give-up timer along with the queue. The demoted target comes
+    // back with the SAME id after the barrier, so doExploitPlan's re-latch
+    // check ("different id?") would keep the old start time — the whole
+    // return drive plus the barrier wait would count against the target and
+    // it would re-activate already past exploit_target_timeout_sec, closing
+    // PARTIAL without a single new dwell attempt.
+    exploit_target_timing_ = false;
   }
 
   current_goal_ = CandidateViewpoint{};
@@ -2787,8 +2811,13 @@ void ExploPlannerNode::doExploitPlan() {
     }
   }
 
-  // (Re)start the per-target give-up timer whenever a new target becomes active,
-  // so the timeout below measures time spent on *this* trunk only.
+  // (Re)start the per-target give-up timer whenever a new target becomes
+  // active, so the timeout below measures time spent on *this* trunk only.
+  // The !timing_ disjunct also catches a rendezvous stand-down re-activating
+  // the SAME id (startReturnToAnchor clears timing_): the return drive and
+  // barrier wait must not count against the target. Progress events re-arm
+  // the timer elsewhere: approach arrival (doNavigate) and completed dwell
+  // (doExploitDwell); proximity holds refund it (doProximityHold release).
   if (!exploit_target_timing_ || exploit_target_started_id_ != tgt->id) {
     exploit_target_started_id_  = tgt->id;
     exploit_target_started_sec_ = this->now().seconds();
@@ -3019,6 +3048,9 @@ void ExploPlannerNode::doExploitPlan() {
         computeApproachGoal(tgt->center, tgt->radius, robot_pos, approach)) {
       current_is_approach_   = true;
       current_vantage_index_ = -1;
+      // Approach hops carry no verified sightline; keep the staged verdict
+      // honest in case a future path ever dwells off an approach goal.
+      current_vantage_los_clear_ = false;
       current_goal_ = CandidateViewpoint{};
       current_goal_.position = approach;
       current_goal_.yaw = std::atan2(tgt->center.y() - approach.y(),
@@ -3061,6 +3093,13 @@ void ExploPlannerNode::doExploitPlan() {
   current_goal_ = vantages[best_idx];
   current_vantage_index_ = best_idx;
   current_is_approach_   = false;  // a real vantage to dwell at
+  // Stage the selection-time LoS verdict (this vantage just passed
+  // lineOfSightClear above). It is what the dwell's map-unavailable fallback
+  // reads — before this was staged here, that fallback silently reused
+  // whatever verdict the PREVIOUS dwell left behind, possibly from another
+  // vantage or another target, and could credit an unverified capture toward
+  // the team quota.
+  current_vantage_los_clear_ = true;
 
   // Stage the exploit diagnostics for the upcoming LOG_STEP. los_clear is staged
   // 0 here and only set to 1 when the dwell completes and re-confirms LoS from
@@ -3132,8 +3171,9 @@ void ExploPlannerNode::doExploitDwell() {
   // at (the controller may have stopped slightly off the planned vantage, and
   // the map has grown during the dwell) — that is the honest "was this a
   // clear-LoS capture?" answer, and it is what counts toward the success quota
-  // and what the CSV logs. Falls back to the selection-time value if the map or
-  // active target is momentarily unavailable.
+  // and what the CSV logs. Falls back to the selection-time verdict — staged in
+  // doExploitPlan when THIS vantage was chosen — if the map or active target is
+  // momentarily unavailable.
   bool los_clear = current_vantage_los_clear_;
   Target* t = target_queue_.active();
   if (t && loadLatestMap()) {
