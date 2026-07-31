@@ -28,9 +28,20 @@
 ///                      consecutive scans before it is emitted; a well-observed
 ///                      read resets the streak (the map grows as the robot
 ///                      moves, so a half-built trunk must not fire);
-///   * emit-once       — each track publishes one TreeTarget when confirmed
+///   * settling        — under bearing coverage, emission additionally waits
+///                      until the tree's viewing-bearing history has stopped
+///                      growing for bearing_settle_ticks scans, i.e. the robot
+///                      has finished passing it. Without that wait the gate
+///                      admits every tree on sight (a tree cannot have been
+///                      circled before it was first detected), which makes
+///                      deficit_thresh decorative. See EmitGate in
+///                      tree_detector.hpp;
+///   * emit-once       — each TREE publishes one TreeTarget when confirmed
 ///                      (latched/transient_local QoS covers late-joining
-///                      planners); it re-arms only after being lost for a while.
+///                      planners). Emitted centres are remembered for the life
+///                      of the node, so a track that times out and re-arms
+///                      re-adopts the original id and stays silent rather than
+///                      re-nominating a tree the planner already has.
 ///
 /// Parameters:
 ///   robot_name            (string) namespace for the default map topic.
@@ -46,6 +57,30 @@
 ///   use_semantics         (bool)   false => geometric mode for LiDAR-only maps
 ///                                  (empty semantic records): terrain removal +
 ///                                  stem-shape gates replace the class gate.
+///   use_bearing_coverage  (bool)   true (default) => score angular coverage
+///                                  from the robot bearings a trunk has been
+///                                  VIEWED from, accumulated per track, rather
+///                                  than from the azimuth spread of its own
+///                                  voxels. The latter is only a proxy and
+///                                  saturates at 1.0 once the axis estimate
+///                                  follows the observed surface, which makes a
+///                                  half-seen trunk read as fully covered. Falls
+///                                  back to the map-geometry score (with a
+///                                  throttled warning) whenever TF cannot supply
+///                                  a pose. Note the bearing history is per-run
+///                                  state: unlike the map-geometry score it
+///                                  cannot be recomputed from a map snapshot.
+///   base_frame            (string) robot frame for that pose (default
+///                                  "base_link").
+///   bearing_settle_ticks  (int)    consecutive scans a tree's bearing history
+///                                  must stay unchanged before it may be
+///                                  emitted (default 3). Costs that many scans
+///                                  of latency per target and lets a tree the
+///                                  robot walked around close itself silently.
+///                                  0 disables the wait (emit as soon as
+///                                  confirmed); ignored when no pose is
+///                                  available, since there is then no bearing
+///                                  history to settle.
 ///   targets_qos_depth     (int)    latched history depth on the targets topic;
 ///                                  must exceed the targets a run can emit.
 ///   plus the TreeDetectorConfig knobs (veg_class, occ_thresh, deficit_thresh…
@@ -57,12 +92,16 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <explo_planner_msgs/msg/tree_target.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "explo_planner/tree_detector.hpp"
 
@@ -85,6 +124,17 @@ public:
     match_radius_        = declare_parameter<double>("track_match_radius_m", 1.5);
     track_timeout_       = declare_parameter<double>("track_timeout_sec", 30.0);
     id_cell_m_           = declare_parameter<double>("id_cell_m", 1.0);
+    use_bearing_coverage_ =
+        declare_parameter<bool>("use_bearing_coverage", true);
+    base_frame_          = declare_parameter<std::string>("base_frame",
+                                                          "base_link");
+    settle_ticks_        = declare_parameter<int>("bearing_settle_ticks", 3);
+
+    if (use_bearing_coverage_) {
+      tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+      tf_listener_ =
+          std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
+    }
 
     // Match the merger's latched publisher QoS so the current map is delivered
     // immediately on connect (same as the planner's own subscription).
@@ -112,10 +162,11 @@ public:
 
     RCLCPP_INFO(get_logger(),
         "Tree detector ready (%s mode): map=%s targets=%s (frame=%s), "
-        "deficit_thresh=%.2f confirm_ticks=%d.",
+        "deficit_thresh=%.2f confirm_ticks=%d settle_ticks=%d (%s coverage).",
         det_.config().use_semantics ? "semantic" : "geometric",
         map_topic.c_str(), targets_topic_.c_str(), frame_id_.c_str(),
-        det_.config().deficit_thresh, confirm_ticks_);
+        det_.config().deficit_thresh, confirm_ticks_, settle_ticks_,
+        use_bearing_coverage_ ? "bearing" : "map-geometry");
   }
 
 private:
@@ -124,9 +175,23 @@ private:
     Eigen::Vector3f center;
     float radius;
     float height;
-    int   confirm = 0;        ///< consecutive under-informed scans.
-    bool  emitted = false;
     rclcpp::Time last_seen;
+    /// Confirmation / bearing-history / emit-once state. Pure logic, defined
+    /// and unit-tested in tree_detector.hpp; this node only feeds it one
+    /// observation per scan and acts on the verdict.
+    EmitGate gate;
+  };
+
+  /// A tree this node has already published a target for. Outlives the Track it
+  /// came from: a track that times out and re-arms must NOT re-emit the same
+  /// tree under a fresh id (observed on the map-test-2 bag -- one trunk emitted
+  /// twice, ~190 s apart, as 813062754 and 823040963, because a 0.10 m drift in
+  /// the centre estimate straddled an id_cell_m boundary). Matching a new track
+  /// against this list restores emit-once AND pins the id to the one already in
+  /// the planner's queue.
+  struct Emitted {
+    uint32_t id;
+    Eigen::Vector3f center;
   };
 
   TreeDetectorConfig loadConfig() {
@@ -228,17 +293,10 @@ private:
     const auto input = buildInput(*latest_map_);
     const auto dets = det_.detect(input);
 
-    // Heartbeat so a mode/topic misconfiguration (e.g. semantic mode on a
-    // LiDAR-only map, where every voxel is dropped) is visible instead of the
-    // node just never emitting anything.
-    size_t needy = 0;
-    for (const auto& d : dets) needy += d.under_informed ? 1 : 0;
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
-        "scan (%s mode): %zu map voxels -> %zu candidate voxels -> %zu trees "
-        "(%zu under-informed), %zu tracks.",
-        det_.config().use_semantics ? "semantic" : "geometric",
-        latest_map_->voxels.size(), input.size(), dets.size(), needy,
-        tracks_.size());
+    // Robot pose for bearing coverage. Looked up once per scan: every trunk in
+    // this scan was observed from the same place.
+    const std::optional<Eigen::Vector2f> robot =
+        use_bearing_coverage_ ? robotXY() : std::optional<Eigen::Vector2f>{};
 
     // Age out stale tracks (re-arms their id for a genuinely new tree later).
     for (auto it = tracks_.begin(); it != tracks_.end();) {
@@ -257,6 +315,8 @@ private:
     // instead of getting its own track and its own emitted target. Index-
     // aligned with tracks_; push_back below keeps both in step.
     std::vector<char> claimed(tracks_.size(), 0);
+    size_t needy_eff = 0;
+    size_t deferred = 0;
 
     for (const auto& d : dets) {
       // Match to the nearest unclaimed track within match_radius_ (XY). Done
@@ -277,42 +337,78 @@ private:
           best_i = i;
         }
       }
-      if (best) claimed[best_i] = 1;
-
-      if (!d.under_informed) {
-        // A well-observed read breaks the confirmation streak: reset the
-        // consecutive counter so emission requires confirm_ticks scans IN A ROW,
-        // not confirm_ticks reads scattered across the track's lifetime. Keep
-        // the track alive (refresh last_seen) but never emit on this branch.
-        if (best) {
-          best->center = d.center;
-          best->radius = d.radius;
-          best->height = d.height;
-          best->last_seen = now;
-          best->confirm = 0;
-        }
-        continue;
-      }
-
-      if (!best) {
-        tracks_.push_back(Track{cellId(d.center), d.center, d.radius, d.height, 1,
-                                false, now});
+      if (best) {
+        claimed[best_i] = 1;
+      } else {
+        // New track, created up front so the gate below has one home for both
+        // paths. If this tree was already emitted under an earlier track that
+        // has since timed out, adopt that id and start already `emitted` --
+        // emit-once is a property of the TREE, not of the track that happened
+        // to see it. Note this now also tracks trees that read well-observed
+        // on first sight (the old code only created a track on the needy
+        // branch): under bearing coverage that case cannot arise, and under
+        // map-geometry coverage tracking it is what makes the consecutive-
+        // under-informed streak mean what it says.
+        const int prev = emittedNear(d.center);
+        const uint32_t id = (prev >= 0) ? emitted_[prev].id : cellId(d.center);
+        tracks_.push_back(Track{id, d.center, d.radius, d.height, now, {}});
         claimed.push_back(1);  // brand-new track: already taken this scan
-        continue;
+        best = &tracks_.back();
+        best->gate.emitted = (prev >= 0);
       }
 
-      // Update the track with the freshest estimate + advance confirmation.
+      // --- Information verdict ------------------------------------------
+      // Default to the detector's own map-geometry score. When a pose is
+      // available, replace the coverage term with the bearings this trunk has
+      // ACTUALLY been viewed from and re-score. The map-geometry proxy cannot
+      // tell "seen from one side" from "circled" once the axis estimate starts
+      // following the observed surface; the bearing history is a direct
+      // measurement of the very thing exploitation improves, so the loop
+      // genuinely closes: circle the tree, the sectors fill, the deficit drops.
+      float cov = d.angular_coverage;
+      float deficit = d.info_deficit;
+      bool needy = d.under_informed;
+      if (robot) {
+        cov = observeBearing(
+            best->gate,
+            bearingBit(d.center.head<2>(), *robot, det_.config().n_azimuth_bins),
+            det_.config().n_azimuth_bins);
+        deficit = infoDeficit(det_.config(), cov, d.mean_entropy,
+                              d.vertical_completeness);
+        needy = deficit > det_.config().deficit_thresh;
+      }
+      needy_eff += needy ? 1 : 0;
+
+      // Freshest estimate regardless of the verdict; a track kept alive on a
+      // well-observed read is how the streak gets reset rather than lost.
       best->center = d.center;
       best->radius = d.radius;
       best->height = d.height;
       best->last_seen = now;
-      if (best->confirm < confirm_ticks_) ++best->confirm;
 
-      if (!best->emitted && best->confirm >= confirm_ticks_) {
-        publishTarget(*best, d, now);
-        best->emitted = true;
+      const bool emit = stepEmitGate(best->gate, needy, robot.has_value(),
+                                     confirm_ticks_, settle_ticks_);
+      if (emit) {
+        publishTarget(*best, d, now, deficit, cov);
+        emitted_.push_back(Emitted{best->id, best->center});
+      } else if (needy && !best->gate.emitted) {
+        ++deferred;  // confirmed-or-confirming but still being passed
       }
     }
+
+    // Heartbeat so a mode/topic misconfiguration (e.g. semantic mode on a
+    // LiDAR-only map, where every voxel is dropped) is visible instead of the
+    // node just never emitting anything. Logged after the loop because the
+    // under-informed count is the OPERATIONAL verdict (bearing-based when a
+    // pose is available), not the detector's map-geometry one.
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+        "scan (%s mode, %s coverage): %zu map voxels -> %zu candidate voxels "
+        "-> %zu trees (%zu under-informed, %zu held pending settle), "
+        "%zu tracks, %zu emitted.",
+        det_.config().use_semantics ? "semantic" : "geometric",
+        robot ? "bearing" : "map-geometry",
+        latest_map_->voxels.size(), input.size(), dets.size(), needy_eff,
+        deferred, tracks_.size(), emitted_.size());
   }
 
   // Deterministic target id from the trunk's map-frame XY, quantised to an
@@ -324,6 +420,36 @@ private:
   // centre-estimate differences; if two estimates still straddle a cell edge the
   // ids differ and credit just isn't shared for that trunk (safe degradation to
   // independent coverage — never a cross-tree mis-merge).
+  /// Robot position in frame_id_, or nullopt if TF cannot supply one yet.
+  /// TimePointZero (latest available) rather than `now`: the detector runs off
+  /// a map that is already seconds old, so the freshest pose is both what we
+  /// want and the only one guaranteed not to throw on extrapolation.
+  std::optional<Eigen::Vector2f> robotXY() {
+    if (!tf_buffer_) return std::nullopt;
+    try {
+      const auto tf = tf_buffer_->lookupTransform(frame_id_, base_frame_,
+                                                  tf2::TimePointZero);
+      return Eigen::Vector2f(static_cast<float>(tf.transform.translation.x),
+                             static_cast<float>(tf.transform.translation.y));
+    } catch (const tf2::TransformException& e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+          "No %s -> %s transform (%s); falling back to map-geometry coverage.",
+          frame_id_.c_str(), base_frame_.c_str(), e.what());
+      return std::nullopt;
+    }
+  }
+
+  /// Index of an already-emitted tree within match_radius_ of `c`, or -1.
+  int emittedNear(const Eigen::Vector3f& c) const {
+    const float r2 = static_cast<float>(match_radius_ * match_radius_);
+    for (size_t i = 0; i < emitted_.size(); ++i) {
+      const float dx = emitted_[i].center.x() - c.x();
+      const float dy = emitted_[i].center.y() - c.y();
+      if (dx * dx + dy * dy <= r2) return static_cast<int>(i);
+    }
+    return -1;
+  }
+
   uint32_t cellId(const Eigen::Vector3f& center) const {
     const double cell = (id_cell_m_ > 0.0) ? id_cell_m_ : 1.0;
     const int64_t cx = static_cast<int64_t>(std::llround(center.x() / cell));
@@ -333,8 +459,11 @@ private:
     return static_cast<uint32_t>(h ^ (h >> 32));
   }
 
+  /// `deficit` / `coverage` are the OPERATIONAL values the emit decision was
+  /// made on (bearing-based when a pose was available), which is why they are
+  /// passed in rather than read back off `d`.
   void publishTarget(const Track& t, const TreeDetection& d,
-                     const rclcpp::Time& now) {
+                     const rclcpp::Time& now, float deficit, float coverage) {
     explo_planner_msgs::msg::TreeTarget msg;
     msg.header.stamp = now;
     msg.header.frame_id = frame_id_;
@@ -350,10 +479,13 @@ private:
 
     RCLCPP_INFO(get_logger(),
         "Emitted target id=%u at (%.2f, %.2f, %.2f) r=%.2f h=%.1f "
-        "[deficit=%.2f cov=%.2f ent=%.2f vert=%.2f, %d trunk voxels].",
+        "[deficit=%.2f cov=%.2f ent=%.2f vert=%.2f, %d trunk voxels] "
+        "(map-geom cov=%.2f, axis %s, settled %d scans).",
         t.id, t.center.x(), t.center.y(), t.center.z(), t.radius, t.height,
-        d.info_deficit, d.angular_coverage, d.mean_entropy,
-        d.vertical_completeness, d.trunk_voxels);
+        deficit, coverage, d.mean_entropy,
+        d.vertical_completeness, d.trunk_voxels,
+        d.angular_coverage, d.axis_fitted ? "fitted" : "MEDIAN-FALLBACK",
+        t.gate.settle);
   }
 
   // Params / wiring.
@@ -364,9 +496,16 @@ private:
   double match_radius_  = 1.5;
   double track_timeout_ = 30.0;
   double id_cell_m_     = 1.0;
+  bool   use_bearing_coverage_ = true;
+  std::string base_frame_ = "base_link";
+  int    settle_ticks_  = 3;
 
   TreeDetector det_;
   std::vector<Track> tracks_;
+  std::vector<Emitted> emitted_;
+
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_map_;
   rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr map_sub_;

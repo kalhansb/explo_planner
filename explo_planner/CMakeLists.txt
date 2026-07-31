@@ -97,7 +97,7 @@ target_link_libraries(tree_detector_node
 )
 
 ament_target_dependencies(tree_detector_node
-  rclcpp scovox_msgs explo_planner_msgs
+  rclcpp scovox_msgs explo_planner_msgs tf2 tf2_ros geometry_msgs
 )
 
 # ==================================================================

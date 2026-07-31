@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Core>
@@ -92,6 +93,35 @@ void addGround(std::vector<SemVoxel>& out, float x0, float x1, float y0,
     }
 }
 
+// A trunk surface with THICKNESS and jitter, not the idealised single-radius
+// shell addTrunk() lays down. This is what a real fused voxel map holds: the
+// surface spans a couple of voxels radially and the returns are noisy. It is
+// also the case the thin-shell tests could not expose -- see
+// OneSidedThickTrunkIsUnderInformed below.
+void addThickTrunk(std::vector<SemVoxel>& out, float cx, float cy, float base_z,
+                   float radius, float height, float a_lo_deg, float a_hi_deg,
+                   float voxel = 0.2f) {
+  const int nz = static_cast<int>(height / voxel);
+  // Deterministic pseudo-jitter: no <random>, so the test stays reproducible
+  // bit-for-bit across platforms.
+  uint32_t s = 12345u;
+  auto rnd = [&s]() {
+    s = s * 1664525u + 1013904223u;
+    return static_cast<float>((s >> 8) & 0xFFFF) / 65535.0f - 0.5f;
+  };
+  for (int k = 0; k <= nz; ++k) {
+    const float z = base_z + k * voxel;
+    for (float a = a_lo_deg; a <= a_hi_deg; a += 4.0f) {
+      const float r = a * static_cast<float>(M_PI) / 180.0f;
+      // Two radial shells plus jitter => a thick, noisy surface.
+      for (float dr : {-0.5f * voxel, 0.5f * voxel}) {
+        const float rr = radius + dr + 0.3f * voxel * rnd();
+        out.push_back(veg(cx + rr * std::cos(r), cy + rr * std::sin(r), z));
+      }
+    }
+  }
+}
+
 }  // namespace
 
 TEST(TreeDetector, EmptyInputYieldsNothing) {
@@ -129,7 +159,92 @@ TEST(TreeDetector, OneSidedTrunkIsUnderInformed) {
   EXPECT_TRUE(d[0].under_informed);
 }
 
+// A non-finite p_occ from an upstream producer must not poison the score.
+// The occupancy gates use `p_occ < occ_thresh`, which is FALSE for NaN, so a
+// poisoned voxel is kept rather than skipped and reaches the entropy sum. If
+// normEntropy let it through, mean_entropy -> info_deficit would go NaN, the
+// `deficit > deficit_thresh` test would compare false (the tree silently reads
+// well-observed and is never targeted), and the std::sort comparator on
+// info_deficit would stop being a strict weak ordering. Both must hold: the
+// outputs stay finite, AND the one-sided trunk stays flagged.
+TEST(TreeDetector, NonFinitePOccDoesNotPoisonTheScore) {
+  std::vector<SemVoxel> vox;
+  addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.5f, {0.0f, 30.0f, 60.0f});
+  // Poison one height layer INSIDE the trunk band (defaultCfg: base + 0.4 ..
+  // base + 3.0) — entropy is summed over the band, not the whole cluster, and
+  // adjacent azimuths on a 0.3 m radius share voxel coords and get deduped, so
+  // poisoning an arbitrary index can silently miss the code path.
+  int poisoned = 0;
+  for (auto& v : vox) {
+    if (std::abs(v.pos.z() - 1.2f) < 0.05f) {
+      v.p_occ = std::numeric_limits<float>::quiet_NaN();
+      ++poisoned;
+    }
+  }
+  ASSERT_GT(poisoned, 0);
+
+  TreeDetector det(defaultCfg());
+  auto d = det.detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_TRUE(std::isfinite(d[0].mean_entropy));
+  EXPECT_TRUE(std::isfinite(d[0].info_deficit));
+  EXPECT_TRUE(d[0].under_informed);
+}
+
 // Two well-separated trunks segment into two distinct detections.
+// REGRESSION (map-test-2 bag): a trunk seen from one side only must read low
+// angular coverage even when its surface is thick and noisy rather than an
+// idealised single-radius arc.
+//
+// The thin-shell OneSidedTrunkIsUnderInformed above passed throughout the
+// period this was broken, because with a one-voxel-thick arc even a biased
+// centre leaves the azimuths clustered. Give the surface real thickness and the
+// old per-component-median centre lands ON the arc, the voxels fan out around
+// it through every sector, and coverage reads ~1.0 -- a half-observed tree
+// scoring as fully covered. On the real map that pinned 13 of 17 trunks at
+// coverage 1.00 and made the emission gate arithmetically unreachable.
+TEST(TreeDetector, OneSidedThickTrunkIsUnderInformed) {
+  std::vector<SemVoxel> vox;
+  addThickTrunk(vox, 1.0f, 2.0f, 0.0f, 0.4f, 3.0f, -60.0f, 60.0f);
+  const auto d = TreeDetector(defaultCfg()).detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_TRUE(d[0].axis_fitted);
+  // 120 deg of 360 was observed, so the ideal reading is 0.33. The measured
+  // value is 0.50: fitting a circle to a partial arc whose radial noise is a
+  // sizeable fraction of its radius (a 0.4 m trunk on a 0.2 m grid -- the real
+  // regime, not a pathological one) still biases the centre slightly toward the
+  // arc, which spreads the azimuths wider than the arc truly spans. That
+  // residual bias is why the node prefers bearing coverage, which measures
+  // viewing geometry directly instead of inferring it from surface shape.
+  //
+  // The value this test actually pins down is that it is no longer ~1.0. Before
+  // the fit it read 1.00 here, i.e. "fully circled" for a trunk seen from 120
+  // degrees, which is what made the emission gate unreachable on real maps.
+  EXPECT_LT(d[0].angular_coverage, 0.6f);
+  EXPECT_TRUE(d[0].under_informed);
+  // The fit must recover the true axis, not the centroid of the observed arc
+  // (which sits ~0.4 m away, at the arc itself).
+  EXPECT_NEAR(d[0].center.x(), 1.0f, 0.15f);
+  EXPECT_NEAR(d[0].center.y(), 2.0f, 0.15f);
+  EXPECT_NEAR(d[0].radius, 0.4f, 0.1f);
+}
+
+// The other half of the loop: once the same trunk has been circled, coverage
+// saturates and it stops being nominated. Without this the fix could pass the
+// test above by simply reading low coverage for everything.
+TEST(TreeDetector, CircledThickTrunkIsNotUnderInformed) {
+  std::vector<SemVoxel> vox;
+  addThickTrunk(vox, 1.0f, 2.0f, 0.0f, 0.4f, 3.0f, 0.0f, 356.0f);
+  const auto d = TreeDetector(defaultCfg()).detect(vox);
+  ASSERT_EQ(d.size(), 1u);
+  EXPECT_TRUE(d[0].axis_fitted);
+  EXPECT_GT(d[0].angular_coverage, 0.95f);
+  EXPECT_FALSE(d[0].under_informed);
+  EXPECT_NEAR(d[0].center.x(), 1.0f, 0.1f);
+  EXPECT_NEAR(d[0].center.y(), 2.0f, 0.1f);
+  EXPECT_NEAR(d[0].radius, 0.4f, 0.1f);
+}
+
 TEST(TreeDetector, SeparatesTwoTrunks) {
   std::vector<SemVoxel> vox;
   addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.5f, {0.0f, 30.0f, 60.0f});
@@ -321,4 +436,130 @@ TEST(TreeDetectorGeometric, SemanticModeIgnoresUnlabeledScene) {
   stripSemantics(vox);
   TreeDetector det(defaultCfg());
   EXPECT_TRUE(det.detect(vox).empty());
+}
+
+// ===================================================================
+// Emission gate (bearing coverage)
+// ===================================================================
+
+namespace {
+
+/// Fold a robot standing at `deg` around a trunk at the origin into `g`.
+float viewFrom(EmitGate& g, float deg, int n_bins = 8) {
+  const float r = deg * static_cast<float>(M_PI) / 180.0f;
+  const Eigen::Vector2f robot(10.0f * std::cos(r), 10.0f * std::sin(r));
+  return observeBearing(g, bearingBit(Eigen::Vector2f::Zero(), robot, n_bins),
+                        n_bins);
+}
+
+}  // namespace
+
+// Each 45-degree sector is one bit, and opposite bearings are distinct bits.
+TEST(EmitGate, BearingBitPartitionsTheCircle) {
+  const Eigen::Vector2f c = Eigen::Vector2f::Zero();
+  EXPECT_EQ(bearingBit(c, Eigen::Vector2f(1.0f, 0.0f), 8), 1u << 0);
+  EXPECT_EQ(bearingBit(c, Eigen::Vector2f(0.0f, 1.0f), 8), 1u << 2);
+  EXPECT_EQ(bearingBit(c, Eigen::Vector2f(-1.0f, 0.0f), 8), 1u << 4);
+  EXPECT_EQ(bearingBit(c, Eigen::Vector2f(0.0f, -1.0f), 8), 1u << 6);
+  // A bearing a hair below zero wraps to (just under) 2*pi, which rounds to
+  // exactly 2*pi in float and would index bin n. Unclamped that is a shift of
+  // 32 -- undefined behaviour -- so it must land in the last bin instead.
+  EXPECT_EQ(bearingBit(c, Eigen::Vector2f(1.0f, -1e-7f), 8), 1u << 7);
+  EXPECT_FLOAT_EQ(bearingCoverage(0u, 8), 0.0f);
+  EXPECT_FLOAT_EQ(bearingCoverage(0xFFu, 8), 1.0f);
+  EXPECT_FLOAT_EQ(bearingCoverage(0x0Fu, 8), 0.5f);
+}
+
+// Re-observing a tree from a sector it has already been seen from does not
+// raise coverage, and each new sector restarts the settle countdown.
+TEST(EmitGate, SettleCountsScansWithoutANewSector) {
+  EmitGate g;
+  EXPECT_FLOAT_EQ(viewFrom(g, 0.0f), 1.0f / 8.0f);
+  EXPECT_EQ(g.settle, 0);          // first sector IS growth
+  EXPECT_FLOAT_EQ(viewFrom(g, 10.0f), 1.0f / 8.0f);  // same sector
+  EXPECT_EQ(g.settle, 1);
+  EXPECT_FLOAT_EQ(viewFrom(g, 20.0f), 1.0f / 8.0f);
+  EXPECT_EQ(g.settle, 2);
+  EXPECT_FLOAT_EQ(viewFrom(g, 90.0f), 2.0f / 8.0f);  // new sector
+  EXPECT_EQ(g.settle, 0);                            // countdown restarts
+}
+
+// The core of limitation #9: a tree the robot is still walking past must not be
+// emitted, however under-informed it reads, until its bearing history goes
+// quiet. Then it fires exactly once.
+TEST(EmitGate, DefersEmissionUntilTheBearingHistorySettles) {
+  EmitGate g;
+  // Three scans while the robot sweeps past: a new sector every scan.
+  for (float deg : {0.0f, 50.0f, 100.0f}) {
+    viewFrom(g, deg);
+    EXPECT_FALSE(stepEmitGate(g, /*under_informed=*/true, /*has_bearing=*/true,
+                              /*confirm_ticks=*/2, /*settle_ticks=*/3));
+  }
+  EXPECT_GE(g.confirm, 2);  // confirmation is satisfied; settling is not
+  // Robot has moved off: same sector from here on.
+  viewFrom(g, 105.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 2, 3));
+  viewFrom(g, 107.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 2, 3));
+  viewFrom(g, 109.0f);
+  EXPECT_TRUE(stepEmitGate(g, true, true, 2, 3));  // settle == 3
+  // Emit-once: still under-informed and still settled, but silent.
+  viewFrom(g, 110.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 2, 3));
+}
+
+// A tree the robot walks all the way around fills enough sectors that it stops
+// reading under-informed, and closes itself without ever being nominated —
+// the behaviour the deferral exists to make possible.
+TEST(EmitGate, ACircledTreeClosesItselfWithoutBeingEmitted) {
+  TreeDetectorConfig cfg;  // stock weights: w_coverage 0.75, w_entropy 0.25
+  EmitGate g;
+  bool emitted = false;
+  for (float deg = 0.0f; deg < 360.0f; deg += 20.0f) {
+    const float cov = viewFrom(g, deg);
+    const float deficit = infoDeficit(cfg, cov, /*mean_entropy=*/0.2f,
+                                      /*vertical=*/1.0f);
+    emitted |= stepEmitGate(g, deficit > cfg.deficit_thresh, true, 2, 3);
+  }
+  EXPECT_FLOAT_EQ(bearingCoverage(g.bearing_mask, 8), 1.0f);
+  EXPECT_FALSE(emitted);
+}
+
+// Without a pose there is no bearing history to settle, so the gate falls back
+// to plain confirmation on the detector's map-geometry verdict.
+TEST(EmitGate, NoPoseMeansNoDeferral) {
+  EmitGate g;
+  EXPECT_FALSE(stepEmitGate(g, true, /*has_bearing=*/false, 2, 3));
+  EXPECT_TRUE(stepEmitGate(g, true, false, 2, 3));
+}
+
+// settle_ticks <= 0 restores the pre-deferral behaviour: emit as soon as the
+// confirmation streak is met.
+TEST(EmitGate, ZeroSettleTicksDisablesTheWait) {
+  EmitGate g;
+  viewFrom(g, 0.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 2, 0));
+  viewFrom(g, 90.0f);  // sector still growing
+  EXPECT_TRUE(stepEmitGate(g, true, true, 2, 0));
+}
+
+// A well-observed read resets the confirmation streak; the bearing history it
+// accumulated is kept, because the robot really did view it from there.
+TEST(EmitGate, WellObservedReadResetsConfirmationNotBearings) {
+  EmitGate g;
+  viewFrom(g, 0.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 3, 0));
+  viewFrom(g, 5.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 3, 0));
+  viewFrom(g, 10.0f);
+  EXPECT_FALSE(stepEmitGate(g, /*under_informed=*/false, true, 3, 0));
+  EXPECT_EQ(g.confirm, 0);
+  EXPECT_EQ(g.bearing_mask, 1u << 0);
+  // Streak restarts from scratch: two more under-informed scans are not enough.
+  viewFrom(g, 12.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 3, 0));
+  viewFrom(g, 14.0f);
+  EXPECT_FALSE(stepEmitGate(g, true, true, 3, 0));
+  viewFrom(g, 16.0f);
+  EXPECT_TRUE(stepEmitGate(g, true, true, 3, 0));
 }

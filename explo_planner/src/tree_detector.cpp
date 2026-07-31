@@ -51,10 +51,134 @@ Coord toCoord(const Eigen::Vector3f& p, double res) {
 
 /// Binary occupancy entropy of p, normalised to [0, 1] (H / ln2). p is clamped
 /// off the {0,1} rails so the log is finite; a fully-decided voxel reads ~0.
+///
+/// A non-finite p reads maximally uncertain (1.0) rather than propagating:
+/// std::min/std::max do NOT sanitise NaN, so without this a single poisoned
+/// voxel would carry NaN through mean_entropy into info_deficit, where (a)
+/// `deficit > deficit_thresh` compares false and the tree silently reads
+/// well-observed, and (b) the std::sort comparator on info_deficit stops being
+/// a strict weak ordering -- undefined behaviour. 1.0 is the conservative
+/// reading: an undecidable voxel is one we know nothing about.
 float normEntropy(float p) {
+  if (!std::isfinite(p)) return 1.0f;
   p = std::min(std::max(p, 1e-4f), 1.0f - 1e-4f);
   const float h = -p * std::log(p) - (1.0f - p) * std::log(1.0f - p);
   return h / static_cast<float>(M_LN2);
+}
+
+/// Result of the trunk cross-section fit. `offset` moves a per-layer median
+/// reference onto the true axis; `radius` is the fitted circle radius.
+struct AxisFit {
+  bool ok = false;
+  Eigen::Vector2f offset = Eigen::Vector2f::Zero();
+  float radius = 0.0f;
+};
+
+/// Algebraic (Taubin) circle fit over pooled trunk residuals.
+///
+/// Why this exists: the obvious axis estimator -- the per-component median of
+/// the trunk voxels -- puts the "axis" wherever the observed voxels are. A
+/// trunk seen from ONE side therefore lands its centre ON the observed arc
+/// instead of behind it, and the azimuths of those voxels then fan out around
+/// that point through every sector. angular_coverage reads ~1.0 for a
+/// half-observed trunk: the primary information metric goes blind exactly when
+/// the tree most needs circling, which is what killed the self-closing loop on
+/// the map-test-2 bag (13/17 real trunks read coverage 1.00, and the reachable
+/// deficit then capped below deficit_thresh so none could ever be nominated).
+///
+/// Fitting a circle instead recovers a centre that does NOT follow the data:
+/// for a one-sided arc the fitted centre sits behind the arc, so the arc spans
+/// its true angular extent and coverage reads ~the fraction actually seen.
+///
+/// The caller pools residuals from every z-layer, each de-referenced by its OWN
+/// median, so axis tilt or bend cancels and all layers superimpose onto one
+/// cross-section. Pooling is what makes the fit conditionable at map
+/// resolution: a single 0.15 m layer of an r=0.25 m trunk holds only ~10
+/// surface voxels, far too few, while the pooled set holds hundreds.
+///
+/// Returns ok=false for any residual set the fit cannot describe -- collinear
+/// (a flat wall patch, det ~ 0), or a short shallow arc that extrapolates to an
+/// implausibly large circle. Those are "this is not a trunk cross-section",
+/// so the caller falls back to the median rather than dropping the cluster.
+AxisFit fitCrossSection(const TreeDetectorConfig& cfg,
+                        const std::vector<Eigen::Vector2f>& res) {
+  AxisFit f;
+  const size_t n = res.size();
+  if (n < 6) return f;
+
+  Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+  for (const auto& p : res) mean += Eigen::Vector2d(p.x(), p.y());
+  mean /= static_cast<double>(n);
+
+  // Taubin's gradient-weighted algebraic fit, not the simpler Kasa fit: Kasa is
+  // heavily biased on PARTIAL arcs -- it pulls the centre toward the arc and
+  // shrinks the radius, which is precisely the regime that matters here (a
+  // one-sided trunk is nothing but a partial arc). Measured on the 120-degree
+  // test arc, Kasa put the centre 0.28 m off and the radius at 0.30 m for a
+  // true 0.40 m; Taubin is near-unbiased over the same data.
+  double Mxx = 0, Myy = 0, Mxy = 0, Mxz = 0, Myz = 0, Mzz = 0;
+  for (const auto& p : res) {
+    const double u = static_cast<double>(p.x()) - mean.x();
+    const double v = static_cast<double>(p.y()) - mean.y();
+    const double zz = u * u + v * v;
+    Mxx += u * u;  Myy += v * v;  Mxy += u * v;
+    Mxz += u * zz; Myz += v * zz; Mzz += zz * zz;
+  }
+  const double dn = static_cast<double>(n);
+  Mxx /= dn;  Myy /= dn;  Mxy /= dn;  Mxz /= dn;  Myz /= dn;  Mzz /= dn;
+
+  const double Mz = Mxx + Myy;
+  const double cov_xy = Mxx * Myy - Mxy * Mxy;
+  const double var_z = Mzz - Mz * Mz;
+
+  // Scale-aware degeneracy test: a collinear residual set (a flat wall patch)
+  // has cov_xy ~ 0 and no recoverable centre. Comparing against Mz^2 keeps the
+  // test invariant to the point count and to the units of the map.
+  if (!(std::abs(cov_xy) > 1e-6 * Mz * Mz) || Mz <= 0.0) return f;
+
+  const double A3 = 4.0 * Mz;
+  const double A2 = -3.0 * Mz * Mz - Mzz;
+  const double A1 = var_z * Mz + 4.0 * cov_xy * Mz - Mxz * Mxz - Myz * Myz;
+  const double A0 = Mxz * (Mxz * Myy - Myz * Mxy) +
+                    Myz * (Myz * Mxx - Mxz * Mxy) - var_z * cov_xy;
+  const double A22 = A2 + A2;
+  const double A33 = A3 + A3 + A3;
+
+  // Newton from x = 0 on the characteristic polynomial; converges in a handful
+  // of steps for any well-posed set, and the guards below catch the rest.
+  double x = 0.0, y = A0;
+  for (int it = 0; it < 100; ++it) {
+    const double dy = A1 + x * (A22 + A33 * x);
+    if (dy == 0.0) break;
+    const double xn = x - y / dy;
+    if (xn == x || !std::isfinite(xn)) break;
+    const double yn = A0 + xn * (A1 + xn * (A2 + xn * A3));
+    if (std::abs(yn) >= std::abs(y)) break;
+    x = xn;
+    y = yn;
+  }
+
+  const double det = x * x - x * Mz + cov_xy;
+  if (!std::isfinite(det) || std::abs(det) < 1e-12) return f;
+  const double uc = (Mxz * (Myy - x) - Myz * Mxy) / det / 2.0;
+  const double vc = (Myz * (Mxx - x) - Mxz * Mxy) / det / 2.0;
+
+  const double r2 = uc * uc + vc * vc + Mz;
+  if (!std::isfinite(r2) || r2 <= 0.0) return f;
+  const double r = std::sqrt(r2);
+
+  const Eigen::Vector2f off(static_cast<float>(mean.x() + uc),
+                            static_cast<float>(mean.y() + vc));
+  // Both bounds mean "the fit ran away" rather than "the tree is too fat" --
+  // the max_radius rejection is the caller's job, on whichever estimate wins.
+  const float lim = 2.0f * cfg.max_radius;
+  if (!std::isfinite(r) || static_cast<float>(r) > lim) return f;
+  if (!off.allFinite() || off.norm() > lim) return f;
+
+  f.ok = true;
+  f.offset = off;
+  f.radius = static_cast<float>(r);
+  return f;
 }
 
 float medianOf(std::vector<float>& v) {
@@ -138,29 +262,94 @@ std::optional<TreeDetection> fitAndScore(const TreeDetectorConfig& cfg,
   const float height = top_z - base_z;
   if (height < cfg.min_height) return std::nullopt;
 
-  // Robust axis = per-component median of trunk XY (immune to a leaning
-  // canopy or a one-sided observation skewing the mean).
-  std::vector<float> xs, ys;
-  xs.reserve(trunk.size());
-  ys.reserve(trunk.size());
+  // --- Trunk axis + radius -------------------------------------------------
+  // Each z-layer is referenced to its OWN median XY, so superimposing the
+  // layers cancels axis tilt or bend and the pooled residuals form a single
+  // cross-section that fitCrossSection can fit a circle to.
+  const double vs = (cfg.voxel_size > 0.0) ? cfg.voxel_size : 0.15;
+  std::unordered_map<int32_t, std::vector<float>> layer_x, layer_y;
   for (int idx : trunk) {
-    xs.push_back(voxels[idx].pos.x());
-    ys.push_back(voxels[idx].pos.y());
+    const int32_t k = static_cast<int32_t>(std::floor(voxels[idx].pos.z() / vs));
+    layer_x[k].push_back(voxels[idx].pos.x());
+    layer_y[k].push_back(voxels[idx].pos.y());
   }
-  const float cx = medianOf(xs);
-  const float cy = medianOf(ys);
+  std::unordered_map<int32_t, Eigen::Vector2f> layer_ref;
+  layer_ref.reserve(layer_x.size());
+  std::vector<float> ref_xs, ref_ys;
+  ref_xs.reserve(layer_x.size());
+  ref_ys.reserve(layer_x.size());
+  for (auto& kv : layer_x) {
+    const float mx = medianOf(kv.second);
+    const float my = medianOf(layer_y[kv.first]);
+    layer_ref.emplace(kv.first, Eigen::Vector2f(mx, my));
+    ref_xs.push_back(mx);
+    ref_ys.push_back(my);
+  }
 
-  // Radius = median trunk-voxel distance to the axis. Reject fat blobs
-  // (walls, hedges) that reach this far only because they are not trees.
-  std::vector<float> dists;
-  dists.reserve(trunk.size());
+  std::vector<Eigen::Vector2f> residuals;
+  residuals.reserve(trunk.size());
   for (int idx : trunk) {
-    const float dx = voxels[idx].pos.x() - cx;
-    const float dy = voxels[idx].pos.y() - cy;
-    dists.push_back(std::sqrt(dx * dx + dy * dy));
+    const int32_t k = static_cast<int32_t>(std::floor(voxels[idx].pos.z() / vs));
+    const Eigen::Vector2f& r = layer_ref[k];
+    residuals.emplace_back(voxels[idx].pos.x() - r.x(),
+                           voxels[idx].pos.y() - r.y());
   }
-  const float radius = std::max(medianOf(dists),
-                                0.5f * static_cast<float>(cfg.voxel_size));
+  const AxisFit fit = fitCrossSection(cfg, residuals);
+
+  float cx, cy, radius;
+  if (fit.ok) {
+    // Median layer reference shifted onto the fitted axis.
+    cx = medianOf(ref_xs) + fit.offset.x();
+    cy = medianOf(ref_ys) + fit.offset.y();
+
+    // Take the CENTRE from the fit but the RADIUS from the median distance to
+    // it -- not fit.radius. The fit is least-squares, so it chases every voxel
+    // in the cluster, and a geometric-mode "trunk" is not a clean shell: it
+    // carries undergrowth, branch stubs and neighbouring stems that survived
+    // clustering. On the map-test-2 bag fit.radius blew the two ground-truth
+    // trunks out to 1.00 m and 0.72 m against true radii of 0.25 m and 0.27 m,
+    // while the median distance to the same fitted centre stays on the trunk
+    // surface. This matters downstream: the planner sets vantage standoff to
+    // radius + vantage_standoff_m, so an inflated radius mis-sizes the ring.
+    std::vector<float> dists;
+    dists.reserve(trunk.size());
+    for (int idx : trunk) {
+      const int32_t k =
+          static_cast<int32_t>(std::floor(voxels[idx].pos.z() / vs));
+      const Eigen::Vector2f& r = layer_ref[k];
+      const float dx = voxels[idx].pos.x() - (r.x() + fit.offset.x());
+      const float dy = voxels[idx].pos.y() - (r.y() + fit.offset.y());
+      dists.push_back(std::sqrt(dx * dx + dy * dy));
+    }
+    radius = medianOf(dists);
+  } else {
+    // Degenerate fit (flat patch, or too short an arc to constrain a circle):
+    // fall back to the old estimator -- per-component median of trunk XY, and
+    // radius as the median distance to it. This is BIASED for a one-sided
+    // trunk, and angular_coverage below inherits that bias, so the detection
+    // is flagged axis_fitted=false for the caller to discount.
+    std::vector<float> xs, ys;
+    xs.reserve(trunk.size());
+    ys.reserve(trunk.size());
+    for (int idx : trunk) {
+      xs.push_back(voxels[idx].pos.x());
+      ys.push_back(voxels[idx].pos.y());
+    }
+    cx = medianOf(xs);
+    cy = medianOf(ys);
+
+    std::vector<float> dists;
+    dists.reserve(trunk.size());
+    for (int idx : trunk) {
+      const float dx = voxels[idx].pos.x() - cx;
+      const float dy = voxels[idx].pos.y() - cy;
+      dists.push_back(std::sqrt(dx * dx + dy * dy));
+    }
+    radius = medianOf(dists);
+  }
+  // Reject fat blobs (walls, hedges) that reach this far only because they are
+  // not trees.
+  radius = std::max(radius, 0.5f * static_cast<float>(cfg.voxel_size));
   if (radius > cfg.max_radius) return std::nullopt;
 
   const float two_pi = 2.0f * static_cast<float>(M_PI);
@@ -173,14 +362,33 @@ std::optional<TreeDetection> fitAndScore(const TreeDetectorConfig& cfg,
   std::vector<char> az_hit(cfg.n_azimuth_bins, 0);
   float entropy_sum = 0.0f;
   for (int idx : trunk) {
-    const float dx = voxels[idx].pos.x() - cx;
-    const float dy = voxels[idx].pos.y() - cy;
+    // Bin about the axis AT THIS VOXEL'S HEIGHT (layer reference + the fitted
+    // offset), so a leaning trunk does not smear its own azimuths across
+    // sectors it was never seen from. Without a fit there is only the one
+    // biased centre to bin about.
+    float ax = cx, ay = cy;
+    if (fit.ok) {
+      const int32_t k =
+          static_cast<int32_t>(std::floor(voxels[idx].pos.z() / vs));
+      const Eigen::Vector2f& r = layer_ref[k];
+      ax = r.x() + fit.offset.x();
+      ay = r.y() + fit.offset.y();
+    }
+    const float dx = voxels[idx].pos.x() - ax;
+    const float dy = voxels[idx].pos.y() - ay;
+    entropy_sum += normEntropy(voxels[idx].p_occ);
+
+    // A voxel sitting near the axis has no meaningful bearing from it: a few
+    // centimetres of noise swing its azimuth through a half-turn, so it lights
+    // an arbitrary sector and inflates coverage. Only voxels out on the surface
+    // carry direction information.
+    if (dx * dx + dy * dy < (0.35f * radius) * (0.35f * radius)) continue;
+
     float a = std::atan2(dy, dx);
     if (a < 0.0f) a += two_pi;
     int b = static_cast<int>(a / two_pi * cfg.n_azimuth_bins);
     if (b >= cfg.n_azimuth_bins) b = cfg.n_azimuth_bins - 1;
     az_hit[b] = 1;
-    entropy_sum += normEntropy(voxels[idx].p_occ);
   }
   int filled = 0;
   for (char h : az_hit) filled += h ? 1 : 0;
@@ -205,15 +413,10 @@ std::optional<TreeDetection> fitAndScore(const TreeDetectorConfig& cfg,
   for (char h : z_hit) z_filled += h ? 1 : 0;
   const float vertical = static_cast<float>(z_filled) / cfg.n_height_bins;
 
-  // --- Combined deficit --- weighted, weights auto-normalised so the score
-  // stays in [0, 1] regardless of how the caller sets them.
-  const float wsum = cfg.w_coverage + cfg.w_entropy + cfg.w_vertical;
-  const float w = (wsum > 0.0f) ? wsum : 1.0f;
-  const float deficit = (cfg.w_coverage * (1.0f - coverage) +
-                         cfg.w_entropy * mean_entropy +
-                         cfg.w_vertical * (1.0f - vertical)) / w;
+  const float deficit = infoDeficit(cfg, coverage, mean_entropy, vertical);
 
   TreeDetection d;
+  d.axis_fitted = fit.ok;
   d.center = Eigen::Vector3f(cx, cy, base_z);
   d.radius = radius;
   d.height = height;
@@ -538,6 +741,67 @@ std::vector<TreeDetection> detectGeometric(const TreeDetectorConfig& cfg,
 }
 
 }  // namespace
+
+float infoDeficit(const TreeDetectorConfig& cfg, float coverage,
+                  float mean_entropy, float vertical) {
+  // Weights auto-normalised so the score stays in [0, 1] regardless of how the
+  // caller sets them -- note this also means zeroing a weight (w_vertical
+  // defaults to 0) redistributes its share rather than shrinking the range.
+  const float wsum = cfg.w_coverage + cfg.w_entropy + cfg.w_vertical;
+  const float w = (wsum > 0.0f) ? wsum : 1.0f;
+  return (cfg.w_coverage * (1.0f - coverage) +
+          cfg.w_entropy * mean_entropy +
+          cfg.w_vertical * (1.0f - vertical)) / w;
+}
+
+// ===================================================================
+// Emission gate (bearing coverage)
+// ===================================================================
+
+uint32_t bearingBit(const Eigen::Vector2f& center, const Eigen::Vector2f& robot,
+                    int n_bins) {
+  const int n = std::min(std::max(n_bins, 1), 32);
+  float a = std::atan2(robot.y() - center.y(), robot.x() - center.x());
+  if (a < 0.0f) a += 2.0f * static_cast<float>(M_PI);
+  int b = static_cast<int>(a / (2.0f * static_cast<float>(M_PI)) * n);
+  if (b >= n) b = n - 1;  // guards a == 2*pi from the float divide
+  return 1u << b;
+}
+
+float bearingCoverage(uint32_t mask, int n_bins) {
+  const int n = std::min(std::max(n_bins, 1), 32);
+  int filled = 0;
+  for (int i = 0; i < n; ++i) filled += (mask >> i) & 1u;
+  return static_cast<float>(filled) / static_cast<float>(n);
+}
+
+float observeBearing(EmitGate& g, uint32_t bit, int n_bins) {
+  const uint32_t grown = g.bearing_mask | bit;
+  // A new sector means the robot is still discovering viewing angles on this
+  // tree, so the observation is not finished: restart the settle countdown.
+  g.settle = (grown != g.bearing_mask) ? 0 : g.settle + 1;
+  g.bearing_mask = grown;
+  return bearingCoverage(g.bearing_mask, n_bins);
+}
+
+bool stepEmitGate(EmitGate& g, bool under_informed, bool has_bearing,
+                  int confirm_ticks, int settle_ticks) {
+  if (!under_informed) {
+    // Break the streak rather than just skipping the emit: emission requires
+    // confirm_ticks scans IN A ROW, not that many reads scattered over the
+    // track's life. The map grows as the robot moves, so a trunk that reads
+    // adequately covered even once must restart the count.
+    g.confirm = 0;
+    return false;
+  }
+  if (g.confirm < confirm_ticks) ++g.confirm;
+
+  const bool settled =
+      !has_bearing || settle_ticks <= 0 || g.settle >= settle_ticks;
+  const bool emit = !g.emitted && g.confirm >= confirm_ticks && settled;
+  if (emit) g.emitted = true;
+  return emit;
+}
 
 std::vector<TreeDetection> TreeDetector::detect(
     const std::vector<SemVoxel>& voxels) const {

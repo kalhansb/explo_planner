@@ -168,91 +168,242 @@ an exploit-queue drain past the budget must not sneak an extra exploration hop.
 **Where:** the `scan()` track loop in
 [`src/tree_detector_node.cpp`](../src/tree_detector_node.cpp) (~L197–245).
 
-**Scenario / current behaviour.** Two edges remain after the
-consecutive-streak fix:
+**Scenario / current behaviour.** Both edges this entry described are now
+closed; it is kept as the record of what they were.
 
-- **`confirm_ticks: 1` still needs two scans.** A brand-new track is created
-  with `confirm = 1` and the loop `continue`s without an emit check, so the
-  emit test only runs when the tree is detected again — one scan later than
-  the configured streak of 1 implies.
-- **Same-scan double-count.** A track pushed by one detection is immediately
-  matchable by a *later* detection in the same scan. If a trunk fragments into
-  two clusters within `track_match_radius_m`, the second cluster advances the
-  first's streak, and with `confirm_ticks: 2` the track emits after a single
-  scan — the debounce is bypassed.
+- **`confirm_ticks: 1` needed two scans** — a brand-new track was created with
+  `confirm = 1` and the loop `continue`d without an emit check, so the emit
+  test only ran when the tree was detected again, one scan later than a
+  configured streak of 1 implies. Closed by the `EmitGate` refactor: `scan()`
+  now creates the track up front and routes *both* the new-track and
+  matched-track paths through `stepEmitGate`, so the emit test runs on the
+  creating scan too. The default `confirm_ticks: 2` masked this entirely, which
+  is why it went unnoticed.
+- **Same-scan double-count** — a track pushed by one detection was immediately
+  matchable by a *later* detection in the same scan, so a trunk that fragmented
+  into two clusters within `track_match_radius_m` advanced one track's streak
+  twice and emitted after a single scan. Closed by the `claimed` vector: it is
+  index-aligned with `tracks_` and a newly-pushed track is appended already
+  marked claimed, so no later detection in the same scan can match it.
 
-**Why it is acceptable today.**
+**Cost.** None outstanding. The planner's `target_dedup_radius_m: 1.5` was the
+backstop for both (id- and proximity-dedup on ingest) and still is.
 
-- The default (and shipped) `confirm_ticks: 2` masks the off-by-one entirely.
-- The double-count needs one trunk to yield two clusters inside the match
-  radius in one detector pass — rare with the trunk-band clustering — and the
-  planner's `target_dedup_radius_m: 1.5` absorbs a duplicate/early TreeTarget
-  anyway (id- and proximity-dedup on ingest).
+**Related, now fixed — re-emission after track timeout.** A third edge was
+observed on the `map-test-2` bag and has been closed. One trunk was emitted
+twice, ~190 s apart, under *different* ids (`813062754` at (14.00, 11.50) and
+`823040963` at (14.00, 11.40)): its track aged out at `track_timeout_sec: 30`,
+a later detection created a fresh track, and a 0.10 m drift in the centre
+estimate straddled an `id_cell_m` boundary so the position hash minted a new
+id. Both the emit-once contract and the "same tree ⇒ same id fleet-wide"
+contract broke at once, and because the ids differed the planner's id-keyed
+dedup could not absorb it either — only its `target_dedup_radius_m` proximity
+check stood between this and a double-booked target. `scan()` now keeps an
+`emitted_` list of published centres that outlives the tracks; a new track
+within `track_match_radius_m` of one adopts that id and starts already
+`emitted`. Emit-once is now a property of the tree, not of the track.
 
-**Cost.** Slightly earlier emission than the documented "N consecutive scans"
-contract in the fragmented-trunk case; a latent surprise if `confirm_ticks: 1`
-is ever used.
-
-**Possible fix.** Run the emit check on track creation when
-`confirm_ticks <= 1`, and mark tracks created in the current scan so same-scan
-detections cannot advance their streak (or match against a snapshot of the
-track list taken at scan entry).
-
-## 6. Median trunk axis is biased under one-sided observation
+## 6. Median trunk axis is biased under one-sided observation (closed by the circle fit)
 
 **Where:** the axis/radius fit in
-[`src/tree_detector.cpp`](../src/tree_detector.cpp) (~L159–181).
+[`src/tree_detector.cpp`](../src/tree_detector.cpp), now `fitCrossSection` +
+the trunk-axis block of `fitAndScore`.
 
 **Scenario.** A trunk seen from one side only — the *normal* state before the
 vantage circle fills the far side; the occluded half of the trunk shell has no
 voxels.
 
-**Current behaviour.** The centre is the per-component median of the observed
+**Old behaviour.** The centre was the per-component median of the observed
 trunk voxels' XY. With a one-sided arc the whole distribution lies on the seen
-shell, so the median sits on that arc — biased toward the sensor by roughly
-the shell offset (~0.1–0.25 m for typical trunk radii) — and the radius
-(median distance to that centre) is correspondingly underestimated. The code
-comment claims the median is "immune to … a one-sided observation": it
-overclaims — a median resists *outliers*, not one-sided *sampling*.
+shell, so the median sat on that arc — biased toward the sensor by roughly
+the shell offset — and the radius (median distance to that centre) was
+correspondingly underestimated. The code comment claimed the median was
+"immune to … a one-sided observation": it overclaimed — a median resists
+*outliers*, not one-sided *sampling*.
 
-**Why it is acceptable today.**
+**The consequence this entry originally missed.** The bias was assessed only
+against vantage-ring placement, where it was indeed harmless. But the same
+centre is the origin for the **azimuth binning that produces
+`angular_coverage`** — the 60%-weighted primary term of `info_deficit`. A
+centre that follows the observed voxels sits *inside* the observed shell, so
+those voxels fan out around it through every sector and coverage reads ~1.0 for
+a trunk seen from one side. The metric went blind exactly when a tree most
+needed circling.
 
-- The bias is well inside `vantage_visited_tol_m` (0.75 m) and tiny against
-  `vantage_standoff_m` (2.0 m), so the vantage ring it seeds is functionally
-  the same ring.
-- The ring exists precisely to observe the far side; later scans re-estimate
-  the centre from fuller coverage.
+On a 300 s replay of the `map-test-2` bag this pinned 13 of 17 real trunks at
+`coverage = 1.00` (the rest at 0.88). Since `deficit = 0.60·(1−cov) +
+0.25·ent + 0.15·(1−vert)` and `vertical_completeness` is itself structurally
+pinned at 1.00, the reachable deficit ceiling was `0.25·ent ≤ 0.25` — below
+the 0.35 `deficit_thresh`. **No properly-observed tree could ever be
+nominated**, so the exploitation loop could not start. Raising
+`n_azimuth_bins` to 16 did not help: coverage still tracked trunk voxel *count*
+(0.69 at 112 voxels rising to 1.00 at 658) rather than viewing geometry.
 
-**Cost.** A slightly off-centre first vantage ring; a comment that promises
-more robustness than the estimator delivers.
+**Fix (applied).** Two changes, both validated on the bag:
 
-**Possible fix.** Replace the medians with a proper circle fit (Taubin/Pratt)
-on the trunk-band XY — but that is an algorithm change that needs
-re-validation on recorded bags, not a patch.
+1. `fitCrossSection` fits a circle (Taubin) to the trunk residuals instead of
+   taking a median. Each z-layer is de-referenced by its own median before the
+   layers are pooled, so axis tilt or bend cancels. Taubin specifically, not
+   Kåsa: on a 120° test arc Kåsa put the centre 0.28 m off and the radius at
+   0.30 m for a true 0.40 m, because Kåsa is badly biased on partial arcs —
+   the only regime that matters here. Degenerate sets (flat wall patches, arcs
+   too short to constrain a circle) fall back to the old median estimator and
+   are flagged `axis_fitted = false`.
+2. Voxels within `0.35·radius` of the axis are excluded from azimuth binning:
+   near the axis a few centimetres of noise swings the azimuth through a
+   half-turn, lighting an arbitrary sector.
 
-## 7. A non-finite `p_occ` would poison the detection sort
+Regression coverage: `TreeDetector.OneSidedThickTrunkIsUnderInformed` and
+`CircledThickTrunkIsNotUnderInformed`. Note the pre-existing thin-shell tests
+(`OneSidedTrunkIsUnderInformed`) passed throughout the broken period — with a
+one-voxel-thick arc even a biased centre leaves the azimuths clustered. The bug
+only appears once the surface has realistic thickness and noise, which is why
+the new tests build the trunk that way.
+
+**Residual limitation.** The fit reduces the 120° test arc from 1.00 to 0.50,
+not to the ideal 0.33. Fitting a circle to a partial arc whose radial noise is
+a sizeable fraction of its radius (a 0.4 m trunk on a 0.2 m grid — the real
+regime) still biases the centre slightly toward the arc. Map-geometry coverage
+is therefore a *proxy* and always will be; the node's `use_bearing_coverage`
+(default on) measures viewing geometry directly from the robot bearings a trunk
+has been observed from and should be preferred whenever TF supplies a pose. On
+the post-fix `map-test-2` map the proxy still reads 1.00 on 9 of the 16 detected
+trunks — better than the pre-fix 13 of 17, and no longer *unconditionally*
+saturated, but not a signal to gate on.
+
+## 7. A non-finite `p_occ` would poison the detection sort (FIXED)
 
 **Where:** `normEntropy` and the deficit sort in
-[`src/tree_detector.cpp`](../src/tree_detector.cpp) (~L48–52, ~L247–254).
+[`src/tree_detector.cpp`](../src/tree_detector.cpp).
 
-**Scenario.** The fused map delivers `p_occ = NaN` for a voxel (an upstream
-producer bug — no known occurrence).
+**Scenario.** A producer delivers `p_occ = NaN` for a voxel (an upstream bug —
+no known occurrence).
 
-**Current behaviour.** `normEntropy` clamps `p` off the {0, 1} rails, so the
-log-of-zero path is closed — but `std::min`/`std::max` do not sanitise NaN, so
-a NaN input passes through, poisons `mean_entropy` → `info_deficit`, and (a)
-the NaN deficit compares false against `deficit_thresh`, so the tree silently
-reads *well-observed* and is never targeted, and (b) the `std::sort` comparator
-on `info_deficit` violates strict weak ordering — formally undefined behaviour.
+**Behaviour before the fix.** `normEntropy` clamped `p` off the {0, 1} rails, so
+the log-of-zero path was closed — but `std::min`/`std::max` do not sanitise NaN,
+so a NaN input passed through, poisoned `mean_entropy` → `info_deficit`, and
+(a) the NaN deficit compares false against `deficit_thresh`, so the tree
+silently read *well-observed* and was never targeted, and (b) the `std::sort`
+comparator on `info_deficit` violated strict weak ordering — formally undefined
+behaviour. Note the occupancy gates (`p_occ < occ_thresh`) do **not** filter it
+out: that comparison is false for NaN, so a poisoned voxel is *kept*.
 
-**Why it is acceptable today.**
+**Fix (applied).** `normEntropy` now returns 1.0 for any non-finite input —
+an undecidable voxel reads maximally uncertain, which is the conservative
+direction (it raises the deficit rather than hiding the tree). That is the only
+NaN inlet into the score: `coverage` and `vertical` are ratios of counts, and
+`infoDeficit` already guards a zero weight sum. Covered by
+`TreeDetector.NonFinitePOccDoesNotPoisonTheScore`.
 
-- It is contingent on scovox emitting a non-finite probability, which has not
-  been observed; the realistic bad inputs (exact 0/1) are already clamped.
+**Residual.** Defence in depth only, at the library boundary. The ROS node's
+`buildInput` ([`src/tree_detector_node.cpp`](../src/tree_detector_node.cpp))
+already computes `p = (N > 0) ? a_occ / N : 0.5`, and `N` is NaN whenever either
+Beta count is, so the live path substitutes 0.5 (below `occ_thresh`, hence
+dropped) before the detector sees it. The guard matters for any other caller of
+the pure library, which constructs `SemVoxel` directly.
 
-**Cost.** None observed; a theoretical UB path guarded only by upstream
-correctness.
+## 8. `vertical_completeness` cannot fall below 1.0 for a real trunk
 
-**Possible fix.** One line in `normEntropy`:
-`if (!std::isfinite(p)) return 1.0f;` (treat an undecidable voxel as maximally
-uncertain), or drop non-finite voxels at ingest in `buildInput`.
+**Where:** the vertical-completeness block of `fitAndScore` in
+[`src/tree_detector.cpp`](../src/tree_detector.cpp).
+
+**Scenario.** Any detected tree, in either mode.
+
+**Current behaviour.** The metric bins `members` into `n_height_bins` over
+`[base_z, top_z]` and reports the filled fraction. But `base_z` and `top_z` are
+*defined* as the min and max z of `members`, so:
+
+- the first and last bins are always occupied, by construction; and
+- the span is normalised by its own extent, so the metric is scale-free — a
+  1.5 m sapling and a 12 m tree are scored identically.
+
+It can therefore only ever drop below 1.0 on an *interior* gap of at least
+`1/n_height_bins` of the observed height containing no voxels at all, which a
+continuous trunk never has. It read exactly **1.00 on all 17 trunks** of the
+`map-test-2` bag. The name promises an occlusion signal; the computation
+delivers an interior-hole detector.
+
+Weighted at `w_vertical: 0.15` this was not merely useless but harmful: because
+the weights are auto-normalised, a term stuck at its "fully informed" value
+consumed 15% of the deficit range and lowered the ceiling every other term had
+to reach.
+
+**Mitigation (applied).** `w_vertical` now defaults to `0.0` (and `w_coverage`
+to `0.75`), so the dead term no longer compresses the score. The field is still
+computed and reported, because an interior hole *is* worth seeing in the logs —
+it just is not vertical completeness.
+
+**Not fixed.** The metric is still misnamed for what it computes. A real
+vertical-completeness signal needs an external reference for expected extent
+(e.g. bins over `[terrain, terrain + expected_tree_height]`, so a trunk whose
+canopy was never observed reads short) rather than the cluster's own bounds.
+That conflates "short tree" with "occluded tree" unless the reference is
+per-species or learned, which is why it was left alone rather than guessed at.
+
+## 9. Under bearing coverage the emission gate barely discriminates (mitigated by the settle wait)
+
+**Where:** `EmitGate` / `stepEmitGate` in
+[`src/tree_detector.cpp`](../src/tree_detector.cpp), driven from the `scan()`
+verdict + emit path in
+[`src/tree_detector_node.cpp`](../src/tree_detector_node.cpp), with
+`use_bearing_coverage: true` (the default).
+
+**Scenario.** Any run. Surfaced while validating the §6 fix.
+
+**Old behaviour.** A track's `bearing_mask` starts empty and only accumulates
+from the scan that created the track onward. A tree therefore had **no** bearing
+history at its first confirmed detection, so `angular_coverage` read
+1/`n_azimuth_bins` (0.12 at the default 8), `info_deficit` landed around
+0.72–0.86 against a 0.35 threshold, and the tree was emitted immediately.
+Combined with emit-once the practical contract became *"every detected tree is
+nominated exactly once, on sight"* — the header describes a gate that separates
+under-observed trees from adequately-observed ones, and there was nothing for it
+to separate, because a robot cannot have circled a tree the detector had not yet
+found. `deficit_thresh` was decorative and `info_deficit` degraded from a gate
+to a priority score (the detection sort still uses it, so the neediest tree is
+offered first either way).
+
+**Mitigation (applied).** Emission now additionally waits until the tree's
+bearing history has gained no new sector for `bearing_settle_ticks` scans
+(default 3, i.e. 6 s at the default 2 s cadence) — "we have finished passing
+this tree; is it *still* under-covered?". A tree the robot walks around fills
+enough sectors to stop reading under-informed and closes itself silently. The
+wait is skipped when no pose is available (nothing to settle) and can be
+disabled with `bearing_settle_ticks: 0`.
+
+On a clean 300 s `map-test-2` replay this changed the shape of the output:
+
+| measure | before (`settle_ticks: 0`) | after (`settle_ticks: 3`) |
+| --- | --- | --- |
+| emissions | all in one scan, 0.03 s apart | 24, spread over 526 s of the run |
+| trees reading adequately covered | 0 | 4 of 17 at the final scan |
+| emitted with >1 bearing sector | 0 | 3 of 24 |
+
+**Not fixed — most trees still fire on a single sector.** 21 of those 24
+emissions still carried `cov = 0.12`. The settle counter measures elapsed scans,
+not viewing progress, and bearing rate falls off with range: a trunk 20 m away
+sweeps well under one 45° sector in 6 s, so it settles and fires long before the
+robot gets near it. The wait therefore only bites for trees the robot is
+actively walking past — which is exactly the population it was aimed at, but it
+means the gate is still permissive for everything else.
+
+**Why that is acceptable today.**
+
+- Nominating a trunk once is a defensible exploitation policy — the planner's
+  queue, `target_dedup_radius_m` and the team quota decide what is worth driving
+  to. The gate is a filter, not an admission control.
+- It is a strict improvement on the pre-§6 behaviour, where the gate admitted
+  *no* real tree at all and the loop could not start.
+- Emit-once bounds the cost: 24 targets over a 300 s replay, not 24 per scan.
+
+**Cost.** Trees the robot has already observed adequately from a distance still
+consume a queue slot and a vantage ring; and every target now costs
+`bearing_settle_ticks` scans of latency.
+
+**Possible fix.** Settle on *observation progress* rather than elapsed scans:
+also reset the counter when the trunk's voxel count grows by more than a few
+percent, so a tree the robot is still approaching (bearing static, map still
+filling) does not count as finished. That closes the range-dependent hole above
+with one extra knob. The general fix — seeding the mask from observation history
+instead of track history — needs scovox to carry a per-voxel first-observation
+bearing, which is an upstream map-format change.
