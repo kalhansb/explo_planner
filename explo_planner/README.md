@@ -227,7 +227,7 @@ ros2 launch explo_planner exploitation_experiment.launch.py \
 
 For a full two-robot field trial — bring-up order, per-robot configuration,
 what to watch, panic stops and data offload — see
-[`../field_trial_manual.md`](../field_trial_manual.md). It spans the localiser,
+[`../docs/user_manual.md`](../docs/user_manual.md). It spans the localiser,
 mapping, nav and planner, so it sits at the repository root rather than in this
 package. The build and launch essentials are below.
 

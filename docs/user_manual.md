@@ -1,4 +1,4 @@
-# Two-robot field trial — operating manual
+# explo_planner — two-robot field trial user manual
 
 How to run a **two-robot coupled exploration/exploitation trial** on real
 hardware: what each robot runs, the order it comes up in, what a healthy run
@@ -183,7 +183,7 @@ feature inert.
 
 ## 5. Per-robot configuration
 
-All tuning lives in [`exploration_params.yaml`](explo_planner/config/exploration_params.yaml),
+All tuning lives in [`exploration_params.yaml`](../explo_planner/config/exploration_params.yaml),
 which ships **field defaults** (`use_sim_time: false`, `done_action: idle`,
 `terrain_relative_z: true`, `coordination_enabled: true`). Both robots load
 that file unchanged, plus a small **per-robot overlay** for the handful of
@@ -220,7 +220,7 @@ the same base + overlay idiom SCovox uses:
 | Setting | Why |
 |---------|-----|
 | SCovox base config (`num_classes`, Dirichlet prior) | The merger pins the map prior from the first stream and **drops** any source whose prior differs (`prior mismatch … dropping frame`). |
-| `n_vantages`, `vantage_start_angle_deg` | Team dwell credit is exchanged as ring **indices**. A mismatch silently credits the wrong bearings and can close a trunk on an angle nobody captured ([limitations.md](explo_planner/doc/limitations.md) §3). |
+| `n_vantages`, `vantage_start_angle_deg` | Team dwell credit is exchanged as ring **indices**. A mismatch silently credits the wrong bearings and can close a trunk on an angle nobody captured ([limitations.md](../explo_planner/doc/limitations.md) §3). |
 | `coord_intent_topic` (`/exploration/intents`) | Shared, root namespace. |
 | DScovox `input_topics` | Must list **both** robots' bin topics, on **both** robots. |
 | `roi_min/max_x/y`, `roi` preset | Coverage-done is measured over this box; different boxes mean the pair cannot agree on when exploration is finished. |
@@ -438,7 +438,7 @@ Classify afterwards: **resumable** (brief single-robot hiccup, map intact) or
 ## 10. Troubleshooting
 
 Almost every "no map" report is one of SCovox's **three gates** on the delta
-stream — see the [SCovox user manual](../scovox/docs/user_manual.md) §8.
+stream — see the [SCovox user manual](../../scovox/docs/user_manual.md) §8.
 The two-robot and planner-specific failures:
 
 | Symptom | Cause → fix |
@@ -486,9 +486,9 @@ the shakedown bag before spending a battery on a measured run.
 | Doc | Use it for |
 |-----|-----------|
 | `doc/experiment_script_forest_inspection.md` (hmr_explo workspace) | Campaign design: AO, sub-areas, targets, run matrix, metrics. |
-| [explo_planner README](explo_planner/README.md) | Planner internals: EIG scoring, MinPos, rendezvous, vantage selection. |
-| [`exploration_params.yaml`](explo_planner/config/exploration_params.yaml) | Every parameter, heavily commented with the reasoning behind each field default. |
-| [SCovox user manual](../scovox/docs/user_manual.md) | Mapping and fusion: bring-up, the three delta-stream gates, bandwidth tuning. |
-| [dscovox_exploration_run.md](explo_planner/doc/dscovox_exploration_run.md) | Bag-replay dry run of the exploration half. |
-| [dscovox_exploitation_run.md](explo_planner/doc/dscovox_exploitation_run.md) | Bag-replay dry run of the vantage ring and target queue, plus the live tree detector. |
-| [limitations.md](explo_planner/doc/limitations.md) | Known rough edges — read §3 before changing any vantage parameter on one robot only. |
+| [explo_planner README](../explo_planner/README.md) | Planner internals: EIG scoring, MinPos, rendezvous, vantage selection. |
+| [`exploration_params.yaml`](../explo_planner/config/exploration_params.yaml) | Every parameter, heavily commented with the reasoning behind each field default. |
+| [SCovox user manual](../../scovox/docs/user_manual.md) | Mapping and fusion: bring-up, the three delta-stream gates, bandwidth tuning. |
+| [dscovox_exploration_run.md](../explo_planner/doc/dscovox_exploration_run.md) | Bag-replay dry run of the exploration half. |
+| [dscovox_exploitation_run.md](../explo_planner/doc/dscovox_exploitation_run.md) | Bag-replay dry run of the vantage ring and target queue, plus the live tree detector. |
+| [limitations.md](../explo_planner/doc/limitations.md) | Known rough edges — read §3 before changing any vantage parameter on one robot only. |

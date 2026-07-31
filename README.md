@@ -18,14 +18,14 @@ a rendezvous anchor when comms drop.
 |------|------------|
 | [`explo_planner/`](explo_planner/) | The planner package — nodes, config, launch files, tests. Start at its [README](explo_planner/README.md). |
 | [`explo_planner_msgs/`](explo_planner_msgs/) | `TreeTarget` and `RobotIntent` message definitions. |
-| [`field_trial_manual.md`](field_trial_manual.md) | **Two-robot field trial operating manual** — bring-up order, per-robot configuration, what to watch, panic stops, data offload. |
+| [`docs/`](docs/) | The **[user manual](docs/user_manual.md)** — two-robot field trial: bring-up order, per-robot configuration, what to watch, panic stops, data offload. |
 
 ## Documentation
 
 | I want to… | Read |
 |------------|------|
 | Understand how the planner works | [explo_planner/README.md](explo_planner/README.md) |
-| Run a two-robot trial on real hardware | [field_trial_manual.md](field_trial_manual.md) |
+| Run a two-robot trial on real hardware | [docs/user_manual.md](docs/user_manual.md) |
 | Dry-run exploration off a bag first | [explo_planner/doc/dscovox_exploration_run.md](explo_planner/doc/dscovox_exploration_run.md) |
 | Dry-run the vantage ring and target queue | [explo_planner/doc/dscovox_exploitation_run.md](explo_planner/doc/dscovox_exploitation_run.md) |
 | Tune anything | [explo_planner/config/exploration_params.yaml](explo_planner/config/exploration_params.yaml) — every parameter, commented with the reasoning behind each field default |
