@@ -183,8 +183,9 @@ feature inert.
 
 ## 5. Per-robot configuration
 
-All tuning lives in [`exploration_params.yaml`](../explo_planner/config/exploration_params.yaml),
-which ships **field defaults** (`use_sim_time: false`, `done_action: idle`,
+All tuning lives in [`shared_params.yaml`](../explo_planner/config/shared_params.yaml)
+— the parameter file shared by every launch and both robots — which ships
+**field defaults** (`use_sim_time: false`, `done_action: idle`,
 `terrain_relative_z: true`, `coordination_enabled: true`). Both robots load
 that file unchanged, plus a small **per-robot overlay** for the handful of
 values that must differ.
@@ -224,7 +225,7 @@ the same base + overlay idiom SCovox uses:
 | `n_vantages`, `vantage_start_angle_deg` | Team dwell credit is exchanged as ring **indices**. A mismatch silently credits the wrong bearings and can close a trunk on an angle nobody captured ([limitations.md](../explo_planner/doc/limitations.md) §3). |
 | `coord_intent_topic` (`/exploration/intents`) | Shared, root namespace. |
 | DScovox `input_topics` | Must list **both** robots' bin topics, on **both** robots. |
-| `roi_min/max_x/y`, `roi` preset | Coverage-done is measured over this box; different boxes mean the pair cannot agree on when exploration is finished. |
+| `roi_min/max_x/y` | Coverage-done is measured over this box; different boxes mean the pair cannot agree on when exploration is finished. |
 
 ### Check these against the platform
 
@@ -233,7 +234,7 @@ the same base + overlay idiom SCovox uses:
 | `base_frame` | `""` → `<robot_name>/base_link` | If the localiser publishes a bare `base_link`, set it explicitly or every TF lookup fails. |
 | `goal_xy_tolerance` / `goal_yaw_tolerance` | `0.4` / `0.4` | Must be strictly **looser** than Nav2's goal checker (shipped default 0.25/0.25). If tighter, Nav2 stops inside its own tolerance but outside the planner's, arrival is never registered, and the planner blacklists a goal the robot is standing on. The node warns at startup. |
 | `goal_republish_sec` | `5.0` | Nav2 turns every `goal_pose` into a fresh `NavigateToPose` goal; an unthrottled re-send fires `GoalUpdated` continuously, which halts the recovery subtree while still burning its retries — transient failures become aborts. Set `0` for publish-on-change once bringup is known reliable. |
-| `roi` preset | `full` | Pass `roi:=phase1` when only part of the AO is worked. The full box wastes candidates and leaves the coverage floor high enough that `done_unknown_fraction: 0.05` may never be satisfiable — the run then ends on battery instead of on coverage. |
+| `roi_min/max_x/y` | full-AO box | Tighten to the phase-1 box (commented next to these values in the yaml) when only part of the AO is worked. The full box wastes candidates and leaves the coverage floor high enough that `done_unknown_fraction: 0.05` may never be satisfiable — the run then ends on battery instead of on coverage. |
 | Z-band | planner `roi_min/max_z` = `-5.5 … +4.0`, **robot-relative** | With `terrain_relative_z: true` this band rides with the robot. The SCovox/DScovox `share_roi_z_min/max` filters are **absolute** and must be a **superset** of everywhere that window can sit. Otherwise free voxels near the edge never reach the fused map and read as unknown — starved candidates and phantom frontiers at the boundary. |
 | `done_unknown_fraction` | `0.05` × 3 steps | **Calibrate at the shakedown run.** Watch where the logged `source=scovox` fraction plateaus and set the threshold above that floor. |
 | `candidate_enable_polar` | `true` | Check at shakedown whether selected goals sit far apart or bunch near the robot. The 96-sample polar ring can outscore frontier goals and burn battery on short hops; if so run frontier-only for the timed runs. |
@@ -283,14 +284,14 @@ cells painted lethal.
 **7. T0 — the planners.** One per robot, on that robot's own PC:
 ```bash
 ros2 run explo_planner explo_planner_node --ros-args \
-    --params-file /tmp/explo_ws/install/explo_planner/share/explo_planner/config/exploration_params.yaml \
+    --params-file /tmp/explo_ws/install/explo_planner/share/explo_planner/config/shared_params.yaml \
     --params-file /field/field_bunker.yaml
 ```
 The launch-file form is convenient when no overlay is needed, but it cannot
 pass the per-robot settings in §5:
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
-    robot:=bunker roi:=phase1 output_csv:=/tmp/RA-1_bunker.csv
+    robot:=bunker output_csv:=/tmp/RA-1_bunker.csv
 ```
 
 > `multi_robot_exploration.launch.py` starts **both** planners on one host. That
@@ -454,7 +455,7 @@ The two-robot and planner-specific failures:
 | One robot finishes and stops while the other explores | `rendezvous_expected_peers` still `0`. It must be 1 on a hand-launched two-robot run. |
 | Goal blacklisted at the robot's own position | `goal_xy_tolerance`/`goal_yaw_tolerance` are tighter than Nav2's goal checker. Loosen them past Nav2's values. |
 | Transient nav failures become hard aborts | `goal_republish_sec` too low — the keep-alive is preempting Nav2's recovery subtree. |
-| Coverage-done never fires | Unreachable columns inside the ROI box put a permanent floor under the unknown fraction. Use `roi:=phase1`, or calibrate `done_unknown_fraction` above the measured floor. |
+| Coverage-done never fires | Unreachable columns inside the ROI box put a permanent floor under the unknown fraction. Tighten `roi_min/max_x/y` to the phase-1 box (commented in the yaml), or calibrate `done_unknown_fraction` above the measured floor. |
 | Target activates, no vantage ever appears | All three rejected on line-of-sight. Check the target's radius against the taped DBH, and that `vantage_start_angle_deg: 30` still suits the row geometry — a 0° start puts the first vantage straight down a plantation row and the other two land in neighbouring canopy. |
 | Trunk closes `PARTIAL` repeatedly | Vantages are being reached and blacklisted without dwelling. Check the arrival gate (row above) before suspecting the vantage geometry. |
 
@@ -488,7 +489,7 @@ the shakedown bag before spending a battery on a measured run.
 |-----|-----------|
 | `doc/experiment_script_forest_inspection.md` (hmr_explo workspace) | Campaign design: AO, sub-areas, targets, run matrix, metrics. |
 | [explo_planner README](../explo_planner/README.md) | Planner internals: EIG scoring, MinPos, rendezvous, vantage selection. |
-| [`exploration_params.yaml`](../explo_planner/config/exploration_params.yaml) | Every parameter, heavily commented with the reasoning behind each field default. |
+| [`shared_params.yaml`](../explo_planner/config/shared_params.yaml) | The shared parameter file: every parameter, heavily commented with the reasoning behind each field default. |
 | [SCovox user manual](../../scovox/docs/user_manual.md) | Mapping and fusion: bring-up, the three delta-stream gates, bandwidth tuning. |
 | [dscovox_exploration_run.md](../explo_planner/doc/dscovox_exploration_run.md) | Bag-replay dry run of the exploration half. |
 | [dscovox_exploitation_run.md](../explo_planner/doc/dscovox_exploitation_run.md) | Bag-replay dry run of the vantage ring and target queue, plus the live tree detector. |

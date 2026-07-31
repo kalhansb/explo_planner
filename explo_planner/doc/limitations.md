@@ -53,7 +53,7 @@ fallback for the genuine "no vantage reachable/mapped yet" case
 **Where:** `coverageUnknownFraction` and the `coverage_done_streak_` accumulation
 in [`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp) (~L1146); config
 key `done_coverage_source` in
-[`config/exploration_params.yaml`](../config/exploration_params.yaml).
+[`config/shared_params.yaml`](../config/shared_params.yaml).
 
 **Scenario.** Coverage-based termination fires once the ROI unknown fraction
 stays below `done_unknown_fraction` for `done_min_consecutive_steps` PLAN cycles
@@ -115,7 +115,7 @@ wrong bearings and could declare a trunk complete with an angle no one captured.
 
 **Why it is acceptable today.**
 
-- Every robot loads the same `exploration_params.yaml`, so `n_vantages` and
+- Every robot loads the same `shared_params.yaml`, so `n_vantages` and
   `vantage_start_angle_deg` are identical fleet-wide and the index→bearing
   mapping agrees. The quota union is correct.
 - The mapping is robust to the differences that *do* vary at runtime: per-robot

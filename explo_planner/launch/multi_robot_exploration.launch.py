@@ -1,8 +1,11 @@
 """Launch one explo_planner_node per robot for an Exp 7 trial.
 
 Thin wrapper around exploration_experiment.launch.py: declares the robot
-team, picks the planner, and stamps coordination on. Does NOT launch
-Gazebo, robots, scovox_node, or dscovox_node -- those come from
+team, picks the planner, and stamps coordination on. Every planner loads
+config/shared_params.yaml (the parameters shared by every launch); the
+arguments declared below are passed on top of it — their defaults here are
+the source of truth for those per-run values. Does NOT launch Gazebo,
+robots, scovox_node, or dscovox_node -- those come from
 single_robot_sim.launch.py + per-robot simple_nav_3d.launch.py invocations
 (the per-robot dscovox_node lives inside simple_nav_3d's mapping=="dscovox"
 block already; the only change there is wiring the peers list, see
@@ -13,7 +16,6 @@ default /<robot>/dscovox_node/scovox -- there is no central merger.
 """
 
 import os
-import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -21,13 +23,10 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-sys.path.insert(0, os.path.dirname(__file__))
-from roi_presets import ROI_PRESET_HELP, roi_overrides  # noqa: E402
-
 
 def launch_setup(context):
     pkg_dir = get_package_share_directory("explo_planner")
-    params_yaml = os.path.join(pkg_dir, "config", "exploration_params.yaml")
+    shared_params = os.path.join(pkg_dir, "config", "shared_params.yaml")
 
     robots_raw = LaunchConfiguration("robots").perform(context)
     robots = [r.strip() for r in robots_raw.split(",") if r.strip()]
@@ -45,8 +44,6 @@ def launch_setup(context):
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
     proximity_stop_enabled = LaunchConfiguration("proximity_stop_enabled").perform(context)
-    # {} for the default 'full' box, so exploration_params.yaml is authoritative.
-    roi = roi_overrides(LaunchConfiguration("roi").perform(context))
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -68,7 +65,7 @@ def launch_setup(context):
             name="explo_planner",
             output="screen",
             parameters=[
-                params_yaml,
+                shared_params,
                 {
                     "use_sim_time": use_sim_time,
                     "robot_name": robot,
@@ -98,8 +95,6 @@ def launch_setup(context):
                     # proximity_peer_pose_topics in the yaml.
                     "proximity_stop_enabled":
                         proximity_stop_enabled.lower() in ("true", "1", "yes", "on"),
-                    # Empty for roi:=full, so the yaml box stands.
-                    **roi,
                 },
             ],
         ))
@@ -128,8 +123,6 @@ def generate_launch_description():
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
-        DeclareLaunchArgument("roi", default_value="full",
-                              description=ROI_PRESET_HELP),
         DeclareLaunchArgument("rendezvous_enabled", default_value="true",
                               description="Return to the last-connected anchor and "
                                           "wait for the whole team when exploration "

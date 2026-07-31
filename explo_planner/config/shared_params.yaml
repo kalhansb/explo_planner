@@ -1,3 +1,11 @@
+# SHARED PARAMETERS — the one parameter file loaded by all three launch files
+# (exploration_experiment, exploitation_experiment, multi_robot_exploration)
+# and by hand-run `ros2 run ... --params-file` invocations. Everything the
+# planner nodes share lives here; the launch files are the source of truth for
+# the per-run values they declare as arguments (robot, use_sim_time, max_steps,
+# output_csv, ...) — those launch defaults are passed on top of this file and
+# win over the same keys below.
+#
 # Namespace wildcard. A bare `explo_planner:` key only matches a node whose
 # FULLY-QUALIFIED name is `/explo_planner`, i.e. one launched at the root
 # namespace. multi_robot_exploration.launch.py launches with namespace=<robot>,
@@ -188,8 +196,9 @@
     # calibrate done_unknown_fraction above that floor at RS (open item 5).
     #
     # Phase 1 (SA-1 + SA-2, u in [-40, 60]) has a tighter bounding box —
-    # x [-51.4, 64.6], y [-38.7, 57.7] — use it to cut wasted candidates and
-    # lower the coverage floor if phase 2 is not run the same day.
+    # x [-51.4, 64.6], y [-38.7, 57.7] — set the four roi_* values below to
+    # that box to cut wasted candidates and lower the coverage floor if
+    # phase 2 is not run the same day.
     roi_min_x: -51.3
     roi_max_x: 100.9
     roi_min_y: -38.7

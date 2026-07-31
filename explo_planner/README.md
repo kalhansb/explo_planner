@@ -256,8 +256,8 @@ docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/i
   && ros2 launch explo_planner exploration_experiment.launch.py robot:=atlas'
 ```
 
-All tuning lives in [`config/exploration_params.yaml`](config/exploration_params.yaml)
-(loaded by every launch file). It now ships **field defaults**: `use_sim_time:
+All tuning lives in [`config/shared_params.yaml`](config/shared_params.yaml)
+(the shared parameter file, loaded by every launch file). It now ships **field defaults**: `use_sim_time:
 false`, `done_action: idle`, `terrain_relative_z: true`, `coordination_enabled:
 true`, and the forest-AO ROI. Sim and bag runs must pass `use_sim_time:=true`
 (every launch file declares the argument, and it overrides the yaml) — with
@@ -294,7 +294,7 @@ Two settings must be matched to the navigator on each platform:
 
 ## Configuration
 
-All parameters live in [`config/exploration_params.yaml`](config/exploration_params.yaml),
+All parameters live in [`config/shared_params.yaml`](config/shared_params.yaml),
 which is heavily commented. Common overrides:
 
 - `use_planning_map` — enable the 2D `planning_map` (free/occupied filter +
@@ -304,9 +304,9 @@ which is heavily commented. Common overrides:
   measure is taken over, so unreachable columns inside it put a permanent floor
   under `done_unknown_fraction`. Only needs keeping in sync with the
   `planning_map` when `use_planning_map` is on — it is off by default, and the
-  dscovox merger publishes no `planning_map`. All three launch files take
-  `roi:=full|phase1` to swap in the tighter phase-1 AO box
-  ([`launch/roi_presets.py`](launch/roi_presets.py)).
+  dscovox merger publishes no `planning_map`. The tighter phase-1 AO box is
+  commented next to these values in the yaml — set it there when phase 2 is
+  not run the same day.
 - `roi_min/max_z` — vertical band, **robot-relative** when
   `terrain_relative_z` is on. It must stay wide enough to contain the whole
   ground-search window plus the re-band hysteresis; the node warns at startup

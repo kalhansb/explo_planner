@@ -28,7 +28,7 @@ a rendezvous anchor when comms drop.
 | Run a two-robot trial on real hardware | [docs/user_manual.md](docs/user_manual.md) |
 | Dry-run exploration off a bag first | [explo_planner/doc/dscovox_exploration_run.md](explo_planner/doc/dscovox_exploration_run.md) |
 | Dry-run the vantage ring and target queue | [explo_planner/doc/dscovox_exploitation_run.md](explo_planner/doc/dscovox_exploitation_run.md) |
-| Tune anything | [explo_planner/config/exploration_params.yaml](explo_planner/config/exploration_params.yaml) — every parameter, commented with the reasoning behind each field default |
+| Tune anything | [explo_planner/config/shared_params.yaml](explo_planner/config/shared_params.yaml) — the shared parameter file: every parameter, commented with the reasoning behind each field default |
 | Understand why something behaves oddly | [explo_planner/doc/limitations.md](explo_planner/doc/limitations.md) |
 
 The field-trial **campaign design** — area of operations, run matrix, target

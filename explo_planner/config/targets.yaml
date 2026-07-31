@@ -7,7 +7,7 @@
 # Stand-in for a future tree detector, which would publish the same TreeTarget
 # message on the same topic instead.
 #
-# Keep centres inside the planner ROI (roi_*_x/y in exploration_params.yaml) and
+# Keep centres inside the planner ROI (roi_*_x/y in shared_params.yaml) and
 # in the planner's map_frame. radius <= 0 => use the default standoff only.
 target_scheduler:
   ros__parameters:
