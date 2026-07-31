@@ -225,6 +225,11 @@ ros2 launch explo_planner exploitation_experiment.launch.py \
 
 ### Real-robot trials (Docker)
 
+For a full two-robot field trial — bring-up order, per-robot configuration,
+what to watch, panic stops and data offload — see
+[doc/field_trial_manual.md](doc/field_trial_manual.md). The build and launch
+essentials are below.
+
 The planner has no container of its own — build and run it in an overlay
 workspace inside the running `scovox` container (image `scovox:jazzy`, the
 sibling repo's `compose.yaml`; it provides ROS 2 Jazzy plus the
