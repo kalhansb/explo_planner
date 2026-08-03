@@ -52,6 +52,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
+#include <scovox_msgs/msg/refinement_region.hpp>
 #include <explo_planner_msgs/msg/robot_intent.hpp>
 #include <explo_planner_msgs/msg/tree_target.hpp>
 #include <tf2/utils.h>
@@ -163,6 +164,13 @@ private:
   void doExploitPlan();
   void doExploitDwell();
   void finishActiveTarget(bool success);
+  // Fine-TSDF region relay: register (remove=false) / unregister (remove=true)
+  // target `id` as a refinement cylinder on this robot's scovox_node.
+  void publishRefinementRegion(uint32_t id, const Eigen::Vector3f& center,
+                               float radius, bool remove);
+  // Terminal cleanup: unregister every region whose target never reached
+  // DONE (finishActiveTarget already removed the DONE ones).
+  void removeLiveRefinementRegions();
   bool inRoi(const Eigen::Vector3f& pos) const;
   // Nearest reachable, free, in-ROI point on the line from the robot toward
   // `center` (marched from just outside the trunk outward). Lets the planner
@@ -379,6 +387,19 @@ private:
   // up after the FIRST failed hop with no retry. 300 = one worst-case failed
   // hop (180) + 120 to re-select and reach another angle.
   double exploit_target_timeout_sec_ = 300.0;
+  // Fine-TSDF region relay. When true, every ingested TreeTarget is registered
+  // as a RefinementRegion on this robot's scovox_node the moment it arrives
+  // (target release == exploitation-phase start) and unregistered when
+  // finishActiveTarget closes it — so fine grids exist only while a tree is
+  // under exploitation. Removal keeps already-fused fine voxels (the region
+  // gate is integration-time policy, not storage); a scovox_node running with
+  // fine_ratio_log2 = 0 ignores the messages, so this is safe to leave on.
+  bool   publish_refinement_regions_ = true;
+  // Radius forwarded to the scovox gate. TreeTarget.radius is the vantage
+  // standoff radius (root flare — 1.8 m in the exploit schedules), far wider
+  // than the breast-height trunk the fine slab measures, so the relay
+  // substitutes this trunk-scale radius. <= 0 forwards TreeTarget.radius.
+  double fine_region_radius_m_       = 0.5;
 
   // --- Components ---
   std::unique_ptr<MapCache> map_cache_;
@@ -529,6 +550,11 @@ private:
   // Shared tree-target topic. The time-based scheduler publishes here today; a
   // detector can publish the same message later with no planner change.
   rclcpp::Subscription<explo_planner_msgs::msg::TreeTarget>::SharedPtr target_sub_;
+  // Fine-TSDF region relay to this robot's own scovox_node (topic built
+  // absolute from robot_name_ — this node is not namespaced by the packaged
+  // launch files). Null unless exploitation and publish_refinement_regions
+  // are both enabled.
+  rclcpp::Publisher<scovox_msgs::msg::RefinementRegion>::SharedPtr region_pub_;
   // Proximity guard inputs + actuation. The pose subs are the peers'
   // localiser outputs (map frame, ~10 Hz) — much fresher than the 1 Hz intent
   // heartbeat that also feeds the guard. The action client exists ONLY to
@@ -855,6 +881,20 @@ ExploPlannerNode::ExploPlannerNode()
   exploit_target_timeout_sec_ = dp("exploit_target_timeout_sec", 300.0);
   std::string targets_topic = dp("targets_topic",
                                  std::string("/exploration/targets"));
+  // Fine-TSDF region relay (see the member comments). The default topic is
+  // built ABSOLUTE from robot_name_, like every other cross-node topic here
+  // (goal_pose, dscovox_node/*): the packaged launch files pass robot_name as
+  // a parameter but do NOT namespace this node, so a relative default would
+  // resolve to the global scope and silently never match the namespaced
+  // scovox_node. An explicit param value is used verbatim.
+  publish_refinement_regions_ = dp("publish_refinement_regions", true);
+  fine_region_radius_m_       = dp("fine_region_radius_m", 0.5);
+  std::string refinement_region_topic = dp(
+      "refinement_region_topic", std::string(""));
+  if (refinement_region_topic.empty()) {
+    refinement_region_topic =
+        "/" + robot_name_ + "/scovox_node/refinement_region";
+  }
 
   // Validate the vantage counts: n_vantages must be >= 1, and
   // min_vantages_required must be in [1, n_vantages] or success is unreachable
@@ -1165,6 +1205,20 @@ ExploPlannerNode::ExploPlannerNode()
         "(n_vantages=%d, min_required=%d, dwell=%.1fs)",
         targets_topic.c_str(), n_vantages, min_vantages_required_,
         exploit_dwell_sec_);
+    if (publish_refinement_regions_) {
+      // Latched (transient_local) both ends, mirroring the scovox_node
+      // subscription: an ADD fires exactly once per target id (ingest dedup —
+      // no retry path exists), so it must survive a DDS discovery race at
+      // startup-with-backlog and a restarted scovox subscription. Replay is
+      // safe: adds are keyed-replace and removes are idempotent, so a late
+      // joiner converges to the correct region set.
+      region_pub_ = create_publisher<scovox_msgs::msg::RefinementRegion>(
+          refinement_region_topic,
+          rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local());
+      RCLCPP_INFO(get_logger(),
+          "Relaying tree targets as fine refinement regions on %s (r=%.2fm).",
+          region_pub_->get_topic_name(), fine_region_radius_m_);
+    }
   }
 
   // --- State machine timer (10 Hz, sim time) ---
@@ -1497,10 +1551,19 @@ void ExploPlannerNode::tick() {
       }
       if (!shutdown_requested_) {
         shutdown_requested_ = true;
+        // Disarm any fine-band regions whose target never reached DONE:
+        // the step-budget checks and the rendezvous give-up land here
+        // WITHOUT passing finishActiveTarget, and shutting down with their
+        // regions live would leave scovox fine-integrating those trunks for
+        // the rest of the run. The actual shutdown is deferred one tick so
+        // DDS gets a cycle to flush the removes (a reliable publisher's
+        // unsent history dies with the process).
+        removeLiveRefinementRegions();
         RCLCPP_INFO(get_logger(),
             "Exploration finished. Shutting down planner node.");
-        rclcpp::shutdown();
+        break;
       }
+      rclcpp::shutdown();
       break;
   }
 }
@@ -2588,6 +2651,15 @@ void ExploPlannerNode::onTreeTarget(
         "(%zu pending).",
         msg->target_id, center.x(), center.y(), msg->radius,
         msg->discovered_by.c_str(), target_queue_.pendingCount());
+    // Arm the fine band the moment the target enters the queue (release ==
+    // exploitation-phase start for the whole team), not on activation: every
+    // robot then fine-maps any released trunk its lidar reaches — including
+    // the approach drive and a tree a peer is circling. Dedup'd re-reports
+    // skip this (their region is already registered).
+    if (region_pub_) {
+      publishRefinementRegion(msg->target_id, center, msg->radius,
+                              /*remove=*/false);
+    }
   } else {
     RCLCPP_DEBUG(get_logger(),
         "Duplicate tree target id=%u ignored.", msg->target_id);
@@ -2638,6 +2710,13 @@ void ExploPlannerNode::finishActiveTarget(bool success) {
   const Target* t = target_queue_.active();
   const uint32_t id = t ? t->id : 0u;
   const int clear = t ? t->clear_los_dwells : 0;
+  // Disarm the fine band for this trunk — integration stops, the fine voxels
+  // already fused stay in the lattice for offline post-processing. Only on
+  // DONE: a stand-down (deactivate) keeps the region live because the target
+  // returns to PENDING and the phase is still exploitation.
+  if (t && region_pub_) {
+    publishRefinementRegion(t->id, t->center, t->radius, /*remove=*/true);
+  }
   target_queue_.markActiveDone();
   have_active_intent_ = false;     // release the claim now the target is closed
   exploit_target_timing_ = false;  // next active target re-latches the timer
@@ -2653,6 +2732,41 @@ void ExploPlannerNode::finishActiveTarget(bool success) {
     RCLCPP_INFO(get_logger(),
         "Target queue empty -> reverting to EXPLORE.");
     transitionTo(State::PLAN);
+  }
+}
+
+// Fine-TSDF region relay (RefinementRegion is field-compatible with TreeTarget
+// by design — see scovox_msgs/msg/RefinementRegion.msg). center.z forwards as
+// base_z, the trunk base the scovox slab params offset from; the radius is
+// swapped for the trunk-scale fine_region_radius_m unless that is <= 0.
+void ExploPlannerNode::publishRefinementRegion(uint32_t id,
+                                               const Eigen::Vector3f& center,
+                                               float radius, bool remove) {
+  scovox_msgs::msg::RefinementRegion m;
+  m.id = id;
+  m.x = center.x();
+  m.y = center.y();
+  m.base_z = center.z();
+  m.radius = fine_region_radius_m_ > 0.0
+                 ? static_cast<float>(fine_region_radius_m_)
+                 : radius;
+  m.remove = remove;
+  region_pub_->publish(m);
+  RCLCPP_INFO(get_logger(),
+      "%s fine refinement region id=%u at (%.2f, %.2f) r=%.2f.",
+      remove ? "Removed" : "Registered", id, m.x, m.y, m.radius);
+}
+
+// Called once, on the tick that latches shutdown_requested_ (State::DONE,
+// done_action=shutdown). DONE-idle deliberately does NOT clean up: its
+// regions stay armed because a target released while idling resumes the
+// exploit sub-loop. Removes here are idempotent with the per-target remove
+// in finishActiveTarget.
+void ExploPlannerNode::removeLiveRefinementRegions() {
+  if (!region_pub_) return;
+  for (const auto& t : target_queue_.targets()) {
+    if (t.status == Target::Status::DONE) continue;
+    publishRefinementRegion(t.id, t.center, t.radius, /*remove=*/true);
   }
 }
 
@@ -3174,11 +3288,26 @@ void ExploPlannerNode::doExploitDwell() {
   // and what the CSV logs. Falls back to the selection-time verdict — staged in
   // doExploitPlan when THIS vantage was chosen — if the map or active target is
   // momentarily unavailable.
+  //
+  // Settled XY, SIGHTLINE z. latest_pos_.z() is base_link — 0.09-0.13 m on a
+  // UGV, and it bobs by more than a voxel as the platform settles — so marching
+  // the ray at it samples the voxel row the mapped ground surface occupies and
+  // reports BLOCKED for the ray's whole length, on a trunk in the open, at
+  // random depending on where the suspension came to rest. The measurement
+  // height is ground + candidate_z_clearance: exactly what generateVantages()
+  // used at selection time, and what exploitZAt() is for (see its contract
+  // above — "a vantage's z IS the measurement"). Ground unknown under the
+  // settled pose => keep the selection-time verdict rather than march the ray
+  // outside the observed volume, where it would pass trivially.
   bool los_clear = current_vantage_los_clear_;
   Target* t = target_queue_.active();
   if (t && loadLatestMap()) {
-    los_clear = vantage_planner_->lineOfSightClear(
-        latest_pos_, t->center, t->radius, *map_cache_);
+    const float sight_z = exploitZAt(latest_pos_.x(), latest_pos_.y());
+    if (std::isfinite(sight_z)) {
+      const Eigen::Vector3f from(latest_pos_.x(), latest_pos_.y(), sight_z);
+      los_clear = vantage_planner_->lineOfSightClear(
+          from, t->center, t->radius, *map_cache_);
+    }
   }
   current_vantage_los_clear_ = los_clear;
   pending_exploit_los_clear_ = los_clear ? 1 : 0;
