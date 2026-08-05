@@ -267,7 +267,9 @@ Each robot broadcasts an **intent** at 1 Hz: its currently selected goal, its
 own pose, a claimed disc radius (default: the sensor range, 10 m) and a
 time-to-live (5 s). Peers keep the latest intent per robot and expire it when
 the time-to-live lapses, so a robot that crashes or leaves radio range releases
-its claims automatically.
+its claims automatically. Exploitation claims are additionally retained for a
+grace period past their expiry, for veto purposes only — the reason is a
+delivery-side failure mode described in §11.
 
 When two robots want the same region, the tie is broken by the **MinPos** rule
 (Bautin, Simonin and Charpillet, IROS 2012): the robot closer to the contested
@@ -380,9 +382,11 @@ sightline through unmapped volume is unknown, not known-bad.
 **dwells** there for 8 s. No goal is re-sent during the dwell: a re-send is a
 fresh navigation request, and the navigator emits at least one velocity command
 even for an already-satisfied goal, which would put a rotation through the
-middle of the capture the dwell exists to take. On completion the sightline is
-re-checked from the pose the robot actually settled at, and it is that verdict —
-not the one from selection time — that is credited and logged.
+middle of the capture the dwell exists to take. With dwell synchronisation
+enabled the dwell clock does not start until the whole team is staged on the
+ring (below). On completion the sightline is re-checked from the pose the robot
+actually settled at, and it is that verdict — not the one from selection time —
+that is credited and logged.
 
 **Completion.** A target succeeds once three clear-sightline dwells are
 credited, and closes as *partial* if the per-target budget (300 s since the last
@@ -405,9 +409,95 @@ the union into their own record of that target, so the three-vantage quota is a
 **team** quota: the ring is covered once, cooperatively, and the trunk closes
 for everyone. Because indices name canonical poses and the mask is cumulative
 state rather than an event, merges are idempotent and a lost message loses no
-credit. A separate, much smaller MinPos disc is used for vantage claims — the
-exploration-scale disc would swallow the entire ring and cause one robot to veto
-the trunk rather than the two of them splitting its angles.
+credit.
+
+**Vantage claims.** Splitting a ring's angles across the team reuses the intent
+machinery of §10.1 but not its rules. Vantage claims carry their own, much
+smaller disc (0.75 m, the visited tolerance) — the exploration-scale disc would
+swallow the entire ring and cause one robot to veto the trunk rather than the
+two of them splitting its angles. Three rules then decide whether a candidate
+vantage is admitted, and which applies is decided by the *kind* of the peer
+claim covering it, not by geometry:
+
+1. A peer's exploitation claim on the **same trunk** vetoes the angle
+   unconditionally — no distance contest. MinPos compares cost-so-far, and a
+   robot standing at the trunk having just finished one angle is, by
+   construction, closer to every remaining vantage than a teammate nineteen
+   seconds into its drive toward one; letting distance decide took the angle
+   away from the robot already committed to it, converged both on one point,
+   and closed the ring solo while the loser was braked repeatedly by the
+   proximity stop. What a mid-drive peer has *left* is cost-to-go, and the
+   claim already encodes that commitment.
+2. Any other claim shape — an exploration claim, or an exploitation claim on a
+   different trunk — keeps the ordinary MinPos distance contest.
+3. Peers whose claims are **staged** (standing on a vantage of this trunk, see
+   below) are position-contested *before selection*, even though they hold no
+   claim on the contested angle yet. The race this settles happens before any
+   claim exists: when the dwell barrier releases, every parked robot re-plans
+   within milliseconds, the 1 Hz claim exchange is blind for that first
+   instant, and with one angle left every free robot picks it — in one run two
+   robots selected the same final vantage 3 ms apart and collided. A staged
+   peer is stationary, so its broadcast pose is current and both sides evaluate
+   the same antisymmetric comparison: exactly one robot admits the angle,
+   without exchanging a message. Driving peers are deliberately exempt — a
+   mover's broadcast pose is a heartbeat stale, and a robot still approaching
+   from afar is farther from *every* angle on the ring, so contesting it by
+   position would freeze it out of the trunk entirely and serialise exactly
+   what the barrier exists to parallelise.
+
+The backstop for the residual race — two robots that each believed they had won
+— remains in the drive itself: a robot that sees, mid-flight, a peer claim on
+its own goal re-runs the comparison and the loser yields, cancelling its
+navigation goal and braking rather than driving on into the winner.
+
+**Synchronised dwells.** By default the team captures a trunk *simultaneously*:
+a robot that reaches its vantage holds there with the dwell clock stopped until
+every live peer claiming the same trunk is also standing on its own angle, so
+the trunk state the sensors record is one moment, not a sequence of visits
+minutes apart. Staging is **declared by the producer**, not inferred: each
+exploitation claim carries a flag set when its sender enters the dwell state,
+after both nav arrival and the post-arrival rotation settle. Peers previously
+inferred staging from broadcast positions, and that inference cannot separate
+"on the vantage" from "arrived in XY but still rotating beside it" — which read
+as staged about five seconds early and started the team's dwells out of step —
+nor from "parked on an approach waypoint", an intermediate hop whose goal is
+not a vantage at all. The wait is unbounded by default (a deadline is available
+as an escape hatch) but releases automatically when a peer's claim ages out on
+its raw TTL: a teammate that dies on approach frees the dwelling robot in about
+five seconds. The barrier is also the experiment's A/B lever — disabling it
+restores the old behaviour, where the first robot to arrive dwells alone and
+can close the quota before its teammate lands.
+
+**Claim grace.** The veto rules above are only as good as the claim table they
+read, and the table is maintained on the *receiving* side by a subscription
+that shares a single-threaded executor with the planning work itself. A heavy
+re-planning phase — retrying a blocked ring at 10 Hz with periodic multi-second
+map refreshes — can starve that subscription for longer than the 5 s TTL even
+while the sender heartbeats faithfully at 1 Hz; the winner's claim then ages
+out of the loser's table mid-delivery-gap, rule 1 goes blind, and the parked
+loser re-selects the angle its teammate is already driving to, yields it back
+on the next heartbeat, and repeats — drifting off its own captured pose with
+every cycle. Exploitation claims are therefore retained for a **grace period**
+past their expiry (10 s, twice the TTL), during which they still veto and still
+lose contests — stale in age, not in meaning. The grace applies to the veto
+side only. Everything that infers *liveness* from a claim keeps the strict
+TTL: the dwell barrier's release, the rendezvous barrier's presence count and
+the exploration-mode MinPos contest all ignore graced claims, so a robot that
+is genuinely gone releases the team on the same five-second clock as before.
+
+**Final-angle hold.** The last round of a ring has a loser: with three angles
+and two robots, one robot ends the round with its own dwell banked and every
+remaining angle either team-captured or under a teammate's claim. That robot
+does not keep planning. It parks on the exact pose it dwelled from —
+re-anchoring position *and* heading if the contests above ever rolled it off —
+and keeps its staged claim beating so the teammate's barrier reads it as
+present, until the merged team mask closes the trunk for everyone. The hold
+decision is re-evaluated every cycle from the same veto rules as selection, so
+it dissolves by itself if the teammate's claim genuinely dies (the survivor
+takes the remaining angle) or the target times out. Holding cycles skip the map
+refresh entirely and cost microseconds, which also removes the executor
+pressure that made the grace window necessary in the first place — the parked
+robot is no longer the one starving its own ears.
 
 ## 12. Coupling to the mapper
 
@@ -488,6 +578,9 @@ offline, and the planner's own success criterion — three clear-sightline dwell
 | Failed-goal blacklist | 2 m for 60 s | Prevents re-selecting failed goals |
 | Coverage termination | < 5 % unknown, 3 consecutive cycles | Saturation criterion |
 | MinPos claim | 10 m disc, 5 s TTL, 1 Hz | Goal deconfliction |
+| Vantage claim disc | 0.75 m (visited tolerance) | Splits one ring's angles across the team |
+| Exploit claim grace | 10 s (2 × TTL) | Veto-side retention across delivery gaps |
+| Dwell synchronisation | on, unbounded wait | Team dwells start together; strict-TTL release |
 | Proximity hold / resume | 5 m / 6 m | Coordinated yield with hysteresis |
 | Parked release / floor | 10 s unmoved / 1.5 m | Deadlock avoidance and its limit |
 | Vantages per trunk | 3 at 120°, 30° start | Prescribed angular coverage |
