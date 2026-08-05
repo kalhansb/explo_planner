@@ -1,0 +1,161 @@
+<?xml version="1.0"?>
+<!-- RViz-only visual model of the hmr_sim COSTAR husky.
+
+     hmr_sim ships the robot as SDF (models/COSTAR_HUSKY_SENSOR_CONFIG_*/model.sdf)
+     and bridges no /robot_description, so RViz's RobotModel display has nothing to
+     draw and a sim run shows the robot as bare TF axes. This URDF wraps the SDF's
+     own visual meshes so robot_state_publisher can serve them.
+
+     Template, not a URDF: run_explo_sim_rviz.sh substitutes
+       @PREFIX@  robot frame prefix, e.g. "atlas/"  (the TF frames
+                 sim_tf_publisher.py publishes are <robot>/base_link, so the link
+                 names are prefixed here rather than using robot_state_publisher's
+                 frame_prefix — that way RViz needs no TF Prefix setting and the
+                 lookup cannot silently miss)
+       @MODEL@   hmr_sim model dir, e.g. COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_YELLOW
+                 (atlas = ..._YELLOW, bestla = ..._GREEN)
+       @ROBOT@   robot short name, used only for the robot's name attribute
+
+     Visual geometry and every <origin> below are the SDF's own <visual> poses,
+     copied verbatim. Deliberately NOT modelled:
+       * collision / inertial — nothing here simulates, gz owns the physics;
+       * the wheel joints, which are `fixed` instead of `revolute`: nothing
+         publishes /joint_states for a gz-driven robot, so revolute joints would
+         leave robot_state_publisher waiting and the wheels undrawn. Fixed wheels
+         do not spin, which is the whole cost of this file;
+       * base_link -> <robot>/velodyne and -> <robot>/realsense, which
+         sim_tf_publisher.py already publishes as static TF — declaring them here
+         too would give those frames two parents.
+-->
+<robot name="@ROBOT@_viz">
+
+  <material name="arch_grey">
+    <color rgba="0.45 0.45 0.45 1"/>
+  </material>
+
+  <!-- Everything the SDF lumps into base_link: chassis, plates, bumpers, the
+       sensor arch, the realsense body and the VLP16 stack. -->
+  <link name="@PREFIX@base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/base_link.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/top_chassis.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.0812 0 0.245" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/top_plate.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.272 0 0.245" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/user_rail.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.48 0 0.091" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/bumper.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="-0.48 0 0.091" rpy="0 0 3.14159"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/bumper.dae"/>
+      </geometry>
+    </visual>
+    <!-- STL carries no material of its own; the SDF paints it 0.45 grey. -->
+    <visual>
+      <origin xyz="0.0012 0 0.251" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/jpl04_arch_nosensor.stl"/>
+      </geometry>
+      <material name="arch_grey"/>
+    </visual>
+    <visual>
+      <origin xyz="0.438 0 0.272" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/realsense.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.0012 0 0.6783" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/VLP16_base_1.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.0012 0 0.6783" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/VLP16_base_2.dae"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.0012 0 0.6783" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/VLP16_scan.dae"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="@PREFIX@front_left_wheel_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/wheel.dae"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="@PREFIX@front_left_wheel_joint" type="fixed">
+    <parent link="@PREFIX@base_link"/>
+    <child link="@PREFIX@front_left_wheel_link"/>
+    <origin xyz="0.256 0.2854 0.03282" rpy="0 0 0"/>
+  </joint>
+
+  <link name="@PREFIX@front_right_wheel_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/wheel.dae"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="@PREFIX@front_right_wheel_joint" type="fixed">
+    <parent link="@PREFIX@base_link"/>
+    <child link="@PREFIX@front_right_wheel_link"/>
+    <origin xyz="0.256 -0.2854 0.03282" rpy="0 0 0"/>
+  </joint>
+
+  <link name="@PREFIX@rear_left_wheel_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/wheel.dae"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="@PREFIX@rear_left_wheel_joint" type="fixed">
+    <parent link="@PREFIX@base_link"/>
+    <child link="@PREFIX@rear_left_wheel_link"/>
+    <origin xyz="-0.256 0.2854 0.03282" rpy="0 0 0"/>
+  </joint>
+
+  <link name="@PREFIX@rear_right_wheel_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://hmr_sim/models/@MODEL@/meshes/wheel.dae"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="@PREFIX@rear_right_wheel_joint" type="fixed">
+    <parent link="@PREFIX@base_link"/>
+    <child link="@PREFIX@rear_right_wheel_link"/>
+    <origin xyz="-0.256 -0.2854 0.03282" rpy="0 0 0"/>
+  </joint>
+
+</robot>

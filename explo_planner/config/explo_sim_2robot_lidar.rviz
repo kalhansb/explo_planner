@@ -1,0 +1,379 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  # Layout for a LIVE hmr_sim 2-robot lidar-only exploration+exploitation run
+  # (run_explo_sim_rviz.sh). Every topic is namespaced per robot — the bag-replay
+  # layouts in scovox/config/explo_experiment*.rviz point at root-namespace
+  # topics and will show nothing here.
+  #
+  # Enabled by default = the story of the run: both robots (mesh), the team map,
+  # each planner's candidate set + selected goal, and the released tree targets.
+  # Disabled by default but one click away: planning maps, raw lidar, nav paths,
+  # bestla's copy of the merged map (both copies converge to <1% of each other,
+  # so drawing the second one doubles the GPU cost to show the same voxels).
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Color: 160; 160; 164
+      Cell Size: 5
+      Plane Cell Count: 40
+      Enabled: true
+      Value: true
+    # Frame axes for the whole tree: map -> <robot>/odom -> <robot>/base_link ->
+    # {velodyne, realsense} (sim_tf_publisher.py) plus the wheel frames
+    # (robot_state_publisher, from the viz URDF).
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Marker Scale: 1.5
+      Show Names: false
+      Show Axes: true
+      Show Arrows: false
+      Enabled: true
+      Value: true
+    # Released tree targets: a translucent trunk cylinder + a ring at the vantage
+    # standoff (radius + vantage_standoff_m), from sim_target_markers.py.
+    # Latched, so a target released before RViz started still shows up.
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Tree targets
+      Topic:
+        Depth: 20
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /exploration/target_markers
+      Enabled: true
+      Value: true
+
+    # ── atlas ────────────────────────────────────────────────────────────
+    # RobotModel needs a /robot_description; hmr_sim bridges none, so
+    # run_explo_sim_rviz.sh runs a robot_state_publisher per robot over
+    # config/costar_husky_viz.urdf.in. Transient Local (robot_state_publisher
+    # latches the description) — a Volatile sub started after it would wait
+    # forever for a message that is never re-sent.
+    - Class: rviz_default_plugins/RobotModel
+      Name: atlas | Robot
+      Collision Enabled: false
+      Visual Enabled: true
+      Alpha: 1
+      Description Source: Topic
+      Description File: ""
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/robot_description
+      Enabled: true
+      Value: true
+    # The merged TEAM map (this robot's dscovox_node merges its own and its
+    # peer's scovox_bin streams). AxisColor on Z, not RGB8: the lidar pipeline
+    # runs geometric-only (no segmentation), so there are no class colours to
+    # show — height reads the forest structure instead. Switch to RGB8 only on
+    # an rgbd run.
+    - Class: rviz_default_plugins/PointCloud2
+      Name: atlas | Team map
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/dscovox_node/pointcloud
+      Alpha: 1
+      Axis: Z
+      Color Transformer: AxisColor
+      Min Intensity: 0
+      Max Intensity: 4096
+      # 1-pixel points, not 0.1 m boxes: the merged forest map runs to hundreds
+      # of thousands of voxels and a box per voxel both costs GPU and hides the
+      # robots and candidate arrows inside a solid block of geometry. Points read
+      # as structure. Size (m) is kept for switching Style back to Boxes in the GUI.
+      Style: Points
+      Size (Pixels): 1
+      Size (m): 0.1
+      Use Fixed Frame: true
+      Decay Time: 0
+      Enabled: true
+      Value: true
+    # Candidate viewpoints: one arrow per candidate, red -> green by normalised
+    # utility, plus a cyan sphere 0.5 m over the selected one. Republished each
+    # PLAN cycle (DELETEALL first). During EXPLOIT these arrows are the vantage
+    # ring around the active trunk. Publishing is gated on subscriber count, so
+    # the markers only exist while this display is subscribed.
+    - Class: rviz_default_plugins/MarkerArray
+      Name: atlas | Candidates
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/explo_planner/candidates
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Name: atlas | Goal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/goal_pose
+      Alpha: 1
+      Shape: Arrow
+      Color: 0; 255; 255
+      Shaft Length: 1
+      Shaft Radius: 0.08
+      Head Length: 0.4
+      Head Radius: 0.2
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: atlas | Global path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/simple_nav_3d/global_path
+      Color: 0; 255; 128
+      Line Style: Lines
+      Alpha: 1
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/Path
+      Name: atlas | Local path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/simple_nav_3d/local_path
+      Color: 255; 255; 0
+      Line Style: Lines
+      Alpha: 1
+      Enabled: false
+      Value: false
+    # 2D rolling planning map the local planner drives on (merged copy).
+    - Class: rviz_default_plugins/Map
+      Name: atlas | Planning map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /atlas/dscovox_node/planning_map
+      Alpha: 0.4
+      Color Scheme: costmap
+      Draw Behind: true
+      Enabled: false
+      Value: false
+    # Raw VLP-16 cloud straight off the gz bridge. Best Effort matches any
+    # publisher QoS (a Reliable publisher satisfies a Best Effort sub).
+    - Class: rviz_default_plugins/PointCloud2
+      Name: atlas | Lidar
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /atlas/velodyne_points
+      Color Transformer: FlatColor
+      Color: 255; 200; 0
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 0
+      Enabled: false
+      Value: false
+    # Ground-truth pose trail — the driven path, independent of the planner.
+    - Class: rviz_default_plugins/Odometry
+      Name: atlas | Odom trail
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /atlas/odom_ground_truth
+      Keep: 300
+      Position Tolerance: 0.5
+      Angle Tolerance: 0.5
+      Shape: Arrow
+      Covariance:
+        Value: false
+      Enabled: false
+      Value: false
+
+    # ── bestla ───────────────────────────────────────────────────────────
+    - Class: rviz_default_plugins/RobotModel
+      Name: bestla | Robot
+      Collision Enabled: false
+      Visual Enabled: true
+      Alpha: 1
+      Description Source: Topic
+      Description File: ""
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/robot_description
+      Enabled: true
+      Value: true
+    # bestla's own merged copy — same voxels as atlas's (the two converge to
+    # <1% of each other via the peer scovox_bin exchange). Off by default;
+    # turn it on to *check* that convergence, not to see the map.
+    - Class: rviz_default_plugins/PointCloud2
+      Name: bestla | Team map
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/dscovox_node/pointcloud
+      Alpha: 1
+      Axis: Z
+      Color Transformer: AxisColor
+      Style: Points
+      Size (Pixels): 1
+      Size (m): 0.1
+      Use Fixed Frame: true
+      Decay Time: 0
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Name: bestla | Candidates
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/explo_planner/candidates
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Name: bestla | Goal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/goal_pose
+      Alpha: 1
+      Shape: Arrow
+      Color: 255; 0; 255
+      Shaft Length: 1
+      Shaft Radius: 0.08
+      Head Length: 0.4
+      Head Radius: 0.2
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: bestla | Global path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/simple_nav_3d/global_path
+      Color: 0; 200; 255
+      Line Style: Lines
+      Alpha: 1
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/Path
+      Name: bestla | Local path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/simple_nav_3d/local_path
+      Color: 255; 128; 0
+      Line Style: Lines
+      Alpha: 1
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/Map
+      Name: bestla | Planning map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /bestla/dscovox_node/planning_map
+      Alpha: 0.4
+      Color Scheme: costmap
+      Draw Behind: true
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: bestla | Lidar
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /bestla/velodyne_points
+      Color Transformer: FlatColor
+      Color: 0; 255; 200
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 0
+      Enabled: false
+      Value: false
+    - Class: rviz_default_plugins/Odometry
+      Name: bestla | Odom trail
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /bestla/odom_ground_truth
+      Keep: 300
+      Position Tolerance: 0.5
+      Angle Tolerance: 0.5
+      Shape: Arrow
+      Covariance:
+        Value: false
+      Enabled: false
+      Value: false
+  Global Options:
+    Background Color: 25; 25; 30
+    # Everything (map voxels, goals, candidate markers) lives in map, which
+    # sim_tf_publisher.py ties to <robot>/odom by identity — the gz odom
+    # publisher reports absolute world pose, so map IS the gz world frame.
+    Fixed Frame: map
+    Frame Rate: 20
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 45
+      # Between the two spawn points (atlas 0,0 / bestla 0,3).
+      Focal Point:
+        X: 0
+        Y: 1.5
+        Z: 0
+      Pitch: 0.95
+      Yaw: 0.785
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 1000
+  Width: 1700
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false
