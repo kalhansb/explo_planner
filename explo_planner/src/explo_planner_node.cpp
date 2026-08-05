@@ -163,6 +163,23 @@ private:
   void onPeerExploitIntent(const explo_planner_msgs::msg::RobotIntent& msg);
   void doExploitPlan();
   void doExploitDwell();
+  // The three peer-claim rules of the vantage filter (same-target exploit
+  // claim = unconditional veto; other claim shapes = distance contest; parked
+  // staged peer = position contest), extracted so doExploitPlan's candidate
+  // walk and its hold branch consult ONE implementation — two hand-copies of
+  // these rules would drift, and a hold decision computed from different rules
+  // than the selection it suppresses could deadlock a ring. Returns true if a
+  // peer claim denies `v_pos`. Caller gates on coord_->enabled().
+  bool vantageVetoedByPeers(uint32_t target_id, const Eigen::Vector3f& v_pos,
+                            const Eigen::Vector3f& robot_pos);
+  // Hold branch of doExploitPlan: true when this robot should PARK on the
+  // vantage it already dwelled (held_vantage_*) because every other angle of
+  // the ring is either team-visited or peer-denied. Publishes the staged hold
+  // claim / re-anchor goal as needed; the caller returns from the tick when
+  // this returns true.
+  bool holdDwelledVantage(Target* tgt,
+                          const std::vector<CandidateViewpoint>& vantages,
+                          const Eigen::Vector3f& robot_pos);
   void finishActiveTarget(bool success);
   // Fine-TSDF region relay: register (remove=false) / unregister (remove=true)
   // target `id` as a refinement cylinder on this robot's scovox_node.
@@ -209,6 +226,12 @@ private:
   bool checkProximityHold();
   void enterProximityHold(const ProximityGuard::Decision& d);
   void doProximityHold();
+  /// Stop the platform when a state transition ABANDONS an in-flight drive
+  /// without immediately replacing it with another goal. Same stop mechanics as
+  /// enterProximityHold (cancel-all + brake goal at our own pose), none of the
+  /// hold bookkeeping. See the definition for the invariant this enforces and
+  /// the collision that motivated it.
+  void abandonNavGoal(const char* why);
   /// Latched operator-facing hold state ("hold peer=... dist=..." / "clear
   /// reason=..."), so a field laptop can see WHO is yielding and why without
   /// grepping planner logs.
@@ -301,6 +324,12 @@ private:
   bool   coord_enabled_        = false;
   double coord_claim_radius_m_ = 0.0;
   double coord_claim_ttl_sec_  = 5.0;
+  // Extra retention for EXPLOIT claims past their TTL (Coordination ctor doc
+  // has the full receive-side-starvation incident). 2x the TTL by default:
+  // long enough to ride out the multi-second executor gaps observed in sim,
+  // short enough that a genuinely dead winner frees its vantage well inside
+  // the 300 s per-target budget.
+  double coord_claim_grace_sec_ = 10.0;
   double coord_heartbeat_hz_   = 1.0;
   std::string coord_intent_topic_;
   // MinPos match radius for EXPLOIT vantage claims. Vantages on one trunk sit
@@ -387,6 +416,20 @@ private:
   // up after the FIRST failed hop with no retry. 300 = one worst-case failed
   // hop (180) + 120 to re-select and reach another angle.
   double exploit_target_timeout_sec_ = 300.0;
+  // Vantage-ring rendezvous barrier. When true (the default) a robot standing on
+  // its vantage does NOT start its dwell clock until every peer holding an
+  // exploit claim on the same trunk is standing on the vantage IT claimed: the
+  // team requirement is simultaneous capture of one trunk state, not three
+  // sequential single-robot dwells. Inert with coordination off or with no peer
+  // claim on this trunk (single-robot runs are bit-for-bit unaffected).
+  bool   exploit_dwell_sync_enabled_ = true;
+  // Barrier give-up (s), measured from EXPLOIT_DWELL entry and NOT from the
+  // re-anchored dwell start. <= 0 (the default) waits until the peer actually
+  // arrives; see the release-path argument in doExploitDwell for why that
+  // terminates. Set a positive value only to force a deadline: a wall-clock
+  // bound cannot distinguish a distant teammate from a wedged one, and 60 s
+  // abandoned one that needed 111 s to cross the plot.
+  double exploit_dwell_sync_max_wait_sec_ = 0.0;
   // Fine-TSDF region relay. When true, every ingested TreeTarget is registered
   // as a RefinementRegion on this robot's scovox_node the moment it arrives
   // (target release == exploitation-phase start) and unregistered when
@@ -433,6 +476,38 @@ private:
   uint32_t exploit_target_started_id_  = 0;
   double   exploit_target_started_sec_ = 0.0;
   bool     exploit_target_timing_      = false;
+  // Dwell-sync barrier bookkeeping, re-initialised on every EXPLOIT_DWELL entry
+  // (transitionTo). The wait clock CANNOT be state_enter_time_: the barrier
+  // holds by re-anchoring that to now every tick, so a wait measured from it
+  // would read ~0 forever and max_wait would never fire. The latch is what
+  // stops a timed-out barrier from re-entering and re-anchoring the dwell clock
+  // on the next tick, which would leave the dwell never completing.
+  //
+  // dwell_sync_started_ is the same guarantee for the SUCCESSFUL release: the
+  // barrier is a start condition, not a per-tick precondition, so once the team
+  // is staged the dwell runs to completion. Re-testing the probe every tick
+  // makes a running dwell hostage to the team's schedule — a peer that finishes
+  // its own capture and drives off to its next angle publishes staged=false
+  // again, and the barrier then re-anchored the dwell clock of a robot that had
+  // been motionless on its vantage for seconds (observed: ~3 s of accumulated
+  // dwell discarded and re-dwelled from zero when the peer hopped v1 -> v0,
+  // i.e. a full extra 8 s capture charged per peer departure).
+  rclcpp::Time dwell_sync_wait_start_;
+  bool         dwell_sync_timed_out_ = false;
+  bool         dwell_sync_started_   = false;
+  // The vantage THIS robot last completed a dwell on — pose (position + the
+  // capture yaw), ring index, and which target it belongs to. This is the
+  // pose the robot parks on when the rest of the ring is covered by the team
+  // (doExploitPlan's hold branch): the requirement, verbatim from the field
+  // operator watching the 2-robot sim, is that the robot which does NOT get
+  // the last vantage "should have kept the first vantage pose". Validity is
+  // the id match — target ids are unique for the life of the queue, so a
+  // stale entry from a finished target can never match the next one and no
+  // explicit invalidation is needed.
+  CandidateViewpoint held_vantage_pose_;
+  int      held_vantage_index_     = -1;
+  uint32_t held_vantage_target_id_ = 0;
+  bool     held_vantage_valid_     = false;
   int   step_  = 0;
   bool  have_pose_ = false;
   bool  have_map_  = false;
@@ -801,6 +876,7 @@ ExploPlannerNode::ExploPlannerNode()
   coord_enabled_         = dp("coordination_enabled", false);
   coord_claim_radius_m_  = dp("coord_claim_radius_m", 0.0);
   coord_claim_ttl_sec_   = dp("coord_claim_ttl_sec", 5.0);
+  coord_claim_grace_sec_ = dp("coord_claim_grace_sec", 10.0);
   coord_intent_topic_    = dp("coord_intent_topic",
                               std::string("/exploration/intents"));
   coord_heartbeat_hz_    = dp("coord_heartbeat_hz", 1.0);
@@ -879,6 +955,16 @@ ExploPlannerNode::ExploPlannerNode()
   // (e.g. its surroundings stay unmapped / unreachable), close it PARTIAL and
   // revert rather than blocking exploration forever. <=0 disables the timeout.
   exploit_target_timeout_sec_ = dp("exploit_target_timeout_sec", 300.0);
+  // Vantage-ring rendezvous barrier. ON by default: the whole point of the ring
+  // is overlapping simultaneous views of one trunk state, and without the
+  // barrier the first robot to arrive burns its dwell alone while the peer is
+  // still driving — on a 3/3 quota the early robot can close the target solo
+  // and the peer arrives to dwell an angle nobody needs. Distinct from the
+  // `rendezvous_*` params above, which are the comms-reconnection barrier at
+  // the anchor pose; these two are the per-vantage capture barrier.
+  exploit_dwell_sync_enabled_ = dp("exploit_dwell_sync_enabled", true);
+  exploit_dwell_sync_max_wait_sec_ =
+      dp("exploit_dwell_sync_max_wait_sec", 0.0);
   std::string targets_topic = dp("targets_topic",
                                  std::string("/exploration/targets"));
   // Fine-TSDF region relay (see the member comments). The default topic is
@@ -948,7 +1034,8 @@ ExploPlannerNode::ExploPlannerNode()
   // (= fov_max_range) case is already a concrete number here.
   coord_ = std::make_unique<Coordination>(
       coord_enabled_, robot_name_,
-      static_cast<float>(coord_claim_radius_m_));
+      static_cast<float>(coord_claim_radius_m_),
+      static_cast<float>(coord_claim_grace_sec_));
 
   // Vantage planner. Geometry from the exploit params; sensor envelope + the
   // LoS occupancy threshold reuse the same FOV config as exploration so a
@@ -1574,6 +1661,31 @@ void ExploPlannerNode::transitionTo(State s) {
   // The post-arrival rotation deadline is per-NAVIGATE-cycle and is armed
   // lazily on arrival at the XY goal; disarm it on every entry.
   if (s == State::NAVIGATE) rotate_deadline_armed_ = false;
+  // The dwell-sync barrier is per-DWELL: its wait clock starts at entry (the
+  // moment the robot is physically staged on the vantage) and neither latch may
+  // survive into the next capture — a timed-out barrier would otherwise disable
+  // the barrier for every remaining vantage of the run, and a started one would
+  // skip the wait at the next vantage entirely.
+  if (s == State::EXPLOIT_DWELL) {
+    dwell_sync_wait_start_ = state_enter_time_;
+    dwell_sync_timed_out_  = false;
+    dwell_sync_started_    = false;
+    // Declare this robot staged on the claim its teammates hold their barriers
+    // against. This entry is the only point that can honestly say it: the dwell
+    // is reached from NAVIGATE only after BOTH the XY-arrival gate and the
+    // post-arrival yaw settle, so the platform is standing still on the vantage
+    // it claimed — not merely inside a tolerance of it, and not parked on an
+    // approach waypoint. Published on the spot instead of waiting for the next
+    // ~1 Hz heartbeat, for the same reason as the post-dwell dwelled_mask
+    // broadcast: a peer already parked on its own angle is re-anchoring its
+    // dwell clock every tick until it hears this, so a second of stale staging
+    // is a second shaved off the team's simultaneous-capture window.
+    if (intent_pub_ && have_active_intent_) {
+      current_intent_msg_.staged = true;
+      current_intent_msg_.header.stamp = state_enter_time_;
+      intent_pub_->publish(current_intent_msg_);
+    }
+  }
 }
 
 // ==================================================================
@@ -1869,9 +1981,15 @@ void ExploPlannerNode::doPlan() {
       continue;
     }
     // 4. MinPos peer-claim check (only when coordination is enabled).
+    // live_after: exploration contests LIVE claims only. Exploit claims are
+    // retained past expiry by the grace window so the vantage contests stay
+    // closed across delivery gaps, but out here a graced claim would keep a
+    // frontier candidate yielded to a peer we have not heard from in 10+
+    // seconds — exploration keeps the original TTL semantics.
     if (coord_ && coord_->enabled()) {
       const auto* peer = coord_->claimMatching(
-          vp.position, static_cast<float>(coord_claim_radius_m_));
+          vp.position, static_cast<float>(coord_claim_radius_m_),
+          &plan_start);
       if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
                                             *peer, robot_name_)) {
         ++rejected_minpos;
@@ -1922,7 +2040,7 @@ void ExploPlannerNode::doPlan() {
       pending_selected_info_gain_, pending_selected_path_cost_,
       candidates.size(), rejected_too_close, rejected_map,
       rejected_unreachable, rejected_blacklist, rejected_minpos,
-      coord_ ? coord_->activePeerCount() : 0u, plan_ms);
+      coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
 
   publishGoal(current_goal_);
   publishCandidateViz(candidates);
@@ -2022,6 +2140,12 @@ void ExploPlannerNode::doNavigate() {
     have_active_intent_ = false;
     target_queue_.activate();
     phase_ = Phase::EXPLOIT;
+    // The released hop must be stopped, not just forgotten: EXPLOIT_PLAN can
+    // sit on "no vantage and no reachable approach yet — retrying" for as long
+    // as the give-up timer allows without ever publishing a goal, and nav2
+    // would drive out the abandoned exploration hop underneath it (invariant:
+    // see abandonNavGoal).
+    abandonNavGoal("target released mid-hop");
     transitionTo(State::EXPLOIT_PLAN);
     return;
   }
@@ -2039,8 +2163,59 @@ void ExploPlannerNode::doNavigate() {
         step_, current_goal_.position.x(),
         current_goal_.position.y());
     have_active_intent_ = false;
+    // PLAN usually re-goals on the next tick, but nothing guarantees it does —
+    // and until it does nav2 is still driving INTO a now-mapped obstacle
+    // (invariant: see abandonNavGoal).
+    abandonNavGoal("goal inside obstacle");
     transitionTo(State::PLAN);
     return;
+  }
+
+  // In-flight cross-pick tiebreak, exploit VANTAGE hops only. The claim
+  // heartbeat is 1 Hz, so around a target release both robots can select the
+  // SAME ring angle before either has heard the other's claim — the
+  // selection-time yield in doExploitPlan cannot see a claim that has not
+  // arrived yet, and with that yield in place neither would ever release the
+  // angle afterwards. Settle it with the same total order MinPos uses:
+  // selfWinsAgainst is strict closer-distance with a lexicographic robot_id
+  // tiebreak, so on the same pair of inputs exactly one of the two abandons —
+  // never both (the ring silently loses an angle) and never neither (they
+  // re-converge on one point and the proximity guard brakes the loser).
+  // Approach hops carry no ring angle to contest; exploration hops are
+  // deconflicted at selection time by the exploration-scale MinPos disc.
+  if (phase_ == Phase::EXPLOIT && !current_is_approach_ &&
+      pending_exploit_target_id_ >= 0 && coord_ && coord_->enabled()) {
+    const auto* peer = coord_->claimMatching(
+        current_goal_.position,
+        static_cast<float>(coord_vantage_claim_radius_m_));
+    if (peer && peer->exploit &&
+        peer->target_id == static_cast<uint32_t>(pending_exploit_target_id_) &&
+        !coord_->selfWinsAgainst(latest_pos_, current_goal_.position, *peer,
+                                 robot_name_)) {
+      RCLCPP_INFO(get_logger(),
+          "Yielding vantage %d of target %d to '%s' (simultaneous pick) -> "
+          "re-planning another angle.",
+          current_vantage_index_, pending_exploit_target_id_,
+          peer->robot_id.c_str());
+      // Release the claim WITH the hop. The winner does not need it — its
+      // symmetric check computes the same total order whether it sees our claim
+      // or none at all — but its dwell-sync barrier reads it: a kept claim is
+      // this yielded angle with staged=false, republished by the heartbeat for
+      // as long as we sit in EXPLOIT_PLAN with nothing else selectable (the
+      // 3-vantage / 2-robot final round), so the robot standing on the angle we
+      // yielded would hold its dwell against US until our per-target give-up
+      // fired, ~minutes for a hop we abandoned in one tick. Our next real claim
+      // is whatever the re-plan picks. The DRIVE is stopped as well, and for
+      // the same final round: the re-plan may find nothing selectable at all
+      // (visited + claimed exhaust the ring between two robots), and a planner
+      // retrying in EXPLOIT_PLAN must not still be rolling toward the angle it
+      // just conceded — that heading is a collision course with the winner
+      // standing on it.
+      have_active_intent_ = false;
+      abandonNavGoal("yielded vantage");
+      transitionTo(State::EXPLOIT_PLAN);
+      return;
+    }
   }
 
   auto robot_pos = latest_pos_;
@@ -2157,6 +2332,10 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
       current_goal_.position.x(), current_goal_.position.y(),
       failed_goals_.size());
   have_active_intent_ = false;  // release the claim on failure
+  // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
+  // know that — the goal is still accepted and still driving (invariant: see
+  // abandonNavGoal), and INTEGRATE is one of the states presumed stationary.
+  abandonNavGoal(reason);
   transitionTo(State::INTEGRATE);
 }
 
@@ -2170,8 +2349,11 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // already present the map is already merged, so exhaustion here means the team
 // is genuinely done — everyone reaches this together and lands in DONE.
 void ExploPlannerNode::finishOrRendezvous(const char* reason) {
+  // livePeerCount, not the raw table size: exploit claims are retained past
+  // expiry by the grace window (vantage-contest lenience), and a graced claim
+  // must not count a 10-s-silent teammate as "present" for the barrier.
   const int active =
-      coord_ ? static_cast<int>(coord_->activePeerCount()) : 0;
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
     startReturnToAnchor(reason);
@@ -2202,8 +2384,9 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
   // Stand the queue down rather than destroying it: the ACTIVE target is
   // demoted to PENDING and the phase reset to EXPLORE, so the exploit claim
   // stops being broadcast (the fresh non-exploit intent published below
-  // overwrites current_intent_msg_, clearing exploit/target_id/dwelled_mask —
-  // peers must not merge dwell credit from a robot that is driving home) and
+  // overwrites current_intent_msg_, clearing exploit/target_id/dwelled_mask and
+  // staged — peers must not merge dwell credit from a robot that is driving
+  // home, nor hold a vantage barrier open for one) and
   // doPlan() picks the target back up once the barrier releases. Leaving it
   // ACTIVE mattered once the step-budget path started routing through here:
   // that path can fire mid-exploitation, unlike coverage saturation.
@@ -2231,7 +2414,7 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
       "Rendezvous: exploration ended [%s], team incomplete (%d/%d peers) "
       "-> returning to anchor (%.2f, %.2f).",
       reason,
-      coord_ ? static_cast<int>(coord_->activePeerCount()) : 0,
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
       rendezvous_expected_peers_,
       last_connected_anchor_.x(), last_connected_anchor_.y());
 
@@ -2263,8 +2446,9 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
 // the anchor turns out unreachable) hand off to RETURN_SYNC to wait for the
 // team from wherever we ended up.
 void ExploPlannerNode::doReturnNav() {
+  // livePeerCount — presence semantics, same note as finishOrRendezvous().
   const int active =
-      coord_ ? static_cast<int>(coord_->activePeerCount()) : 0;
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   if (teamComplete(active, rendezvous_expected_peers_)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team reconnected en route (%d/%d) -> re-planning against "
@@ -2319,8 +2503,9 @@ void ExploPlannerNode::doReturnNav() {
 // heartbeat keeps broadcasting our presence throughout so arriving peers count
 // us and release their own barriers.
 void ExploPlannerNode::doReturnSync() {
+  // livePeerCount — presence semantics, same note as finishOrRendezvous().
   const int active =
-      coord_ ? static_cast<int>(coord_->activePeerCount()) : 0;
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   if (teamComplete(active, rendezvous_expected_peers_)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: full team connected (%d/%d) -> re-planning against "
@@ -2471,6 +2656,73 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
   transitionTo(State::PROXIMITY_HOLD);
 }
 
+// Stop the platform on a transition that ABANDONS the in-flight hop instead of
+// replacing it. Same wire mechanics as enterProximityHold, no hold state.
+//
+// The invariant: the proximity guard runs ONLY in NAVIGATE / RETURN_NAV (see
+// tick()), on the explicit assumption that every other state is stationary. So
+// any transition out of a driving state that does not IMMEDIATELY publish a
+// replacement goal must stop the platform itself — because ceasing to publish
+// goal_pose does NOT stop nav2: the last accepted NavigateToPose goal runs to
+// completion. Without this, the robot keeps rolling in a state the guard has
+// been told is standing still, which is the one combination the coordination
+// layer cannot see.
+//
+// That is not hypothetical. In a 2-robot run both robots' rendezvous-synced
+// dwells ended 3 ms apart, both re-planned in the same instant, and both picked
+// the last remaining vantage of the target before either had heard the other's
+// 1 Hz claim. The loser took the cross-pick yield in doNavigate, hopped to
+// EXPLOIT_PLAN — and its re-plan found NOTHING selectable (two vantages
+// visited, the third claimed by the winner), so it never published another
+// goal. nav2 spent the next 29 s driving a robot the guard believed was
+// "planning" 6.6 m across the ring into the peer standing on the very vantage
+// it had just yielded. They collided.
+//
+// Belt and braces, for the same reason enterProximityHold uses both: the cancel
+// is fire-and-forget on the wire (a dropped or rejected cancel must not leave
+// nav2 driving), so a brake goal at our own pose goes out as well, and
+// whichever order bt_navigator processes the pair the robot ends with either no
+// goal or a zero-travel one. The brake is harmlessly preempted the moment a
+// later tick does select a real goal — it costs one goal_pose message.
+//
+// Every call site is an exit from a DRIVING state, so latest_pos_ is a live
+// pose and the brake is genuinely zero-travel; do not call this from a state
+// entered before the first pose, where it would command the frame origin.
+void ExploPlannerNode::abandonNavGoal(const char* why) {
+  if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
+    // The reason is copied into the callback, not captured as a pointer: the
+    // response lands ticks later and one caller forwards failGoal's `reason`
+    // argument, so nothing here may assume the string outlives this call.
+    nav_cancel_client_->async_cancel_all_goals(
+        [this, tag = std::string(why)](auto resp) {
+          if (!resp ||
+              resp->return_code !=
+                  action_msgs::srv::CancelGoal::Response::ERROR_NONE) {
+            RCLCPP_WARN(get_logger(),
+                "Nav abandon [%s]: cancel returned code %d — the brake goal is "
+                "the only stop command.",
+                tag.c_str(), resp ? static_cast<int>(resp->return_code) : -1);
+          }
+        });
+  } else {
+    RCLCPP_WARN(get_logger(),
+        "Nav abandon [%s]: cancel client for '%s' unavailable (proximity stop "
+        "disabled, or the action server is not up) — the brake goal is the "
+        "only stop command.",
+        why, proximity_nav_cancel_action_.c_str());
+  }
+  // Brake in place. current_goal_ is deliberately left alone: callers still
+  // read it (failGoal blacklists it) and the states we transition INTO
+  // overwrite it when they select their own goal.
+  CandidateViewpoint brake;
+  brake.position = latest_pos_;
+  brake.yaw = latest_yaw_;
+  publishGoal(brake);
+
+  RCLCPP_INFO(get_logger(),
+      "Abandoning nav goal [%s]: cancelled + braking in place.", why);
+}
+
 void ExploPlannerNode::doProximityHold() {
   const auto now = this->now();
   const double held = (now - state_enter_time_).seconds();
@@ -2557,8 +2809,12 @@ void ExploPlannerNode::doLogStep() {
   m.selected_info_gain  = pending_selected_info_gain_;
   m.selected_path_cost  = pending_selected_path_cost_;
   m.selected_utility    = current_goal_.score;
-  m.coord_active_peers  = coord_ ? static_cast<int>(coord_->activePeerCount())
-                                  : 0;
+  // livePeerCount: the column documents "peers heard within one TTL", and
+  // grace-retained exploit claims must not inflate it (CSV schema unchanged,
+  // only the count's honesty restored).
+  m.coord_active_peers  = coord_
+      ? static_cast<int>(coord_->livePeerCount(this->now()))
+      : 0;
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
 
@@ -2903,6 +3159,165 @@ void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
   progress_check_dist_ = cumulative_distance_;
 }
 
+bool ExploPlannerNode::vantageVetoedByPeers(uint32_t target_id,
+                                            const Eigen::Vector3f& v_pos,
+                                            const Eigen::Vector3f& robot_pos) {
+  // Uses the small per-vantage disc, NOT the exploration-scale
+  // coord_claim_radius_m — one fov-range disc would swallow the whole ring
+  // and veto the tree outright instead of splitting the angles across the
+  // team. Two claim rules, and which one applies is decided by the CLAIM
+  // KIND, not by geometry; a third rule then contests the peers that are
+  // parked on this ring with no claim on this angle yet. NOTE the default
+  // (nullptr) liveness on claimMatching: exploit claims are read as RETAINED
+  // — grace included — because a vantage under recent pursuit must stay
+  // denied across a receive-side delivery gap (see Coordination's ctor doc
+  // for the starved-executor incident that motivated the grace window).
+  const auto* peer = coord_->claimMatching(
+      v_pos, static_cast<float>(coord_vantage_claim_radius_m_));
+  // An EXPLOIT claim on THIS trunk is not contested by distance at all: a
+  // ring angle under active pursuit belongs to its claimant until the claim
+  // lapses. Live-distance MinPos is what lost a ring — a robot standing at
+  // the trunk having just finished one angle was, by construction, closer to
+  // every remaining vantage than a peer 12 m out and 19 s into its drive, so
+  // it took the angle the peer was already committed to, both converged on
+  // one point, the proximity right-of-way braked the loser 8 times, and the
+  // winner closed the 3/3 quota solo. The comparison was never meaningful
+  // here: cost-to-go, not cost-so-far, is what a peer mid-hop has left.
+  if (peer && peer->exploit && peer->target_id == target_id) return true;
+  // Any other claim shape keeps the distance contest. An EXPLORATION claim
+  // carries the fov-range disc (~8-10 m), wide enough to cover the entire
+  // ring, so yielding to it unconditionally would veto every vantage of the
+  // tree for as long as a peer explores anywhere near it.
+  if (peer && !coord_->selfWinsAgainst(robot_pos, v_pos, *peer, robot_name_))
+    return true;
+  // Third rule, and it is not about claims on this angle at all — both
+  // rules above can only see a vantage a peer has ALREADY claimed, and the
+  // race that actually hurts happens BEFORE any claim exists. When the
+  // dwell-sync barrier releases the team, every parked robot re-plans within
+  // milliseconds of every other, and the 1 Hz claim exchange is blind for
+  // that first instant: with one angle left, every free robot picks it.
+  // Observed: two robots picked the same last vantage 3 ms apart, and the
+  // loser's in-flight yield (doNavigate) came 83 ms too late to prevent the
+  // drive — they collided.
+  //
+  // So contest the peers we KNOW are parked on this ring. A staged claim is
+  // set at dwell entry and kept while its producer re-plans in place, i.e.
+  // that peer is about to pick from a dead standstill beside the ring;
+  // settle it now with the same total order the in-flight tiebreak would
+  // use later, and if the parked peer strictly wins the angle simply do not
+  // select it — no goal, no drive, no yield to walk back. Because staged
+  // claims come only from stationary producers, its broadcast robot_pos
+  // still matches reality, both sides evaluate the same antisymmetric
+  // comparison, and exactly one robot admits the vantage without exchanging
+  // a message.
+  //
+  // DRIVING peers are deliberately not contested by position here — their
+  // claim discs above are their instrument. A mover's wire pose is a
+  // heartbeat stale, and a robot still approaching from far away is farther
+  // from EVERY angle on the ring, so position-contesting movers would freeze
+  // it out of the whole tree and serialize exactly what the barrier exists
+  // to parallelize. The doNavigate tiebreak remains the backstop for the
+  // residual race between two robots that each believed they had won
+  // (comms skew).
+  return coord_->stagedExploitPeerWinning(
+             target_id, v_pos, robot_pos, robot_name_, this->now()) != nullptr;
+}
+
+bool ExploPlannerNode::holdDwelledVantage(
+    Target* tgt, const std::vector<CandidateViewpoint>& vantages,
+    const Eigen::Vector3f& robot_pos) {
+  // The requirement, from the operator watching the 2-robot sim live: "both
+  // robot go to their vantage poses[,] the dwell time starts, then one of the
+  // robots get the next vantage pose, it goes there then dwell time starts[,]
+  // then after dwell time finishes the exploitation finishes" — and the robot
+  // that does NOT get the last vantage "should have kept the first vantage
+  // pose". What it did instead (run9) was thrash: every time the winner's
+  // claim aged out of the table mid-delivery-gap, the parked loser re-selected
+  // the winner's vantage, rolled toward it for ~0.6 s, yielded it back, and
+  // braked ~0.15 m further off its own vantage — twice, plus 25 s of retry
+  // log spam, ending 0.3 m off-pose with a random heading.
+  //
+  // So: once THIS robot has completed a dwell on this target and every other
+  // angle of the ring is either team-visited or peer-denied (the SAME rules
+  // the selection walk uses — vantageVetoedByPeers), there is nothing left
+  // for it to contribute by driving. Park on the dwelled vantage, keep the
+  // staged claim beating (a peer's dwell barrier reads it as "released"),
+  // and let the tick's earlier stages — team-quota merge, per-target timeout
+  // — end the hold. Exit paths, all above or upstream of this branch:
+  //   * peer's mask merge completes the quota -> finishActiveTarget;
+  //   * the winner dies -> its claim ages out (TTL + grace) -> the angle
+  //     stops being vetoed -> this returns false and the normal walk selects;
+  //   * per-target timeout -> PARTIAL.
+  // This branch also runs BEFORE the fused-map refresh and flood, so a
+  // holding robot's ticks drop from seconds to microseconds — which is what
+  // lets the single-threaded executor actually deliver the peer's heartbeats
+  // while we hold (the receive-side gap that started all of this).
+  if (!held_vantage_valid_ || held_vantage_target_id_ != tgt->id) return false;
+
+  for (const auto& v : vantages) {
+    if (target_queue_.isVantageVisited(
+            v.position, static_cast<float>(vantage_visited_tol_m_)))
+      continue;
+    // NOT visited: only a peer-denial keeps it off the table. Blacklist alone
+    // is deliberately NOT enough to hold on — a blacklisted-but-unclaimed
+    // angle means nobody is going there, and parking would leave the ring
+    // permanently short; the normal walk's retry/approach/timeout machinery
+    // owns that case.
+    if (!vantageVetoedByPeers(tgt->id, v.position, robot_pos)) return false;
+  }
+
+  // Ring covered. Re-anchor if the yield-roll drifted us off the pose (the
+  // brake goal in abandonNavGoal stops the platform where it happens to be,
+  // which after a ~0.6 s roll is decimetres off the vantage): publish the
+  // held vantage itself as the nav goal. This is a sub-metre reposition onto
+  // our own angle — the contested angle is a third of the ring away — and
+  // publishGoal alone is correct here: there is no in-flight hop to cancel
+  // (the yield already abandoned it) and EXPLOIT_PLAN is re-entered every
+  // tick, so arrival needs no state transition.
+  {
+    const float dx = robot_pos.x() - held_vantage_pose_.position.x();
+    const float dy = robot_pos.y() - held_vantage_pose_.position.y();
+    const float yaw_err = std::remainder(
+        latest_yaw_ - held_vantage_pose_.yaw, 2.0f * static_cast<float>(M_PI));
+    if (dx * dx + dy * dy > goal_xy_tol_ * goal_xy_tol_ ||
+        std::abs(yaw_err) > goal_yaw_tol_) {
+      publishGoal(held_vantage_pose_);
+    }
+  }
+
+  // Keep the staged hold-claim beating. After a completed dwell the cached
+  // intent already IS this claim (dwell entry set staged=true, the dwell-end
+  // broadcast patched the mask, and LOG_STEP left it alone) — but after a
+  // YIELD the intent was released (have_active_intent_=false, deliberately:
+  // a kept claim would have been the CONCEDED angle with staged=false, which
+  // would hold the winner's barrier open against us). Rebuild it here as
+  // what we actually are: staged on our own dwelled vantage. The heartbeat
+  // then re-publishes it at 1 Hz for as long as we hold.
+  if (intent_pub_ && (!have_active_intent_ || !current_intent_msg_.staged ||
+                      current_intent_msg_.target_id != tgt->id)) {
+    current_intent_msg_ = coord_->buildIntent(
+        held_vantage_pose_, robot_pos, this->now(),
+        static_cast<float>(coord_claim_ttl_sec_),
+        static_cast<float>(coord_vantage_claim_radius_m_),
+        /*planner_type_id (eig)=*/0u, map_frame_,
+        /*exploit=*/true, tgt->id, tgt->clear_mask, /*staged=*/true);
+    intent_pub_->publish(current_intent_msg_);
+    have_active_intent_ = true;
+  } else if (have_active_intent_) {
+    // Team credit can grow while we hold (the winner's dwell lands in our
+    // clear_mask via the merge above this branch); keep the broadcast mask
+    // current so OUR heartbeat also carries the newest union.
+    current_intent_msg_.dwelled_mask = tgt->clear_mask;
+  }
+
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Target %u: holding vantage %d (staged) — ring covered by team; "
+      "waiting for quota (%d/%d clear-LoS dwells).",
+      tgt->id, held_vantage_index_, tgt->clear_los_dwells,
+      min_vantages_required_);
+  return true;
+}
+
 void ExploPlannerNode::doExploitPlan() {
   auto plan_start = this->now();
 
@@ -3000,6 +3415,19 @@ void ExploPlannerNode::doExploitPlan() {
       finishActiveTarget(/*success=*/false);
       return;
     }
+  }
+
+  // Hold branch: with a dwell of our own banked and every other ring angle
+  // team-visited or peer-denied, PARK on the dwelled vantage instead of
+  // running the full selection below (see holdDwelledVantage for the run9
+  // thrash this replaces). Placed above the map refresh + flood on purpose:
+  // a holding robot's tick must cost microseconds, not seconds, or the
+  // executor starves the very intent subscription whose claims the hold
+  // decision reads. Quota merge and the per-target timeout stay ABOVE this,
+  // so a hold can always end.
+  if (coord_ && coord_->enabled() &&
+      holdDwelledVantage(tgt, vantages, latest_pos_)) {
+    return;
   }
 
   // The LoS ray-march reads the fused grid; refresh it (cheap when unchanged).
@@ -3121,19 +3549,16 @@ void ExploPlannerNode::doExploitPlan() {
       ++rej_blk;
       continue;
     }
-    // MinPos per-vantage deconfliction: yield an angle a peer currently
-    // claims (in-flight or mid-dwell) when the peer is closer. Uses the small
-    // per-vantage disc, NOT the exploration-scale coord_claim_radius_m — one
-    // fov-range disc would swallow the whole ring and veto the tree outright
-    // instead of splitting the angles across the team.
-    if (coord_ && coord_->enabled()) {
-      const auto* peer = coord_->claimMatching(
-          v.position, static_cast<float>(coord_vantage_claim_radius_m_));
-      if (peer && !coord_->selfWinsAgainst(robot_pos, v.position, *peer,
-                                           robot_name_)) {
-        ++rej_minpos;
-        continue;
-      }
+    // Per-vantage deconfliction: yield an angle a peer currently claims
+    // (in-flight or mid-dwell) or that a parked peer is about to win. The
+    // three rules live in vantageVetoedByPeers() — the hold branch above this
+    // walk consults the same implementation, which is what keeps "nothing
+    // selectable, park on my own vantage" and "this vantage is selectable"
+    // mutually exclusive by construction.
+    if (coord_ && coord_->enabled() &&
+        vantageVetoedByPeers(tgt->id, v.position, robot_pos)) {
+      ++rej_minpos;  // all three rules fold here: the CSV schema is unchanged
+      continue;
     }
     if (cost < best_cost) {
       best_cost = cost;
@@ -3142,7 +3567,12 @@ void ExploPlannerNode::doExploitPlan() {
   }
 
   if (best_idx < 0) {
-    RCLCPP_INFO(get_logger(),
+    // Throttled: this branch re-runs at the 10 Hz tick rate while nothing is
+    // selectable, and an unthrottled print turned a 25 s hold into 200
+    // identical lines that buried the two log lines that actually explained
+    // the round (run9). The rejection counters still tell the whole story
+    // once per window.
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Target %u: no selectable vantage (valid=%d noground=%d roi=%d map=%d "
         "unreach=%d los=%d visited=%d blk=%d minpos=%d).",
         tgt->id, n_valid, rej_noground, rej_roi, rej_map, rej_unreach, rej_los,
@@ -3259,7 +3689,121 @@ void ExploPlannerNode::doExploitDwell() {
         "EXPLOIT_DWELL: clock went backwards (elapsed=%.2fs) — re-anchoring "
         "dwell start.", elapsed);
     state_enter_time_ = this->now();
+    // Carry the dwell-sync wait clock back with it. That one is anchored ONCE at
+    // state entry and never re-anchored per tick, so a rewind leaves it in the
+    // future: the wait reads negative, stays below max_wait forever, and the
+    // barrier holds the robot at the vantage for the rest of the run.
+    dwell_sync_wait_start_ = state_enter_time_;
     return;
+  }
+
+  // Vantage-ring rendezvous barrier. Hold here — dwell clock NOT started — while
+  // any peer holds an exploit claim on this trunk and has not yet declared
+  // itself staged on the vantage it claimed. The ring exists to capture ONE
+  // trunk state from several angles at once; a robot that arrives first and
+  // dwells alone spends the team's 3/3 quota on sequential single-robot views,
+  // and the peer that arrives after the target closed dwells an angle nobody
+  // needs.
+  //
+  // "Staged" is PRODUCER-DECLARED (each robot sets the flag on its own claim at
+  // dwell entry, i.e. after arrival AND the post-arrival rotation settle) rather
+  // than inferred here from the claim's robot_pos against its goal_pos. Only the
+  // producer knows whether the exploit hop it is holding is a vantage at all (an
+  // approach waypoint is not) and whether it has stopped turning: the geometric
+  // test read a peer that had arrived in XY but was still rotating as staged
+  // ~5 s early, and the team's overlap collapsed to ~3 s of an 8 s dwell.
+  //
+  // The barrier is a START condition, latched by dwell_sync_started_ once
+  // satisfied. It must not be re-tested per tick: peers go staged=false again
+  // the moment they leave for their next angle, and re-testing then wiped the
+  // accumulated dwell of a robot that had been motionless all along (see the
+  // member's declaration). Started dwells therefore RUN TO COMPLETION.
+  //
+  // The wait mechanism is a per-tick re-anchor of state_enter_time_, not a
+  // separate hold state: `elapsed` below therefore still measures real
+  // motionless seconds at the vantage from the moment the team was staged, so
+  // the CSV dwell_sec stays an honest capture length rather than wait time plus
+  // capture. Release paths (unchanged): every claiming peer staged, no peer
+  // claims this trunk, a peer's claim ages out (firstUnstagedExploitPeer filters
+  // expiry itself — prune() runs in the PLAN ticks, which do not happen while we
+  // sit here), or max_wait below. The 1 Hz heartbeat republish of each claim is
+  // what carries a peer's staging to us; it bounds the residual asymmetry to
+  // one heartbeat plus the DDS hop, and the immediate publish at dwell entry
+  // (transitionTo) removes even that for the common case.
+  if (exploit_dwell_sync_enabled_ && coord_ && coord_->enabled() &&
+      !dwell_sync_started_ && !dwell_sync_timed_out_) {
+    const Target* synced_target = target_queue_.active();
+    if (synced_target) {
+      const auto now = this->now();
+      const auto* waiting_on =
+          coord_->firstUnstagedExploitPeer(synced_target->id, now);
+      if (!waiting_on) {
+        // Barrier satisfied -> latch the start for the rest of this dwell.
+        //
+        // Logged only when we actually held for somebody. The probe returns
+        // nullptr for two different situations — every same-target peer staged,
+        // and no peer claiming this trunk at all (the solo capture, which is the
+        // single-robot-equivalent case and must not produce a "team staged" line
+        // per vantage) — and the Coordination API exposes no per-target peer
+        // claim count to separate them. The hold branch's re-anchor IS that
+        // record: state_enter_time_ sits past the entry-time wait clock iff this
+        // barrier held for at least one tick. A peer that was already staged when
+        // we arrived consequently starts its dwell silently too.
+        if (state_enter_time_ > dwell_sync_wait_start_) {
+          RCLCPP_INFO(get_logger(),
+              "dwell-sync: team staged on target %u — dwell runs to "
+              "completion.", synced_target->id);
+        }
+        dwell_sync_started_ = true;
+      } else {
+        const double waited = (now - dwell_sync_wait_start_).seconds();
+        // max_wait <= 0 means "wait until the peer actually arrives", which is
+        // the default. A wall-clock bound cannot tell a teammate that is merely
+        // FAR from one that is wedged: the ring of the next trunk can be 30 m
+        // away across the plot, and a peer that is still driving toward its own
+        // angle was abandoned at 60 s while it needed 111 s — the capture went
+        // solo for no reason. Waiting indefinitely does not hang the run,
+        // because a robot that is waiting is by definition standing on its
+        // vantage with staged=true already on the wire (published at dwell
+        // entry), so it never holds a peer's barrier: only a DRIVING peer
+        // holds, and that peer is bounded by its own timers, which do tick
+        // while it drives. It arrives, or it goes silent and its claim ages out
+        // of the table on the receipt-time TTL, or its own per-target give-up
+        // closes the trunk and it stops claiming it. All three release us.
+        const bool wait_bounded = exploit_dwell_sync_max_wait_sec_ > 0.0;
+        if (!wait_bounded || waited < exploit_dwell_sync_max_wait_sec_) {
+          state_enter_time_ = now;
+          if (wait_bounded) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "dwell-sync: holding at vantage %d, waiting for '%s' to stage "
+                "on target %u (%.0fs / %.0fs).",
+                current_vantage_index_, waiting_on->robot_id.c_str(),
+                synced_target->id, waited, exploit_dwell_sync_max_wait_sec_);
+          } else {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "dwell-sync: holding at vantage %d, waiting for '%s' to stage "
+                "on target %u (%.0fs, no deadline — until it arrives).",
+                current_vantage_index_, waiting_on->robot_id.c_str(),
+                synced_target->id, waited);
+          }
+          return;
+        }
+        // Give-up bound: a peer wedged in a proximity hold or cycling
+        // EXPLOIT_PLAN with no selectable vantage must not cost this robot its
+        // capture. Latched for the rest of THIS dwell — re-testing would
+        // re-anchor the dwell clock on the next tick and the dwell would never
+        // complete. transitionTo clears the latch on the next EXPLOIT_DWELL
+        // entry, so one timed-out barrier does not disable the feature.
+        dwell_sync_timed_out_ = true;
+        RCLCPP_WARN(get_logger(),
+            "dwell-sync: barrier timed out after %.0fs waiting for '%s' on "
+            "target %u (limit %.0fs) — DWELLING SOLO. This capture is not "
+            "simultaneous with the team's; check that peer for a proximity hold "
+            "or an unreachable ring.",
+            waited, waiting_on->robot_id.c_str(), synced_target->id,
+            exploit_dwell_sync_max_wait_sec_);
+      }
+    }
   }
 
   // NO goal re-send during the dwell. The dwell is only ever entered from
@@ -3319,10 +3863,29 @@ void ExploPlannerNode::doExploitDwell() {
                                    current_vantage_index_);
   pending_exploit_dwell_sec_ = static_cast<float>(elapsed);
 
+  // Remember the exact pose this dwell was captured from. If the rest of the
+  // ring ends up covered by the team, doExploitPlan's hold branch parks the
+  // robot back on precisely this position AND yaw — the operator requirement
+  // is that the robot which does not get the last vantage keeps its vantage
+  // pose, not "stops somewhere near it".
+  if (t) {
+    held_vantage_pose_      = current_goal_;
+    held_vantage_index_     = current_vantage_index_;
+    held_vantage_target_id_ = t->id;
+    held_vantage_valid_     = true;
+  }
+
   // Broadcast the updated team-credit mask immediately (don't wait for the
   // next selection or heartbeat) so a peer picking its next angle right now
   // already sees this dwell — and so the credit lands before this robot
   // could release the claim on target completion.
+  //
+  // Patch the cached message in place; do NOT rebuild it through buildIntent().
+  // Rebuilding would reset `staged` to false while the robot is still standing
+  // on the vantage, which is exactly wrong for the last round of a ring: a robot
+  // with no selectable vantage left holds here, and the heartbeat republish of
+  // THIS message (staged, at the vantage) is what keeps a peer's barrier
+  // released while that peer takes the final angle.
   if (intent_pub_ && coord_ && have_active_intent_ && t) {
     current_intent_msg_.dwelled_mask = t->clear_mask;
     current_intent_msg_.header.stamp = this->now();

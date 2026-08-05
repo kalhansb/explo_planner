@@ -317,6 +317,17 @@
     # survives before peers can take its target.
     coord_claim_radius_m: 0.0       # 0 = auto = fov_max_range (Burgard 2005)
     coord_claim_ttl_sec: 5.0        # 5 x heartbeat; stalled peer releases ~5 s
+    # Extra retention for EXPLOIT claims past their TTL, used only by the
+    # vantage-contest lookups. The TTL assumes the 1 Hz heartbeat is HEARD at
+    # 1 Hz, but the receiving planner is a single-threaded executor whose
+    # EXPLOIT_PLAN retry ticks (fused-map refresh, whole-grid floods) can
+    # starve the intent subscription for multiple seconds; in a 2-robot sim
+    # run the driving winner's claim aged out of the parked loser's table
+    # twice and the loser re-selected the winner's vantage each time. Grace
+    # keeps an engagement contestable across such gaps. Barrier release and
+    # rendezvous presence stay on the raw TTL (a dead peer still frees the
+    # team in ~5 s); a dead winner frees its vantage in ttl + grace.
+    coord_claim_grace_sec: 10.0     # 2 x ttl; 0 = legacy single-TTL behaviour
     coord_intent_topic: "/exploration/intents"
     coord_heartbeat_hz: 1.0
     # EXPLOIT claims use a separate, much smaller MinPos disc: vantages on one
@@ -440,6 +451,57 @@
     # vantages then land in the neighbouring canopy and fail LoS together.
     vantage_start_angle_deg: 30.0
     exploit_dwell_sec: 8.0          # hold time at each vantage (s)
+
+    # Vantage-ring RENDEZVOUS BARRIER (multi-robot). ON by default: a robot that
+    # has arrived at its vantage does NOT start its dwell clock until every peer
+    # holding an active exploit claim on the SAME trunk has flagged itself STAGED.
+    # Staging is declared by the producer, never inferred by the observer: each
+    # robot sets `staged` on its own intent when it ENTERS its dwell at the vantage
+    # — after nav arrival AND the post-arrival rotation settle — and every claim it
+    # publishes while driving anywhere carries staged=false. The flag rides the
+    # 1 Hz intent heartbeat, so a robot parked on its last vantage keeps reading as
+    # staged to the team.
+    # Once every same-target claim is flagged, all of them dwell simultaneously —
+    # the point of the ring: overlapping views of ONE trunk state, not
+    # min_vantages_required sequential single-robot views of a trunk that moved in
+    # the wind between them — and each dwell then RUNS TO COMPLETION. The barrier
+    # is a START condition only: a peer moving on to its next angle (staged=false
+    # again) no longer restarts anyone's dwell clock, which used to cost the robot
+    # left behind its accumulated dwell and a full re-capture.
+    # The wait is implemented as a per-tick re-anchor of the dwell start, so the
+    # CSV dwell_sec stays an honest capture length (wait time is not counted as
+    # dwell), and it releases as soon as the last peer stages, when no peer claims
+    # this trunk, or when a peer's claim ages out of the table (a dead teammate
+    # stops holding the team ~coord_claim_ttl_sec after it was last heard).
+    # `staged` is a RobotIntent WIRE field, so every team member must run the same
+    # build: an older peer's intents never flag it, and its teammates then hold
+    # their barriers until the give-up path below.
+    # Not to be confused with rendezvous_* above: that is the COMMS-reconnection
+    # barrier at the anchor pose. This one is per-vantage capture sync.
+    # Without it (observed, 2-robot sim, 3/3 quota): one robot finished an angle,
+    # was by construction the closest robot to every remaining angle, took the one
+    # its peer had been driving toward for 19 s, both converged on the same point,
+    # the proximity right-of-way braked the loser 8 times, and the winner closed
+    # the target solo while the peer arrived 5 s late to dwell an angle that no
+    # longer counted. The selection-time exploit-claim yield fixes the poach; this
+    # is what makes the captures simultaneous.
+    exploit_dwell_sync_enabled: true
+    # Barrier give-up (s), measured from arrival at the vantage rather than from
+    # the (re-anchored) dwell start. 0 = WAIT UNTIL THE PEER ARRIVES, the default.
+    # A wall-clock deadline cannot tell a teammate that is merely far away from one
+    # that is wedged, and the two need opposite responses: observed at 60 s, a robot
+    # abandoned a peer that was still driving and needed 111 s to cross the plot to
+    # the next trunk, so that capture went solo for nothing.
+    # An unbounded wait does not hang the run. A robot that is waiting is standing
+    # on its vantage, so it is staged and never holds a peer's barrier — only a
+    # DRIVING peer holds one, and a driving peer still runs its own timers. It
+    # arrives; or it goes silent and its claim ages out on coord_claim_ttl_sec; or
+    # its own exploit_target_timeout_sec closes that trunk and it stops claiming it.
+    # Every one of those releases the barrier.
+    # Set a positive value to force a deadline anyway: on expiry the robot WARNs
+    # loudly and dwells solo, and that capture is not simultaneous with the team's.
+    exploit_dwell_sync_max_wait_sec: 0.0
+
     # Per-target give-up budget (s): wall-clock on ONE trunk since the last
     # progress event — activation, approach-waypoint arrival, or a completed
     # dwell each re-arm it, and proximity-hold time is refunded. When it

@@ -61,3 +61,19 @@ uint32 target_id
 # captured once, cooperatively. Cumulative-state (not per-event) so a lost
 # message never loses credit. Supports n_vantages <= 32.
 uint32 dwelled_mask
+
+# Meaningful only when exploit is true. True means the producer is physically
+# standing on the vantage in goal_pos, in its dwell state: the flag is set at
+# EXPLOIT_DWELL entry, i.e. after nav arrival AND the post-arrival rotation
+# settle. False on every claim published while the producer is driving (vantage
+# hop, approach hop) and on all exploration claims.
+#
+# The producer declares this because a consumer cannot infer it. Peers used to
+# derive staging from geometry — XY distance from this claim's robot_pos to its
+# own goal_pos within a tolerance — and that inference cannot separate "on the
+# vantage" from "arrived in XY but still rotating beside it", which read as
+# staged ~5 s early and started the team's dwells out of step, nor from
+# "standing at an approach waypoint", an intermediate exploit hop whose goal is
+# the waypoint and not a vantage at all. Peers use this flag as the
+# rendezvous-barrier staging signal, so the team's dwells start together.
+bool staged
