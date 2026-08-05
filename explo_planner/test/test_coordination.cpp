@@ -47,6 +47,30 @@ rclcpp::Time at(double sec) {
   return rclcpp::Time(static_cast<int64_t>(sec * 1e9), RCL_ROS_TIME);
 }
 
+/// Peer exploit claim for the rendezvous-barrier tests: the producer is holding
+/// (or driving to) vantage (gx, gy) on `target_id` while its last heartbeat put
+/// it at (rx, ry) and declared `staged` — true only if that peer was in its own
+/// dwell state on (gx, gy) when it published. The pose is still filled in
+/// because MinPos uses it; the barrier does not. `expiry_sec` is on the same
+/// local clock as at()/now.
+Coordination::Claim exploitClaim(const std::string& robot_id,
+                                 uint32_t target_id,
+                                 float gx, float gy,
+                                 float rx, float ry,
+                                 bool staged = false,
+                                 double expiry_sec = 1000.0) {
+  Coordination::Claim c;
+  c.robot_id = robot_id;
+  c.goal_pos = Eigen::Vector3f(gx, gy, 0.0f);
+  c.robot_pos = Eigen::Vector3f(rx, ry, 0.0f);
+  c.radius_m = 0.75f;   // exploit-scale: one vantage angle around a trunk
+  c.expiry = at(expiry_sec);
+  c.exploit = true;
+  c.target_id = target_id;
+  c.staged = staged;
+  return c;
+}
+
 }  // namespace
 
 // 1. Disabled mode: claimMatching always returns nullptr regardless of
@@ -297,24 +321,37 @@ TEST(Coordination, ExploitFieldsRoundTrip) {
   auto msg = producer.buildIntent(vp, Eigen::Vector3f(0, 0, 0), now,
                                    5.0f, 0.75f, 2, "map",
                                    /*exploit=*/true, /*target_id=*/42,
-                                   /*dwelled_mask=*/0b1011u);
+                                   /*dwelled_mask=*/0b1011u, /*staged=*/true);
   EXPECT_TRUE(msg.exploit);
   EXPECT_EQ(msg.target_id, 42u);
   EXPECT_EQ(msg.dwelled_mask, 0b1011u);
+  EXPECT_TRUE(msg.staged);
 
   // A peer ingesting that intent stores the exploit fields and surfaces them
-  // through peerDwellUnion.
+  // through peerDwellUnion and the rendezvous barrier.
   Coordination peer(true, "rama");
   peer.onIntent(msg, now);
   EXPECT_EQ(peer.activePeerCount(), 1u);
   EXPECT_EQ(peer.peerDwellUnion(42), 0b1011u);
+  EXPECT_EQ(peer.firstUnstagedExploitPeer(42, now), nullptr);
 
-  // Default (explore) build leaves the exploit fields zeroed.
+  // The same claim republished while driving holds that peer's barrier: staging
+  // travels on the wire, it is not re-derived from the pose in the claim.
+  auto driving = producer.buildIntent(vp, Eigen::Vector3f(0, 0, 0), now,
+                                       5.0f, 0.75f, 2, "map",
+                                       /*exploit=*/true, /*target_id=*/42,
+                                       /*dwelled_mask=*/0b1011u,
+                                       /*staged=*/false);
+  peer.onIntent(driving, now);
+  EXPECT_NE(peer.firstUnstagedExploitPeer(42, now), nullptr);
+
+  // Default (explore) build leaves the exploit fields zeroed and unstaged.
   auto explore = producer.buildIntent(vp, Eigen::Vector3f(0, 0, 0), now,
                                        5.0f, 4.0f, 0, "map");
   EXPECT_FALSE(explore.exploit);
   EXPECT_EQ(explore.target_id, 0u);
   EXPECT_EQ(explore.dwelled_mask, 0u);
+  EXPECT_FALSE(explore.staged);
 }
 
 // 14. claimMatching sizes each claim's exclusion disc by the radius the
@@ -458,4 +495,400 @@ TEST(Coordination, NonFiniteTtlExpiresOnTheNextPrune) {
     c.prune(at(100.0));
     EXPECT_EQ(c.activePeerCount(), 0u) << "ttl=" << ttl;
   }
+}
+
+// ==================================================================
+// Rendezvous barrier: firstUnstagedExploitPeer()
+// ==================================================================
+// A robot that has reached its exploitation vantage waits in EXPLOIT_DWELL
+// until every peer holding an active exploit claim on the SAME target has
+// DECLARED itself staged on its own claimed vantage, so the whole team dwells
+// simultaneously. The barrier is up for as long as this query returns non-null,
+// and the claim it returns is the peer being waited on (logging).
+
+TEST(Coordination, FirstUnstagedExploitPeerNoClaimsIsNullptr) {
+  // Solo run, or a target no peer has claimed: nothing to wait for, dwell now.
+  Coordination c(true, "atlas");
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerReturnsPeerStillDriving) {
+  Coordination c(true, "atlas");
+  // rama has claimed the vantage at (10, 0) but its latest heartbeat declared
+  // staged=false -- it is driving in, so the barrier holds and names it.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 10.0f, 0.0f, 4.0f, 0.0f,
+                                    /*staged=*/false));
+
+  const auto* waiting = c.firstUnstagedExploitPeer(7u, at(100.0));
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_EQ(waiting->robot_id, "rama");
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerNullptrOncePeerStages) {
+  Coordination c(true, "atlas");
+  // Same peer, a later heartbeat: it has entered its dwell on that vantage and
+  // says so. Barrier releases.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 10.0f, 0.0f, 10.0f, 0.0f,
+                                    /*staged=*/true));
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerFlagBeatsGeometry) {
+  // The contract: staging is what the PRODUCER declares, and the barrier reads
+  // nothing else. Position used to decide it, and could not tell "on the
+  // vantage" from "arrived in XY, still rotating beside it" (released ~5 s
+  // early, so the team's dwells no longer overlapped) or from "parked at an
+  // approach waypoint", which is an exploit hop but not a vantage at all.
+  Coordination c(true, "atlas");
+
+  // Sitting EXACTLY on its own goal and still not staged -- the peer has
+  // arrived but has not settled its capture yaw. The barrier holds.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 3.0f, 0.0f, 3.0f, 0.0f,
+                                    /*staged=*/false));
+  const auto* waiting = c.firstUnstagedExploitPeer(7u, at(100.0));
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_EQ(waiting->robot_id, "rama");
+
+  // 50 m from the goal in the claim, but staged=true (e.g. the pose in the
+  // claim is one heartbeat stale, or the peer re-anchored): still released,
+  // because the distance is never looked at.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 3.0f, 0.0f, 53.0f, 0.0f,
+                                    /*staged=*/true));
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerIgnoresExploreClaims) {
+  Coordination c(true, "atlas");
+  // exploit=false: the peer is driving to an exploration goal, not to a vantage
+  // on our trunk. It is not part of this rendezvous whatever it declares --
+  // waiting for it would couple our dwell to unrelated frontier travel.
+  auto explore = exploitClaim("rama", 7u, 10.0f, 0.0f, 0.0f, 0.0f,
+                              /*staged=*/false);
+  explore.exploit = false;
+  c.injectClaimForTest(explore);
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerIgnoresOtherTargets) {
+  Coordination c(true, "atlas");
+  // Unstaged, but exploiting a DIFFERENT trunk: the barrier is per-target, so
+  // that peer's arrival is none of our business.
+  c.injectClaimForTest(exploitClaim("rama", 8u, 10.0f, 0.0f, 0.0f, 0.0f,
+                                    /*staged=*/false));
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerIgnoresExpiredClaimWithoutPrune) {
+  // Dead-peer release path. The caller queries this from EXPLOIT_DWELL, where
+  // the PLAN tick -- and therefore prune() -- never runs, so the stale claim of
+  // a peer that died on its way in is still in the table, still unstaged.
+  // There is deliberately NO prune() call in this test: the query must step
+  // over the expired claim itself, otherwise the robot that did arrive dwells
+  // forever.
+  Coordination c(true, "atlas");
+  c.injectClaimForTest(exploitClaim("rama", 7u, 10.0f, 0.0f, 0.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);   // unpruned, still stored
+
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);  // == now
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(105.0)), nullptr);  // past
+  EXPECT_EQ(c.activePeerCount(), 1u);   // and the query is non-mutating
+
+  // Sanity: the very same claim one second BEFORE its expiry does hold us, so
+  // the release above is the TTL and not a mis-filtered field.
+  EXPECT_NE(c.firstUnstagedExploitPeer(7u, at(99.0)), nullptr);
+}
+
+TEST(Coordination, FirstUnstagedExploitPeerReturnsTheUnstagedOfTwo) {
+  Coordination c(true, "atlas");
+  // rama is dwelling on its vantage; ravana claimed the far side of the trunk
+  // and is still driving. Stored in that order, so this also checks that a
+  // staged claim is skipped rather than returned.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 3.0f, 0.0f, 3.0f, 0.0f,
+                                    /*staged=*/true));
+  c.injectClaimForTest(exploitClaim("ravana", 7u, -3.0f, 0.0f, 2.0f, 0.0f,
+                                    /*staged=*/false));
+
+  const auto* waiting = c.firstUnstagedExploitPeer(7u, at(100.0));
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_EQ(waiting->robot_id, "ravana");
+
+  // Once ravana stages on its vantage too, the whole team is staged.
+  c.injectClaimForTest(exploitClaim("ravana", 7u, -3.0f, 0.0f, -3.0f, 0.0f,
+                                    /*staged=*/true));
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);
+}
+
+// ==================================================================
+// Selection-time parked-peer contest: stagedExploitPeerWinning()
+// ==================================================================
+// When the team's synchronised dwells end, both robots re-plan within
+// milliseconds and both see the SAME single remaining un-dwelled vantage. Their
+// claims on it cross in the air — the intent heartbeat is only ~1 Hz — so both
+// drove at the same angle and, in the last field run, collided. This probe
+// decides the contest at selection time from claims already in the table: a
+// candidate a parked same-target peer would win under MinPos's total order is
+// not selectable, so the yield happens before either robot moves. Only PARKED
+// (staged) peers contest this way; a driving peer contests through its claim
+// disc alone.
+
+TEST(Coordination, StagedExploitPeerWinningNoClaimsIsNullptr) {
+  // Solo run, or a target no peer has claimed: nothing contests the angle.
+  Coordination c(true, "atlas");
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(0.0f, 0.0f, 0.0f),
+                                       "atlas", at(100.0)),
+            nullptr);
+}
+
+TEST(Coordination, StagedExploitPeerWinningBlocksCandidateWhenPeerCloser) {
+  Coordination c(true, "atlas");
+  // Trunk 7 at the origin, vantages on a 3 m ring, and (-3, 0) is the last
+  // un-dwelled angle. rama is PARKED on the vantage at (0, 3), 4.24 m from that
+  // angle; we are parked at (3, 0), a full 6 m away. rama is about to re-plan
+  // from a standstill and will take it, so the candidate is not ours to select.
+  c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 0.0f, 3.0f,
+                                    /*staged=*/true));
+
+  const auto* blocking = c.stagedExploitPeerWinning(
+      7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+      Eigen::Vector3f(3.0f, 0.0f, 0.0f), "atlas", at(100.0));
+  ASSERT_NE(blocking, nullptr);
+  EXPECT_EQ(blocking->robot_id, "rama");   // named for the caller's log
+  EXPECT_EQ(c.activePeerCount(), 1u);      // and the probe is non-mutating
+}
+
+TEST(Coordination, StagedExploitPeerWinningNullptrWhenSelfCloser) {
+  // Mirror of the case above — rama is parked on the far side of the trunk and
+  // we are the one standing next to the free angle, so it is ours to take. Our
+  // id is deliberately the LEXICOGRAPHICALLY LARGER one ("zulu" > "rama"): the
+  // tiebreak must not be reached at all when the distances differ, or the
+  // farther robot could steal an angle it is nowhere near.
+  Coordination c(true, "zulu");
+  c.injectClaimForTest(exploitClaim("rama", 7u, 3.0f, 0.0f, 3.0f, 0.0f,
+                                    /*staged=*/true));
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(0.0f, 3.0f, 0.0f),
+                                       "zulu", at(100.0)),
+            nullptr);
+}
+
+TEST(Coordination, StagedExploitPeerWinningExactTieLexTiebreak) {
+  // Exactly equidistant, which happens for real whenever the two robots park on
+  // vantages symmetric about the free angle. Candidate at the origin, we at
+  // (4, 0), the parked peer at (-4, 0): powers of two, so both squared distances
+  // are the SAME float and the comparison genuinely falls through to the id
+  // tiebreak rather than being decided by rounding.
+  Coordination self_wins(true, "atlas");
+  self_wins.injectClaimForTest(exploitClaim("rama", 7u, -4.0f, 0.0f,
+                                            -4.0f, 0.0f, /*staged=*/true));
+  EXPECT_EQ(self_wins.stagedExploitPeerWinning(
+                7u, Eigen::Vector3f(0.0f, 0.0f, 0.0f),
+                Eigen::Vector3f(4.0f, 0.0f, 0.0f), "atlas", at(100.0)),
+            nullptr);   // "atlas" < "rama" -> ours
+
+  // Swap the ids and nothing else. Now WE lose the tie and the very same
+  // geometry blocks the candidate: run on both robots, this pair of outcomes is
+  // what guarantees exactly ONE of them admits the vantage.
+  Coordination peer_wins(true, "rama");
+  peer_wins.injectClaimForTest(exploitClaim("atlas", 7u, -4.0f, 0.0f,
+                                            -4.0f, 0.0f, /*staged=*/true));
+  const auto* blocking = peer_wins.stagedExploitPeerWinning(
+      7u, Eigen::Vector3f(0.0f, 0.0f, 0.0f),
+      Eigen::Vector3f(4.0f, 0.0f, 0.0f), "rama", at(100.0));
+  ASSERT_NE(blocking, nullptr);
+  EXPECT_EQ(blocking->robot_id, "atlas");
+}
+
+TEST(Coordination, StagedExploitPeerWinningDrivingPeerNeverBlocks) {
+  // Identical geometry to BlocksCandidateWhenPeerCloser — the peer is still the
+  // closer robot — but its heartbeat says staged=false, so it is DRIVING and
+  // this probe ignores it entirely. A moving peer contests only through its
+  // claim disc (claimMatching), because a position contest against a mover would
+  // deny an approaching robot every angle on the ring at once: arriving from far
+  // away it is farther from all of them than a peer already circling the trunk,
+  // and exploitation would serialise instead of running in parallel. The mover's
+  // pose on the wire is up to a heartbeat stale anyway.
+  Coordination c(true, "atlas");
+  c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 0.0f, 3.0f,
+                                    /*staged=*/false));
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       "atlas", at(100.0)),
+            nullptr);
+}
+
+TEST(Coordination, StagedExploitPeerWinningIgnoresOtherTargetAndExploreClaims) {
+  Coordination c(true, "atlas");
+  // Both of these peers are staged and both are much closer to the candidate
+  // than we are (they sit on it), so only the target/exploit filters can save
+  // the candidate. Neither peer is on OUR ring: one is parked at a vantage of a
+  // different trunk that happens to be nearby, the other is not exploiting at
+  // all. Contesting an angle of trunk 7 against either would strand us with no
+  // vantage to take on a trunk nobody else is working.
+  c.injectClaimForTest(exploitClaim("rama", 8u, -3.0f, 0.0f, -3.0f, 0.0f,
+                                    /*staged=*/true));
+  auto explore = exploitClaim("ravana", 7u, -3.0f, 0.0f, -3.0f, 0.0f,
+                              /*staged=*/true);
+  explore.exploit = false;
+  c.injectClaimForTest(explore);
+
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       "atlas", at(100.0)),
+            nullptr);
+}
+
+TEST(Coordination, StagedExploitPeerWinningIgnoresExpiredClaimWithoutPrune) {
+  // A peer that went silent — died, or drove out of comms — must not keep vetoing
+  // an angle forever. There is deliberately NO prune() call here: the probe steps
+  // over the expired claim itself, so the receipt-time TTL is the release path
+  // however the caller is scheduled.
+  Coordination c(true, "atlas");
+  c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 0.0f, 3.0f,
+                                    /*staged=*/true, /*expiry_sec=*/100.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);   // unpruned, still stored
+
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       "atlas", at(100.0)),
+            nullptr);   // == now
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       "atlas", at(105.0)),
+            nullptr);   // past
+  EXPECT_EQ(c.activePeerCount(), 1u);   // and the query is non-mutating
+
+  // Sanity: one second BEFORE its expiry the same claim does block us, so the
+  // release above is the TTL and not a mis-filtered field or bad geometry.
+  EXPECT_NE(c.stagedExploitPeerWinning(7u, Eigen::Vector3f(-3.0f, 0.0f, 0.0f),
+                                       Eigen::Vector3f(3.0f, 0.0f, 0.0f),
+                                       "atlas", at(99.0)),
+            nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Exploit-claim grace window. The TTL is sized for a 1 Hz heartbeat HEARD at
+// 1 Hz, but the receiver is a single-threaded executor whose EXPLOIT_PLAN
+// ticks can starve the intent subscription for seconds at a stretch. In a
+// 2-robot sim run the driving winner's claim aged out of the parked loser's
+// table twice — between plan ticks 7 ms apart — and the loser re-selected the
+// winner's vantage both times. Grace keeps exploit claims RETAINED (and the
+// vantage contests closed) one extra window past expiry, while everything
+// with presence semantics — the dwell barrier, rendezvous counting — stays
+// on the raw TTL.
+// ---------------------------------------------------------------------------
+
+TEST(Coordination, ExploitClaimGraceRetainsThroughPrune) {
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+
+  // Inside the grace window prune() keeps the claim and the vantage contest
+  // (claimMatching with default liveness = retained) still sees it.
+  c.prune(at(105.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(5.0f, 0.0f, 0.0f), 0.75f),
+            nullptr);
+
+  // At expiry + grace the retention ends: pruned, gone.
+  c.prune(at(110.0));
+  EXPECT_EQ(c.activePeerCount(), 0u);
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(5.0f, 0.0f, 0.0f), 0.75f),
+            nullptr);
+}
+
+TEST(Coordination, GraceDoesNotApplyToExploreClaims) {
+  // Grace is an EXPLOIT-claim property. An exploration claim held past its
+  // TTL would keep contesting frontier candidates for a peer we may not have
+  // heard from in 10+ seconds — exploration keeps single-TTL semantics.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  auto claim = exploitClaim("rama", 0u, 5.0f, 0.0f, 5.0f, 0.0f,
+                            /*staged=*/false, /*expiry_sec=*/100.0);
+  claim.exploit = false;
+  c.injectClaimForTest(claim);
+
+  c.prune(at(99.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);   // still live, still stored
+  c.prune(at(101.0));
+  EXPECT_EQ(c.activePeerCount(), 0u);   // dropped at expiry, no grace
+}
+
+TEST(Coordination, GraceZeroPreservesLegacyPrune) {
+  // Default-constructed grace (0) must be bit-for-bit the old behaviour:
+  // exploit claims drop AT expiry.
+  Coordination c(true, "atlas");
+  c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+  c.prune(at(100.0));
+  EXPECT_EQ(c.activePeerCount(), 0u);
+}
+
+TEST(Coordination, LivePeerCountExcludesGracedClaims) {
+  // livePeerCount is the PRESENCE count (rendezvous barriers, the CSV
+  // column): a claim past its raw expiry no longer proves the peer is alive,
+  // however long the table retains it for the vantage contests.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+
+  EXPECT_EQ(c.livePeerCount(at(99.0)), 1u);
+  c.prune(at(105.0));                        // graced: retained...
+  ASSERT_EQ(c.activePeerCount(), 1u);
+  EXPECT_EQ(c.livePeerCount(at(105.0)), 0u); // ...but not PRESENT
+}
+
+TEST(Coordination, ClaimMatchingLiveAfterFiltersExpired) {
+  // The optional liveness filter is what the exploration MinPos walk passes:
+  // it must see live claims only, while the exploit contest sites (nullptr)
+  // read the table as retained. No prune() here — the filter itself decides.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+
+  const auto before = at(99.0);
+  const auto after  = at(101.0);
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(5.0f, 0.0f, 0.0f), 0.75f, &before),
+            nullptr);
+  EXPECT_EQ(c.claimMatching(Eigen::Vector3f(5.0f, 0.0f, 0.0f), 0.75f, &after),
+            nullptr);
+  // Default (no filter): found regardless — the retained view.
+  EXPECT_NE(c.claimMatching(Eigen::Vector3f(5.0f, 0.0f, 0.0f), 0.75f),
+            nullptr);
+}
+
+TEST(Coordination, StagedExploitPeerWinningHonoursGrace) {
+  // The parked-peer contest is a veto, and a parked peer whose heartbeats sat
+  // undelivered is still parked — the staged flag only flips through a
+  // message. Within grace the peer keeps winning the angle; one grace window
+  // past the TTL a genuinely dead peer stops.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 0.0f, 3.0f,
+                                    /*staged=*/true, /*expiry_sec=*/100.0));
+  const Eigen::Vector3f cand(-3.0f, 0.0f, 0.0f);
+  const Eigen::Vector3f self(30.0f, 0.0f, 0.0f);   // far: peer clearly closer
+
+  EXPECT_NE(c.stagedExploitPeerWinning(7u, cand, self, "atlas", at(99.0)),
+            nullptr);   // live
+  EXPECT_NE(c.stagedExploitPeerWinning(7u, cand, self, "atlas", at(105.0)),
+            nullptr);   // expired but graced: still vetoes
+  EXPECT_EQ(c.stagedExploitPeerWinning(7u, cand, self, "atlas", at(110.0)),
+            nullptr);   // == expiry + grace: released
+}
+
+TEST(Coordination, BarrierIgnoresGracedClaims) {
+  // THE regression guard for the barrier: grace lengthens how long a claim
+  // can VETO a vantage, and must not lengthen how long a silent peer can
+  // HOLD a dwell barrier. firstUnstagedExploitPeer releases on the raw TTL
+  // exactly as before — a dead teammate frees the dwelling robot in one TTL,
+  // not TTL + grace.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 6.0f, 6.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+
+  EXPECT_NE(c.firstUnstagedExploitPeer(7u, at(99.0)), nullptr);   // held
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(100.0)), nullptr);  // == expiry
+  // Still in the table (graced), yet the barrier is already released.
+  EXPECT_EQ(c.firstUnstagedExploitPeer(7u, at(105.0)), nullptr);
+  EXPECT_EQ(c.activePeerCount(), 1u);
 }

@@ -7,9 +7,21 @@
 namespace explo_planner {
 
 Coordination::Coordination(bool enabled, std::string self_id,
-                           float max_claim_radius_m)
+                           float max_claim_radius_m,
+                           float exploit_claim_grace_sec)
     : enabled_(enabled), self_id_(std::move(self_id)),
-      max_claim_radius_m_(max_claim_radius_m) {}
+      max_claim_radius_m_(max_claim_radius_m),
+      exploit_grace_sec_(
+          std::isfinite(exploit_claim_grace_sec) && exploit_claim_grace_sec > 0.0f
+              ? exploit_claim_grace_sec
+              : 0.0f) {}
+
+bool Coordination::withinRetention(const Claim& c,
+                                   const rclcpp::Time& now) const {
+  if (c.expiry > now) return true;
+  if (!c.exploit || exploit_grace_sec_ <= 0.0f) return false;
+  return c.expiry + rclcpp::Duration::from_seconds(exploit_grace_sec_) > now;
+}
 
 void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
                             const rclcpp::Time& now_local) {
@@ -47,6 +59,7 @@ void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
   claim.exploit = msg.exploit;
   claim.target_id = msg.target_id;
   claim.dwelled_mask = msg.dwelled_mask;
+  claim.staged = msg.staged;
 
   // Expiry = LOCAL receipt time + ttl, so prune(now) compares two timestamps
   // from the SAME clock. Building expiry from the producer's header.stamp
@@ -80,21 +93,37 @@ void Coordination::onIntent(const explo_planner_msgs::msg::RobotIntent& msg,
 }
 
 void Coordination::prune(const rclcpp::Time& now) {
+  // Exploit claims are retained one grace window past expiry (withinRetention)
+  // so the vantage contests stay closed across receive-side delivery gaps —
+  // see the constructor doc for the incident. Non-exploit claims drop at
+  // expiry exactly as before.
   claims_.erase(
       std::remove_if(
           claims_.begin(), claims_.end(),
-          [&now](const Claim& c) { return c.expiry <= now; }),
+          [this, &now](const Claim& c) { return !withinRetention(c, now); }),
       claims_.end());
 }
 
+size_t Coordination::livePeerCount(const rclcpp::Time& now) const {
+  size_t n = 0;
+  for (const auto& c : claims_)
+    if (c.expiry > now) ++n;
+  return n;
+}
+
 const Coordination::Claim* Coordination::claimMatching(
-    const Eigen::Vector3f& candidate_xy, float match_radius_m) const {
+    const Eigen::Vector3f& candidate_xy, float match_radius_m,
+    const rclcpp::Time* live_after) const {
   if (claims_.empty()) return nullptr;
 
   const Claim* best = nullptr;
   float best_d2 = std::numeric_limits<float>::infinity();
 
   for (const auto& c : claims_) {
+    // Liveness filter for callers that must not see graced exploit claims
+    // (the exploration MinPos walk — see the header). Exploit contest sites
+    // pass nullptr and read the table as retained.
+    if (live_after && c.expiry <= *live_after) continue;
     // Test against the radius the CLAIMER advertised, not our own. The claim
     // radius is the size of the region that peer is occupying, and it is
     // phase-dependent: an exploration claim is ~8-10 m ("I'm driving to this
@@ -152,6 +181,78 @@ uint32_t Coordination::peerDwellUnion(uint32_t target_id) const {
   return mask;
 }
 
+const Coordination::Claim* Coordination::firstUnstagedExploitPeer(
+    uint32_t target_id, const rclcpp::Time& now) const {
+  for (const auto& c : claims_) {
+    // Expiry is tested HERE instead of being left to prune(), unlike every
+    // other lookup in this class. The caller is parked in EXPLOIT_DWELL, a
+    // state whose whole point is that it does not re-plan, so the PLAN tick —
+    // and with it prune() — never fires while the barrier is up. A peer that
+    // died mid-drive would leave an unstaged claim sitting in the table and the
+    // robot that DID arrive would dwell on it forever. With this check the
+    // receipt-time TTL is the release path: a silent peer holds us for one TTL
+    // (~5 s, one heartbeat plus margin) and no longer.
+    if (c.expiry <= now) continue;
+    if (!c.exploit || c.target_id != target_id) continue;
+
+    // "Staged" is the producer's own word: it sets the flag when it enters
+    // EXPLOIT_DWELL, after nav arrival AND the post-arrival rotation settle, and
+    // clears it on every claim it publishes while driving. Each ~1 Hz heartbeat
+    // carries the current value, so an inbound peer's claim flips staged by
+    // itself and the barrier progresses without a re-plan on our side.
+    //
+    // Nothing geometric is consulted here any more. Comparing the claim's
+    // robot_pos against its own goal_pos within a tolerance answered "is it
+    // near that point", which is not the question: a peer that had arrived in
+    // XY but was still rotating to its capture yaw passed the test ~5 s before
+    // it was actually settled, and peers that released on it lost most of the
+    // simultaneous window (~3 s of an 8 s dwell overlapped); and an APPROACH
+    // hop — an exploit claim whose goal IS an intermediate waypoint — passed it
+    // while the peer stood nowhere near a vantage. Which of a peer's exploit
+    // hops is a vantage it is HOLDING is knowable only at the producer.
+    if (!c.staged) return &c;
+  }
+  return nullptr;
+}
+
+const Coordination::Claim* Coordination::stagedExploitPeerWinning(
+    uint32_t target_id, const Eigen::Vector3f& candidate_xy,
+    const Eigen::Vector3f& self_pos, const std::string& self_id,
+    const rclcpp::Time& now) const {
+  for (const auto& c : claims_) {
+    // Retention filtered here as in firstUnstagedExploitPeer(), but on the
+    // GRACED bound, not raw expiry — this probe is a veto, and a parked peer
+    // whose heartbeats sat undelivered is still parked (see the header). The
+    // check is redundant when called right after a plan-tick prune(); it is
+    // kept so the probe is correct from any call site, and so a future caller
+    // in a non-planning state cannot be vetoed by a claim past even the grace
+    // window.
+    if (!withinRetention(c, now)) continue;
+    if (!c.exploit || c.target_id != target_id) continue;
+
+    // Staged claims ONLY. A parked peer is about to re-plan from a standstill
+    // beside this ring, so if it is closer to this angle it wins the race for it
+    // and we may as well concede now, before either of us moves — that is the
+    // collision this probe prevents.
+    //
+    // A DRIVING peer must never block a candidate this way. It contests through
+    // its claim disc (claimMatching()) and nothing more: a robot approaching the
+    // ring from far away is farther from EVERY vantage on it than a peer already
+    // circling the trunk, so a position contest against a mover would deny it
+    // the whole ring and serialise an exploitation that is meant to run in
+    // parallel. The mover's `robot_pos` is also up to a heartbeat stale, so the
+    // comparison would be against a pose it has already left.
+    if (!c.staged) continue;
+
+    // Same total order the yield path uses, so both robots compute complementary
+    // answers: strictly closer robot_pos wins, exact ties broken lexicographically
+    // by robot_id. Losing to this peer is a veto on the candidate, and we return
+    // the claim rather than a bool so the caller can name the peer in its log.
+    if (!selfWinsAgainst(self_pos, candidate_xy, c, self_id)) return &c;
+  }
+  return nullptr;
+}
+
 explo_planner_msgs::msg::RobotIntent Coordination::buildIntent(
     const CandidateViewpoint& goal,
     const Eigen::Vector3f& self_pos,
@@ -162,7 +263,8 @@ explo_planner_msgs::msg::RobotIntent Coordination::buildIntent(
     const std::string& map_frame,
     bool exploit,
     uint32_t target_id,
-    uint32_t dwelled_mask) const {
+    uint32_t dwelled_mask,
+    bool staged) const {
   explo_planner_msgs::msg::RobotIntent msg;
   msg.header.stamp = now;
   msg.header.frame_id = map_frame;
@@ -183,6 +285,7 @@ explo_planner_msgs::msg::RobotIntent Coordination::buildIntent(
   msg.exploit = exploit;
   msg.target_id = target_id;
   msg.dwelled_mask = dwelled_mask;
+  msg.staged = staged;
   return msg;
 }
 
