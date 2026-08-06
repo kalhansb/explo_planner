@@ -53,7 +53,7 @@ claim that is actually novel.
 **The baseline scorers are already here.** `scoring.cpp` on the current branch
 implements `eig`, `entropy`, `frontier` and `random` behind a `scoring::create()`
 factory, all covered by `test_scoring.cpp`. Only the node's selection knob was
-removed: `explo_planner_node.cpp:943` hardcodes `score_fn_ = scoring::eig`.
+removed: `explo_planner_node.cpp:1029` hardcodes `score_fn_ = scoring::eig`.
 Restoring the comparison is a parameter declaration and one factory call — not a
 port.
 

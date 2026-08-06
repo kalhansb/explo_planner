@@ -18,7 +18,7 @@ a rendezvous anchor when comms drop.
 |------|------------|
 | [`explo_planner/`](explo_planner/) | The planner package — nodes, config, launch files, tests. Start at its [README](explo_planner/README.md). |
 | [`explo_planner_msgs/`](explo_planner_msgs/) | `TreeTarget` and `RobotIntent` message definitions. |
-| [`docs/`](docs/) | The **[user manual](docs/user_manual.md)** — two-robot field trial: bring-up order, per-robot configuration, what to watch, panic stops, data offload. |
+| [`docs/`](docs/) | Repository-level docs: the **[ROS API reference](docs/ros_api.md)**, the **[method doc](docs/planner_method.md)**, and the **[user manual](docs/user_manual.md)** — two-robot field trial: bring-up order, per-robot configuration, what to watch, panic stops, data offload. |
 
 ## Documentation
 

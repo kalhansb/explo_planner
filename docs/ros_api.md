@@ -74,7 +74,7 @@ WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → D
                          │  ▲
                  PROXIMITY_HOLD           (yield while a peer drives past)
 exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
-rendezvous:        RETURN_NAV             (drive to the last-connected anchor)
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
 ```
 
 A `TreeTarget` on the targets topic pulls the planner from the exploration

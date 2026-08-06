@@ -73,7 +73,17 @@ in air or buried in soil.
 
 ## 3. The planning cycle
 
-The planner runs a state machine at 10 Hz. In exploration the cycle is:
+The planner runs a state machine at 10 Hz:
+
+```
+WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → DONE
+                         │  ▲
+                 PROXIMITY_HOLD           (yield while a peer drives past)
+exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
+```
+
+In exploration the cycle is:
 
 **PLAN** — select the next viewpoint (§4–§7) and publish it as a goal.
 **NAVIGATE** — monitor the drive; detect arrival, timeout or stall (§8).

@@ -8,7 +8,7 @@ today, and how it could be addressed if it starts to matter.
 
 **Where:** `doExploitPlan` — the `best_idx < 0` branch in
 [`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp) (around the
-`computeApproachGoal` fallback, ~L2082–2124).
+`computeApproachGoal` fallback, ~L3580–3630).
 
 **Scenario.** Coordination + exploitation are on and more robots converge on one
 trunk than there are currently-claimable vantages (e.g. 3 vantages, and all
@@ -51,8 +51,8 @@ fallback for the genuine "no vantage reachable/mapped yet" case
 ## 2. `done_coverage_source: "auto"` mixed-metric coverage streak (closed by the map-less refactor)
 
 **Where:** `coverageUnknownFraction` and the `coverage_done_streak_` accumulation
-in [`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp) (~L1146); config
-key `done_coverage_source` in
+in [`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp) (~L1740 /
+L2096); config key `done_coverage_source` in
 [`config/shared_params.yaml`](../config/shared_params.yaml).
 
 **Scenario.** Coverage-based termination fires once the ROI unknown fraction
@@ -97,7 +97,7 @@ source changes between ticks, so every counted streak stays single-source even i
 **Where:** the team-quota merge — `mergePeerDwells`
 ([`src/target_queue.cpp`](../src/target_queue.cpp)) fed from `onPeerExploitIntent`
 and the per-tick catch-up in `doExploitPlan`
-([`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp), ~L1789 / L1963);
+([`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp), ~L2949 / L3382);
 ring geometry in
 [`src/vantage_planner.cpp`](../src/vantage_planner.cpp) (`generateVantages`).
 
@@ -139,7 +139,7 @@ the fully general one.
 ## 4. `max_steps <= 0` stops the planner before it can exploit
 
 **Where:** the step-budget guard at the top of `doPlan`
-([`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp), ~L1105).
+([`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp), ~L1702).
 
 **Scenario.** Someone sets `max_steps: 0` (or negative) expecting "no
 exploration budget — exploit-only run".
@@ -166,7 +166,7 @@ an exploit-queue drain past the budget must not sneak an extra exploration hop.
 ## 5. Tree-track confirmation gate edge cases
 
 **Where:** the `scan()` track loop in
-[`src/tree_detector_node.cpp`](../src/tree_detector_node.cpp) (~L197–245).
+[`src/tree_detector_node.cpp`](../src/tree_detector_node.cpp) (~L300–360).
 
 **Scenario / current behaviour.** Both edges this entry described are now
 closed; it is kept as the record of what they were.
