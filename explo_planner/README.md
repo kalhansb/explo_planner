@@ -17,8 +17,11 @@ branch; `main` ships the EIG planner only.
 Each PLAN cycle the node:
 
 1. **Generates candidates** — a polar grid of viewpoints (radius × ring × yaw)
-   around the current robot pose, filtered against a region-of-interest box and,
-   when `use_planning_map: true`, the 2D inflated `planning_map` for free/occupied.
+   around the current robot pose, **plus one candidate per frontier-cluster
+   centroid** anywhere in the ROI (the long-range escape from a locally
+   exhausted neighbourhood). Both are filtered against a region-of-interest box
+   and, when `use_planning_map: true`, the 2D inflated `planning_map` for
+   free/occupied.
 2. **Scores each candidate** — simulated FOV ray-casting over the SCovox map
    yields an expected information gain (EIG) from the Beta-conjugate occupancy.
 3. **Costs each candidate** — bounded grid Dijkstra over the `planning_map`
@@ -135,10 +138,13 @@ exploration when the target's vantages are covered. Sensor fusion of the
 captured data is **offline** — the planner only positions and dwells.
 
 Targets arrive on a shared topic (`targets_topic`, default
-`/exploration/targets`) as `explo_planner_msgs/TreeTarget` messages. There is **no live
-tree detection**: today a small time-based `target_scheduler_node` publishes a
-preselected list on a schedule, but a real detector can publish the identical
-message on the same topic later with no planner change.
+`/exploration/targets`) as `explo_planner_msgs/TreeTarget` messages. Two
+producers ship with the package: the live `tree_detector_node` (segments trunks
+out of the fused SCovox map and emits each once, with position-derived stable
+ids so every robot names a tree identically), and the time-based
+`target_scheduler_node` (publishes a preselected list on a schedule — the
+repeatable-experiment stand-in). The exploitation launch picks with
+`use_detector:=true|false`; the planner is agnostic to which one feeds it.
 
 **Vantage-point selection** (per active target, recomputed each `EXPLOIT_PLAN`
 tick so the map can improve a previously-blocked angle):
@@ -157,10 +163,27 @@ tick so the map can improve a previously-blocked angle):
    selectable vantage remains.
 
 Vantages flow through the same candidate → cost → `RobotIntent`/MinPos pipeline
-as exploration, so multi-robot vantage deconfliction (different robots taking
-different angles on one tree) drops in later with no new selection code.
+as exploration, and multi-robot vantage deconfliction is live: each robot
+claims its selected vantage through the intent table (per-vantage MinPos, with
+yield rules for in-flight, mid-dwell and parked peers), and every intent
+carries a **team dwell-credit mask**, so with coordination on
+`min_vantages_required` is a team quota — robots take different angles on the
+same tree and their clear-LoS dwells count together.
 
 ## Architecture
+
+One planner node per robot. Each planner consumes its **own robot's** fused
+map and talks to peers only through the shared intent topic:
+
+```
+                         (per robot)
+  dscovox merger ──ScovoxMap──▶ ┌───────────────────┐ ──PoseStamped──▶ Nav2
+  target producer ──TreeTarget▶ │ explo_planner_node │ ──MarkerArray──▶ RViz
+  tf: map → base_link ────────▶ │  (10 Hz tick)      │ ──CSV──▶ output_csv
+                                └─────────┬─────────┘
+                                          │ RobotIntent (pub + sub)
+                             /exploration/intents  ◀── every peer planner
+```
 
 The node logic is split into small, unit-tested modules:
 
@@ -178,11 +201,13 @@ The node logic is split into small, unit-tested modules:
 | `proximity_guard` | Coordinated proximity-stop arbiter (yield/hold/resume decisions) |
 | `target_queue` | Tree-target queue (ingest/dedup/lifecycle) for exploitation |
 | `vantage_planner` | Vantage-point generation + line-of-sight occlusion test |
+| `tree_detector` | Trunk segmentation over the fused map (stable position-derived ids) |
 | `metrics_logger` | Per-step CSV metric logging |
 | `planner_util` | Small shared pure helpers |
 
-The `target_scheduler_node` executable is the time-based tree-target publisher
-(stand-in for a detector) that drives the exploitation targets topic.
+Two further executables drive the exploitation targets topic: the live
+`tree_detector_node` (wraps the `tree_detector` module) and the time-based
+`target_scheduler_node` (publishes a preselected list on a schedule).
 
 ## Build
 
@@ -273,7 +298,7 @@ Two settings must be matched to the navigator on each platform:
   nav2's goal checker (shipped defaults: 0.25 / 0.25). If they are tighter, nav2
   stops inside its own tolerance but outside the planner's, the planner never
   registers arrival, and it blacklists a goal the robot is standing on. The node
-  warns at startup if either is at or below nav2's default.
+  warns at startup if either is below 0.3.
 - `goal_republish_sec` throttles the keep-alive re-send of an unchanged goal.
   Nav2 turns every `goal_pose` message into a fresh `NavigateToPose` goal, so an
   unthrottled re-send makes `GoalUpdated` fire continuously, which halts the
@@ -290,7 +315,7 @@ Two settings must be matched to the navigator on each platform:
 | sub | `/exploration/targets` | Tree targets to exploit (`TreeTarget`; shared) |
 | pub | `goal_topic` | Selected NBV / vantage goal pose for the nav stack |
 | pub | `~/candidates` | Candidate / vantage markers (RViz) |
-| pub | `/exploration/intents` | MinPos intents (multi-robot only) |
+| pub | `/exploration/intents` | MinPos intents (always published; consumed by peers when coordination is on) |
 
 ## Configuration
 
@@ -332,8 +357,8 @@ colcon test-result --verbose
 
 GTest suites cover scoring, candidate generation, FOV evaluation, cost grid,
 coordination, plan-map queries, the failed-goal blacklist, planner utils, the
-tree-target queue (dedup/lifecycle), and the vantage planner (spacing/standoff/
-line-of-sight).
+map cache, the proximity guard, the tree detector, the tree-target queue
+(dedup/lifecycle), and the vantage planner (spacing/standoff/line-of-sight).
 
 ## License
 
