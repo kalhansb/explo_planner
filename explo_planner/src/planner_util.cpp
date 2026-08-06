@@ -4,6 +4,7 @@
 #include "explo_planner/planner_util.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 namespace explo_planner {
 
@@ -36,9 +37,18 @@ bool rendezvousWaitExpired(double waited_sec, double max_wait_sec) {
   return max_wait_sec > 0.0 && waited_sec >= max_wait_sec;
 }
 
-ReconnectMode reconnectModeFromString(const std::string& s) {
-  if (s == "pursuit") return ReconnectMode::PURSUIT;
-  if (s == "hybrid")  return ReconnectMode::HYBRID;
+ReconnectMode reconnectModeFromString(const std::string& s, bool* known) {
+  std::string t;
+  t.reserve(s.size());
+  for (const char c : s) {
+    t.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  if (known) *known = true;
+  if (t == "rendezvous") return ReconnectMode::RENDEZVOUS;
+  if (t == "pursuit")    return ReconnectMode::PURSUIT;
+  if (t == "hybrid")     return ReconnectMode::HYBRID;
+  if (known) *known = false;
   return ReconnectMode::RENDEZVOUS;
 }
 
@@ -55,7 +65,11 @@ double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
   }
   const double raw = (trail_head_dist_m / std::max(speed_est_mps, 1e-3)) *
                      safety_factor * freshness;
-  return std::clamp(raw, min_sec, max_sec);
+  // The ceiling wins over the floor: min_sec comes from the nav-timeout
+  // family and max_sec from the pursuit family, so nothing orders them —
+  // and std::clamp with lo > hi is UB. max_sec is the bound a WAITING
+  // teammate relies on, so it must hold regardless of the floor.
+  return std::clamp(raw, std::min(min_sec, max_sec), max_sec);
 }
 
 Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,

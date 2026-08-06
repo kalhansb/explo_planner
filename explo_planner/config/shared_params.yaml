@@ -368,25 +368,44 @@
     #   "hybrid"     — pursue on the budget, then fall back to the
     #     deterministic meeting point (midpoint of the last-contact pose
     #     pair; both sides compute ~the same point from their own records, no
-    #     negotiation) and wait there. Worst case degenerates to the
-    #     rendezvous guarantee; a fresh trail wins early.
+    #     negotiation) and wait there. The midpoints agree when both sides
+    #     recorded the same contact event; a one-way fly-by (reception is
+    #     state-independent, transmission is state-gated) can desynchronise
+    #     them, and the midpoint itself is a synthetic coordinate that may be
+    #     unreachable — both are accepted limitations (doc/limitations.md);
+    #     rendezvous_max_wait_sec is the field backstop.
     # All three re-plan against the merged map the instant the team is back
-    # in comms, mid-drive included. Same preconditions as rendezvous_* above.
+    # in comms, mid-drive included (the released drive is stopped and the
+    # saturation streak recleared). The chase/midpoint pair ONE missing peer
+    # at a time — designed and validated for the 2-robot team, like MinPos.
+    # Needs done_action=idle: a finished robot keeps its presence beacon so
+    # a teammate that finishes later can count it; with shutdown the first
+    # finisher goes permanently invisible (the node warns at startup).
+    # Same preconditions as rendezvous_* above.
     reconnect_mode: "hybrid"
-    # Hard ceiling on one chase (s); also the worst-case bound a WAITING
-    # teammate can assume about its pursuer, hence a fixed cap and not a
-    # formula. Flatforest sizing: the ROI is ~152 x 113 m and the huskys
-    # drive ~0.8 m/s, so 240 s covers a >100 m chase leg with slack while
-    # staying comparable to exploit_target_timeout_sec (300) and above
-    # nav_max_timeout_sec (180) — at least one full worst-case nav leg plus
-    # margin fits inside a chase. <= 0 disables pursuit (pursuit/hybrid then
-    # act as their fallback).
+    # Ceiling on one chase leg (s); always wins over the nav_min_timeout_sec
+    # floor if the two are configured inconsistently. NOT the total worst
+    # case a WAITING teammate observes — a hybrid pursuer that spends the
+    # budget still drives the fallback leg (up to nav_max_timeout_sec more),
+    # and proximity-hold time is refunded to the chase clock. Flatforest
+    # sizing: the ROI is ~152 x 113 m and the huskys drive ~0.8 m/s, so
+    # 240 s covers a >100 m chase leg with slack while staying comparable to
+    # exploit_target_timeout_sec (300) and above nav_max_timeout_sec (180) —
+    # though note the trail is up to TWO waypoints (goal, then last pose),
+    # each with its own per-waypoint nav budget inside the overall chase, so
+    # a wp1 that burns a full 180 s leaves the sweep leg only 60 s. <= 0
+    # disables pursuit (pursuit/hybrid then act as their fallback).
     pursuit_budget_max_sec: 240.0
     # Record age (s) beyond which the trail head is worthless and the chase
-    # is skipped outright; freshness scales the budget linearly to zero
-    # across this window. Flatforest sizing: at ~0.8 m/s a teammate silent
-    # for 180 s can be ~140 m away — anywhere in the plot — so past three
-    # minutes the guaranteed fallback beats any chase. <= 0 = no gate.
+    # is skipped outright. Freshness scales the raw budget linearly across
+    # the window, but the clamp dominates at field scale: at these params
+    # (nav_speed_estimate 0.15 x safety 3.0 = 20 s/m) any trail head past
+    # ~12 m saturates the 240 s ceiling, so the effective budget is the
+    # ceiling for most of the window, ramps briefly, floors at
+    # nav_min_timeout_sec, then gates to 0 here. Flatforest sizing: at
+    # ~0.8 m/s a teammate silent for 180 s can be ~140 m away — anywhere in
+    # the plot — so past three minutes the guaranteed fallback beats any
+    # chase. <= 0 = no gate.
     pursuit_staleness_max_sec: 180.0
 
     # ----------------------------------------------------------------

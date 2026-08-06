@@ -119,18 +119,29 @@ the peer clears or parks.
 > live peer data, both planners alive, and Nav2 honouring the cancel. The
 > crewed 1.5 m panic stop (§9) remains the hard backstop.
 
-### 3.3 Rendezvous reconnection
+### 3.3 Reconnection: rendezvous / pursuit / hybrid
 
 A robot that loses comms keeps exploring alone. When it exhausts its goals it
-does **not** stop while its teammate is still out of range: it drives back to
-its **last-connected anchor** — the pose where it last heard the teammate — and
-holds there until the team is back in comms, then re-plans against the merged
-map. Neither robot can finish while the other is still exploring.
+does **not** stop while its teammate is still out of range: it runs the
+`reconnect_mode` manoeuvre and holds at its endpoint until the team is back in
+comms, then re-plans against the merged map. Neither robot can finish while
+the other is still exploring — and a finished robot keeps beaconing while it
+idles in `DONE`, so the slower robot can count it (this needs the field
+default `done_action: idle`; `shutdown` would make the first finisher
+invisible and the node warns about it at startup).
 
-The anchor needs no configuration; it is recorded automatically from incoming
+The modes, with the radios carried on the robots (no base station):
+`rendezvous` returns to the **last-connected anchor** (own pose at last
+contact); `pursuit` chases the missing teammate's last declared goal and then
+its last heard pose, on a time budget (`pursuit_budget_max_sec`, skipped
+entirely once the record is older than `pursuit_staleness_max_sec`); `hybrid`
+— the shipped yaml default — chases on the budget, then waits at the midpoint
+of the last-contact pose pair, which both robots compute independently.
+
+The records need no configuration; they build automatically from incoming
 peer intents. **`rendezvous_expected_peers` must be set to 1 by hand on a
 hardware launch** (§5) — the shipped value is `0`, which leaves the whole
-feature inert.
+feature (all three modes) inert.
 
 ---
 
@@ -200,7 +211,9 @@ the same base + overlay idiom SCovox uses:
     robot_name: "curt"
     output_csv: "/tmp/RA-1_curt.csv"
     targets_topic: "/exploration/targets/curt"
-    # Rendezvous is INERT at the shipped 0. Team size minus this robot.
+    # Reconnection is INERT at the shipped 0. Team size minus this robot.
+    # (reconnect_mode / pursuit_* ride along from the shared yaml: hybrid,
+    # 240 s chase ceiling, 180 s staleness gate — retune for the site scale.)
     rendezvous_expected_peers: 1
     # Peer robot pose from its localiser (~10 Hz), whatever that topic is
     # called on the platform. Intents alone are too coarse to brake on.

@@ -47,18 +47,29 @@ Multi-robot coordination (optional) uses a MinPos intent table so teammates
 deconflict their selected viewpoints. Each robot plans against its own fused
 SCovox view — there is no central merger.
 
-### Rendezvous reconnection (multi-robot, default on)
+### Reconnection: rendezvous / pursuit / hybrid (multi-robot, default on)
 
 A robot that loses comms keeps exploring on its own rather than halting. When it
 exhausts its exploration goals (the coverage termination above) it does **not**
-stop while a teammate is still out of range: it drives back to its
-**last-connected anchor** — the pose where it last heard a teammate, which sits
-inside the router's coverage bubble — and **holds there until the whole team is
-back in comms**, then re-plans against the now-merged map. If new frontiers
-appeared it disperses again (MinPos splits them); if not, the whole team reaches
-`DONE` together. A robot can therefore only finish when the full team is present
-and the merged map is saturated, so nobody quits while a teammate is still
-exploring.
+stop while a teammate is still out of range: it runs the manoeuvre selected by
+`reconnect_mode` and **holds at its endpoint until the whole team is back in
+comms**, then re-plans against the now-merged map. `rendezvous` (the legacy
+behaviour, and the code default) drives back to the **last-connected anchor** —
+the pose where it last heard a teammate. For a robot-carried radio mesh the
+planner also keeps a per-peer **last-contact record** (its own pose, the peer's
+advertised pose, and the peer's declared goal at the last received intent):
+`pursuit` chases the missing peer's declared goal and then its last heard pose
+on a staleness-scaled time budget, and `hybrid` (the shipped yaml default)
+chases on the budget and then falls back to the deterministic meeting point —
+the midpoint of the last-contact pose pair, computed independently by both
+sides. Once the team reconnects, if new frontiers appeared it disperses again
+(MinPos splits them); if not, the whole team reaches `DONE` together. A robot
+can therefore only finish when the full team is present and the merged map is
+saturated, so nobody quits while a teammate is still exploring — and a robot
+that *has* finished keeps beaconing its presence while idling in `DONE`
+(`done_action: idle`), so a later finisher can count it. See
+`docs/planner_method.md` §10.2 for the guarantee arguments and
+`doc/limitations.md` §10–11 for the accepted failure modes.
 
 This is `rendezvous_enabled` and it defaults **on**, but it only *activates*
 where it is meaningful: `coordination_enabled` must be on (the barrier waits on
@@ -340,7 +351,9 @@ which is heavily commented. Common overrides:
 - `fov_*` — FOV geometry for information-gain ray-casting
 - `coordination_enabled` — turn multi-robot MinPos on/off
 - `rendezvous_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
-  — return-to-anchor-and-wait reconnection (see "Rendezvous reconnection")
+  / `reconnect_mode` / `pursuit_budget_max_sec` / `pursuit_staleness_max_sec`
+  — reconnection barrier and manoeuvre (see "Reconnection: rendezvous /
+  pursuit / hybrid")
 - `exploitation_enabled` — turn the exploitation overlay on/off
 - `n_vantages` / `min_vantages_required` / `vantage_standoff_m` /
   `exploit_dwell_sec` — vantage geometry and dwell behaviour

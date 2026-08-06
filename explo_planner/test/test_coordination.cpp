@@ -838,6 +838,27 @@ TEST(Coordination, LivePeerCountExcludesGracedClaims) {
   EXPECT_EQ(c.livePeerCount(at(105.0)), 0u); // ...but not PRESENT
 }
 
+TEST(Coordination, PeerLiveMatchesPresenceSemantics) {
+  // peerLive is the per-id form of livePeerCount's presence test — it is what
+  // missingPeerRecord() keys the reconnect manoeuvres on (WHICH teammate the
+  // barrier waits on), so it must share the raw-expiry semantics exactly: a
+  // graced-but-expired exploit claim proves table retention, not presence,
+  // and an id never heard is simply not live.
+  Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
+  c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
+                                    /*staged=*/false, /*expiry_sec=*/100.0));
+
+  EXPECT_TRUE(c.peerLive("rama", at(99.0)));
+  EXPECT_FALSE(c.peerLive("rama", at(100.0)));   // raw expiry, no grace
+  EXPECT_FALSE(c.peerLive("bruno", at(99.0)));   // never heard
+
+  // Retention must not resurrect presence: within the grace window the claim
+  // survives prune() for the vantage contests, but the peer is still gone.
+  c.prune(at(105.0));
+  ASSERT_EQ(c.activePeerCount(), 1u);
+  EXPECT_FALSE(c.peerLive("rama", at(105.0)));
+}
+
 TEST(Coordination, ClaimMatchingLiveAfterFiltersExpired) {
   // The optional liveness filter is what the exploration MinPos walk passes:
   // it must see live claims only, while the exploit contest sites (nullptr)

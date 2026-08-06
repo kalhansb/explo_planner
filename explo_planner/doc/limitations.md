@@ -407,3 +407,85 @@ filling) does not count as finished. That closes the range-dependent hole above
 with one extra knob. The general fix — seeding the mask from observation history
 instead of track history — needs scovox to carry a per-voxel first-observation
 bearing, which is an upstream map-format change.
+
+## 10. Hybrid meeting points desynchronise after a one-way contact
+
+**Where:** the per-peer last-contact recording in the intent callback and
+`meetingPoint()` / `pursuitFallback` in
+[`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp);
+`meetingPoint` itself in `src/planner_util.cpp`.
+
+**Scenario.** Hybrid reconnection derives its fallback point from each side's
+*own* last-contact record — the midpoint of (my pose, your advertised pose) at
+the moment I last heard you. The two sides' midpoints agree only as closely as
+their last successful receptions were simultaneous. Reception is
+state-independent (the callback always records), but *transmission* is
+state-gated: a robot mid-PLAN-retry, in LOG_STEP, or parked without an active
+intent sends nothing. A brief fly-by in which A hears B while A itself is
+silent refreshes A's record and not B's.
+
+**Current behaviour.** After such a one-way contact the two records describe
+*different contact events*, and the two midpoints can be arbitrarily far
+apart — each robot parks at its own midpoint, both beacon, neither hears the
+other, and the barrier holds until `rendezvous_max_wait_sec` (forever at the
+default 0). The chase snapshot (`pursue_rec_`) keeps a single robot's chase
+and fallback self-consistent, but cannot make the *pair* consistent.
+
+**Why it is acceptable today.**
+
+- The barrier releases on **comms contact**, not co-location: for the ordinary
+  asymmetry (heartbeat jitter, seconds of executor starvation) the midpoint
+  disagreement is metres against a radio range of tens of metres, and
+  reconnection succeeds.
+- The desynchronising fly-by requires losing comms, regaining it exactly
+  one-way, and losing it again before any reply — a narrow window at 1 Hz
+  heartbeats.
+- The field escape hatch (`rendezvous_max_wait_sec > 0`) bounds the damage,
+  and DONE-idle robots keep beaconing, so the searching teammate can still be
+  found by *its* pursuer.
+
+**Possible fix.** Echo the receipt stamp of the last intent heard *from you*
+inside my own intent. Both sides can then agree on the older of the two
+contact events and midpoint that one — a two-way agreement without
+negotiation. Needs a `RobotIntent` field (wire-format change).
+
+## 11. The hybrid meeting point is a synthetic, unvalidated coordinate; the pairing is 2-robot
+
+**Where:** `finishOrRendezvous` / `pursuitFallback` →
+`startReturnTo(meetingPoint(...))` in
+[`src/explo_planner_node.cpp`](../src/explo_planner_node.cpp).
+
+**Scenario.** The rendezvous anchor is a pose the robot physically occupied,
+hence traversable in its own map. The hybrid midpoint is not: the average of
+two poses that straddled a thicket, pond or unmapped space can be
+un-navigable, and it is published as a nav goal with none of the free/reached
+validation exploration candidates get. Separately, the chase and midpoint are
+*pairwise* constructs dispatched against one missing peer at a time, while
+the barrier waits on **all** peers: with 3+ robots mutually partitioned the
+unilateral pairings need not form a matching (an odd team cannot have one),
+so no tie-break makes the meeting points mutually consistent.
+
+**Current behaviour.** An unreachable midpoint burns the RETURN_NAV budget /
+no-progress watchdog, the drive is stopped, and the robot waits at the
+barrier *from wherever it stalled* — the pair separation is then set by the
+obstacle geometry, not the records. A 3+ team that fragments falls back on
+the barrier and its escape hatch; a chase does release early the moment its
+own quarry is heard, so re-dispatching on the next missing peer works, but no
+all-pairs meeting guarantee exists.
+
+**Why it is acceptable today.**
+
+- The shipped team is 2 robots (the same scope as the MinPos tiebreak, which
+  is documented N=2), and flatforest is benign terrain — a midpoint of two
+  reachable poses is overwhelmingly reachable there.
+- Validating the midpoint against the *local* map would break the determinism
+  that substitutes for negotiation: each robot's map differs, so each would
+  snap to a different "nearest free cell" anyway.
+- The failure degrades to a barrier hold within radio-range-plus-obstacle of
+  the intended point, with the standard escape hatch.
+
+**Possible fix.** For reachability: bias the midpoint toward own-traversed
+space (e.g. project onto the own past trajectory's closest point) — still
+deterministic per side, bounded divergence. For N≥3: meet at the centroid of
+ALL last-contact pairs, or serialise reconnection pair-by-pair ordered by the
+same lexicographic rule MinPos uses.

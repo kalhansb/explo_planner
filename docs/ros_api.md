@@ -35,7 +35,7 @@ trunk at occlusion-free vantage points and dwells at each so the rosbag
 captures overlapping close-range views. Multiple robots deconflict goals
 through a MinPos intent table on one shared topic, split a trunk's vantage
 ring between them, dwell simultaneously, yield to each other when paths cross,
-and rendezvous when comms drop.
+and reconnection manoeuvres (rendezvous / pursuit / hybrid) when comms drop.
 
 - **Repository:** <https://github.com/kalhansb/explo_planner>
 - **Packages:** `explo_planner` (nodes), `explo_planner_msgs` (interfaces)
@@ -74,7 +74,8 @@ WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → D
                          │  ▲
                  PROXIMITY_HOLD           (yield while a peer drives past)
 exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
-rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor/meeting point, hold for the team)
+pursuit:           PURSUE → RETURN_NAV / RETURN_SYNC  (chase the missing peer's trail, then fall back per reconnect_mode)
 ```
 
 A `TreeTarget` on the targets topic pulls the planner from the exploration
@@ -323,9 +324,9 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, run the `reconnect_mode` manoeuvre. |
 | `rendezvous_expected_peers` | int | `0` | Teammates to wait for. **`0` leaves the feature inert** — the multi-robot launch sets team size − 1; set it by hand on hardware. |
 | `rendezvous_max_wait_sec` | double | `0.0` | Barrier give-up (s); `0` = wait forever. |
-| `reconnect_mode` | string | `rendezvous` | Mesh (robot-carried radio) manoeuvre: `rendezvous` = return to own last-contact anchor (legacy); `pursuit` = budgeted chase of the missing peer's last declared goal, then hold in place; `hybrid` = chase, then the deterministic meeting point (midpoint of the last-contact pose pair). The yaml/sim ship `hybrid`. |
-| `pursuit_budget_max_sec` | double | `240.0` | Hard ceiling on one chase (s); also the worst-case bound a waiting teammate can assume about its pursuer. `<= 0` disables pursuit. |
-| `pursuit_staleness_max_sec` | double | `180.0` | Last-contact record age beyond which the chase is skipped; freshness scales the budget linearly to zero across this window. `<= 0` = no gate. |
+| `reconnect_mode` | string | `rendezvous` | Mesh (robot-carried radio) manoeuvre: `rendezvous` = return to own last-contact anchor (legacy); `pursuit` = budgeted chase of the missing peer's last declared goal, then hold in place; `hybrid` = chase, then the deterministic meeting point (midpoint of the last-contact pose pair). Case-insensitive; the yaml/sim ship `hybrid`. Designed for the 2-robot team (like the MinPos tiebreak): with 3+ robots the chase/midpoint pairs one missing peer at a time. Needs `done_action: idle` — a finished robot keeps beaconing so a later finisher can count it; `shutdown` makes the first finisher permanently invisible (startup WARN). |
+| `pursuit_budget_max_sec` | double | `240.0` | Ceiling on one chase leg (s); always wins over the `nav_min_timeout_sec` floor. `<= 0` disables pursuit. NOT the total bound a waiting teammate sees: hybrid then drives the fallback leg (up to `nav_max_timeout_sec` more) and proximity-hold time is refunded to the chase. |
+| `pursuit_staleness_max_sec` | double | `180.0` | Last-contact record age beyond which the chase is skipped entirely. Freshness scales the raw budget linearly across the window, but the clamp dominates at field scale: past a ~12 m trail head (flatforest params) the budget sits AT the ceiling until staleness eats below it, then floors, then gates to 0. `<= 0` = no gate. |
 
 **Proximity stop (coordinated yield)** — best-effort coordination, *not* a
 certified safety stop. Right of way: the lexicographically smaller
@@ -550,8 +551,9 @@ one planner per robot PC by hand — this is also the only launch that sets
 | `output_dir` / `config_id` / `world` | `/tmp` / `c1` / `flatforest` | Compose the per-robot CSV name `exp7_<planner>_<world>_<config_id>_<robot>.csv`. |
 | `max_steps` | `100` | Per-robot budget. |
 | `coordination_enabled` | `true` | MinPos deconfliction. |
-| `rendezvous_enabled` | `true` | Anchor-return reconnection. |
+| `rendezvous_enabled` | `true` | Run the `reconnect_mode` manoeuvre on goal exhaustion with teammates out of comms. |
 | `rendezvous_max_wait_sec` | `0.0` | Barrier give-up. |
+| `reconnect_mode` | `hybrid` | Which manoeuvre: `rendezvous` / `pursuit` / `hybrid` (see the §4 parameter table). |
 | `proximity_stop_enabled` | `true` | Coordinated yield. |
 
 ---

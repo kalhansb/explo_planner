@@ -324,34 +324,68 @@ mesh the link re-forms the moment any point of the chase comes within range,
 no arrival needed. The chase runs on a **staleness-scaled budget**: distance
 to the trail head at the conservative nav speed estimate, scaled linearly
 down by the record's age and skipped entirely past `pursuit_staleness_max_sec`
-(a teammate three minutes silent could be anywhere in the plot). The budget
-has a hard configured ceiling, `pursuit_budget_max_sec`, so a *waiting*
-teammate — which cannot observe the chase — can still bound how long its
-pursuer might take. A spent chase in pure pursuit mode holds in place and
-beacons: the method deliberately has no agreed fallback point, which is the
-A/B against hybrid.
+(a teammate three minutes silent could be anywhere in the plot). In practice
+the clamp dominates the formula: at the flatforest parameters any trail head
+past ~12 m saturates the `pursuit_budget_max_sec` ceiling, so the budget *is*
+the ceiling for most of the staleness window, ramps briefly, floors, then
+gates to zero — the staleness gate, not the distance term, is what varies
+between runs. The ceiling bounds one chase leg (it always wins over the
+nav-timeout floor if the two are configured inconsistently), but it is **not**
+the total worst case a waiting teammate observes: a hybrid pursuer that spends
+the budget still drives the fallback leg (up to `nav_max_timeout_sec` more),
+and proximity-hold time is refunded to the chase clock. A spent chase in pure
+pursuit mode holds in place and beacons: the method deliberately has no
+agreed fallback point, which is the A/B against hybrid.
 
 **Hybrid** (the shipped default). Pursue on the budget; when it is spent, fall
 back to the **deterministic meeting point** — the midpoint of the last-contact
-pose pair. Each side computes it from its *own* record with no negotiation
-(determinism substituting for messages, exactly as in the MinPos tiebreak);
-the two records differ by at most a heartbeat of travel, so the two midpoints
-agree to within a couple of metres, well inside the range the pair had at last
-contact. The worst case therefore degenerates to the rendezvous guarantee,
-while a fresh trail lets pursuit win early.
+pose pair, taken from the record the chase was armed with. Each side computes
+it from its *own* record with no negotiation (determinism substituting for
+messages, exactly as in the MinPos tiebreak). The two midpoints agree exactly
+when both sides last heard each other at the same contact event; they drift
+apart with the asymmetry between the two directions' last receptions. For the
+ordinary case — heartbeat jitter, a few seconds of executor starvation — the
+drift is metres, and it does not need to be zero anyway: the barrier releases
+on *comms contact*, not co-location, so the pair only has to close to radio
+range. The genuine failure mode is a **one-way contact**: reception is
+state-independent but transmission is state-gated (a robot mid-plan-retry or
+DONE-after-shutdown sends nothing), so a fly-by can refresh one side's record
+and not the other's, leaving the two midpoints arbitrarily far apart. The
+midpoint is also a synthetic coordinate no robot has occupied — unlike the
+anchor it is not guaranteed traversable, and a drive that fails (nav budget,
+no progress) parks the robot where it stalled. Both caveats are accepted
+limitations of the negotiation-free design (`doc/limitations.md` §10–11); the
+unbounded-wait escape hatch `rendezvous_max_wait_sec` is the field backstop
+for the residual deadlock they can produce.
+
+The chase and the midpoint are **pairwise** constructs, dispatched against one
+missing peer at a time (the freshest non-live record; a chase also releases
+early the moment *its* peer is heard, so a 3-robot team re-dispatches on
+whoever is still missing). Like the MinPos tiebreak, the agreement argument is
+designed and validated for the 2-robot team; with three or more robots
+mutually partitioned the pairings need not form a matching, and the barrier —
+which waits on *all* peers — falls back on the escape hatch.
 
 In every mode, a team that comes back into contact mid-manoeuvre releases the
-barrier immediately — the robot re-plans against the now-merged map: if the
-merge revealed new frontiers the team disperses again (MinPos splits them),
-and if not, everyone reaches the end together.
+barrier immediately — the drive is stopped (a released PURSUE/RETURN_NAV
+robot must not keep rolling at its stale goal while PLAN retries), the
+coverage-saturation streak is cleared so saturation is re-confirmed against
+the post-merge map, and the robot re-plans: if the merge revealed new
+frontiers the team disperses again (MinPos splits them), and if not, everyone
+reaches the end together.
 
 The barrier enforces a useful invariant: **a robot can only finish when the
 whole team is present and the merged map is saturated**, so no robot quits
-while a teammate is still working. The wait is unbounded by default, with an
-optional timeout as a field escape hatch for a teammate that has genuinely
-died. The barrier takes priority over exploitation: an open tree target is
-stood down rather than serviced on the way, because a robot detouring to
-inspect trees would leave its teammate waiting indefinitely.
+while a teammate is still working. The invariant needs the converse too: a
+robot that *has* finished stays countable. With `done_action: idle` a DONE
+robot keeps its presence beacon on the heartbeat, so a teammate finishing
+minutes later sees a full team instead of chasing a parked robot's trail and
+waiting forever (`done_action: shutdown` breaks this — the node warns at
+startup). The wait is unbounded by default, with an optional timeout as a
+field escape hatch for a teammate that has genuinely died. The barrier takes
+priority over exploitation: an open tree target is stood down rather than
+serviced on the way, because a robot detouring to inspect trees would leave
+its teammate waiting indefinitely.
 
 ### 10.3 Coordinated proximity stop
 

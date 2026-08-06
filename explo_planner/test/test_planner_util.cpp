@@ -84,13 +84,28 @@ TEST(PlannerUtil, RendezvousWaitExpired) {
 // --- Mesh reconnection helpers ---
 
 // The wire strings are what the yaml/launch pass; anything else must fall back
-// to the legacy behaviour, never crash or invent a mode.
+// to the legacy behaviour, never crash or invent a mode. Matching is
+// case-insensitive (a hand-typed "Hybrid" must not silently run legacy
+// rendezvous), and the `known` flag is what the node's startup warning keys
+// on, so it must be false exactly when the fallback was NOT asked for.
 TEST(PlannerUtil, ReconnectModeFromString) {
   EXPECT_EQ(reconnectModeFromString("rendezvous"), ReconnectMode::RENDEZVOUS);
   EXPECT_EQ(reconnectModeFromString("pursuit"), ReconnectMode::PURSUIT);
   EXPECT_EQ(reconnectModeFromString("hybrid"), ReconnectMode::HYBRID);
+  EXPECT_EQ(reconnectModeFromString("Hybrid"), ReconnectMode::HYBRID);
+  EXPECT_EQ(reconnectModeFromString("PURSUIT"), ReconnectMode::PURSUIT);
   EXPECT_EQ(reconnectModeFromString("nonsense"), ReconnectMode::RENDEZVOUS);
   EXPECT_EQ(reconnectModeFromString(""), ReconnectMode::RENDEZVOUS);
+
+  bool known = false;
+  reconnectModeFromString("rendezvous", &known);
+  EXPECT_TRUE(known);
+  reconnectModeFromString("HYBRID", &known);
+  EXPECT_TRUE(known);
+  reconnectModeFromString("nonsense", &known);
+  EXPECT_FALSE(known);
+  reconnectModeFromString("", &known);
+  EXPECT_FALSE(known);
 }
 
 // Fresh record, mid-range trail head: navBudget shape at full freshness.
@@ -129,6 +144,37 @@ TEST(PlannerUtil, PursuitBudgetFloorAndDisable) {
   // staleness_max <= 0 disables the gate: full freshness however old.
   EXPECT_NEAR(pursuitBudgetSec(10.0, 1e6, 0.15, 3.0, 0.0, 30.0, 240.0),
               200.0, 1e-9);
+}
+
+// The ceiling wins over the floor. min_sec is the nav-family floor
+// (nav_min_timeout_sec, 30 s in the yaml) and max_sec the pursuit-family
+// ceiling — nothing orders them, and a short-chase A/B like
+// pursuit_budget_max_sec:=15 is legitimate config. The naive
+// clamp(raw, 30, 15) is UB (lo > hi) whose libstdc++ artifact returned the
+// FLOOR — a budget above the "hard ceiling" the waiting teammate relies on.
+// The ceiling must hold from both directions: raw below the floor and raw
+// above the ceiling.
+TEST(PlannerUtil, PursuitBudgetCeilingBeatsFloor) {
+  // raw = 0.5/0.15*3 = 10 s, floor 30 > ceiling 15 -> 15, never 30.
+  EXPECT_NEAR(pursuitBudgetSec(0.5, 0.0, 0.15, 3.0, 180.0, 30.0, 15.0),
+              15.0, 1e-9);
+  // raw = 400 s -> still the 15 s ceiling.
+  EXPECT_NEAR(pursuitBudgetSec(20.0, 0.0, 0.15, 3.0, 180.0, 30.0, 15.0),
+              15.0, 1e-9);
+}
+
+// Degenerate inputs must stay inside [0, max_sec]: a negative staleness
+// (clock skew between the record stamp and now on the same local clock is
+// impossible, but a caller bug must not inflate the budget past full
+// freshness) and a zero/negative speed estimate (guarded to 1e-3, so the raw
+// term explodes and the ceiling absorbs it — same guard navBudgetSec tests).
+TEST(PlannerUtil, PursuitBudgetDegenerateInputs) {
+  // Negative staleness: freshness clamps to 1.0 — identical to fresh.
+  EXPECT_NEAR(pursuitBudgetSec(10.0, -50.0, 0.15, 3.0, 180.0, 30.0, 240.0),
+              200.0, 1e-9);
+  // Zero speed: raw = 10/1e-3*3 = 30000 -> ceiling.
+  EXPECT_NEAR(pursuitBudgetSec(10.0, 0.0, 0.0, 3.0, 180.0, 30.0, 240.0),
+              240.0, 1e-9);
 }
 
 // The meeting point is the plain midpoint of the last-contact pose pair; both

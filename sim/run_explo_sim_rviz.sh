@@ -43,6 +43,11 @@
 #   DWELL_SYNC=0 ./run_explo_sim_rviz.sh    # A/B: drop the vantage-ring
 #                                           # rendezvous barrier (first robot to
 #                                           # arrive dwells alone) — see below
+#   RECONNECT_MODE=rendezvous ./run_explo_sim_rviz.sh
+#                                           # A/B: reconnection manoeuvre at
+#                                           # exploration exhaustion
+#                                           # (rendezvous | pursuit | hybrid)
+#                                           # — see below
 # Ctrl-C tears the whole stack down in reverse start order (SIGINT to each
 # process group, then SIGKILL to stragglers), the same teardown the campaign
 # driver used.
@@ -94,10 +99,18 @@ DWELL_SYNC="${DWELL_SYNC:-1}"
 # robot-carried-radio reconnection methods runs when a planner exhausts its
 # goals with its teammate out of comms. The pursuit budgets ride along from
 # shared_params.yaml (240 s cap / 180 s staleness gate, flatforest-sized).
-# NOTE: stock sim DDS is one broadcast domain — the two planners always hear
-# each other, so the barrier releases instantly and the mode never bites.
-# It matters when a planner is killed/restarted mid-run (dead-peer A/B) or
-# once a range-gated intent bridge emulates finite comms.
+# The planner invocation below also passes rendezvous_expected_peers:=1
+# (this is a 2-robot stack): shared_params.yaml ships 0 — the field value,
+# where the launch file computes team-size-1 — and the planner hard-disables
+# the whole reconnect feature at startup on expected_peers=0, which would
+# leave this knob silently inert.
+# NOTE: stock sim DDS is one broadcast domain, so with both planners healthy
+# no manoeuvre ever runs: the first finisher parks DONE-idle and keeps
+# beaconing, the second finisher counts it and goes DONE in place. The A/B
+# that exercises the mode is a dead peer (kill one planner mid-run: the
+# survivor's exhaustion finds the claim aged out, chases the corpse's trail,
+# then falls back per mode) or, later, a range-gated intent bridge emulating
+# finite comms.
 RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, NOT the default 0. This box runs other ROS work (the scovox
@@ -333,6 +346,7 @@ for r in $ROBOTS; do
       -p proximity_resume_dist_m:=$PROX_RESUME_M \
       -p exploit_dwell_sync_enabled:=$DWELL_SYNC_ARG \
       -p reconnect_mode:=$RECONNECT_MODE \
+      -p rendezvous_expected_peers:=1 \
       -p output_csv:="$OUTDIR/planner_$r.csv"
 done
 # Scheduler last; its node name must stay target_scheduler in the root namespace

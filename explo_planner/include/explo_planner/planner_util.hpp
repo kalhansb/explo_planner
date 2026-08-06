@@ -56,9 +56,12 @@ bool rendezvousWaitExpired(double waited_sec, double max_wait_sec);
 ///     meeting point (both sides compute the same one) and wait there.
 enum class ReconnectMode { RENDEZVOUS, PURSUIT, HYBRID };
 
-/// Parse the `reconnect_mode` parameter. Unknown strings map to RENDEZVOUS
-/// (the legacy behaviour); the caller warns on the mismatch.
-ReconnectMode reconnectModeFromString(const std::string& s);
+/// Parse the `reconnect_mode` parameter, case-insensitively. Unknown strings
+/// map to RENDEZVOUS (the legacy behaviour); `known`, when non-null, receives
+/// whether the string matched a mode, so the caller can warn on the mismatch
+/// without duplicating the accepted-string set.
+ReconnectMode reconnectModeFromString(const std::string& s,
+                                      bool* known = nullptr);
 
 /// Pursuit spend limit (seconds). 0 means "do not pursue" — the caller falls
 /// straight through to its fallback. Non-zero budgets follow the navBudgetSec
@@ -67,20 +70,31 @@ ReconnectMode reconnectModeFromString(const std::string& s);
 /// record: trust in the trail head decays linearly with `staleness_sec` and
 /// hits zero at `staleness_max_sec` — by then the peer could be anywhere in
 /// the plot and chasing the record is worse than the guaranteed fallback.
+/// Note the clamp: at field-scale distances the raw distance term saturates
+/// the ceiling (flatforest params put that at a ~12 m trail head), so in
+/// practice the returned budget IS max_sec until staleness eats into it, and
+/// it never lands in (0, min(min_sec, max_sec)).
 ///   - max_sec <= 0 disables pursuit outright (always 0).
 ///   - staleness_max_sec <= 0 disables the staleness gate (freshness = 1).
+///   - max_sec < min_sec: the ceiling wins (the result never exceeds
+///     max_sec — it is the bound a waiting teammate relies on; min_sec comes
+///     from the unrelated nav-timeout family and must not override it).
 double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
                         double speed_est_mps, double safety_factor,
                         double staleness_max_sec, double min_sec,
                         double max_sec);
 
-/// Deterministic meeting point for the HYBRID fallback: the midpoint of the
-/// last-contact pose pair. Each side computes it from its OWN record — the
-/// records differ by at most one heartbeat of travel, so the two midpoints
-/// land within a couple of metres of each other, and each robot standing at
-/// its own midpoint puts the pair well inside the range they had at last
-/// contact. No message is exchanged; determinism substitutes for negotiation
-/// exactly as in the MinPos tiebreak.
+/// Meeting point for the HYBRID fallback: the midpoint of the last-contact
+/// pose pair (all three axes — on flat worlds the z average is the shared
+/// ground height; the arrival test is xy-only either way). Each side computes
+/// it from its OWN record, so no message is exchanged; determinism
+/// substitutes for negotiation exactly as in the MinPos tiebreak. The two
+/// records — and so the two midpoints — agree only as closely as the two
+/// directions' last successful receptions were simultaneous: intent traffic
+/// is state-gated, so a one-way fly-by can refresh one side's record and not
+/// the other's. The barrier releasing on COMMS (not co-location) is what
+/// absorbs the ordinary asymmetry; see planner_method.md for the failure
+/// mode when it can't.
 Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,
                              const Eigen::Vector3f& peer_at_contact);
 
