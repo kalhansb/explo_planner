@@ -24,6 +24,7 @@ a rendezvous anchor when comms drop.
 
 | I want to… | Read |
 |------------|------|
+| Integrate or drive the planner from ROS (nodes, topics, parameters, tf) | [docs/ros_api.md](docs/ros_api.md) |
 | Understand how the planner works | [explo_planner/README.md](explo_planner/README.md) |
 | Run a two-robot trial on real hardware | [docs/user_manual.md](docs/user_manual.md) |
 | Dry-run exploration off a bag first | [explo_planner/doc/dscovox_exploration_run.md](explo_planner/doc/dscovox_exploration_run.md) |
