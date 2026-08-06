@@ -278,6 +278,12 @@ public:
   /// ditch.
   size_t livePeerCount(const rclcpp::Time& now) const;
 
+  /// Per-peer liveness on the same raw-expiry semantics as livePeerCount().
+  /// The mesh-reconnection planner uses this to tell WHICH teammate the
+  /// barrier is waiting on: a recorded last-contact whose producer is not
+  /// live is the peer to pursue / meet.
+  bool peerLive(const std::string& robot_id, const rclcpp::Time& now) const;
+
   const std::string& selfId() const { return self_id_; }
 
   // Test seam: install a peer claim directly without going through the

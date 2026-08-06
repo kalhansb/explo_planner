@@ -352,6 +352,43 @@
     # doesn't hold the anchor indefinitely.
     rendezvous_max_wait_sec: 0.0
 
+    # Mesh reconnection (robot-carried radios, peer-to-peer — no base
+    # station). With the wifi on the robots, "where I last heard you" is a
+    # PAIR of poses, both stale the moment the link drops; the planner keeps a
+    # per-peer last-contact record (my pose, the peer's advertised pose, its
+    # declared goal) and this mode picks the manoeuvre when exploration
+    # exhausts with a teammate out of comms:
+    #   "rendezvous" — the legacy return-to-own-anchor barrier (pre-mesh
+    #     behaviour, still sound by symmetry: every robot at its own
+    #     last-contact pose restores the pair distance the link had).
+    #   "pursuit"    — chase the missing peer's last declared goal (trail
+    #     head), then its last heard pose, on the budget below; budget spent
+    #     -> hold in place and beacon. No agreed fallback point (that is the
+    #     A/B against hybrid).
+    #   "hybrid"     — pursue on the budget, then fall back to the
+    #     deterministic meeting point (midpoint of the last-contact pose
+    #     pair; both sides compute ~the same point from their own records, no
+    #     negotiation) and wait there. Worst case degenerates to the
+    #     rendezvous guarantee; a fresh trail wins early.
+    # All three re-plan against the merged map the instant the team is back
+    # in comms, mid-drive included. Same preconditions as rendezvous_* above.
+    reconnect_mode: "hybrid"
+    # Hard ceiling on one chase (s); also the worst-case bound a WAITING
+    # teammate can assume about its pursuer, hence a fixed cap and not a
+    # formula. Flatforest sizing: the ROI is ~152 x 113 m and the huskys
+    # drive ~0.8 m/s, so 240 s covers a >100 m chase leg with slack while
+    # staying comparable to exploit_target_timeout_sec (300) and above
+    # nav_max_timeout_sec (180) — at least one full worst-case nav leg plus
+    # margin fits inside a chase. <= 0 disables pursuit (pursuit/hybrid then
+    # act as their fallback).
+    pursuit_budget_max_sec: 240.0
+    # Record age (s) beyond which the trail head is worthless and the chase
+    # is skipped outright; freshness scales the budget linearly to zero
+    # across this window. Flatforest sizing: at ~0.8 m/s a teammate silent
+    # for 180 s can be ~140 m away — anywhere in the plot — so past three
+    # minutes the guaranteed fallback beats any chase. <= 0 = no gate.
+    pursuit_staleness_max_sec: 180.0
+
     # ----------------------------------------------------------------
     # Proximity stop (coordinated yield)
     # ----------------------------------------------------------------

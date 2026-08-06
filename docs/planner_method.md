@@ -80,7 +80,8 @@ WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → D
                          │  ▲
                  PROXIMITY_HOLD           (yield while a peer drives past)
 exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
-rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the barrier point, hold for the team)
+pursuit:           PURSUE → RETURN_NAV/RETURN_SYNC  (chase the trail, then fall back)
 ```
 
 In exploration the cycle is:
@@ -92,11 +93,11 @@ folds in observations taken from the new pose before they are scored.
 **LOG_STEP** — write one row of per-step metrics (§12) and return to PLAN.
 
 Exploitation substitutes **EXPLOIT_PLAN** and **EXPLOIT_DWELL** for PLAN and
-INTEGRATE, reusing NAVIGATE and LOG_STEP unchanged. Two further states,
-**RETURN_NAV** and **RETURN_SYNC**, implement the multi-robot rendezvous
-behaviour (§10.2), and **PROXIMITY_HOLD** implements the coordinated stop
-(§10.3). A run ends in **DONE**, which either shuts the node down or leaves it
-idling, ready to service targets released later.
+INTEGRATE, reusing NAVIGATE and LOG_STEP unchanged. Three further states,
+**RETURN_NAV**, **RETURN_SYNC** and **PURSUE**, implement the multi-robot
+reconnection behaviour (§10.2), and **PROXIMITY_HOLD** implements the
+coordinated stop (§10.3). A run ends in **DONE**, which either shuts the node
+down or leaves it idling, ready to service targets released later.
 
 A *step* is one full cycle, and the step count — not wall-clock time — is the
 planner's own budget. Runs terminate on coverage saturation (§9), on the step
@@ -294,27 +295,63 @@ field are not synchronised — offsets of hours have been observed in this
 system's own logs — and an expiry computed from the sender's clock makes claims
 either immortal or stillborn depending on the sign of the offset.
 
-### 10.2 Rendezvous reconnection
+### 10.2 Reconnection: rendezvous, pursuit, hybrid
 
 A robot that loses radio contact keeps exploring alone; the difficulty is what
 it should do when it *finishes*. Stopping is wrong, because its teammate may
 still be exploring and their maps have not merged.
 
-Instead, a robot that exhausts its goals while a teammate is out of contact
-drives back to its **last-connected anchor** — the pose at which it last heard
-from a teammate, which by construction lies inside radio coverage — and waits
-there until the whole team is back in contact, broadcasting its presence
-throughout so that arriving teammates can count it. It then re-plans against the
-now-merged map: if the merge revealed new frontiers the team disperses again
-(MinPos splits them), and if not, everyone reaches the end together.
+With the radios carried on the robots (a peer-to-peer mesh, no base station),
+"where I last heard you" is not a place but a **pair of places** — both
+endpoints of the lost link have moved since. The planner therefore keeps a
+**per-peer last-contact record**: at every received intent it stores its own
+pose (the anchor of old), the peer's advertised pose, and the peer's declared
+goal, stamped with local receipt time. Three reconnection manoeuvres are built
+on that record, selected by `reconnect_mode`:
 
-The barrier therefore enforces a useful invariant: **a robot can only finish
-when the whole team is present and the merged map is saturated**, so no robot
-quits while a teammate is still working. The wait is unbounded by default, with
-an optional timeout as a field escape hatch for a teammate that has genuinely
-died. The barrier takes priority over exploitation: an open tree target is stood
-down rather than serviced on the way home, because a robot detouring to inspect
-trees would leave its teammate waiting indefinitely.
+**Rendezvous** (the legacy behaviour). A robot that exhausts its goals while a
+teammate is out of contact drives back to its **last-connected anchor** — its
+own pose the last time it heard a teammate — and waits there, broadcasting its
+presence throughout so that arriving teammates can count it. On a mesh this
+retains its guarantee *by symmetry*: every robot that reaches its own anchor
+restores the pair distance the link had at last contact, which was by
+construction within range.
+
+**Pursuit**. The record contains something rendezvous ignores: the missing
+peer's *declared goal* — the freshest hypothesis of where it went. The pursuer
+chases that trail head, then sweeps toward the peer's last heard pose; on a
+mesh the link re-forms the moment any point of the chase comes within range,
+no arrival needed. The chase runs on a **staleness-scaled budget**: distance
+to the trail head at the conservative nav speed estimate, scaled linearly
+down by the record's age and skipped entirely past `pursuit_staleness_max_sec`
+(a teammate three minutes silent could be anywhere in the plot). The budget
+has a hard configured ceiling, `pursuit_budget_max_sec`, so a *waiting*
+teammate — which cannot observe the chase — can still bound how long its
+pursuer might take. A spent chase in pure pursuit mode holds in place and
+beacons: the method deliberately has no agreed fallback point, which is the
+A/B against hybrid.
+
+**Hybrid** (the shipped default). Pursue on the budget; when it is spent, fall
+back to the **deterministic meeting point** — the midpoint of the last-contact
+pose pair. Each side computes it from its *own* record with no negotiation
+(determinism substituting for messages, exactly as in the MinPos tiebreak);
+the two records differ by at most a heartbeat of travel, so the two midpoints
+agree to within a couple of metres, well inside the range the pair had at last
+contact. The worst case therefore degenerates to the rendezvous guarantee,
+while a fresh trail lets pursuit win early.
+
+In every mode, a team that comes back into contact mid-manoeuvre releases the
+barrier immediately — the robot re-plans against the now-merged map: if the
+merge revealed new frontiers the team disperses again (MinPos splits them),
+and if not, everyone reaches the end together.
+
+The barrier enforces a useful invariant: **a robot can only finish when the
+whole team is present and the merged map is saturated**, so no robot quits
+while a teammate is still working. The wait is unbounded by default, with an
+optional timeout as a field escape hatch for a teammate that has genuinely
+died. The barrier takes priority over exploitation: an open tree target is
+stood down rather than serviced on the way, because a robot detouring to
+inspect trees would leave its teammate waiting indefinitely.
 
 ### 10.3 Coordinated proximity stop
 

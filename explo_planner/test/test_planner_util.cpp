@@ -80,3 +80,64 @@ TEST(PlannerUtil, RendezvousWaitExpired) {
   EXPECT_TRUE(rendezvousWaitExpired(10.0, 10.0));      // exactly at the cap
   EXPECT_TRUE(rendezvousWaitExpired(11.0, 10.0));      // past the cap
 }
+
+// --- Mesh reconnection helpers ---
+
+// The wire strings are what the yaml/launch pass; anything else must fall back
+// to the legacy behaviour, never crash or invent a mode.
+TEST(PlannerUtil, ReconnectModeFromString) {
+  EXPECT_EQ(reconnectModeFromString("rendezvous"), ReconnectMode::RENDEZVOUS);
+  EXPECT_EQ(reconnectModeFromString("pursuit"), ReconnectMode::PURSUIT);
+  EXPECT_EQ(reconnectModeFromString("hybrid"), ReconnectMode::HYBRID);
+  EXPECT_EQ(reconnectModeFromString("nonsense"), ReconnectMode::RENDEZVOUS);
+  EXPECT_EQ(reconnectModeFromString(""), ReconnectMode::RENDEZVOUS);
+}
+
+// Fresh record, mid-range trail head: navBudget shape at full freshness.
+// 20 m / 0.15 m/s * 3.0 = 400 s -> clamped to the 240 s ceiling (the
+// flatforest defaults: any trail head past ~12 m rides the ceiling).
+TEST(PlannerUtil, PursuitBudgetFreshClampsToCeiling) {
+  EXPECT_NEAR(pursuitBudgetSec(20.0, 0.0, 0.15, 3.0, 180.0, 30.0, 240.0),
+              240.0, 1e-9);
+}
+
+// Freshness decays linearly: at half the staleness window the raw budget is
+// halved BEFORE the clamp. 10 m / 0.15 * 3.0 = 200 s raw; * 0.5 = 100 s,
+// inside [30, 240].
+TEST(PlannerUtil, PursuitBudgetScalesWithStaleness) {
+  EXPECT_NEAR(pursuitBudgetSec(10.0, 90.0, 0.15, 3.0, 180.0, 30.0, 240.0),
+              100.0, 1e-9);
+}
+
+// At (or past) the staleness ceiling the record is worthless: budget 0, which
+// the caller reads as "skip pursuit, go straight to the fallback". The floor
+// clamp must NOT resurrect a gated budget.
+TEST(PlannerUtil, PursuitBudgetStalenessGate) {
+  EXPECT_NEAR(pursuitBudgetSec(50.0, 180.0, 0.15, 3.0, 180.0, 30.0, 240.0),
+              0.0, 1e-9);
+  EXPECT_NEAR(pursuitBudgetSec(50.0, 1e6, 0.15, 3.0, 180.0, 30.0, 240.0),
+              0.0, 1e-9);
+}
+
+// A close, fresh trail head clamps UP to the floor (a viable minimum chase),
+// and max_sec <= 0 disables pursuit outright regardless of everything else.
+TEST(PlannerUtil, PursuitBudgetFloorAndDisable) {
+  EXPECT_NEAR(pursuitBudgetSec(0.5, 0.0, 0.15, 3.0, 180.0, 30.0, 240.0),
+              30.0, 1e-9);
+  EXPECT_NEAR(pursuitBudgetSec(50.0, 0.0, 0.15, 3.0, 180.0, 30.0, 0.0),
+              0.0, 1e-9);
+  // staleness_max <= 0 disables the gate: full freshness however old.
+  EXPECT_NEAR(pursuitBudgetSec(10.0, 1e6, 0.15, 3.0, 0.0, 30.0, 240.0),
+              200.0, 1e-9);
+}
+
+// The meeting point is the plain midpoint of the last-contact pose pair; both
+// sides compute it from their own record, so the arithmetic must be exact.
+TEST(PlannerUtil, MeetingPointMidpoint) {
+  const Eigen::Vector3f a(10.0f, -4.0f, 0.0f);
+  const Eigen::Vector3f b(-2.0f, 8.0f, 1.0f);
+  const Eigen::Vector3f m = meetingPoint(a, b);
+  EXPECT_NEAR(m.x(), 4.0f, 1e-6f);
+  EXPECT_NEAR(m.y(), 2.0f, 1e-6f);
+  EXPECT_NEAR(m.z(), 0.5f, 1e-6f);
+}

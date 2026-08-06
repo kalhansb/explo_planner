@@ -2,6 +2,8 @@
 /// @file planner_util.hpp
 /// @brief Small pure helpers shared by the exploration planner node.
 
+#include <Eigen/Core>
+
 #include <cstdint>
 #include <string>
 
@@ -38,5 +40,48 @@ bool shouldRendezvous(bool rendezvous_enabled, bool have_anchor,
 /// Barrier give-up test: with `max_wait_sec` <= 0 the robot waits forever
 /// (always false); otherwise true once `waited_sec` >= `max_wait_sec`.
 bool rendezvousWaitExpired(double waited_sec, double max_wait_sec);
+
+// --- Mesh reconnection (robot-carried radios; see explo_planner_node.cpp) ---
+// With the radios on the robots instead of a fixed router, "where I last heard
+// you" is a PAIR of poses (mine and the peer's advertised one), both stale the
+// moment the link drops. Three reconnection policies are built on that record.
+
+/// Reconnection policy at exploration exhaustion with a teammate out of comms.
+///   RENDEZVOUS: drive to the own-pose anchor and wait (the pre-mesh
+///     behaviour; with every robot doing this the pair distance at arrival
+///     equals the distance at last contact, i.e. within comms range).
+///   PURSUIT: chase the peer's last declared goal (the trail head) on a
+///     budget; when the budget is spent, hold in place and beacon.
+///   HYBRID: pursue on the budget, then fall back to the deterministic
+///     meeting point (both sides compute the same one) and wait there.
+enum class ReconnectMode { RENDEZVOUS, PURSUIT, HYBRID };
+
+/// Parse the `reconnect_mode` parameter. Unknown strings map to RENDEZVOUS
+/// (the legacy behaviour); the caller warns on the mismatch.
+ReconnectMode reconnectModeFromString(const std::string& s);
+
+/// Pursuit spend limit (seconds). 0 means "do not pursue" — the caller falls
+/// straight through to its fallback. Non-zero budgets follow the navBudgetSec
+/// shape (distance to the trail head at the conservative speed estimate,
+/// clamped to [min_sec, max_sec]) scaled by the freshness of the last-contact
+/// record: trust in the trail head decays linearly with `staleness_sec` and
+/// hits zero at `staleness_max_sec` — by then the peer could be anywhere in
+/// the plot and chasing the record is worse than the guaranteed fallback.
+///   - max_sec <= 0 disables pursuit outright (always 0).
+///   - staleness_max_sec <= 0 disables the staleness gate (freshness = 1).
+double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
+                        double speed_est_mps, double safety_factor,
+                        double staleness_max_sec, double min_sec,
+                        double max_sec);
+
+/// Deterministic meeting point for the HYBRID fallback: the midpoint of the
+/// last-contact pose pair. Each side computes it from its OWN record — the
+/// records differ by at most one heartbeat of travel, so the two midpoints
+/// land within a couple of metres of each other, and each robot standing at
+/// its own midpoint puts the pair well inside the range they had at last
+/// contact. No message is exchanged; determinism substitutes for negotiation
+/// exactly as in the MinPos tiebreak.
+Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,
+                             const Eigen::Vector3f& peer_at_contact);
 
 } // namespace explo_planner

@@ -111,6 +111,13 @@ size_t Coordination::livePeerCount(const rclcpp::Time& now) const {
   return n;
 }
 
+bool Coordination::peerLive(const std::string& robot_id,
+                            const rclcpp::Time& now) const {
+  for (const auto& c : claims_)
+    if (c.robot_id == robot_id && c.expiry > now) return true;
+  return false;
+}
+
 const Coordination::Claim* Coordination::claimMatching(
     const Eigen::Vector3f& candidate_xy, float match_radius_m,
     const rclcpp::Time* live_after) const {

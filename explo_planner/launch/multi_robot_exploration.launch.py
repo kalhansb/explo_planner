@@ -43,6 +43,7 @@ def launch_setup(context):
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
+    reconnect_mode = LaunchConfiguration("reconnect_mode").perform(context)
     proximity_stop_enabled = LaunchConfiguration("proximity_stop_enabled").perform(context)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -88,6 +89,12 @@ def launch_setup(context):
                         rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
+                    # Mesh reconnection manoeuvre on a robot-carried radio
+                    # team: rendezvous (return to own anchor), pursuit (chase
+                    # the missing peer's trail on a budget), or hybrid
+                    # (pursue, then meet at the deterministic midpoint). The
+                    # pursuit_* budgets come from shared_params.yaml.
+                    "reconnect_mode": reconnect_mode,
                     # Coordinated proximity stop: yield (cancel the nav goal,
                     # hold) when a lex-smaller teammate is moving nearby. In
                     # sim the guard runs off the 1 Hz intent heartbeats; on
@@ -130,6 +137,14 @@ def generate_launch_description():
                                           "false for independent finish-and-stop)"),
         DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
                               description="Barrier give-up seconds (0 = wait forever)"),
+        DeclareLaunchArgument("reconnect_mode", default_value="hybrid",
+                              description="Mesh reconnection manoeuvre at "
+                                          "exploration exhaustion: rendezvous "
+                                          "(return to own anchor), pursuit "
+                                          "(budgeted chase of the missing "
+                                          "peer's trail), or hybrid (chase, "
+                                          "then the deterministic meeting "
+                                          "point)"),
         DeclareLaunchArgument("proximity_stop_enabled", default_value="true",
                               description="Coordinated proximity stop: the "
                                           "lex-larger robot of a close pair "

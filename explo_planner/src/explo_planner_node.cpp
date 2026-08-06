@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <numeric>
 
 #include <Eigen/Core>
@@ -94,10 +95,17 @@ enum class State {
   // the merged map. Gated by rendezvous_enabled_; see the rendezvous_* params.
   RETURN_NAV,
   RETURN_SYNC,
+  // Mesh-reconnection pursuit (robot-carried radios). Instead of driving home
+  // to the anchor, chase the missing peer's last declared goal (and its last
+  // heard pose) on a staleness-scaled budget; the mesh re-forms the moment we
+  // come within range, no arrival needed. Budget spent -> fall back to the
+  // deterministic meeting point (hybrid) or hold in place (pursuit). Gated by
+  // reconnect_mode_; see the pursuit_* params.
+  PURSUE,
   // Coordinated proximity stop (multi-robot). A DRIVING robot that has lost
   // right-of-way to a nearby moving teammate cancels its nav goal and parks
   // here until the peer clears off or parks, then resumes the same goal.
-  // Entered only from NAVIGATE / RETURN_NAV; see checkProximityHold().
+  // Entered only from NAVIGATE / RETURN_NAV / PURSUE; see checkProximityHold().
   PROXIMITY_HOLD
 };
 
@@ -142,15 +150,39 @@ private:
   void doLogStep();
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
-  // exploration exhaustion, between DONE and returning to the anchor;
-  // startReturnToAnchor arms the drive back; doReturnNav drives there;
-  // doReturnSync holds at the anchor until the whole team is in comms.
-  // `reason` is the termination cause, for logging only — EVERY termination
-  // path must route through here, not just coverage saturation.
+  // exploration exhaustion, between DONE and the reconnect_mode_ manoeuvre
+  // (return-to-anchor, pursuit, or pursuit-then-meeting-point);
+  // startReturnTo arms a drive to any barrier destination (anchor or meeting
+  // point); doReturnNav drives there; doReturnSync holds until the whole team
+  // is in comms. `reason` is the termination cause, for logging only — EVERY
+  // termination path must route through here, not just coverage saturation.
   void finishOrRendezvous(const char* reason);
-  void startReturnToAnchor(const char* reason);
+  void startReturnTo(const Eigen::Vector3f& dest, const char* what,
+                     const char* reason);
   void doReturnNav();
   void doReturnSync();
+  // Mesh-reconnection pursuit (see the PURSUE state). startPursuit arms the
+  // chase along the missing peer's last-contact trail (returns false when the
+  // record is too stale to be worth chasing — pursuitBudgetSec() == 0);
+  // armPursuitWaypoint publishes the current trail waypoint as the nav goal;
+  // doPursue drives the trail under the budget; pursuitFallback routes a
+  // spent/failed chase to the mode's fallback (meeting point or hold-here);
+  // holdForTeam raises the RETURN_SYNC barrier at the CURRENT pose.
+  // standDownExploitation is the shared open-target demotion every barrier
+  // entry performs (factored out of the old startReturnToAnchor).
+  struct LastContact;  // defined with the members below
+  bool startPursuit(const std::string& peer_id, const LastContact& rec,
+                    const char* reason);
+  void armPursuitWaypoint();
+  void doPursue();
+  void pursuitFallback(const char* why);
+  void holdForTeam(const char* why);
+  void standDownExploitation();
+  // Freshest last-contact record whose producer is NOT currently live — the
+  // teammate the barrier is actually waiting on. nullptr when every recorded
+  // peer is live (the missing one was never heard at all). `peer_id_out`
+  // receives the record's robot id when non-null.
+  const LastContact* missingPeerRecord(std::string* peer_id_out);
 
   // Exploitation. onTreeTarget ingests targets off the shared topic;
   // doExploitPlan generates + validates + selects the next vantage;
@@ -354,6 +386,30 @@ private:
   // until all connected). A positive value is an escape hatch for field trials
   // so a robot whose teammate died doesn't hold the anchor indefinitely.
   double rendezvous_max_wait_sec_  = 0.0;
+  // --- Mesh reconnection (robot-carried radios) params ---
+  // With the radios on the robots (peer-to-peer mesh, no base station) the
+  // anchor loses its router-bubble meaning: the link existed because the PAIR
+  // of poses was within range, and both endpoints have moved since. The mode
+  // picks the reconnection manoeuvre at exploration exhaustion:
+  //   rendezvous — the legacy return-to-own-anchor barrier. Still sound on a
+  //     mesh BY SYMMETRY: every robot returning to its own last-contact pose
+  //     restores the pair distance the link had when it last worked.
+  //   pursuit   — chase the missing peer's last declared goal (trail head) on
+  //     a staleness-scaled budget; budget spent -> hold in place and beacon.
+  //   hybrid    — pursue on the budget, then fall back to the deterministic
+  //     meeting point (midpoint of the last-contact pose pair — both sides
+  //     compute the same one from their own record) and wait there. Worst
+  //     case degenerates to rendezvous' guarantee; best case wins early.
+  // Code default is the legacy mode; the yaml/sim opt into hybrid.
+  ReconnectMode reconnect_mode_ = ReconnectMode::RENDEZVOUS;
+  // Hard ceiling on one chase (s). <= 0 disables pursuit (pursuit/hybrid then
+  // behave like their fallback). Also the worst-case bound a WAITING teammate
+  // can assume about its pursuer, so it wants a config'd cap, not a formula.
+  double pursuit_budget_max_sec_    = 240.0;
+  // Last-contact record age (s) beyond which the trail head is worthless and
+  // pursuit is skipped outright; freshness scales the budget linearly down to
+  // zero across this window. <= 0 = no staleness gate.
+  double pursuit_staleness_max_sec_ = 180.0;
 
   // --- Proximity stop (coordinated yield) params ---
   // Thresholds/staleness live in the guard's Config; these are the node-side
@@ -556,6 +612,32 @@ private:
   // never rendezvous).
   Eigen::Vector3f last_connected_anchor_ = Eigen::Vector3f::Zero();
   bool  have_anchor_ = false;
+
+  // Per-peer last-contact record (mesh reconnection). The mobile-radio
+  // generalisation of the anchor: at every received intent, the PAIR of poses
+  // that made the link — mine and the peer's advertised one — plus the peer's
+  // declared goal, which is the freshest hypothesis of where it went (the
+  // pursuit trail head). Keyed by robot_id; stamped with LOCAL receipt time
+  // (the same clock discipline as claim expiry — peer stamps are untrusted).
+  struct LastContact {
+    Eigen::Vector3f self_pose = Eigen::Vector3f::Zero();
+    Eigen::Vector3f peer_pose = Eigen::Vector3f::Zero();
+    Eigen::Vector3f peer_goal = Eigen::Vector3f::Zero();
+    rclcpp::Time    stamp;
+  };
+  std::map<std::string, LastContact> last_contact_;
+
+  // Pursuit bookkeeping (valid while state_ == PURSUE). The trail is the
+  // waypoint list startPursuit builds from the missing peer's record — goal
+  // first (where it was heading), then its last heard pose (sweeps the leg it
+  // was driving; the mesh lights up the moment any point of it is in range).
+  // The budget clock runs from pursue_start_time_ across ALL waypoints;
+  // proximity-hold time is refunded to it (a hold is not chase progress lost).
+  std::vector<Eigen::Vector3f> pursue_waypoints_;
+  size_t       pursue_wp_index_   = 0;
+  double       pursue_budget_sec_ = 0.0;
+  rclcpp::Time pursue_start_time_;
+  std::string  pursue_peer_id_;
 
   // Proximity-hold bookkeeping: the driving state to resume into (NAVIGATE or
   // RETURN_NAV — current_goal_ is left untouched across the hold), cumulative
@@ -900,6 +982,25 @@ ExploPlannerNode::ExploPlannerNode()
     rendezvous_enabled_ = false;
   }
 
+  // Mesh reconnection mode. Default "rendezvous" = the legacy return-to-anchor
+  // barrier, bit-for-bit; "pursuit"/"hybrid" are the robot-carried-radio
+  // manoeuvres (see the param comments above). Gated by the same
+  // rendezvous_enabled_ preconditions — the mode only picks WHICH manoeuvre
+  // runs once shouldRendezvous() says one should.
+  {
+    const std::string mode_str =
+        dp("reconnect_mode", std::string("rendezvous"));
+    reconnect_mode_ = reconnectModeFromString(mode_str);
+    if (mode_str != "rendezvous" && mode_str != "pursuit" &&
+        mode_str != "hybrid") {
+      RCLCPP_WARN(get_logger(),
+          "Unknown reconnect_mode '%s' — falling back to 'rendezvous'.",
+          mode_str.c_str());
+    }
+  }
+  pursuit_budget_max_sec_    = dp("pursuit_budget_max_sec", 240.0);
+  pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 180.0);
+
   // Proximity stop (coordinated yield). ON by default and deliberately NOT
   // tied to coordination_enabled: the guard is inert until it actually tracks
   // a peer (intents from teammates, or the pose topics below), so single-robot
@@ -1164,6 +1265,22 @@ ExploPlannerNode::ExploPlannerNode()
               msg->robot_id != robot_name_) {
             last_connected_anchor_ = latest_pos_;
             have_anchor_ = true;
+            // Mesh reconnection: with robot-carried radios BOTH endpoints of
+            // the lost link have moved, so keep the whole last-contact pair
+            // per peer — my pose (the anchor generalised), its advertised
+            // pose, and its declared goal, the pursuit trail head. Stamped
+            // with local receipt time, same clock discipline as claim expiry.
+            auto& rec = last_contact_[msg->robot_id];
+            rec.self_pose = latest_pos_;
+            rec.peer_pose =
+                Eigen::Vector3f(static_cast<float>(msg->robot_pos.x),
+                                static_cast<float>(msg->robot_pos.y),
+                                static_cast<float>(msg->robot_pos.z));
+            rec.peer_goal =
+                Eigen::Vector3f(static_cast<float>(msg->goal_pos.x),
+                                static_cast<float>(msg->goal_pos.y),
+                                static_cast<float>(msg->goal_pos.z));
+            rec.stamp = this->now();
           }
           // Proximity guard: the peer's advertised live pose (refreshed by
           // its 1 Hz heartbeat). Coarse but always available in multi-robot
@@ -1530,7 +1647,8 @@ void ExploPlannerNode::tick() {
   // driving states would otherwise do this tick. The stationary states are
   // deliberately exempt — a dwelling/integrating/planning robot is already
   // still, and the moving peer's costmap treats it as an ordinary obstacle.
-  if ((state_ == State::NAVIGATE || state_ == State::RETURN_NAV) &&
+  if ((state_ == State::NAVIGATE || state_ == State::RETURN_NAV ||
+       state_ == State::PURSUE) &&
       checkProximityHold()) {
     return;
   }
@@ -1605,6 +1723,10 @@ void ExploPlannerNode::tick() {
 
     case State::RETURN_SYNC:
       doReturnSync();
+      break;
+
+    case State::PURSUE:
+      doPursue();
       break;
 
     case State::PROXIMITY_HOLD:
@@ -2344,8 +2466,8 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // ==================================================================
 
 // Called at exploration exhaustion (coverage saturated). If rendezvous is on,
-// an anchor is known, and a teammate is still out of comms, return to the
-// anchor and wait for the team; otherwise finish. When the whole team is
+// an anchor is known, and a teammate is still out of comms, run the
+// reconnect_mode_ manoeuvre; otherwise finish. When the whole team is
 // already present the map is already merged, so exhaustion here means the team
 // is genuinely done — everyone reaches this together and lands in DONE.
 void ExploPlannerNode::finishOrRendezvous(const char* reason) {
@@ -2356,7 +2478,31 @@ void ExploPlannerNode::finishOrRendezvous(const char* reason) {
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
-    startReturnToAnchor(reason);
+    // Mode dispatch (mesh radios). Pursuit and hybrid try the chase first;
+    // startPursuit declines when the missing peer's record is too stale for
+    // its trail head to mean anything (pursuitBudgetSec == 0), and each mode
+    // then falls through to its fallback. rec can be null even here: the
+    // missing teammate may never have been heard at all (the anchor came from
+    // a DIFFERENT peer) — then there is nothing to chase and no pair to
+    // midpoint, so every mode degrades to the own-anchor return.
+    std::string peer_id;
+    const LastContact* rec = missingPeerRecord(&peer_id);
+    if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
+        startPursuit(peer_id, *rec, reason)) {
+      return;
+    }
+    if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
+      startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
+                    "meeting point", reason);
+      return;
+    }
+    if (reconnect_mode_ == ReconnectMode::PURSUIT) {
+      // Pure pursuit has no agreed fallback point by design (that is the
+      // A/B against hybrid): a chase that never started waits right here.
+      holdForTeam(reason);
+      return;
+    }
+    startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
     return;
   }
   if (rendezvous_enabled_ && rendezvous_expected_peers_ > 0) {
@@ -2368,28 +2514,23 @@ void ExploPlannerNode::finishOrRendezvous(const char* reason) {
   transitionTo(State::DONE);
 }
 
-// Arm the drive back to the last-connected anchor, reusing the NAVIGATE
-// smart-timeout + arrival test. A presence intent is published (and re-sent by
-// the heartbeat, which now fires in the RETURN states) so teammates arriving
-// later count us at the barrier — without it two robots waiting at their own
-// anchors would never see each other and would deadlock.
-void ExploPlannerNode::startReturnToAnchor(const char* reason) {
-  // The rendezvous barrier is HARD: nothing preempts it. doNavigate()
-  // interrupts an exploration hop the moment a target arrives, but the RETURN
-  // states deliberately do NOT check target_queue_ — with
-  // rendezvous_max_wait_sec <= 0 (wait forever, the default) a robot that
-  // serviced trees on the way back would leave its teammate blocked at the
-  // anchor indefinitely.
-  //
-  // Stand the queue down rather than destroying it: the ACTIVE target is
-  // demoted to PENDING and the phase reset to EXPLORE, so the exploit claim
-  // stops being broadcast (the fresh non-exploit intent published below
-  // overwrites current_intent_msg_, clearing exploit/target_id/dwelled_mask and
-  // staged — peers must not merge dwell credit from a robot that is driving
-  // home, nor hold a vantage barrier open for one) and
-  // doPlan() picks the target back up once the barrier releases. Leaving it
-  // ACTIVE mattered once the step-budget path started routing through here:
-  // that path can fire mid-exploitation, unlike coverage saturation.
+// Shared barrier-entry stand-down. The rendezvous/pursuit barrier is HARD:
+// nothing preempts it. doNavigate() interrupts an exploration hop the moment a
+// target arrives, but the RETURN/PURSUE states deliberately do NOT check
+// target_queue_ — with rendezvous_max_wait_sec <= 0 (wait forever, the
+// default) a robot that serviced trees on the way would leave its teammate
+// blocked at the barrier indefinitely.
+//
+// Stand the queue down rather than destroying it: the ACTIVE target is
+// demoted to PENDING and the phase reset to EXPLORE, so the exploit claim
+// stops being broadcast (the fresh non-exploit intent the caller publishes
+// overwrites current_intent_msg_, clearing exploit/target_id/dwelled_mask and
+// staged — peers must not merge dwell credit from a robot that is driving
+// home, nor hold a vantage barrier open for one) and
+// doPlan() picks the target back up once the barrier releases. Leaving it
+// ACTIVE mattered once the step-budget path started routing through here:
+// that path can fire mid-exploitation, unlike coverage saturation.
+void ExploPlannerNode::standDownExploitation() {
   if (target_queue_.active() || target_queue_.hasPending()) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: standing down exploitation (%zu target(s) still open) — "
@@ -2405,18 +2546,28 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
     // PARTIAL without a single new dwell attempt.
     exploit_target_timing_ = false;
   }
+}
+
+// Arm the drive to a barrier destination — the own-pose anchor (rendezvous
+// mode) or the pair midpoint (hybrid fallback) — reusing the NAVIGATE
+// smart-timeout + arrival test. A presence intent is published (and re-sent by
+// the heartbeat, which fires in the RETURN states) so teammates arriving
+// later count us at the barrier — without it two robots waiting at their own
+// anchors would never see each other and would deadlock.
+void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
+                                     const char* what, const char* reason) {
+  standDownExploitation();
 
   current_goal_ = CandidateViewpoint{};
-  current_goal_.position = last_connected_anchor_;
+  current_goal_.position = dest;
   current_goal_.yaw = latest_yaw_;
 
   RCLCPP_INFO(get_logger(),
       "Rendezvous: exploration ended [%s], team incomplete (%d/%d peers) "
-      "-> returning to anchor (%.2f, %.2f).",
+      "-> returning to %s (%.2f, %.2f).",
       reason,
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
-      rendezvous_expected_peers_,
-      last_connected_anchor_.x(), last_connected_anchor_.y());
+      rendezvous_expected_peers_, what, dest.x(), dest.y());
 
   publishGoal(current_goal_);
 
@@ -2527,9 +2678,240 @@ void ExploPlannerNode::doReturnSync() {
   }
 
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-      "Rendezvous: waiting at anchor for team (%d/%d present)%s.",
+      "Rendezvous: waiting for team at the barrier (%d/%d present)%s.",
       active, rendezvous_expected_peers_,
       rendezvous_max_wait_sec_ > 0.0 ? "" : " (no timeout)");
+}
+
+// ==================================================================
+// Mesh-reconnection pursuit (robot-carried radios)
+// ==================================================================
+
+// The teammate the barrier is actually waiting on: among the peers we have
+// EVER heard (last_contact_), the one not currently live, freshest record
+// first. Liveness is the raw claim expiry — the same presence semantics as
+// livePeerCount, and deliberately not the exploit grace window.
+const ExploPlannerNode::LastContact*
+ExploPlannerNode::missingPeerRecord(std::string* peer_id_out) {
+  const auto now = this->now();
+  const LastContact* best = nullptr;
+  for (const auto& [id, rec] : last_contact_) {
+    if (coord_ && coord_->peerLive(id, now)) continue;
+    if (best == nullptr || rec.stamp > best->stamp) {
+      best = &rec;
+      if (peer_id_out) *peer_id_out = id;
+    }
+  }
+  return best;
+}
+
+// Arm the chase. The trail is the missing peer's last declared goal (the
+// trail head — the freshest hypothesis of where it went) and then its last
+// heard pose (sweeping the leg it was driving; on a mesh the link re-forms
+// the moment ANY point of the sweep comes within range of it, so partial
+// coverage of the leg is already useful). Returns false without touching any
+// state when the budget comes back 0 — record too stale, or pursuit disabled
+// by pursuit_budget_max_sec <= 0 — and the caller falls through to the
+// mode's fallback.
+bool ExploPlannerNode::startPursuit(const std::string& peer_id,
+                                    const LastContact& rec,
+                                    const char* reason) {
+  const auto now = this->now();
+  const double staleness = (now - rec.stamp).seconds();
+  const float dx = rec.peer_goal.x() - latest_pos_.x();
+  const float dy = rec.peer_goal.y() - latest_pos_.y();
+  const float trail_head_dist = std::sqrt(dx * dx + dy * dy);
+  pursue_budget_sec_ = pursuitBudgetSec(
+      trail_head_dist, staleness, nav_speed_est_mps_, nav_safety_factor_,
+      pursuit_staleness_max_sec_, nav_min_timeout_sec_,
+      pursuit_budget_max_sec_);
+  if (pursue_budget_sec_ <= 0.0) {
+    RCLCPP_INFO(get_logger(),
+        "Pursuit: record of '%s' is %.0fs old (max %.0fs) — trail head "
+        "worthless, skipping the chase.",
+        peer_id.c_str(), staleness, pursuit_staleness_max_sec_);
+    return false;
+  }
+
+  standDownExploitation();
+
+  pursue_peer_id_ = peer_id;
+  pursue_start_time_ = now;
+  pursue_waypoints_.clear();
+  pursue_waypoints_.push_back(rec.peer_goal);
+  // The last heard pose only earns a waypoint when it is meaningfully apart
+  // from the goal — a peer claiming a goal beside itself would produce two
+  // coincident hops.
+  if ((rec.peer_pose - rec.peer_goal).head<2>().norm() > 1.0f) {
+    pursue_waypoints_.push_back(rec.peer_pose);
+  }
+  pursue_wp_index_ = 0;
+
+  RCLCPP_INFO(get_logger(),
+      "Pursuit: exploration ended [%s], '%s' out of comms (record %.0fs old) "
+      "-> chasing its trail head (%.2f, %.2f), budget %.0fs, %zu waypoint(s).",
+      reason, peer_id.c_str(), staleness,
+      rec.peer_goal.x(), rec.peer_goal.y(),
+      pursue_budget_sec_, pursue_waypoints_.size());
+
+  armPursuitWaypoint();
+  return true;
+}
+
+// Publish the current trail waypoint as the nav goal and (re)enter PURSUE.
+// Called for the first waypoint by startPursuit and again on each advance —
+// re-entering resets state_enter_time_, so the per-waypoint nav budget and
+// progress window restart while the pursuit budget keeps running from
+// pursue_start_time_. The presence intent keeps the claim/beacon fresh for
+// the same reason as the RETURN states: the pursued robot must be able to
+// count us the moment the mesh re-forms.
+void ExploPlannerNode::armPursuitWaypoint() {
+  current_goal_ = CandidateViewpoint{};
+  current_goal_.position = pursue_waypoints_[pursue_wp_index_];
+  current_goal_.yaw = latest_yaw_;
+
+  publishGoal(current_goal_);
+
+  if (intent_pub_ && coord_) {
+    current_intent_msg_ = coord_->buildIntent(
+        current_goal_, latest_pos_, this->now(),
+        static_cast<float>(coord_claim_ttl_sec_),
+        static_cast<float>(coord_claim_radius_m_),
+        /*planner_type_id (eig)=*/0u, map_frame_);
+    intent_pub_->publish(current_intent_msg_);
+    have_active_intent_ = true;
+  }
+
+  transitionTo(State::PURSUE);
+
+  const float dx = current_goal_.position.x() - latest_pos_.x();
+  const float dy = current_goal_.position.y() - latest_pos_.y();
+  const float dist = std::sqrt(dx * dx + dy * dy);
+  nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
+                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
+  progress_check_time_ = state_enter_time_;
+  progress_check_dist_ = cumulative_distance_;
+}
+
+// Drive the trail. Release conditions, in priority order: the team is back
+// in comms (the whole point — re-plan against the merged map, no arrival
+// needed); the pursuit budget is spent (the chase hypothesis is dead — hand
+// off to the mode's fallback); the current waypoint is reached or judged
+// unreachable (advance to the next, or fall back when the trail is
+// exhausted). Per-waypoint nav failures advance rather than abort: waypoint
+// 2 can be reachable when waypoint 1 is not.
+void ExploPlannerNode::doPursue() {
+  // livePeerCount — presence semantics, same note as finishOrRendezvous().
+  const int active =
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  if (teamComplete(active, rendezvous_expected_peers_)) {
+    RCLCPP_INFO(get_logger(),
+        "Pursuit: team reconnected mid-chase (%d/%d) -> re-planning against "
+        "merged map.", active, rendezvous_expected_peers_);
+    have_active_intent_ = false;
+    transitionTo(State::PLAN);
+    return;
+  }
+
+  const auto now = this->now();
+  const double chased = (now - pursue_start_time_).seconds();
+  if (chased >= pursue_budget_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "Pursuit: budget spent (%.0fs of %.0fs) without contact with '%s'.",
+        chased, pursue_budget_sec_, pursue_peer_id_.c_str());
+    pursuitFallback("pursuit-budget");
+    return;
+  }
+
+  const float dx = latest_pos_.x() - current_goal_.position.x();
+  const float dy = latest_pos_.y() - current_goal_.position.y();
+  const float dist = std::sqrt(dx * dx + dy * dy);
+  const double elapsed = (now - state_enter_time_).seconds();
+  const double window_elapsed = (now - progress_check_time_).seconds();
+  bool no_progress = false;
+  if (window_elapsed > progress_window_sec_) {
+    no_progress =
+        (cumulative_distance_ - progress_check_dist_) < progress_min_distance_m_;
+    progress_check_time_ = now;
+    progress_check_dist_ = cumulative_distance_;
+  }
+
+  if (dist < goal_xy_tol_ || elapsed > nav_budget_sec_ || no_progress) {
+    const bool arrived = dist < goal_xy_tol_;
+    if (!arrived) {
+      RCLCPP_WARN(get_logger(),
+          "Pursuit: waypoint %zu/%zu unreachable (%s, dist=%.2f).",
+          pursue_wp_index_ + 1, pursue_waypoints_.size(),
+          elapsed > nav_budget_sec_ ? "nav budget" : "no progress", dist);
+    }
+    ++pursue_wp_index_;
+    if (pursue_wp_index_ < pursue_waypoints_.size()) {
+      RCLCPP_INFO(get_logger(),
+          "Pursuit: %s waypoint %zu -> driving trail waypoint %zu/%zu "
+          "(%.2f, %.2f).",
+          arrived ? "reached" : "skipping", pursue_wp_index_,
+          pursue_wp_index_ + 1, pursue_waypoints_.size(),
+          pursue_waypoints_[pursue_wp_index_].x(),
+          pursue_waypoints_[pursue_wp_index_].y());
+      armPursuitWaypoint();
+    } else {
+      RCLCPP_INFO(get_logger(),
+          "Pursuit: trail exhausted (%zu waypoint(s)) without contact with "
+          "'%s'.", pursue_waypoints_.size(), pursue_peer_id_.c_str());
+      pursuitFallback("trail-exhausted");
+    }
+    return;
+  }
+
+  republishGoal(current_goal_);
+}
+
+// Route a spent or exhausted chase to the mode's fallback. HYBRID drives to
+// the deterministic meeting point and waits there — the pursued robot's own
+// hybrid dispatch computes (approximately) the same point from its own
+// record, so the worst case degenerates to the rendezvous guarantee. Pure
+// PURSUIT waits wherever the chase ended: no agreed point is part of that
+// method, which is exactly the A/B against hybrid.
+void ExploPlannerNode::pursuitFallback(const char* why) {
+  const auto it = last_contact_.find(pursue_peer_id_);
+  if (reconnect_mode_ == ReconnectMode::HYBRID &&
+      it != last_contact_.end()) {
+    startReturnTo(meetingPoint(it->second.self_pose, it->second.peer_pose),
+                  "meeting point", why);
+    return;
+  }
+  holdForTeam(why);
+}
+
+// Raise the RETURN_SYNC barrier at the CURRENT pose. Used by pure-pursuit
+// endings and by the no-record corner of the pursuit dispatch. PURSUE is a
+// driving state, so the platform must be stopped explicitly (the guard's
+// stationary-state assumption; see abandonNavGoal) — ceasing to publish
+// goal_pose alone leaves nav2 finishing the last accepted goal. The presence
+// intent (kept fresh by the heartbeat, which fires in RETURN_SYNC) is what
+// lets the pursued teammate count us whenever it comes into range.
+void ExploPlannerNode::holdForTeam(const char* why) {
+  standDownExploitation();
+  abandonNavGoal(why);
+
+  current_goal_ = CandidateViewpoint{};
+  current_goal_.position = latest_pos_;
+  current_goal_.yaw = latest_yaw_;
+
+  if (intent_pub_ && coord_) {
+    current_intent_msg_ = coord_->buildIntent(
+        current_goal_, latest_pos_, this->now(),
+        static_cast<float>(coord_claim_ttl_sec_),
+        static_cast<float>(coord_claim_radius_m_),
+        /*planner_type_id (eig)=*/0u, map_frame_);
+    intent_pub_->publish(current_intent_msg_);
+    have_active_intent_ = true;
+  }
+
+  RCLCPP_INFO(get_logger(),
+      "Reconnect: holding for the team at the current pose (%.2f, %.2f) "
+      "[%s].", latest_pos_.x(), latest_pos_.y(), why);
+  transitionTo(State::RETURN_SYNC);
 }
 
 // Re-publish the active intent on a fixed sim-time cadence so peers
@@ -2539,17 +2921,17 @@ void ExploPlannerNode::heartbeatTick() {
   if (!coord_enabled_) return;
   if (!have_active_intent_) return;
   // Re-publish while we hold a claim: NAVIGATE/INTEGRATE (exploration), the
-  // EXPLOIT states, and the RETURN states. The dwell in particular can outlast
-  // the claim TTL, so a peer would otherwise poach the vantage angle
-  // mid-capture; in RETURN the beacon is what lets teammates arriving at the
-  // rendezvous count us and release the barrier. PROXIMITY_HOLD keeps beating
+  // EXPLOIT states, the RETURN states, and PURSUE. The dwell in particular can
+  // outlast the claim TTL, so a peer would otherwise poach the vantage angle
+  // mid-capture; in RETURN/PURSUE the beacon is what lets teammates coming
+  // back into range count us and release the barrier. PROXIMITY_HOLD keeps beating
   // too: the interrupted goal is resumed after the hold, so its claim must
   // survive, and the beacon (with the live robot_pos refreshed below) is what
   // feeds the right-of-way peer's view of us while we sit in its way.
   if (state_ != State::NAVIGATE && state_ != State::INTEGRATE &&
       state_ != State::EXPLOIT_PLAN && state_ != State::EXPLOIT_DWELL &&
       state_ != State::RETURN_NAV && state_ != State::RETURN_SYNC &&
-      state_ != State::PROXIMITY_HOLD) {
+      state_ != State::PURSUE && state_ != State::PROXIMITY_HOLD) {
     return;
   }
   if (!intent_pub_) return;
@@ -2755,6 +3137,13 @@ void ExploPlannerNode::doProximityHold() {
   // exploit give-up timer gets the held time back for the same reason: a
   // hold is not target stall.
   if (exploit_target_timing_) exploit_target_started_sec_ += held;
+  // The pursuit budget gets the held time back too: yielding to a teammate is
+  // not evidence the chase hypothesis is wrong, and charging it would let one
+  // crossing-route hold convert a viable pursuit into its fallback.
+  if (prox_resume_state_ == State::PURSUE) {
+    pursue_start_time_ =
+        pursue_start_time_ + rclcpp::Duration::from_seconds(held);
+  }
   prox_hold_total_sec_ += held;
   const char* why = d.hold ? "max-hold" : d.note.c_str();
   RCLCPP_INFO(get_logger(),

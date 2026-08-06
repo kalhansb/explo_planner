@@ -320,9 +320,12 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, drive to the last-connected anchor and wait. |
+| `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, run the `reconnect_mode` manoeuvre. |
 | `rendezvous_expected_peers` | int | `0` | Teammates to wait for. **`0` leaves the feature inert** — the multi-robot launch sets team size − 1; set it by hand on hardware. |
 | `rendezvous_max_wait_sec` | double | `0.0` | Barrier give-up (s); `0` = wait forever. |
+| `reconnect_mode` | string | `rendezvous` | Mesh (robot-carried radio) manoeuvre: `rendezvous` = return to own last-contact anchor (legacy); `pursuit` = budgeted chase of the missing peer's last declared goal, then hold in place; `hybrid` = chase, then the deterministic meeting point (midpoint of the last-contact pose pair). The yaml/sim ship `hybrid`. |
+| `pursuit_budget_max_sec` | double | `240.0` | Hard ceiling on one chase (s); also the worst-case bound a waiting teammate can assume about its pursuer. `<= 0` disables pursuit. |
+| `pursuit_staleness_max_sec` | double | `180.0` | Last-contact record age beyond which the chase is skipped; freshness scales the budget linearly to zero across this window. `<= 0` = no gate. |
 
 **Proximity stop (coordinated yield)** — best-effort coordination, *not* a
 certified safety stop. Right of way: the lexicographically smaller

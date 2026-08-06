@@ -36,4 +36,31 @@ bool rendezvousWaitExpired(double waited_sec, double max_wait_sec) {
   return max_wait_sec > 0.0 && waited_sec >= max_wait_sec;
 }
 
+ReconnectMode reconnectModeFromString(const std::string& s) {
+  if (s == "pursuit") return ReconnectMode::PURSUIT;
+  if (s == "hybrid")  return ReconnectMode::HYBRID;
+  return ReconnectMode::RENDEZVOUS;
+}
+
+double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
+                        double speed_est_mps, double safety_factor,
+                        double staleness_max_sec, double min_sec,
+                        double max_sec) {
+  if (max_sec <= 0.0) return 0.0;
+  double freshness = 1.0;
+  if (staleness_max_sec > 0.0) {
+    if (staleness_sec >= staleness_max_sec) return 0.0;
+    freshness =
+        std::clamp(1.0 - staleness_sec / staleness_max_sec, 0.0, 1.0);
+  }
+  const double raw = (trail_head_dist_m / std::max(speed_est_mps, 1e-3)) *
+                     safety_factor * freshness;
+  return std::clamp(raw, min_sec, max_sec);
+}
+
+Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,
+                             const Eigen::Vector3f& peer_at_contact) {
+  return 0.5f * (self_at_contact + peer_at_contact);
+}
+
 } // namespace explo_planner
