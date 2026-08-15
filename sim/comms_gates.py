@@ -484,6 +484,19 @@ def main():
     ap.add_argument("--period", type=float, default=30.0,
                     help="watch mode poll period, seconds")
     ap.add_argument("--odom-timeout", type=float, default=10.0)
+    # The outage gate is the one gate that is wrong for a deliberate control
+    # run. Phase 1 of the plan runs the control THROUGH the emulator at high
+    # tx_power_dbm — so the relay path (extra hop, delay_ms, rx QoS) is present
+    # but the link never drops, which is the intended condition, not a defect.
+    # Left on, every control run would end flagged as "a comms arm that never
+    # differed from the control", which is exactly backwards, and a campaign
+    # whose baseline arm always reports FAIL trains the reader to ignore the
+    # gate on the arms where it matters. Off, the gate still runs and still
+    # reports what it saw — it just does not make the run a failure, and an
+    # outage under a control label is worth knowing about either way.
+    ap.add_argument("--expect-outage", choices=["yes", "no"], default="yes",
+                    help="watch mode: 'no' for a control arm run at a "
+                         "tx_power_dbm where the link is meant to stay up")
     args = ap.parse_args()
 
     robots = [r.strip() for r in args.robots.split(",") if r.strip()]
@@ -536,8 +549,21 @@ def main():
     except (KeyboardInterrupt, _Stop):
         pass
     summary = Report(args.report)
-    if not gate_outage_occurred(summary, ever_outage, polls):
-        tripped = True
+    if args.expect_outage == "yes":
+        if not gate_outage_occurred(summary, ever_outage, polls):
+            tripped = True
+    elif ever_outage:
+        # Not a failure, but it means the "control" was degraded, so the
+        # unknown floor and makespan it produces are not a clean reference.
+        summary.note("outage",
+                     "link outage(s) observed in a run declared outage-free "
+                     "(--expect-outage no) — tx_power_dbm may be too low for a "
+                     "control arm; the floor/makespan from this run are not a "
+                     "clean reference")
+    else:
+        summary.note("outage",
+                     f"no link outage in {polls} poll(s), as expected for a "
+                     f"control arm (--expect-outage no)")
     if tripped:
         summary.fail("watch", f"gates tripped during the run ({polls} polls)")
     else:
