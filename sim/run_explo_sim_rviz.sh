@@ -300,6 +300,18 @@ FRONTIER_Z_HI_OFF="$(flt "${FRONTIER_Z_HI_OFF:-2.5}")"
 # genuinely re-frontiered later in the run can still be revisited.
 VISITED_RADIUS="$(flt "${VISITED_RADIUS:-6.0}")"
 VISITED_TTL="$(flt "${VISITED_TTL:-180.0}")"
+# scovox voxel edge length. The launch default is 0.10, which does not survive a
+# run long enough to reach coverage termination: free space is carved along the
+# whole ray to max_range 20 m, so the fused map grew to 12.7M voxels by t=550 s
+# and the planner's map ingest fell behind for good — one robot then drove for
+# three minutes on a frozen map, still stepping, still logging, coverage flat,
+# with nothing in the stack reporting it. 0.20 is ~8x cheaper.
+#
+# NOT a free knob under COMMS=1: the ScovoxMapBinary deltas are exactly what the
+# radio model carries, so this sets the offered load the link is stressed with.
+# The §4 severity calibration must be run at the resolution the campaign runs
+# at; a tx_power_dbm calibrated at another resolution does not transfer.
+VOXEL_RES="$(flt "${VOXEL_RES:-0.20}")"
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, NOT the default 0. This box runs other ROS work (the scovox
 # replay harnesses) on domain 0, and a second /clock publisher appearing there
@@ -551,12 +563,14 @@ start nav_atlas "$OUTDIR/nav_atlas.log" \
   ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=atlas mode:=ugv \
     mapping:=dscovox_lidar peers:=bestla \
     peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
+    voxel_resolution_m:=$VOXEL_RES \
     global_planning_map_size_m:=$PLAN_MAP_SIZE \
     global_planning_map_resolution:=$PLAN_MAP_RES
 start nav_bestla "$OUTDIR/nav_bestla.log" \
   ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=bestla mode:=ugv \
     mapping:=dscovox_lidar peers:=atlas \
     peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
+    voxel_resolution_m:=$VOXEL_RES \
     global_planning_map_size_m:=$PLAN_MAP_SIZE \
     global_planning_map_resolution:=$PLAN_MAP_RES
 for r in $ROBOTS; do
@@ -736,6 +750,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "frontier_z_hi_offset_m=$FRONTIER_Z_HI_OFF"
   echo "visited_goal_radius_m=$VISITED_RADIUS"
   echo "visited_goal_ttl_sec=$VISITED_TTL"
+  echo "voxel_resolution_m=$VOXEL_RES"
   echo "done_coverage_source=scovox"
   echo "prox_hold_m=$PROX_HOLD_M"
   echo "prox_resume_m=$PROX_RESUME_M"
@@ -807,6 +822,7 @@ for r in $ROBOTS; do
       -p done_coverage_source:=scovox \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
+      -p map_resolution:=$VOXEL_RES \
       -p frontier_z_lo_offset_m:=$FRONTIER_Z_LO_OFF \
       -p frontier_z_hi_offset_m:=$FRONTIER_Z_HI_OFF \
       -p visited_goal_radius_m:=$VISITED_RADIUS \
@@ -882,6 +898,15 @@ if [ "$COMMS" = "1" ]; then
   # emulator (so the relay hop, delay_ms and rx QoS are all present) at a
   # tx_power_dbm where the link is meant to stay up, and the outage gate would
   # otherwise fail every single control run for behaving as designed.
+  # Per-run connectivity trace. link_states is published at link_rate_hz and
+  # kept nowhere else: the gate watcher reads the aggregate `stats` topic, and
+  # recovering it from the bag afterwards means decoding a bag per run. Every
+  # §5 metric that mentions the radio -- realised disconnection fraction,
+  # outage durations, contact events and their attribution to a planner state
+  # -- is derived from this file.
+  start linklog "$OUTDIR/link_logger.log" \
+    python3 "$HERE/link_logger.py" --out "$OUTDIR/link_states.csv" \
+      --ros-args -p use_sim_time:=true
   start gateswatch "$OUTDIR/gates_watch.log" \
     python3 "$HERE/comms_gates.py" watch --robots "$ROBOT_CSV" \
       --report "$GATE_REPORT" \
