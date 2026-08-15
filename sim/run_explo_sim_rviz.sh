@@ -192,6 +192,20 @@ TX_POWER="$(flt "${TX_POWER:-30.0}")"
 # severity is TX_POWER's job alone, and the two are set independently so that a
 # control run whose link DID drop is still reported rather than excused.
 EXPECT_OUTAGE="${EXPECT_OUTAGE:-1}"
+# Reliable-relay backlog cap, in bytes. The emulator's shipped default is 64 MiB
+# and on overflow it drops the OLDEST queued map delta and never retransmits, so
+# the receiver's merged map loses those voxels for the rest of the run. That
+# silently breaks the experiment's central premise — the backlog is supposed to
+# DRAIN at each contact (B0a), which requires the link to be a delay, not a
+# lossy channel. At 64 MiB it did not hold: measured against tx_power_dbm=-14
+# and 0.20 m voxels, atlas published 3345 scovox_bin deltas and bestla received
+# 3190, i.e. 153 lost exactly as drop_overflow reported, and the `off` arm lost
+# 1180 in BOTH directions. Sized here for the worst case instead: ~120 kB/s of
+# deltas per direction (2 Hz, ~60 kB each) against a full T=3600 s blackout is
+# ~430 MB, so 1 GiB carries a 2.4x margin and costs at most 2 GiB of RAM across
+# both directions. The overflow counter stays a hard gate — this raises the cap
+# so the gate stops firing for real, it does not silence it.
+RELAY_QUEUE_BYTES="${RELAY_QUEUE_BYTES:-1073741824}"
 # Planner ROI half-extent, SIM ONLY (square, centred on the world origin).
 # shared_params.yaml carries the real field site's ROI — x ∈ [-51.3, 100.9],
 # y ∈ [-38.7, 74.5] — and on flatforest ~42% of that footprint has no geometry
@@ -446,6 +460,9 @@ teardown() {
   # is a control run wearing a treatment label, and nothing before this point
   # can tell.
   if [ "$COMMS" = "1" ] && [ -f "$OUTDIR/comms_gates.txt" ]; then
+    # teardown is trapped long before GATES_STRICT is assigned, and `set -u` is
+    # on, so an early die() would abort IN the trap on an unbound variable.
+    GATE_VERDICT=UNKNOWN
     NFAIL=$(grep -c "^FAIL" "$OUTDIR/comms_gates.txt" 2>/dev/null || true)
     NUNRUN=$(grep -c "^UNRUN" "$OUTDIR/comms_gates.txt" 2>/dev/null || true)
     if [ "${NFAIL:-0}" != 0 ]; then
@@ -453,10 +470,27 @@ teardown() {
       log "RUN INVALID: $NFAIL gate failure(s). $OUTDIR/comms_gates.txt:"
       grep "^FAIL" "$OUTDIR/comms_gates.txt" | sed 's/^/    /' || true
       log "=============================================================="
+      GATE_VERDICT=INVALID
     elif [ "${NUNRUN:-0}" != 0 ]; then
       log "RUN SUSPECT: $NUNRUN gate(s) could not be evaluated — see $OUTDIR/comms_gates.txt"
+      GATE_VERDICT=SUSPECT
     else
       log "comms gates: clean for the whole run"
+      GATE_VERDICT=CLEAN
+    fi
+    # The verdict has to outlive this shell. A campaign driver decides "is this
+    # cell done?" from the manifest alone, so a verdict that exists only in the
+    # console log means an INVALID cell is indistinguishable from a good one on
+    # resume and gets skipped forever.
+    [ -f "$OUTDIR/run_manifest.txt" ] && \
+      echo "run_gates_verdict=$GATE_VERDICT" >> "$OUTDIR/run_manifest.txt"
+    # GATES_STRICT used to cover only the BRING-UP gates, so a run whose link
+    # gates failed at minute 40 still exited 0 and every campaign driver recorded
+    # it as OK. The three phase-3 mode runs were all logged "OK rc=0" while the
+    # same teardown printed RUN INVALID directly above it.
+    if [ "$GATE_VERDICT" = "INVALID" ] && [ "${GATES_STRICT:-0}" = "1" ]; then
+      log "exiting non-zero: GATES_STRICT=1 and the run-time gates failed"
+      exit 1
     fi
   fi
   log "teardown complete — outputs in $OUTDIR"
@@ -564,9 +598,11 @@ if [ "$COMMS" = "1" ]; then
   start comms "$OUTDIR/comms.log" \
     ros2 launch hmr_sim comms_sim.launch.py \
       scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
-      tx_power_dbm:="$TX_POWER"
+      tx_power_dbm:="$TX_POWER" \
+      reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES"
   sleep 3
-  log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER) ahead of the mappers"
+  log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
+      "relay_queue=${RELAY_QUEUE_BYTES}B) ahead of the mappers"
 fi
 
 # --- 3. nav + lidar mapping, mergers cross-wired ----------------------------
@@ -755,6 +791,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "expect_outage=$EXPECT_OUTAGE"
   echo
   echo "# --- held fixed ---"
+  echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
   echo "scenario=$SCENARIO"
   echo "exploitation_enabled=$EXPLOIT_ARG"
   echo "dwell_sync=$DWELL_SYNC_ARG"

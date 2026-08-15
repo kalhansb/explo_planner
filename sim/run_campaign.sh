@@ -83,10 +83,18 @@ for cell in "${CELL_LIST[@]}"; do
   name="${TAG}_${arm}_seed${seed}"
   out="$ROOT/$name"
 
+  # "Complete" means reached an end reason AND passed its run-time gates. A run
+  # that dropped relay traffic reaches all_done exactly like a good one, so
+  # resuming on run_end_reason alone would skip every invalid cell forever and
+  # quietly hand the analysis a matrix of corrupted maps.
   if [ -f "$out/run_manifest.txt" ] && grep -q '^run_end_reason=' "$out/run_manifest.txt" 2>/dev/null; then
-    log "SKIP $name (already complete)"
-    n_skip=$((n_skip + 1))
-    continue
+    if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then
+      log "REDO $name (previous attempt failed its gates)"
+    else
+      log "SKIP $name (already complete)"
+      n_skip=$((n_skip + 1))
+      continue
+    fi
   fi
   # A half-finished OUTDIR from an interrupted attempt would otherwise mix its
   # CSVs with the retry's.
