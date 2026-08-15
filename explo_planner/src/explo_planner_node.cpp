@@ -109,6 +109,30 @@ enum class State {
   PROXIMITY_HOLD
 };
 
+// Stable, machine-readable state names. These are wire/CSV values consumed by
+// the offline analysis (merge attribution classifies each contact event by the
+// planner state at contact time), so treat them as an interface: renaming one
+// silently re-buckets every past run's events. No default case — adding a
+// State without a name here is a compile warning, not a mystery at analysis
+// time.
+inline const char* stateName(State s) {
+  switch (s) {
+    case State::WAIT_FOR_MAP:   return "WAIT_FOR_MAP";
+    case State::PLAN:           return "PLAN";
+    case State::NAVIGATE:       return "NAVIGATE";
+    case State::INTEGRATE:      return "INTEGRATE";
+    case State::LOG_STEP:       return "LOG_STEP";
+    case State::DONE:           return "DONE";
+    case State::EXPLOIT_PLAN:   return "EXPLOIT_PLAN";
+    case State::EXPLOIT_DWELL:  return "EXPLOIT_DWELL";
+    case State::RETURN_NAV:     return "RETURN_NAV";
+    case State::RETURN_SYNC:    return "RETURN_SYNC";
+    case State::PURSUE:         return "PURSUE";
+    case State::PROXIMITY_HOLD: return "PROXIMITY_HOLD";
+  }
+  return "UNKNOWN";
+}
+
 // Top-level behaviour mode. NAVIGATE / INTEGRATE / LOG_STEP are shared between
 // modes and branch on this to route correctly.
 enum class Phase { EXPLORE, EXPLOIT };
@@ -148,6 +172,15 @@ private:
   void doNavigate();
   void doIntegrate();
   void doLogStep();
+
+  // CSV row assembly. fillCommonMetrics populates every column that is a
+  // property of the world right now (map stats, odometry, peers, holds, state,
+  // reconnect clock) and is shared by both emitters; the plan-attribution
+  // columns are left at zero for it to stay honest on a timer row, and doLogStep
+  // adds them for genuine end-of-step rows. metricsTick is the periodic
+  // sampler that runs in every state.
+  void fillCommonMetrics(StepMetrics& m);
+  void metricsTick();
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
   // exploration exhaustion, between DONE and the reconnect_mode_ manoeuvre
@@ -368,7 +401,30 @@ private:
   // the 300 s per-target budget.
   double coord_claim_grace_sec_ = 10.0;
   double coord_heartbeat_hz_   = 1.0;
+  // Heartbeat-suppression episode tracking (see heartbeatTick). Lets the
+  // analysis separate "peer missing because the radio was down" from "peer
+  // missing because its planner was busy in a non-beaconing state" — the two
+  // are identical in coord_active_peers, and only one of them is a comms
+  // result.
+  bool hb_suppressed_ = false;
+  bool hb_suppress_warned_ = false;
+  // Previous heartbeatTick entry, for late-tick (executor starvation)
+  // detection, and a running count of ticks later than the claim TTL.
+  rclcpp::Time hb_last_tick_;
+  int  hb_late_count_ = 0;
+  rclcpp::Time hb_suppress_start_;
   std::string coord_intent_topic_;
+  // Intent stream, split. By default the planner pubs and subs the SAME
+  // global topic (coord_intent_topic_), which means no external process can
+  // sit between two robots' intents — and a peer that reads as *missing* is
+  // the trigger for every reconnect manoeuvre, so a comms emulator that
+  // cannot gate this stream cannot exercise them at all. These two params
+  // separate the ends: publish to one topic, subscribe to a list of others
+  // (typically the emulator's relayed copies, /<self>/rx/<peer>/...). Both
+  // default empty -> fall back to coord_intent_topic_, i.e. today's exact
+  // behaviour, self-echo included (filtered downstream as before).
+  std::string coord_intent_pub_topic_;
+  std::vector<std::string> coord_intent_sub_topics_;
   // MinPos match radius for EXPLOIT vantage claims. Vantages on one trunk sit
   // only ~(radius + standoff) apart, so the exploration-scale claim disc
   // (fov_max_range) would swallow the whole ring and veto the tree outright
@@ -653,6 +709,17 @@ private:
   // anchor" or "meeting point"), set by startReturnTo for doReturnNav's logs.
   std::string  return_dest_label_;
 
+  // Reconnect-manoeuvre clock, for the CSV's reconnect_elapsed_sec. Deliberately
+  // NOT state_enter_time_: the manoeuvre spans state changes that must not
+  // restart it — RETURN_NAV -> RETURN_SYNC on arrival, a PROXIMITY_HOLD taken
+  // mid-drive, and in HYBRID the whole PURSUE -> meeting-point handoff. Armed
+  // once by whichever of startReturnTo/startPursuit fires first (hence the
+  // already-active guard in both) and cleared in transitionTo on leaving the
+  // manoeuvre states, so the column measures one thing: wall seconds this robot
+  // spent trying to re-establish contact rather than exploring.
+  bool         reconnect_active_ = false;
+  rclcpp::Time reconnect_start_time_;
+
   // Proximity-hold bookkeeping: the driving state to resume into (NAVIGATE or
   // RETURN_NAV — current_goal_ is left untouched across the hold), cumulative
   // hold count / held seconds (CSV columns, so post-hoc analysis can correlate
@@ -717,7 +784,11 @@ private:
   bool            goal_had_subscriber_ = false;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
   rclcpp::Publisher<explo_planner_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
-  rclcpp::Subscription<explo_planner_msgs::msg::RobotIntent>::SharedPtr intent_sub_;
+  // One subscription per configured source topic. Single-element in the
+  // default (shared-bus) wiring; one entry per peer when the stream is split
+  // across an emulator's per-link relays.
+  std::vector<rclcpp::Subscription<explo_planner_msgs::msg::RobotIntent>::SharedPtr>
+      intent_subs_;
   // Shared tree-target topic. The time-based scheduler publishes here today; a
   // detector can publish the same message later with no planner change.
   rclcpp::Subscription<explo_planner_msgs::msg::TreeTarget>::SharedPtr target_sub_;
@@ -740,6 +811,17 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr prox_state_pub_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
+  // Periodic CSV sampler (SIM seconds); see metricsTick(). <= 0 disables it and restores the
+  // pre-experiment behaviour of one row per completed exploration step.
+  double metrics_period_sec_ = 5.0;
+  rclcpp::TimerBase::SharedPtr metrics_timer_;
+  // Adaptive back-off state for metricsTick (see the comment there). Steady
+  // clock, deliberately: this bounds executor-thread work, which is wall-clock
+  // work regardless of use_sim_time.
+  double metrics_max_duty_ = 0.2;
+  double metrics_effective_period_ = 5.0;
+  int    metrics_backoffs_ = 0;
+  std::chrono::steady_clock::time_point metrics_next_{};
 };
 
 // ==================================================================
@@ -758,6 +840,19 @@ ExploPlannerNode::ExploPlannerNode()
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
   output_csv_   = dp("output_csv", std::string("/tmp/exploration.csv"));
+  // Wall-clock CSV sampling period. The end-of-step row is the only row a
+  // pre-experiment run produced, and steps do not advance during a reconnect
+  // manoeuvre — so a run that spent four minutes chasing a peer recorded that
+  // interval as a single flat segment between two step rows, which is precisely
+  // the interval the comms experiment is measuring. 0 restores the old
+  // step-rows-only behaviour.
+  metrics_period_sec_ = dp("metrics_period_sec", 5.0);
+  // Ceiling on the fraction of wall time the metrics sampler may consume. It is
+  // a real-time budget, not a preference: the sampler shares one thread with
+  // the coordination beacon, and a beacon delayed past coord_claim_ttl_sec is
+  // read by peers as this robot having vanished.
+  metrics_max_duty_ = std::clamp(dp("metrics_max_duty", 0.2), 0.01, 1.0);
+  metrics_effective_period_ = metrics_period_sec_;
   map_resolution_ = dp("map_resolution", 0.10);
   map_frame_    = dp("map_frame", std::string("map"));
   base_frame_   = dp("base_frame", std::string(""));
@@ -975,6 +1070,35 @@ ExploPlannerNode::ExploPlannerNode()
   coord_claim_grace_sec_ = dp("coord_claim_grace_sec", 10.0);
   coord_intent_topic_    = dp("coord_intent_topic",
                               std::string("/exploration/intents"));
+  // Split intent stream (see member comments). Empty -> today's shared bus.
+  // A non-absolute value is resolved under /<robot_name>/, matching this
+  // file's convention for every other cross-node topic (see
+  // refinement_region_topic below): the packaged launch files pass robot_name
+  // as a parameter but do NOT namespace this node, so a relative topic would
+  // otherwise land in the global scope and silently never match the
+  // emulator's per-robot relays — which reads as "peer missing forever",
+  // indistinguishable from the outage the run is trying to measure.
+  auto resolve_topic = [this](const std::string& t) {
+    if (t.empty() || t.front() == '/' || t.front() == '~') return t;
+    return "/" + robot_name_ + "/" + t;
+  };
+  coord_intent_pub_topic_ =
+      resolve_topic(dp("coord_intent_pub_topic", std::string("")));
+  if (coord_intent_pub_topic_.empty())
+    coord_intent_pub_topic_ = coord_intent_topic_;
+  coord_intent_sub_topics_ =
+      dp("coord_intent_sub_topics", std::vector<std::string>{});
+  for (auto& t : coord_intent_sub_topics_) t = resolve_topic(t);
+  // Drop empties before the fallback test, so a stray "" in the list cannot
+  // create a subscription on the empty topic (rclcpp throws) and an
+  // all-empty list still degrades to the shared bus rather than leaving the
+  // planner deaf.
+  coord_intent_sub_topics_.erase(
+      std::remove(coord_intent_sub_topics_.begin(),
+                  coord_intent_sub_topics_.end(), std::string("")),
+      coord_intent_sub_topics_.end());
+  if (coord_intent_sub_topics_.empty())
+    coord_intent_sub_topics_ = {coord_intent_topic_};
   coord_heartbeat_hz_    = dp("coord_heartbeat_hz", 1.0);
   coord_vantage_claim_radius_m_ = dp("coord_vantage_claim_radius_m", 0.0);
 
@@ -1260,6 +1384,26 @@ ExploPlannerNode::ExploPlannerNode()
         planning_map_topic,
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
         [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+          // Frame check, matching the one the ScovoxMap path already does.
+          // planMapCellAt/isCellFree/unknownFractionInRoi index this grid with
+          // raw world XY and no TF at all, so if the publisher stamps it in a
+          // frame that is not numerically the planner's map frame, every
+          // lookup silently reads the wrong cell — candidates rejected as
+          // occupied on the strength of geometry from somewhere else. The
+          // usual sim publisher is scovox_node, which stamps its integration
+          // frame (<robot>/odom); that is only safe because map->odom is
+          // published as identity. Nothing enforces that, so say so out loud
+          // when it stops being true.
+          if (!msg->header.frame_id.empty() &&
+              msg->header.frame_id != map_frame_) {
+            RCLCPP_WARN_ONCE(get_logger(),
+                "planning_map is in frame '%s' but the planner works in '%s'. "
+                "2D cell lookups apply NO transform, so this is only correct "
+                "while the two frames are numerically identical (e.g. an "
+                "identity map->odom). Candidate free/occupied and reachability "
+                "results are unreliable otherwise.",
+                msg->header.frame_id.c_str(), map_frame_.c_str());
+          }
           latest_plan_map_ = msg;
           have_plan_map_ = true;
         });
@@ -1278,9 +1422,8 @@ ExploPlannerNode::ExploPlannerNode()
   {
     auto qos = rclcpp::QoS(rclcpp::KeepLast(8)).reliable();
     intent_pub_ = create_publisher<explo_planner_msgs::msg::RobotIntent>(
-        coord_intent_topic_, qos);
-    intent_sub_ = create_subscription<explo_planner_msgs::msg::RobotIntent>(
-        coord_intent_topic_, qos,
+        coord_intent_pub_topic_, qos);
+    auto on_intent =
         [this](explo_planner_msgs::msg::RobotIntent::SharedPtr msg) {
           if (coord_) coord_->onIntent(*msg, this->now());
           // Rendezvous: record where we were the last time we heard a
@@ -1325,7 +1468,24 @@ ExploPlannerNode::ExploPlannerNode()
           // broadcast just before the peer releases its claim can't be lost
           // to the claim TTL while this robot is mid-hop or mid-dwell.
           onPeerExploitIntent(*msg);
-        });
+        };
+    for (const auto& topic : coord_intent_sub_topics_) {
+      intent_subs_.push_back(
+          create_subscription<explo_planner_msgs::msg::RobotIntent>(
+              topic, qos, on_intent));
+    }
+    // Logged unconditionally: a split-stream run that silently fell back to
+    // the shared bus looks exactly like a run with perfect comms, and the
+    // per-link relay topics are the first thing to check when every peer
+    // reads present (leak) or absent (typo / QoS mismatch) for a whole run.
+    std::string subs;
+    for (const auto& t : coord_intent_sub_topics_) subs += (subs.empty() ? "" : ", ") + t;
+    RCLCPP_INFO(get_logger(),
+        "Intents: pub '%s' <- KeepLast(8).reliable() -> sub [%s]%s",
+        coord_intent_pub_topic_.c_str(), subs.c_str(),
+        (coord_intent_sub_topics_.size() == 1 &&
+         coord_intent_sub_topics_[0] == coord_intent_pub_topic_)
+            ? " (shared bus: no external process can gate this stream)" : "");
   }
 
   // --- Proximity-stop wiring: peer localiser poses + the nav2 cancel client.
@@ -1456,6 +1616,23 @@ ExploPlannerNode::ExploPlannerNode()
   tick_timer_ = rclcpp::create_timer(
       this, get_clock(), std::chrono::milliseconds(100),
       [this] { tick(); });
+
+  // --- Periodic CSV sampler (sim time, same clock as the state machine).
+  //     Shares the node's default (mutually-exclusive) callback group with
+  //     tick(), so a row can never be assembled from half-updated state.
+  if (metrics_period_sec_ > 0.0) {
+    auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(metrics_period_sec_));
+    metrics_timer_ = rclcpp::create_timer(
+        this, get_clock(), period, [this] { metricsTick(); });
+    RCLCPP_INFO(get_logger(),
+        "Metrics: sampling every %.1f s in ALL states (rows where state != "
+        "LOG_STEP); end-of-step rows unchanged.", metrics_period_sec_);
+  } else {
+    RCLCPP_WARN(get_logger(),
+        "Metrics: periodic sampling DISABLED (metrics_period_sec=0) — the CSV "
+        "will have no rows during reconnect manoeuvres.");
+  }
 
   // --- Coord heartbeat. Re-publishes the active claim while NAVIGATE-ing
   //     so peers don't lose it through TTL. Period = 1 / coord_heartbeat_hz.
@@ -1805,6 +1982,21 @@ void ExploPlannerNode::tick() {
 }
 
 void ExploPlannerNode::transitionTo(State s) {
+  // Reconnect clock. The manoeuvre owns RETURN_NAV / RETURN_SYNC / PURSUE, plus
+  // any PROXIMITY_HOLD taken while already inside one. Staying within that set
+  // keeps the clock running, which is what lets a single manoeuvre span the
+  // RETURN_NAV -> RETURN_SYNC arrival and the HYBRID chase -> meeting-point
+  // handoff without restarting; leaving it means the manoeuvre resolved, one
+  // way or the other, so the clock stops and the CSV reverts to its sentinel.
+  const bool manoeuvre = (s == State::RETURN_NAV || s == State::RETURN_SYNC ||
+                          s == State::PURSUE || s == State::PROXIMITY_HOLD);
+  if (reconnect_active_ && !manoeuvre) {
+    RCLCPP_INFO(get_logger(),
+        "Reconnect manoeuvre ended after %.1f s sim (-> %s).",
+        (this->now() - reconnect_start_time_).seconds(), stateName(s));
+    reconnect_active_ = false;
+  }
+
   state_ = s;
   state_enter_time_ = this->now();
   // The post-arrival rotation deadline is per-NAVIGATE-cycle and is armed
@@ -2595,6 +2787,14 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
                                      const char* what, const char* reason) {
   standDownExploitation();
 
+  // Arm the reconnect clock only if nothing is running it yet. In HYBRID this
+  // is reached as the fallback leg of a spent pursuit, and the column has to
+  // report the total time spent trying to reconnect — not just the last leg.
+  if (!reconnect_active_) {
+    reconnect_active_ = true;
+    reconnect_start_time_ = this->now();
+  }
+
   return_dest_label_ = what;
   current_goal_ = CandidateViewpoint{};
   current_goal_.position = dest;
@@ -2798,6 +2998,15 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
 
   standDownExploitation();
 
+  // See startReturnTo: first leg of the manoeuvre arms the clock, later legs
+  // inherit it. Distinct from pursue_start_time_, which is the budget clock and
+  // is refunded proximity-hold time — this one is never refunded, because the
+  // hold really was time spent not exploring.
+  if (!reconnect_active_) {
+    reconnect_active_ = true;
+    reconnect_start_time_ = now;
+  }
+
   pursue_budget_sec_ = budget;
   pursue_peer_id_ = peer_id;
   pursue_rec_ = rec;
@@ -2982,6 +3191,15 @@ void ExploPlannerNode::holdForTeam(const char* why) {
   standDownExploitation();
   abandonNavGoal(why);
 
+  // Same idempotent arm as startReturnTo/startPursuit. Reached both as the
+  // fallback of a spent chase (clock already running) and directly in PURSUIT
+  // mode when the record was too stale to chase at all (clock not yet running,
+  // and this wait is still the robot's reconnect attempt — it must be timed).
+  if (!reconnect_active_) {
+    reconnect_active_ = true;
+    reconnect_start_time_ = this->now();
+  }
+
   publishPresenceIntent();
 
   RCLCPP_INFO(get_logger(),
@@ -3015,6 +3233,71 @@ void ExploPlannerNode::publishPresenceIntent() {
 // Stamps the message with the current time so peer expiry resets.
 void ExploPlannerNode::heartbeatTick() {
   if (!coord_enabled_) return;
+  // Suppression accounting (comms experiments). The beacon is STATE-GATED, so
+  // a planner busy longer than coord_claim_ttl_sec in a non-beaconing state —
+  // PLAN above all, which can loop indefinitely when every candidate is
+  // rejected — reads as *missing* in every peer's claim table under perfect
+  // comms. That is indistinguishable from a radio outage from the receiver's
+  // side, and it is enough to arm a reconnect manoeuvre against a healthy
+  // teammate. Logging the episodes here is what lets the analysis classify
+  // each peer-missing window as outage (corroborated by the emulator's
+  // link_states) or suppression (corroborated by these lines) instead of
+  // charging planner latency to the radio.
+  const bool beaconing =
+      have_active_intent_ && intent_pub_ &&
+      (state_ == State::NAVIGATE || state_ == State::INTEGRATE ||
+       state_ == State::EXPLOIT_PLAN || state_ == State::EXPLOIT_DWELL ||
+       state_ == State::RETURN_NAV || state_ == State::RETURN_SYNC ||
+       state_ == State::PURSUE || state_ == State::PROXIMITY_HOLD ||
+       state_ == State::DONE);
+  const auto hb_now = this->now();
+  // Second, independent suppression cause: EXECUTOR STARVATION. The block below
+  // keys entirely off state_, so it can only see a beacon that was never
+  // attempted. A beacon that was attempted LATE is invisible to it — and this
+  // node spins a single-threaded executor, so every timer here is serialised
+  // behind the state machine and behind the metrics sampler, whose map ingest +
+  // grid walk grows with the fused map (millions of voxels by late run). If one
+  // of those callbacks runs longer than coord_claim_ttl_sec the beacon simply
+  // does not go out in time, peers age the claim out, and the analysis charges
+  // a healthy link with an outage. Measuring the actual inter-tick interval is
+  // the only way to see it from inside the node.
+  if (hb_last_tick_.nanoseconds() > 0) {
+    const double gap = (hb_now - hb_last_tick_).seconds();
+    if (gap >= coord_claim_ttl_sec_) {
+      ++hb_late_count_;
+      RCLCPP_WARN(get_logger(),
+          "Heartbeat tick LATE: %.2f s since the previous tick (>= claim TTL "
+          "%.1f s), state %s. The executor was blocked, not the radio — peers "
+          "may have aged this robot's claim out with the link up. Late ticks "
+          "so far: %d.", gap, coord_claim_ttl_sec_, stateName(state_),
+          hb_late_count_);
+    }
+  }
+  hb_last_tick_ = hb_now;
+  if (!beaconing) {
+    if (!hb_suppressed_) {
+      hb_suppressed_ = true;
+      hb_suppress_start_ = hb_now;
+      hb_suppress_warned_ = false;
+    }
+    const double held = (hb_now - hb_suppress_start_).seconds();
+    // One WARN per episode, at the moment peers can first read us as gone.
+    if (!hb_suppress_warned_ && held >= coord_claim_ttl_sec_) {
+      hb_suppress_warned_ = true;
+      RCLCPP_WARN(get_logger(),
+          "Heartbeat suppressed %.1f s in state %s (>= claim TTL %.1f s): "
+          "peers now read this robot as MISSING with the link up. Classify "
+          "any peer-missing window overlapping this as suppression, not "
+          "outage.", held, stateName(state_), coord_claim_ttl_sec_);
+    }
+  } else if (hb_suppressed_) {
+    hb_suppressed_ = false;
+    const double held = (hb_now - hb_suppress_start_).seconds();
+    RCLCPP_INFO(get_logger(),
+        "Heartbeat resumed after %.1f s suppressed (now %s)%s.",
+        held, stateName(state_),
+        held >= coord_claim_ttl_sec_ ? " [exceeded claim TTL]" : "");
+  }
   if (!have_active_intent_) return;
   // Re-publish while we hold a claim: NAVIGATE/INTEGRATE (exploration), the
   // EXPLOIT states, the RETURN states, PURSUE, and DONE. The dwell in
@@ -3285,47 +3568,61 @@ void ExploPlannerNode::doIntegrate() {
 }
 
 // ==================================================================
-// LOG_STEP state
+// CSV rows — shared assembly, and the periodic sampler
 // ==================================================================
 
-void ExploPlannerNode::doLogStep() {
-  StepMetrics m;
-  m.step = step_;
-  m.sim_time_sec = this->now().seconds();
+// Every column that is a property of the world at this instant, as opposed to
+// an attribution of the last plan. Shared by the end-of-step row and the timer
+// row; the plan-attribution columns (plan_time_ms, mean_/selected_*, the
+// rejection counts, the exploited vantage) are deliberately NOT set here, so a
+// timer row leaves them zero instead of repeating the last plan's numbers on
+// every sample and inviting the analysis to average them.
+void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
+  const auto now = this->now();
+  m.step              = step_;
+  m.sim_time_sec      = now.seconds();
   m.distance_traveled = cumulative_distance_;
-  m.selected_score = current_goal_.score;
-  m.plan_time_ms = pending_plan_ms_;
-
-  // Drain utility / coord diagnostics from doPlan().
-  m.mean_info_gain      = pending_mean_info_gain_;
-  m.mean_path_cost      = pending_mean_path_cost_;
-  m.selected_info_gain  = pending_selected_info_gain_;
-  m.selected_path_cost  = pending_selected_path_cost_;
-  m.selected_utility    = current_goal_.score;
   // livePeerCount: the column documents "peers heard within one TTL", and
   // grace-retained exploit claims must not inflate it (CSV schema unchanged,
   // only the count's honesty restored).
   m.coord_active_peers  = coord_
-      ? static_cast<int>(coord_->livePeerCount(this->now()))
+      ? static_cast<int>(coord_->livePeerCount(now))
       : 0;
-  m.rejected_by_minpos        = pending_rejected_by_minpos_;
-  m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
-
-  // Cumulative proximity-hold columns. LOG_STEP is never reached mid-hold
-  // (holds only interrupt driving states), so these are always settled.
+  // Cumulative proximity-hold columns.
   m.prox_hold_count     = prox_hold_count_;
   m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
+  m.phase = (phase_ == Phase::EXPLOIT) ? "exploit" : "explore";
+  m.state = stateName(state_);
 
-  // Exploitation columns. Left at the "explore"/-1/0 defaults for exploration
-  // rows; filled from the dwelled vantage for exploitation rows.
-  if (phase_ == Phase::EXPLOIT) {
-    m.phase             = "exploit";
-    m.target_id         = pending_exploit_target_id_;
-    m.vantage_index     = pending_exploit_vantage_index_;
-    m.n_vantages_valid  = pending_exploit_n_valid_;
-    m.vantage_los_clear = pending_exploit_los_clear_;
-    m.dwell_sec         = pending_exploit_dwell_sec_;
+  // Reconnect columns. Both stay at their -1 "not applicable" sentinel outside
+  // a manoeuvre — 0.0 would read as "arrived", which is a real and different
+  // thing to record.
+  if (reconnect_active_) {
+    m.reconnect_elapsed_sec =
+        static_cast<float>((now - reconnect_start_time_).seconds());
+    if (state_ == State::RETURN_SYNC) {
+      // The barrier itself: the robot has stopped where it is going to wait, so
+      // the distance left to run is zero by definition — not the range to
+      // whatever goal it last drove toward.
+      m.reconnect_range_to_goal_m = 0.0f;
+    } else {
+      // current_goal_ is the live manoeuvre destination in RETURN_NAV and
+      // PURSUE, and survives a PROXIMITY_HOLD untouched (the hold publishes a
+      // separate brake goal), so it is correct in all three.
+      const float dx = current_goal_.position.x() - latest_pos_.x();
+      const float dy = current_goal_.position.y() - latest_pos_.y();
+      m.reconnect_range_to_goal_m = std::sqrt(dx * dx + dy * dy);
+    }
   }
+
+  // Coverage-termination measure, on every row. This is the primary endpoint
+  // quantity AND what the DONE criterion is compared against, so a run that
+  // does not carry it cannot be scored on its own stopping rule. Same call the
+  // termination check makes, so the CSV and the decision can never disagree.
+  const char* cov_src = "none";
+  const double uf = coverageUnknownFraction(&cov_src);
+  m.unknown_fraction = static_cast<float>(uf);
+  m.coverage_source  = cov_src;
 
   // Aggregate map stats from map_cache_ (the fused ROI grid). The dscovox node
   // no longer computes these — scoring and stats both live in the planner now.
@@ -3337,6 +3634,110 @@ void ExploPlannerNode::doLogStep() {
   m.mean_eig              = stats.mean_eig;
   m.mean_entropy          = stats.mean_entropy;
   m.mean_variance         = stats.mean_variance;
+}
+
+// Sample the CSV on a periodic timer, in every state. The period is SIM time
+// (use_sim_time), so at RTF != 1 it is not a wall-clock period; the adaptive
+// back-off below is the only part measured on a steady wall clock, because it
+// bounds executor-thread work. Steps only advance through
+// the explore loop, so without this a robot that spends four minutes in PURSUE
+// or RETURN_NAV contributes one flat segment between two step rows across the
+// exact interval the comms experiment measures.
+void ExploPlannerNode::metricsTick() {
+  if (!logger_ || !map_cache_) return;
+  // Self-throttle. This callback is NOT cheap and gets more expensive as the
+  // run proceeds: loadLatestMap() reallocates and re-inserts the whole fused
+  // grid whenever a new map has arrived (dscovox publishes at 1 Hz, so at any
+  // sane period one always has), and computeStats() then walks every voxel
+  // evaluating digamma/log terms plus up to six neighbour lookups per free
+  // voxel. Prior campaign CSVs reach ~4M voxels with plan_time_ms ~1700, so on
+  // a single-threaded executor a fixed 5 s period would spend a large and
+  // GROWING fraction of the node's only thread here — delaying the 1 Hz
+  // coordination beacon past coord_claim_ttl_sec and manufacturing exactly the
+  // peer-missing signal this experiment is trying to attribute to the radio.
+  //
+  // So the period floats: measure each tick, and if it cost more than
+  // metrics_max_duty_ of the current period, stretch the period until it does
+  // not. The sampling rate degrades (visibly, in the log) instead of the
+  // planner's real-time behaviour degrading (invisibly, in the data).
+  const auto mt_now = std::chrono::steady_clock::now();
+  if (metrics_next_.time_since_epoch().count() != 0 && mt_now < metrics_next_)
+    return;
+  // LOG_STEP emits its own, strictly richer row on this same tick. Skipping it
+  // here is what makes state=="LOG_STEP" a sound discriminator for end-of-step
+  // rows instead of a coin flip on timer phase.
+  if (state_ == State::LOG_STEP) return;
+
+  // RE-INGEST FIRST — the whole reason this function is more than three lines.
+  // total_observed_voxels is read off map_cache_, and map_cache_ is only ever
+  // rebuilt by loadLatestMap(), which outside WAIT_FOR_MAP/PLAN is called by
+  // nothing but the exploit states. A sample taken without this would report the
+  // voxel count frozen at whatever the last PLAN ingested, for the entire
+  // manoeuvre: a coverage curve that goes flat the moment a robot loses contact
+  // whether or not it kept mapping — manufacturing precisely the result the
+  // experiment is supposed to be testing for. Cheap when no new map has arrived
+  // (pointer-identity check, no rebuild).
+  loadLatestMap();
+
+  StepMetrics m;
+  fillCommonMetrics(m);
+  logger_->logStep(m);
+
+  const double cost_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - mt_now).count();
+  // Steady clock throughout: this bounds work on the executor thread, which is
+  // wall-clock work whatever use_sim_time says. Using the ROS clock here would
+  // make the back-off scale with RTF and stop bounding anything.
+  const double budget = std::max(1e-3, metrics_period_sec_ * metrics_max_duty_);
+  double eff_period = metrics_period_sec_;
+  if (cost_s > budget) {
+    eff_period = cost_s / metrics_max_duty_;
+    if (eff_period > metrics_effective_period_ * 1.5 || metrics_backoffs_ == 0) {
+      ++metrics_backoffs_;
+      RCLCPP_WARN(get_logger(),
+          "Metrics sampler backing off: a tick cost %.2f s (> %.0f%% of the "
+          "%.1f s period); sampling every %.1f s until it gets cheaper. Rows "
+          "during this window are sparser — the coverage curve is undersampled, "
+          "not flat. (backoff #%d)",
+          cost_s, metrics_max_duty_ * 100.0, metrics_period_sec_, eff_period,
+          metrics_backoffs_);
+    }
+  }
+  metrics_effective_period_ = eff_period;
+  metrics_next_ = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(eff_period));
+}
+
+// ==================================================================
+// LOG_STEP state
+// ==================================================================
+
+void ExploPlannerNode::doLogStep() {
+  StepMetrics m;
+  fillCommonMetrics(m);
+  m.selected_score = current_goal_.score;
+  m.plan_time_ms = pending_plan_ms_;
+
+  // Drain utility / coord diagnostics from doPlan().
+  m.mean_info_gain      = pending_mean_info_gain_;
+  m.mean_path_cost      = pending_mean_path_cost_;
+  m.selected_info_gain  = pending_selected_info_gain_;
+  m.selected_path_cost  = pending_selected_path_cost_;
+  m.selected_utility    = current_goal_.score;
+  m.rejected_by_minpos        = pending_rejected_by_minpos_;
+  m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
+
+  // Exploitation columns. Left at the -1/0 defaults for exploration rows;
+  // filled from the dwelled vantage for exploitation rows (m.phase itself is
+  // set from phase_ in fillCommonMetrics).
+  if (phase_ == Phase::EXPLOIT) {
+    m.target_id         = pending_exploit_target_id_;
+    m.vantage_index     = pending_exploit_vantage_index_;
+    m.n_vantages_valid  = pending_exploit_n_valid_;
+    m.vantage_los_clear = pending_exploit_los_clear_;
+    m.dwell_sec         = pending_exploit_dwell_sec_;
+  }
 
   logger_->logStep(m);
   RCLCPP_INFO(get_logger(),

@@ -24,6 +24,31 @@
     robot_name: "atlas"
     max_steps: 200
     output_csv: "/tmp/exploration_eig.csv"
+    # CSV sampling period in SIM seconds (not wall — the node samples on
+    # this->now() under use_sim_time). The CSV used to gain a row only at the
+    # end of an exploration step, but steps do not advance during a reconnect
+    # manoeuvre (RETURN_NAV / RETURN_SYNC / PURSUE) — so a run that spent
+    # minutes reconnecting recorded that whole interval as one flat segment
+    # between two step rows. Timer rows carry state != "LOG_STEP" and leave the
+    # plan-attribution columns zero; end-of-step rows are unchanged. 0 disables.
+    #
+    # NOT cheap, and the cost GROWS with the run: each sample re-ingests the
+    # fused map (a full grid realloc + re-insert whenever a new one has arrived,
+    # which at dscovox's 1 Hz publish rate is essentially every time) and then
+    # walks every voxel. Late-run maps reach millions of voxels. The node spins
+    # a single-threaded executor, so that work is serialised ahead of the 1 Hz
+    # coordination beacon — and a beacon delayed past coord_claim_ttl_sec makes
+    # every peer read this robot as MISSING with the link perfectly healthy,
+    # which is indistinguishable from the radio outage the comms experiment
+    # exists to measure. metrics_max_duty below is the guard.
+    metrics_period_sec: 5.0
+    # Hard ceiling on the fraction of wall time the sampler may consume. When a
+    # tick exceeds it the sampler stretches its own period (with a WARN) until
+    # it fits, so the sampling RATE degrades visibly instead of the planner's
+    # real-time behaviour degrading invisibly. Measured on a steady clock, not
+    # the ROS clock: it bounds executor-thread work, which is wall-clock work
+    # whatever use_sim_time says.
+    metrics_max_duty: 0.2
     map_resolution: 0.10
 
     # Frames — planner reads dscovox map (in map_frame) and uses TF
@@ -329,6 +354,26 @@
     # team in ~5 s); a dead winner frees its vantage in ttl + grace.
     coord_claim_grace_sec: 10.0     # 2 x ttl; 0 = legacy single-TTL behaviour
     coord_intent_topic: "/exploration/intents"
+    # Split intent stream. Both empty (the default) = the single shared bus
+    # above: the planner publishes and subscribes the SAME topic, so nothing
+    # can sit between two robots' intents. That is fine on real hardware and
+    # wrong under a link emulator — a peer reading as *missing* is what arms
+    # every reconnect manoeuvre, so an ungated intent stream means the
+    # manoeuvres can never fire no matter how bad the modelled radio is.
+    # Set these to route each robot's intents through the emulator:
+    #   coord_intent_pub_topic:  "exploration/intents"          -> /<self>/...
+    #   coord_intent_sub_topics: ["rx/<peer>/exploration/intents"]
+    # A value without a leading '/' is resolved under /<robot_name>/ (this
+    # node is NOT namespaced by the packaged launch files, so a relative
+    # topic would otherwise land in the global scope and never match).
+    # QoS is KeepLast(8).reliable() on both ends, unchanged.
+    # Left unset here (like proximity_peer_pose_topics below) rather than
+    # written as []: an empty yaml sequence has no inferable element type and
+    # the parameter would come back NOT_SET instead of an empty string array.
+    # A [""] entry is tolerated — empty strings are stripped before the
+    # fallback, so a placeholder cannot leave the planner deaf.
+    coord_intent_pub_topic: ""
+    #coord_intent_sub_topics: [""]
     coord_heartbeat_hz: 1.0
     # EXPLOIT claims use a separate, much smaller MinPos disc: vantages on one
     # trunk sit only ~(radius + standoff) apart, so the exploration-scale disc

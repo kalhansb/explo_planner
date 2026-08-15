@@ -95,6 +95,21 @@ PROX_RESUME_M="${PROX_RESUME_M:-2.5}"
 # first robot to arrive dwells alone and can close the quota before the peer
 # lands. See exploit_dwell_sync_* in shared_params.yaml.
 DWELL_SYNC="${DWELL_SYNC:-1}"
+# EXPLOIT=0 turns the run into pure exploration: exploitation_enabled:=false and
+# no target_scheduler at all. The comms/reconnection matrix REQUIRES this (plan
+# §3.5) and the yaml default is true, so a matrix run left on the default would
+# not be the experiment the plan describes.
+#
+# Why it contaminates: the scheduler releases three trunks on a sim-time
+# schedule, both robots detour to each one, and the vantage ring is split
+# through peer CLAIMS on /exploration/intents — the very stream COMMS=1 gates.
+# Link severity would then drive exploitation stalls directly, standDownExploitation()
+# would fire inside every reconnect manoeuvre, and target detours of arm-dependent
+# length would land in the primary coverage endpoint. /exploration/targets is
+# also a global bus the emulator does not relay, so the one piece of team
+# knowledge that stays perfect under a modelled radio outage would be the target
+# list. Default 1 keeps this script's watchable-demo behaviour unchanged.
+EXPLOIT="${EXPLOIT:-1}"
 # Mesh reconnection manoeuvre (rendezvous | pursuit | hybrid) — which of the
 # robot-carried-radio reconnection methods runs when a planner exhausts its
 # goals with its teammate out of comms. The pursuit budgets ride along from
@@ -111,7 +126,112 @@ DWELL_SYNC="${DWELL_SYNC:-1}"
 # survivor's exhaustion finds the claim aged out, chases the corpse's trail,
 # then falls back per mode) or, later, a range-gated intent bridge emulating
 # finite comms.
+#
+# `off` is a FOURTH value handled here, not by the planner: it disables the
+# manoeuvre outright (rendezvous_enabled:=false) and is the control arm the
+# matrix compares the other three against. It cannot be expressed as a
+# reconnect_mode — reconnectModeFromString() falls back to RENDEZVOUS on any
+# string it does not recognise (planner_util.cpp), setting only a `known` flag
+# that the node reports as a single WARN and then ignores. So passing
+# `reconnect_mode:=off` would not disable anything; it would silently run the
+# rendezvous arm twice and the control-vs-treatment contrast would be a
+# comparison of an arm with itself. Unknown values are rejected below rather
+# than quietly mapped, for the same reason.
 RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
+case "$RECONNECT_MODE" in
+  rendezvous|pursuit|hybrid|off) ;;
+  *) echo "FATAL: RECONNECT_MODE='$RECONNECT_MODE' is not one of \
+rendezvous|pursuit|hybrid|off. The planner would silently fall back to \
+rendezvous and the run would be mislabelled." >&2; exit 2 ;;
+esac
+# COMMS=1 puts the message-level radio emulator (hmr_comms_sim_node) between the
+# two robots, which is what turns the NOTE above from a caveat into a runnable
+# experiment: with it, "peer out of comms" is produced by distance through trees
+# rather than by killing a process. It rewires two streams, and BOTH are needed —
+# gating only one produces a run that looks fine and measures nothing:
+#   * scovox_bin  — each merger reads its peer's map off /<self>/rx/<peer>/...
+#     instead of the peer's own publisher, so map sharing obeys the link.
+#   * exploration/intents — planners publish to /<robot>/exploration/intents
+#     (per-robot, so the emulator has something to relay) and subscribe to the
+#     relayed copies. Left on the shared global bus, no outage can ever make a
+#     peer read as missing, and no reconnect manoeuvre would ever fire.
+# COMMS=0 (default) leaves both on their direct topics: one broadcast domain,
+# perfect comms. That is the only thing COMMS toggles — it is NOT "the 2026-08-02
+# campaign unchanged". This script now also enables the 2D planning map
+# (use_planning_map, off in the yaml and off in that campaign), which activates
+# the candidate free/occupied filter AND the cost-grid reachability filter that
+# were both entirely inactive before; overrides the ROI to a ±50 box instead of
+# the yaml's field site; and samples the CSV on a timer. rejected_by_unreachable,
+# rejected_by_minpos and goal selection therefore do not mean the same thing they
+# did in that campaign's CSVs, and the two are not directly comparable.
+COMMS="${COMMS:-0}"
+# Link fading is a pure function of (seed, tick), so this alone selects the run's
+# link realisation. Paired-seed designs vary it while holding everything else
+# fixed; it is inert with COMMS=0.
+SEED="${SEED:-42}"
+# Radio severity. Matches comms_sim_params.yaml's shipped value, so the default
+# changes nothing — it exists so the number lands in the run manifest and can be
+# swept from the command line during calibration rather than by editing the
+# installed yaml, which would silently re-scope every later run and leave no
+# record of which severity any given run used.
+TX_POWER="${TX_POWER:-30.0}"
+# Planner ROI half-extent, SIM ONLY (square, centred on the world origin).
+# shared_params.yaml carries the real field site's ROI — x ∈ [-51.3, 100.9],
+# y ∈ [-38.7, 74.5] — and on flatforest ~42% of that footprint has no geometry
+# at all: those columns never leave the prior, so the unknown fraction can never
+# reach done_unknown_fraction and EVERY run ends at max_steps instead of at
+# coverage. That still fires one reconnect manoeuvre (the step-budget path also
+# routes through finishOrRendezvous), which is why the symptom is invisible —
+# what it destroys is the repeat reconnect -> re-disperse cycles the experiment
+# needs. ±50 fits inside the 110x110 ground plane and covers the oak field.
+# ±50 also fits inside the global planning map derived from it just below.
+ROI_HALF="${ROI_HALF:-50.0}"
+# Side of scovox_node's WORLD-FIXED planning map (~/global_planning_map) — the
+# 2D map the EXPLORATION planner consults for free/occupied and reachability.
+# Both it and the ROI are centred on the world origin, so side 2*ROI_HALF
+# exactly covers the ROI and 3*ROI_HALF leaves ROI_HALF/2 of margin on each
+# side. The margin is not cosmetic: candidates are ROI-clipped but the ROBOT is
+# not, and the cost-grid flood starts from the robot's own cell — a robot that
+# has drifted past the ROI edge onto an out-of-bounds cell floods nothing and
+# every candidate is rejected as unreachable. Derived from ROI_HALF so the two
+# cannot drift apart.
+#
+# This is NOT /<r>/scovox_node/planning_map. That one is a 20 m robot-centred
+# crop whose extent IS simple_nav_3d's local-planner window, and the exploration
+# planner rejects any candidate whose cell is out of bounds (isCellOccupied
+# treats out-of-bounds as occupied) — on the rolling map every frontier beyond
+# ~10 m is dropped and exploration collapses to a bubble around the robot.
+# Widening that topic instead would push the whole world through the local A*
+# on the control path. dscovox_node publishes no planning_map at all (only a
+# GetOccupancyGrid service), so the planner's own default topic —
+# /<r>/dscovox_node/planning_map — has no publisher anywhere in this stack.
+PLAN_MAP_SIZE="${PLAN_MAP_SIZE:-$(awk "BEGIN{print 3*$ROI_HALF}")}"
+PLAN_MAP_RES="${PLAN_MAP_RES:-0.40}"
+# Dijkstra flood radius for the candidate reachability filter. MUST be set here,
+# and this is the trap that comes with switching the planning map on.
+#
+# The filter is dead code with use_planning_map=false: no map means no cost grid
+# to flood, so doPlan sets skip_reachability and every candidate passes. Turning
+# the map on activates it — with a cap that has therefore never been exercised.
+# The yaml ships cost_grid_radius_cap_m: 0.0 = auto = candidate_max_radius + 2 =
+# 10 m, a bound sized for POLAR candidates, which are generated within
+# candidate_max_radius by construction. Frontier centroids have no range limit
+# at all (addFrontierCandidates clips to the ROI and nothing else), and
+# FRONTIER_ONLY=1 removes the polar set entirely — so under the auto cap every
+# frontier more than 10 m of walked distance away comes back kInfCost and is
+# rejected as unreachable. The escape hatch does not save it either: it only
+# trips below 10 reached cells, and a 10 m flood at 0.4 m/cell reaches ~1900.
+# Exploration would degenerate to 10 m hops, or stall outright once no frontier
+# remains inside the disc — and it would look like a legitimate result.
+#
+# 10x ROI_HALF is deliberately far past the grid diagonal ($PLAN_MAP_SIZE * 1.41
+# = 212 m at the defaults): the intent is "unbounded within this grid", and a
+# cap must not be clamped to the diagonal because a walked Dijkstra distance
+# routinely exceeds the straight line (see the warning in CostGrid::floodFrom).
+# Passing 0 to mean unbounded does NOT work — 0 is the auto sentinel. The cost
+# is one full flood of a ~140k-cell grid per PLAN tick, which the exploitation
+# planner already pays on the same grid with a genuinely unbounded flood.
+COST_CAP="${COST_CAP:-$(awk "BEGIN{print 10*$ROI_HALF}")}"
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, NOT the default 0. This box runs other ROS work (the scovox
 # replay harnesses) on domain 0, and a second /clock publisher appearing there
@@ -132,6 +252,10 @@ declare -A VIZ_MODEL=(
 
 mkdir -p "$OUTDIR"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+# The other robot in a 2-robot stack. Everything COMMS=1 rewires is per-link, so
+# the wiring needs to name the far end; this is deliberately only correct for
+# |ROBOTS| == 2, which is what this harness is.
+peer_of() { local s=$1 p; for p in $ROBOTS; do [ "$p" = "$s" ] || { echo "$p"; return; }; done; }
 
 # --- environment: humble + ws overlay, miniconda stripped -------------------
 # (miniconda on PATH shadows /usr/bin/python3 and breaks catkin_pkg/ament)
@@ -163,7 +287,8 @@ TARGETS="${TARGETS:-$PLANNER_SHARE/config/targets_flatforest.yaml}"
 # both are pure config, so editing them applies on the next run with no rebuild.
 RVIZ_CFG="$HERE/../explo_planner/config/explo_sim_2robot_lidar.rviz"
 URDF_IN="$HERE/../explo_planner/config/costar_husky_viz.urdf.in"
-for f in "$RVIZ_CFG" "$URDF_IN" "$HERE/sim_tf_publisher.py" "$HERE/sim_target_markers.py"; do
+for f in "$RVIZ_CFG" "$URDF_IN" "$HERE/sim_tf_publisher.py" "$HERE/sim_target_markers.py" \
+         "$HERE/comms_gates.py"; do
   [ -f "$f" ] || { echo "ERROR missing $f"; exit 2; }
 done
 
@@ -189,7 +314,7 @@ sim_clock() {
   rm -f "$f"
 }
 stack_procs() {
-  ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
+  ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
     | grep -v grep | grep -v claude | grep -v run_explo_sim_rviz
 }
 TORN=0
@@ -212,6 +337,27 @@ teardown() {
   if [ -n "$LEFT" ]; then
     log "WARN leftover processes, force-killing by pid:"; echo "$LEFT"
     echo "$LEFT" | awk '{print $1}' | xargs -r kill -KILL 2>/dev/null
+  fi
+  # Final gate verdict. The watcher is a background child killed by the loop
+  # above, so its exit status is unreachable here — the report file it appends
+  # to is the only durable record, and until it is read out the run ends looking
+  # successful whatever the gates found at minute 40. Includes the outage gate,
+  # which can only be decided at the end: a COMMS=1 run whose link never dropped
+  # is a control run wearing a treatment label, and nothing before this point
+  # can tell.
+  if [ "$COMMS" = "1" ] && [ -f "$OUTDIR/comms_gates.txt" ]; then
+    NFAIL=$(grep -c "^FAIL" "$OUTDIR/comms_gates.txt" 2>/dev/null || true)
+    NUNRUN=$(grep -c "^UNRUN" "$OUTDIR/comms_gates.txt" 2>/dev/null || true)
+    if [ "${NFAIL:-0}" != 0 ]; then
+      log "=============================================================="
+      log "RUN INVALID: $NFAIL gate failure(s). $OUTDIR/comms_gates.txt:"
+      grep "^FAIL" "$OUTDIR/comms_gates.txt" | sed 's/^/    /' || true
+      log "=============================================================="
+    elif [ "${NUNRUN:-0}" != 0 ]; then
+      log "RUN SUSPECT: $NUNRUN gate(s) could not be evaluated — see $OUTDIR/comms_gates.txt"
+    else
+      log "comms gates: clean for the whole run"
+    fi
   fi
   log "teardown complete — outputs in $OUTDIR"
 }
@@ -274,16 +420,49 @@ for r in $ROBOTS; do
       -r __ns:=/$r --params-file "$params"
 done
 
+# --- 2b. comms emulator (COMMS=1) -------------------------------------------
+# BEFORE the mappers, and the order is load-bearing. Relay subscriptions are
+# created by a 1 Hz topic-discovery poll, and only once the source topic already
+# exists — so an emulator started after scovox_node misses everything published
+# in between, including the initial full map snapshot. That loss is invisible:
+# it happens upstream of the relay, so no drop statistic counts it, and the run
+# just quietly begins with each robot missing the other's first map. Started
+# here, the subscription is in place ~1 s after each publisher appears, well
+# before scovox_node has integrated enough lidar to emit anything.
+# Robot names and the tree-bearing world SDF come from the same scenario file
+# the sim was launched with; the /rx/ readiness check is deferred until after
+# the mappers are up, since that is when the relays can first form.
+if [ "$COMMS" = "1" ]; then
+  start comms "$OUTDIR/comms.log" \
+    ros2 launch hmr_sim comms_sim.launch.py \
+      scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
+      tx_power_dbm:="$TX_POWER"
+  sleep 3
+  log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER) ahead of the mappers"
+fi
+
 # --- 3. nav + lidar mapping, mergers cross-wired ----------------------------
 # mapping:=dscovox_lidar => per robot a scovox_node on /<r>/velodyne_points plus
 # a dscovox_node merging BOTH robots' scovox_bin streams, so each planner reads
 # its own copy of the TEAM map.
+# With COMMS=1 each merger takes its PEER's binary off the emulator's relayed
+# copy instead of the peer's own publisher. Self is untouched by the pattern —
+# a robot's own map never crosses a radio link.
+PEER_BIN_PATTERN="/{peer}/scovox_node/scovox_bin"
+[ "$COMMS" = "1" ] && PEER_BIN_PATTERN="/{self}/rx/{peer}/scovox_node/scovox_bin"
+log "peer_bin_topic_pattern=$PEER_BIN_PATTERN (COMMS=$COMMS)"
 start nav_atlas "$OUTDIR/nav_atlas.log" \
   ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=atlas mode:=ugv \
-    mapping:=dscovox_lidar peers:=bestla
+    mapping:=dscovox_lidar peers:=bestla \
+    peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
+    global_planning_map_size_m:=$PLAN_MAP_SIZE \
+    global_planning_map_resolution:=$PLAN_MAP_RES
 start nav_bestla "$OUTDIR/nav_bestla.log" \
   ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=bestla mode:=ugv \
-    mapping:=dscovox_lidar peers:=atlas
+    mapping:=dscovox_lidar peers:=atlas \
+    peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
+    global_planning_map_size_m:=$PLAN_MAP_SIZE \
+    global_planning_map_resolution:=$PLAN_MAP_RES
 for r in $ROBOTS; do
   ok=0
   for i in $(seq 1 24); do
@@ -291,7 +470,30 @@ for r in $ROBOTS; do
   done
   [ "$ok" = 1 ] || die "nav: no /$r planning_map after 3 min (see $OUTDIR/nav_$r.log)"
   log "$r mapping alive (planning_map publishing)"
+  # The exploration planner's map is a SEPARATE publisher and it is a hard
+  # precondition: with use_planning_map=true the planner sits in its start-up
+  # wait until one arrives, so a typo in the topic name or a launch arg that
+  # silently defaulted to 0.0 (= disabled) would present as two planners that
+  # never leave INIT — an hour into a run, with no error anywhere. Gate on it
+  # here instead. Both publishers are transient_local and only emit when
+  # someone is subscribed, so this echo is also what pulls the first sample.
+  ok=0
+  for i in $(seq 1 12); do
+    timeout 10 ros2 topic echo /$r/scovox_node/global_planning_map --once \
+      >/dev/null 2>&1 && { ok=1; break; }
+  done
+  [ "$ok" = 1 ] || die "nav: no /$r global_planning_map after 2 min — the \
+exploration planner will never leave INIT (see $OUTDIR/nav_$r.log)"
+  log "$r global_planning_map alive (${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell)"
 done
+if [ "$COMMS" = "1" ]; then
+  ok=0
+  for i in $(seq 1 20); do
+    timeout 6 ros2 topic list 2>/dev/null | grep -q "/rx/" && { ok=1; break; }
+  done
+  [ "$ok" = 1 ] || die "comms: no /rx/ relay topics after ~2 min (see $OUTDIR/comms.log)"
+  log "comms relay topics present"
+fi
 sleep 10   # let the nav pipelines finish coming up
 
 # --- 4. RViz ----------------------------------------------------------------
@@ -305,6 +507,30 @@ fi
 start targetviz "$OUTDIR/targetviz.log" python3 "$HERE/sim_target_markers.py"
 
 # --- 5. optional bag --------------------------------------------------------
+# Under COMMS=1 the interesting streams are the RELAYED ones: /exploration/intents
+# is empty (the planners moved to per-robot topics) and the peers' direct
+# scovox_bin publishers still carry everything, so a bag of only the pre-relay
+# topics would show perfect comms no matter what the link did. Add the link
+# states too — they are the ground truth for when each link was up.
+COMMS_BAG_TOPICS=()
+if [ "$COMMS" = "1" ]; then
+  for r in $ROBOTS; do
+    p=$(peer_of "$r")
+    COMMS_BAG_TOPICS+=( "/$r/exploration/intents"
+                        "/$r/rx/$p/exploration/intents"
+                        "/$r/rx/$p/scovox_node/scovox_bin" )
+  done
+  # /hmr_comms_sim/stats carries backlog_bytes and the drop_* counters
+  # (drop_airtime, drop_ber, drop_overflow). Those are the ONLY evidence for
+  # the backlog gate and for the shared-airtime confound — a single global
+  # token bucket means one large map delta can drive the pool negative and drop
+  # every best-effort intent on every link, precisely during the post-reconnect
+  # drain when peer presence has to be re-detected. Unrecorded, that mechanism
+  # is unfalsifiable after the fact: the gate watcher samples it live but only
+  # writes a sample out when it fails.
+  COMMS_BAG_TOPICS+=( /hmr_comms_sim/link_states /hmr_comms_sim/robot_index
+                      /hmr_comms_sim/stats )
+fi
 if [ "$RECORD" = "1" ]; then
   start bag "$OUTDIR/bag.log" \
     ros2 bag record -o "$OUTDIR/rosbag2" \
@@ -312,11 +538,14 @@ if [ "$RECORD" = "1" ]; then
       /clock /tf /tf_static \
       /atlas/odom_ground_truth /atlas/imu/data /atlas/cmd_vel \
       /atlas/scovox_node/scovox_bin /atlas/scovox_node/planning_map \
+      /atlas/scovox_node/global_planning_map \
       /atlas/goal_pose /atlas/explo_planner/candidates \
       /bestla/odom_ground_truth /bestla/imu/data /bestla/cmd_vel \
       /bestla/scovox_node/scovox_bin /bestla/scovox_node/planning_map \
+      /bestla/scovox_node/global_planning_map \
       /bestla/goal_pose /bestla/explo_planner/candidates \
-      /exploration/targets /exploration/intents
+      /exploration/targets /exploration/intents \
+      ${COMMS_BAG_TOPICS[@]+"${COMMS_BAG_TOPICS[@]}"}
   sleep 3
 fi
 
@@ -330,11 +559,114 @@ fi
 # z=0, so the fixed absolute height is the same number anyway.
 POLAR_ARG="true"; [ "$FRONTIER_ONLY" = "1" ] && POLAR_ARG="false"
 DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
+# The control arm. `off` is not a reconnect_mode (see the RECONNECT_MODE block);
+# it is rendezvous_enabled:=false, which is the switch the planner actually
+# gates the manoeuvre on. reconnect_mode is left at its yaml value in that case
+# and is inert, since shouldRendezvous() returns false before the mode is
+# consulted.
+RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
+if [ "$RECONNECT_MODE" = "off" ]; then RDV_ENABLED="false"; MODE_ARG="hybrid"; fi
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
 log "proximity_hold/resume_dist_m=$PROX_HOLD_M/$PROX_RESUME_M m (yaml field defaults 5.0/6.0 overridden for sim)"
+EXPLOIT_ARG="true"; [ "$EXPLOIT" = "0" ] && EXPLOIT_ARG="false"
+log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
-log "reconnect_mode=$RECONNECT_MODE"
+log "reconnect_mode=$MODE_ARG rendezvous_enabled=$RDV_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
+log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field site's ROI)"
+# done_coverage_source is pinned to scovox, NOT left on "auto". auto switches to
+# the 2D planning_map the instant one is received, so enabling the planning map
+# would have silently swapped the termination metric from 2.5D column coverage
+# of the ROI to 2D cell coverage — a different number against the same
+# done_unknown_fraction threshold, changing when every run ends and invalidating
+# any comparison with runs recorded before this change.
+log "planning_map = /<r>/scovox_node/global_planning_map (${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=scovox"
+
+# --- 6a. run manifest -------------------------------------------------------
+# Everything that distinguishes this run from another one, written INTO the run
+# directory. Until now the arm, the seed and the radio severity existed only as
+# log() lines on the harness's own stdout — so across a 40-run matrix the label
+# for each run lived in the operator's scrollback and nowhere else, and two runs
+# that differed only in RECONNECT_MODE were indistinguishable after the fact.
+# Git hashes with a dirty marker matter just as much: every repo here has
+# uncommitted changes, so a bare commit id would be an actively misleading
+# provenance record.
+MANIFEST="$OUTDIR/run_manifest.txt"
+{
+  echo "# hmr_explo comms/reconnection run manifest"
+  echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "host=$(hostname)"
+  echo "outdir=$OUTDIR"
+  echo "ros_domain_id=${ROS_DOMAIN_ID:-unset}"
+  echo
+  echo "# --- arm / independent variables ---"
+  echo "reconnect_mode_requested=$RECONNECT_MODE"
+  echo "reconnect_mode_param=$MODE_ARG"
+  echo "rendezvous_enabled=$RDV_ENABLED"
+  echo "comms=$COMMS"
+  echo "seed=$SEED"
+  echo "tx_power_dbm=$TX_POWER"
+  echo
+  echo "# --- held fixed ---"
+  echo "scenario=$SCENARIO"
+  echo "exploitation_enabled=$EXPLOIT_ARG"
+  echo "dwell_sync=$DWELL_SYNC_ARG"
+  echo "candidate_enable_polar=$POLAR_ARG"
+  echo "max_steps=$MAX_STEPS"
+  echo "duration_s=$DURATION_S"
+  echo "roi_half=$ROI_HALF"
+  echo "plan_map_size_m=$PLAN_MAP_SIZE"
+  echo "plan_map_res_m=$PLAN_MAP_RES"
+  echo "cost_grid_radius_cap_m=$COST_CAP"
+  echo "done_coverage_source=scovox"
+  echo "prox_hold_m=$PROX_HOLD_M"
+  echo "prox_resume_m=$PROX_RESUME_M"
+  echo "targets=$TARGETS"
+  echo "record=$RECORD"
+  echo
+  # Number of trunks the radio model can actually see. Recorded because it is
+  # NOT recoverable from the commit sha while a change is uncommitted: two runs
+  # either side of a fix to the tree matcher carry byte-identical "<sha>-dirty"
+  # provenance but different link statistics. link_states col 3 gives per-link
+  # counts, never the world total.
+  if [ "$COMMS" = "1" ]; then
+    echo "comms_trees_loaded=$(sed -n 's/.*Loaded \([0-9]\+\) tree positions.*/\1/p' \
+      "$OUTDIR/comms.log" 2>/dev/null | head -1)"
+  fi
+  echo
+  echo "# --- provenance (dirty = uncommitted changes present) ---"
+  for repo in "$WS/.." "$WS/src/explo_planner" "$WS/src/hmr_sim" \
+              "$WS/src/simple_nav_3d" "$WS/src/scovox"; do
+    name=$(basename "$(cd "$repo" && pwd)")
+    if git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+      sha=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)
+      dirty=""
+      if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+        # A bare "-dirty" flag cannot tell two different uncommitted trees apart,
+        # which is exactly the case during a build session. Hash the diff (plus
+        # untracked file names) so each working-tree state gets its own id.
+        dirty="-dirty.$( { git -C "$repo" diff HEAD; \
+          git -C "$repo" ls-files --others --exclude-standard; } 2>/dev/null \
+          | sha1sum | cut -c1-8 )"
+      fi
+      echo "git_$name=$sha$dirty"
+    else
+      echo "git_$name=not-a-repo"
+    fi
+  done
+} > "$MANIFEST"
+log "run manifest written: $MANIFEST"
 for r in $ROBOTS; do
+  # COMMS=1 splits the intent stream: publish to a per-robot topic the emulator
+  # can see, subscribe to the relayed copy of the peer's. Both defaults are
+  # empty, so with COMMS=0 nothing is passed and the planner keeps using the one
+  # shared /exploration/intents bus exactly as before.
+  EXTRA=()
+  if [ "$COMMS" = "1" ]; then
+    peer=$(peer_of "$r")
+    EXTRA=( -p coord_intent_pub_topic:=exploration/intents
+            -p coord_intent_sub_topics:="[\"rx/$peer/exploration/intents\"]" )
+    log "$r intents: pub /$r/exploration/intents  sub /$r/rx/$peer/exploration/intents"
+  fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \
       -r __ns:=/$r -r __node:=explo_planner \
@@ -345,16 +677,32 @@ for r in $ROBOTS; do
       -p proximity_hold_dist_m:=$PROX_HOLD_M \
       -p proximity_resume_dist_m:=$PROX_RESUME_M \
       -p exploit_dwell_sync_enabled:=$DWELL_SYNC_ARG \
-      -p reconnect_mode:=$RECONNECT_MODE \
+      -p reconnect_mode:=$MODE_ARG \
+      -p rendezvous_enabled:=$RDV_ENABLED \
+      -p exploitation_enabled:=$EXPLOIT_ARG \
       -p rendezvous_expected_peers:=1 \
+      -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
+      -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
+      -p use_planning_map:=true \
+      -p planning_map_topic:=/$r/scovox_node/global_planning_map \
+      -p done_coverage_source:=scovox \
+      -p cost_grid_radius_cap_m:=$COST_CAP \
+      ${EXTRA[@]+"${EXTRA[@]}"} \
       -p output_csv:="$OUTDIR/planner_$r.csv"
 done
 # Scheduler last; its node name must stay target_scheduler in the root namespace
-# or the targets yaml's parameter key will not match.
-start sched "$OUTDIR/sched.log" \
-  ros2 run explo_planner target_scheduler_node --ros-args \
-    -r __node:=target_scheduler \
-    --params-file "$TARGETS" -p use_sim_time:=true
+# or the targets yaml's parameter key will not match. Skipped entirely with
+# EXPLOIT=0: exploitation_enabled=false already makes the planners ignore
+# releases, but leaving the scheduler running would still put TreeTarget traffic
+# on the ungated global /exploration/targets bus during a comms run.
+if [ "$EXPLOIT" = "0" ]; then
+  log "EXPLOIT=0 — pure exploration, target_scheduler NOT started"
+else
+  start sched "$OUTDIR/sched.log" \
+    ros2 run explo_planner target_scheduler_node --ros-args \
+      -r __node:=target_scheduler \
+      --params-file "$TARGETS" -p use_sim_time:=true
+fi
 sleep 8
 # Count real node binaries only, by the absolute install path that ONLY the
 # launched binary carries. Matching the bare node name instead counts anything
@@ -370,6 +718,47 @@ NPLAN=$(ps -eo cmd= | grep -c "[l]ib/explo_planner/explo_planner_node")
 [ "$NPLAN" = 2 ] || die "expected exactly 2 explo_planner_node, found $NPLAN"
 log "planners up (exactly 2 explo_planner_node)"
 
+# --- 6b. comms gates (COMMS=1) ----------------------------------------------
+# Run AFTER the planners, because two of the four can only be judged once the
+# intent endpoints exist. GATES_STRICT=1 aborts the run on a failed bring-up
+# check; the default reports and continues, because a leak found at t=0 is
+# still worth seeing the run for. The watcher keeps polling overflow and the
+# odom watchdog for the whole run and its verdict lands in the report file —
+# an overflow at minute 40 invalidates the run just as surely as one at t=0.
+# Strict by default whenever the emulator is in the loop (inert with COMMS=0).
+# Every gate here detects a condition the plan treats as run-invalidating —
+# intent leakage past the radio model, a QoS mismatch that silently forms no
+# relay, reliable-backlog overflow, a dead odom source. Continuing past one does
+# not produce a degraded run, it produces a run that measures the wrong thing
+# while looking healthy, and an hour of sim time is more expensive than a
+# restart. GATES_STRICT=0 still forces the old report-and-continue behaviour.
+GATES_STRICT="${GATES_STRICT:-$COMMS}"
+if [ "$COMMS" = "1" ]; then
+  GATE_REPORT="$OUTDIR/comms_gates.txt"
+  ROBOT_CSV=$(echo $ROBOTS | tr ' ' ',')
+  log "running comms bring-up gates (report: $GATE_REPORT)"
+  # Capture the GATE's status, not the pipeline's. `if cmd | tee ...; then`
+  # tests tee's exit status, which is 0 unless the disk fills — so every gate
+  # failure announced itself as success and GATES_STRICT was dead code. This
+  # script runs `set -u` without `pipefail`, and adding pipefail globally would
+  # change the failure semantics of every other pipeline in here (several
+  # legitimately end in `|| true` grep counts), so the status is taken directly
+  # instead.
+  python3 "$HERE/comms_gates.py" check --robots "$ROBOT_CSV" \
+      --report "$GATE_REPORT" >"$OUTDIR/gates_check.out" 2>&1
+  GATE_RC=$?
+  cat "$OUTDIR/gates_check.out" | tee -a "$OUTDIR/gates.log"
+  if [ "$GATE_RC" = 0 ]; then
+    log "comms gates: all clear"
+  else
+    log "WARNING comms gates FAILED (rc=$GATE_RC) — see $GATE_REPORT"
+    [ "$GATES_STRICT" = "1" ] && die "comms gates failed rc=$GATE_RC (GATES_STRICT=1)"
+  fi
+  start gateswatch "$OUTDIR/gates_watch.log" \
+    python3 "$HERE/comms_gates.py" watch --robots "$ROBOT_CSV" \
+      --report "$GATE_REPORT"
+fi
+
 T0=$(sim_clock)
 [ -n "$T0" ] || die "cannot read /clock"
 log "sim t0=$T0 — targets release at +120 / +420 / +720 s of the SCHEDULER's clock"
@@ -381,6 +770,12 @@ fi
 
 # --- 7. hold, watching component health -------------------------------------
 LAST_HB=0
+# Step-stall hang detector state. HANG_HB counts 60-sim-second heartbeats, so
+# the default aborts after 10 minutes of sim time with no step on EITHER robot.
+# Sized well above a slow step: a RETURN_NAV or PURSUE manoeuvre legitimately
+# spends minutes without completing one.
+HANG_HB="${HANG_HB:-10}"
+LAST_SA=-1; LAST_SB=-1; STALL=0
 while true; do
   sleep 15
   for entry in "${PIDS[@]}"; do
@@ -400,6 +795,31 @@ while true; do
     CA=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
     CB=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
     log "HB t_sim=$T steps(atlas/bestla)=$SA/$SB complete=$CA/$CB"
+    # Hang gate. A planner that cannot find an acceptable candidate returns from
+    # doPlan and re-enters PLAN forever: no crash, no error, every process
+    # alive, and the CSV keeps growing because the metrics timer samples every
+    # metrics_period_sec regardless of state. So neither the liveness loop above
+    # nor "is the CSV still being written" can see it — the only quantity that
+    # actually stalls is the STEP counter, which advances solely on a completed
+    # explore step. A silent hang is worth more than a crash to catch: it yields
+    # a full-length run whose coverage curve is flat and plausible.
+    #
+    # Not fatal if a robot has legitimately finished: DONE-idle is a terminal
+    # state by design and its step count is supposed to stop.
+    if [ "$SA" = "$LAST_SA" ] && [ "$SB" = "$LAST_SB" ]; then
+      STALL=$((STALL + 1))
+      DONE_A=$(grep -c "Exploration complete\|DONE" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
+      DONE_B=$(grep -c "Exploration complete\|DONE" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
+      if [ "$STALL" -ge "$HANG_HB" ] && [ "$DONE_A" = 0 ] && [ "$DONE_B" = 0 ]; then
+        die "HUNG: neither planner advanced a step in $((STALL * 60)) sim-s \
+(steps still $SA/$SB) and neither reports DONE. Run is invalid — check \
+'rejected' counts in $OUTDIR/planner_*.log (cost_grid_radius_cap_m=$COST_CAP)."
+      fi
+      [ "$STALL" -ge 2 ] && log "WARNING no step progress for $((STALL * 60)) sim-s"
+    else
+      STALL=0
+    fi
+    LAST_SA=$SA; LAST_SB=$SB
   fi
   [ "$DURATION_S" != "0" ] && [ "$T" -ge $((T0 + DURATION_S)) ] && break
 done

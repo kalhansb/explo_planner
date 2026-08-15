@@ -50,6 +50,54 @@ struct StepMetrics {
   // columns the only record of the yields was planner stdout.
   int    prox_hold_count          = 0;
   float  prox_hold_total_sec      = 0.0f;
+
+  // Reconnection diagnostics. Rows are emitted on a periodic timer in EVERY
+  // state, not just at LOG_STEP, so a minutes-long reconnect manoeuvre samples
+  // the coverage curve instead of leaving a gap in it.
+  //
+  // ALL DURATIONS HERE ARE SIM SECONDS under use_sim_time (the node reads
+  // this->now()/get_clock()). At RTF != 1 they are not wall seconds, and the
+  // sampling period is likewise a sim-time period.
+  //
+  // `state` is the planner state at emit time, from stateName(). It is also the
+  // row discriminator: a row with state == "LOG_STEP" is an end-of-step row
+  // (plan-attribution columns populated); every other value is a timer row
+  // (plan-attribution columns are zero by construction — there was no plan on
+  // that tick to attribute them to). The timer deliberately skips LOG_STEP ticks
+  // so the two kinds never collide.
+  //
+  // The reconnect_* pair is -1 whenever no manoeuvre is in flight, which keeps 0
+  // meaning "arrived / just started" rather than "not applicable".
+  // reconnect_elapsed_sec is raw elapsed sim time since the manoeuvre was armed
+  // and is NOT bounded by pursuit_budget_max_sec: proximity-hold time is refunded to
+  // the pursuit budget clock but not to this one, and in HYBRID the meeting-point
+  // leg runs on the same clock after the chase is spent.
+  //
+  // reconnect_range_to_goal_m is REMAINING straight-line XY range to the
+  // manoeuvre goal — a decreasing sample, not a travelled distance. Named for
+  // what it is: as `reconnect_distance_m` it read like the manoeuvre's path
+  // cost, which inverts the comparison it would be used for (a robot that
+  // drives far and arrives ends near 0; one that gives up early stays large).
+  // Travelled distance is `distance_traveled` differenced across the rows where
+  // reconnect_elapsed_sec >= 0.
+  std::string state                    = "UNKNOWN";
+  float  reconnect_range_to_goal_m     = -1.0f;
+  float  reconnect_elapsed_sec         = -1.0f;
+
+  // Coverage-termination measure, as evaluated this tick, plus which source
+  // produced it ("scovox" 2.5D column coverage of the ROI footprint, or
+  // "planning_map" 2D cell coverage). This IS the primary endpoint quantity and
+  // the one the DONE criterion is compared against, and until now it existed
+  // nowhere in the CSV — it reached stdout only inside the branch where it had
+  // already dropped below threshold, so a run could not be scored on the
+  // criterion it terminates on. total_observed_voxels is not a substitute: it
+  // is a 3D active-cell count whose relationship to column coverage varies with
+  // occlusion and the z-band.
+  //
+  // -1 when it cannot be measured (source "planning_map" with no planning_map
+  // received, or a degenerate ROI), matching coverageUnknownFraction().
+  float  unknown_fraction         = -1.0f;
+  std::string coverage_source     = "none";
 };
 
 class MetricsLogger {

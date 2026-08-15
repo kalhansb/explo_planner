@@ -34,7 +34,12 @@ void MetricsLogger::writeHeader() {
         << "coord_active_peers,rejected_by_minpos,rejected_by_unreachable,"
         << "phase,target_id,vantage_index,n_vantages_valid,"
         << "vantage_los_clear,dwell_sec,"
-        << "prox_hold_count,prox_hold_total_sec\n";
+        << "prox_hold_count,prox_hold_total_sec,"
+        // Appended, never inserted: the analysis reads these by name, but older
+        // run archives are read positionally by more than one script, and
+        // widening the middle of the schema silently re-labels every one of them.
+        << "state,reconnect_range_to_goal_m,reconnect_elapsed_sec,"
+        << "unknown_fraction,coverage_source\n";
   header_written_ = true;
 }
 
@@ -65,7 +70,12 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.vantage_los_clear << ","
         << m.dwell_sec << ","
         << m.prox_hold_count << ","
-        << m.prox_hold_total_sec << "\n";
+        << m.prox_hold_total_sec << ","
+        << m.state << ","
+        << m.reconnect_range_to_goal_m << ","
+        << m.reconnect_elapsed_sec << ","
+        << m.unknown_fraction << ","
+        << m.coverage_source << "\n";
   file_.flush();
 }
 
