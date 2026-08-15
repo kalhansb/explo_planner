@@ -330,6 +330,9 @@ private:
   int    max_steps_;
   double map_resolution_;
   double goal_xy_tol_;
+  // Minimum straight-line XY range from the robot to an acceptable candidate.
+  // 0 = off (shipped default). See the param load for why it exists.
+  double cand_min_goal_dist_{0.0};
   double goal_yaw_tol_;
   // Deadline for the post-arrival in-place rotation, measured from the first
   // tick the robot is inside goal_xy_tol_ — NOT shared with nav_budget_sec_,
@@ -514,6 +517,12 @@ private:
   // bin. Larger -> fewer, coarser long-range targets. The sibling roi_*_z args
   // to findFrontierCentroids are already params; this was the lone hardcoded one.
   float frontier_cluster_radius_m_ = 5.0f;
+  // Inset of the FRONTIER search band from the effective ROI band, in metres
+  // off the bottom and off the top. Both 0 (the default) = search the whole ROI
+  // band, i.e. today's behaviour. See the param load for what these are for.
+  bool  frontier_band_set_ = false;
+  float frontier_z_lo_off_ = 0.0f;
+  float frontier_z_hi_off_ = 0.0f;
 
   // --- Exploitation params ---
   // When false the exploitation overlay is inert (no target subscription is
@@ -640,6 +649,11 @@ private:
 
   // Recently-failed goals (TTL + radius blacklist).
   FailedGoalBlacklist failed_goals_;
+  // Recently-REACHED exploration goals, same structure, opposite trigger. See
+  // the param load for why "nearest frontier" needs this to terminate.
+  FailedGoalBlacklist visited_goals_;
+  double visited_goal_radius_m_ = 0.0;   // 0 = feature off
+  double visited_goal_ttl_sec_  = 120.0;
 
   // Per-navigate-cycle state for the smart timeout.
   double nav_budget_sec_ = 0.0;
@@ -885,6 +899,41 @@ ExploPlannerNode::ExploPlannerNode()
         "xy_goal_tolerance (0.25) — see the goal_yaw_tolerance warning.",
         goal_xy_tol_);
   }
+  // Minimum useful hop. Candidates nearer than this are rejected in doPlan
+  // alongside the ones inside goal_xy_tolerance.
+  //
+  // Without it the planner deadlocks into a two-point oscillation, and the
+  // mechanism is structural rather than a tuning accident. Utility is the
+  // SSMI-style info_gain / (eps + path_cost). In a mostly-unknown map every
+  // candidate's raycast terminates in unknown space, so info_gain is nearly
+  // constant across the whole candidate set — measured spread was 6% while
+  // path_cost varied ninefold — and argmax(U) degenerates to argmin(cost),
+  // i.e. "drive to the closest frontier". The closest frontier is typically
+  // under a metre away, and here is why that never resolves: a VLP-16 has a
+  // +-15 deg vertical field of view, so at 0.6 m of standoff it sees a band
+  // barely 0.3 m tall. Voxels beside the robot at any other height are
+  // physically unobservable from that range. Driving there reveals nothing,
+  // the frontier survives, and the pair of candidates either side of the
+  // robot regenerate every step forever. Neither guard already in the loop
+  // catches it: goal_xy_tolerance only skips candidates at arm's length, and
+  // the failed-goal blacklist never fires because the robot REACHES each goal.
+  //
+  // So this is not a heuristic to break ties; it encodes that a goal closer
+  // than the sensor's useful standoff cannot reduce uncertainty where it
+  // stands. Scale it to the sensor, not the robot: a few metres for a VLP-16
+  // with fov_max_range 10 m.
+  //
+  // Default 0.0 keeps the shipped behaviour bit-identical — every field
+  // config that predates this parameter selects exactly the goals it did
+  // before.
+  cand_min_goal_dist_ = dp("candidate_min_goal_dist_m", 0.0);
+  if (cand_min_goal_dist_ > 0.0 && cand_min_goal_dist_ <= goal_xy_tol_) {
+    RCLCPP_WARN(get_logger(),
+        "candidate_min_goal_dist_m=%.2f is not above goal_xy_tolerance=%.2f, "
+        "so it rejects nothing the arrival gate did not already reject and "
+        "the near-frontier oscillation it exists to prevent is still live.",
+        cand_min_goal_dist_, goal_xy_tol_);
+  }
   integrate_wait_ = dp("integrate_wait", 2.0);
 
   // Distance-budgeted navigate timeout. The total budget for a NAVIGATE
@@ -919,6 +968,30 @@ ExploPlannerNode::ExploPlannerNode()
       dp("failed_goal_radius_m", 2.0);
   failed_goal_ttl_sec_ =
       dp("failed_goal_ttl_sec", 60.0);
+  // Visited-goal suppression. A goal the robot REACHED is parked for
+  // visited_goal_ttl_sec, and EXPLORE candidates within visited_goal_radius_m
+  // of a live entry are skipped. 0 (default) = off, shipped behaviour.
+  //
+  // Needed because frontier exploration has no fixed point in a forest. A
+  // frontier is a free voxel beside an unknown one, and every trunk casts a
+  // permanently unknown shadow, so frontier clusters regenerate no matter how
+  // thoroughly an area is observed. Utility is info/(eps+cost) and info is
+  // near-constant while the map is mostly unknown, so selection collapses to
+  // argmin(cost) -- and two neighbouring clusters then trade places as
+  // "nearest" forever. Measured on flatforest: after narrowing the frontier
+  // band the robot advanced in bursts but still alternated between two goals
+  // 4.7 m apart for six consecutive steps with no net movement.
+  //
+  // The failed-goal blacklist cannot cover this: it only fires when a goal is
+  // NOT reached, and here every goal is reached, on time, successfully.
+  //
+  // Size the radius near the frontier cluster radius, so suppressing a visited
+  // goal suppresses the cluster that produced it rather than a point inside
+  // it. The TTL must outlast a there-and-back trip or the entry expires before
+  // the oscillation it prevents can recur; it is a TTL rather than permanent so
+  // a genuinely re-frontiered area can be revisited late in a run.
+  visited_goal_radius_m_ = dp("visited_goal_radius_m", 0.0);
+  visited_goal_ttl_sec_  = dp("visited_goal_ttl_sec", 120.0);
 
   // Coverage-based termination. Each PLAN tick we measure the unknown
   // fraction of the ROI (source per done_coverage_source below). When it
@@ -1034,6 +1107,43 @@ ExploPlannerNode::ExploPlannerNode()
   // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
   frontier_cluster_radius_m_ =
       static_cast<float>(dp("frontier_cluster_radius_m", 5.0));
+  // Narrow the FRONTIER search band relative to the ROI band, from the bottom
+  // and from the top. Both 0 = search the whole ROI band (shipped behaviour).
+  //
+  // The ROI band is sized for terrain and canopy — the yaml ships a 9.5 m slab,
+  // -5.5 to +4.0 — and searching a slab that tall for frontiers produces a
+  // candidate set dominated by voxels no robot can ever observe. A frontier is
+  // a free voxel with an unknown neighbour, and a lidar's free space is a wedge
+  // bounded by its vertical FOV, so the ENTIRE upper and lower surface of that
+  // wedge qualifies, at every range, forever: a VLP-16 at +-15 deg simply has
+  // no ray that reaches 3 m up at 4 m out. Those frontiers cannot be consumed
+  // by driving to them, which is what makes them poison rather than noise —
+  // they regenerate beside the robot every tick, they are always the nearest
+  // ones, and (utility being info/cost with near-constant info) they are
+  // therefore always chosen. Measured on flatforest: frontier_voxels stayed at
+  // ~94% of all observed voxels and GREW monotonically as the map grew, while
+  // both robots ping-ponged between two adjacent goals indefinitely.
+  //
+  // Set these so the band covers only the heights the sensor sweeps as it
+  // drives — roughly the navigable slice. Then a frontier means "ground I have
+  // not been past", which driving there does clear, and the candidate set
+  // drains as the ROI is covered, which is also what makes coverage
+  // termination reachable at all.
+  //
+  // Only ever NARROWS: the result is intersected with the ROI band, because a
+  // frontier outside the ingested band would reference voxels map_cache_ never
+  // loaded.
+  const double f_lo_off = dp("frontier_z_lo_offset_m", 0.0);
+  const double f_hi_off = dp("frontier_z_hi_offset_m", 0.0);
+  frontier_z_lo_off_ = static_cast<float>(std::max(0.0, f_lo_off));
+  frontier_z_hi_off_ = static_cast<float>(std::max(0.0, f_hi_off));
+  frontier_band_set_ = (frontier_z_lo_off_ > 0.0f || frontier_z_hi_off_ > 0.0f);
+  if (frontier_band_set_) {
+    RCLCPP_INFO(get_logger(),
+        "Frontier search band inset by %.2f m from the ROI floor and %.2f m "
+        "from its ceiling (ROI z [%.2f, %.2f]).",
+        frontier_z_lo_off_, frontier_z_hi_off_, roi_min_z_, roi_max_z_);
+  }
 
   // FOV evaluation
   FovConfig fcfg;
@@ -2048,6 +2158,7 @@ void ExploPlannerNode::doPlan() {
   auto plan_start = this->now();
 
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+  visited_goals_.prune(plan_start.seconds(), visited_goal_ttl_sec_);
   if (coord_) coord_->prune(plan_start);
 
   // Exploitation takes priority over exploration: the moment a target is
@@ -2141,8 +2252,25 @@ void ExploPlannerNode::doPlan() {
   auto candidates =
       candidate_gen_->generate(robot_pos, robot_yaw, terrain_map);
   size_t n_radial = candidates.size();
+  // Frontier search band. Defaults to the effective ROI band (unchanged
+  // behaviour); frontier_z_lo_/hi_ narrow it, and can only ever narrow it.
+  float f_lo = eff_roi_min_z_, f_hi = eff_roi_max_z_;
+  if (frontier_band_set_) {
+    // Offsets ride the ROI band so terrain_relative_z keeps working: in flat
+    // mode eff_roi_* are the absolute yaml values and these are absolute
+    // heights; in terrain mode eff_roi_* track the robot and so does this.
+    f_lo = std::max(f_lo, eff_roi_min_z_ + frontier_z_lo_off_);
+    f_hi = std::min(f_hi, eff_roi_max_z_ - frontier_z_hi_off_);
+    if (f_lo >= f_hi) {          // degenerate: fall back rather than find none
+      f_lo = eff_roi_min_z_; f_hi = eff_roi_max_z_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "frontier_z_*_offset_m collapse the band to nothing — ignoring them "
+          "for this tick and searching the full ROI band [%.2f, %.2f].",
+          f_lo, f_hi);
+    }
+  }
   auto frontiers = map_cache_->findFrontierCentroids(
-      eff_roi_min_z_, eff_roi_max_z_, frontier_cluster_radius_m_);
+      f_lo, f_hi, frontier_cluster_radius_m_);
   candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos,
                                         terrain_map);
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
@@ -2285,12 +2413,16 @@ void ExploPlannerNode::doPlan() {
   for (size_t idx : order) {
     const auto& vp = candidates[idx];
     // 0. Skip candidates at the robot's feet — these are "already reached"
-    //    by goal_xy_tolerance so they waste a step without any movement.
+    //    by goal_xy_tolerance so they waste a step without any movement —
+    //    and, when candidate_min_goal_dist_m is set, everything inside the
+    //    sensor's useful standoff as well: a goal too close to observe from
+    //    cannot clear the frontier that generated it, which is the whole
+    //    near-frontier oscillation (see the param load).
     {
+      const double near = std::max(goal_xy_tol_, cand_min_goal_dist_);
       float dx = vp.position.x() - robot_pos.x();
       float dy = vp.position.y() - robot_pos.y();
-      if (dx * dx + dy * dy < static_cast<float>(
-              goal_xy_tol_ * goal_xy_tol_)) {
+      if (dx * dx + dy * dy < static_cast<float>(near * near)) {
         ++rejected_too_close;
         continue;
       }
@@ -2316,7 +2448,14 @@ void ExploPlannerNode::doPlan() {
       ++rejected_unreachable;
       continue;
     }
-    // 3. Failed-goal blacklist (existing).
+    // 3. Failed-goal blacklist (existing) + recently-visited suppression.
+    //    Both counted as `blk` in the per-step log: they reject for the same
+    //    reason from the planner's point of view -- do not go back there yet.
+    if (visited_goal_radius_m_ > 0.0 &&
+        visited_goals_.isNear(vp.position, visited_goal_radius_m_)) {
+      ++rejected_blacklist;
+      continue;
+    }
     if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
       ++rejected_blacklist;
       continue;
@@ -2604,6 +2743,14 @@ void ExploPlannerNode::doNavigate() {
       }
       // Exploration goal reached: integrate the new observation.
       have_active_intent_ = false;
+      // Park it in the visited set so the next PLAN does not immediately pick
+      // it again. In a forest the frontier set never drains -- every trunk
+      // casts a permanently unknown shadow -- so "go to the nearest frontier"
+      // has no natural stopping point and the planner ping-pongs between two
+      // neighbouring clusters indefinitely. Recording where it has just BEEN
+      // is what breaks the cycle; recording only where it failed (below) never
+      // could, because these goals are reached successfully every time.
+      visited_goals_.add(current_goal_.position, this->now().seconds());
       RCLCPP_INFO(get_logger(),
           "Goal reached: dist=%.2f yaw_err=%.1f deg", dist,
           yaw_err * 180.0f / static_cast<float>(M_PI));
@@ -4351,6 +4498,7 @@ void ExploPlannerNode::doExploitPlan() {
   // Age out stale blacklist entries (same TTL as exploration) so a vantage that
   // failed earlier can be retried once its entry expires.
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+  visited_goals_.prune(plan_start.seconds(), visited_goal_ttl_sec_);
 
   const auto robot_pos = latest_pos_;
 

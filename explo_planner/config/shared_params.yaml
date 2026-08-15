@@ -84,6 +84,30 @@
     # Set these from the actual goal_checker params on each platform.
     goal_xy_tolerance: 0.4
     goal_yaw_tolerance: 0.4
+    # Minimum straight-line range to an acceptable EXPLORE candidate. Rejected
+    # alongside the goal_xy_tolerance "at my feet" set. 0 = off.
+    #
+    # Off is the shipped default so field configs keep selecting exactly the
+    # goals they always did, but ANY run on a lidar in an open, mostly-unknown
+    # ROI wants it non-zero, because without it the planner deadlocks:
+    #
+    #   Utility is info_gain / (eps + path_cost). While the map is mostly
+    #   unknown every candidate's raycast ends in unknown space, so info_gain
+    #   is near-constant across the candidate set (measured: 6% spread against
+    #   a ninefold spread in path_cost) and argmax(U) becomes argmin(cost) --
+    #   "drive to the nearest frontier". The nearest frontier is usually under
+    #   a metre away, and a VLP-16's +-15 deg vertical FOV sees a band only
+    #   ~0.3 m tall at that range, so the voxels that made it a frontier are
+    #   physically unobservable from it. The robot arrives, learns nothing,
+    #   and the frontier behind it is now the nearest one. Observed directly:
+    #   both robots ping-ponging between two points 0.6-0.9 m apart for the
+    #   rest of the run, steps advancing, coverage flat, no error anywhere.
+    #
+    # Size it to the SENSOR's useful standoff, not the robot's footprint —
+    # a few metres for a VLP-16 with fov_max_range 10.0. Too large starves
+    # the candidate set in tight terrain (watch the `close=` count in the
+    # per-step log; all-rejected keeps the planner in PLAN and retrying).
+    candidate_min_goal_dist_m: 0.0
     # Deadline for the in-place rotation after the XY goal is reached, timed
     # from arrival. Separate from the nav_* travel budget on purpose: sharing
     # that budget failed (and blacklisted) goals the robot was already
@@ -143,6 +167,28 @@
     # within failed_goal_radius_m of an active entry. Prevents the planner
     # from re-picking the same unreachable goal when the robot is stuck.
     failed_goal_radius_m: 2.0
+    # Recently-REACHED goal suppression: same structure as the failed-goal
+    # blacklist above, opposite trigger. An EXPLORE candidate within
+    # visited_goal_radius_m of a goal reached in the last visited_goal_ttl_sec
+    # is skipped. 0 = off (shipped behaviour).
+    #
+    # Frontier exploration has no fixed point in a forest: every trunk casts a
+    # permanently unknown shadow, so frontier clusters regenerate however
+    # thoroughly an area is observed. With utility = info/(eps+cost) and info
+    # near-constant while the map is mostly unknown, selection collapses to
+    # argmin(cost), and two neighbouring clusters then trade places as "the
+    # nearest one" indefinitely. Measured on flatforest: six consecutive steps
+    # alternating between two goals 4.7 m apart, with no net movement.
+    #
+    # The failed-goal blacklist cannot substitute — it only fires when a goal is
+    # NOT reached, and every goal here is reached successfully and on time.
+    #
+    # Size the radius at or just above frontier_cluster_radius_m so suppressing
+    # a visited goal suppresses the cluster that generated it. The TTL must
+    # outlast a there-and-back trip, and is a TTL rather than permanent so an
+    # area that genuinely re-frontiers late in a run can be revisited.
+    visited_goal_radius_m: 0.0
+    visited_goal_ttl_sec: 120.0
     failed_goal_ttl_sec: 60.0
 
     # Coverage-based termination. Once the unknown fraction in the ROI drops
@@ -205,6 +251,32 @@
     # one centroid per bin is emitted as a long-range candidate. Larger ->
     # fewer, coarser frontier targets.
     frontier_cluster_radius_m: 5.0
+    # Inset of the FRONTIER search band from the ROI z band, off the bottom and
+    # off the top. Both 0 = search the whole ROI band (shipped behaviour).
+    #
+    # The ROI band is sized for terrain and canopy — 9.5 m here — and searching
+    # all of it for frontiers yields a candidate set dominated by voxels that
+    # can never be observed. A frontier is a free voxel with an unknown
+    # neighbour; a lidar's free space is a wedge bounded by its vertical FOV; so
+    # the whole upper and lower surface of that wedge is frontier at every
+    # range, permanently. A VLP-16 at +-15 deg has no ray reaching 3 m up at
+    # 4 m out, so driving to such a frontier cannot consume it. They regenerate
+    # beside the robot every tick, they are always the nearest, and since
+    # utility is info/(eps+cost) with near-constant info, they are always
+    # chosen. Measured on flatforest: frontier_voxels held at ~94% of observed
+    # voxels and grew with the map while both robots ping-ponged between two
+    # adjacent goals for the rest of the run — steps advancing, coverage flat,
+    # no error raised anywhere.
+    #
+    # Set these so the band covers roughly the slice the sensor sweeps while
+    # driving. A frontier then means "ground I have not been past", which
+    # driving does clear — and the set drains as the ROI is covered, which is
+    # what makes coverage termination reachable at all.
+    #
+    # Only ever narrows: the band is intersected with the ROI band, since a
+    # frontier outside it would reference voxels the map cache never ingested.
+    frontier_z_lo_offset_m: 0.0
+    frontier_z_hi_offset_m: 0.0
 
     # Region of interest (XY bounding box, map frame, metres). The planner
     # will not select candidates outside this box. KEEP IN SYNC with the
