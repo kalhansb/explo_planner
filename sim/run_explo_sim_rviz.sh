@@ -474,6 +474,15 @@ teardown() {
     elif [ "${NUNRUN:-0}" != 0 ]; then
       log "RUN SUSPECT: $NUNRUN gate(s) could not be evaluated — see $OUTDIR/comms_gates.txt"
       GATE_VERDICT=SUSPECT
+    elif ! grep -q "	watch	" "$OUTDIR/comms_gates.txt" 2>/dev/null; then
+      # No watch summary => the run-time watcher never adjudicated, and the file
+      # holds bring-up PASSes only. Absence of failures is NOT a pass: the
+      # missing line is exactly the one carrying the outage gate, i.e. the proof
+      # that the treatment happened. Every run before 2026-08-15 landed here and
+      # was scored CLEAN on bring-up alone, because the watcher was killed with a
+      # signal it did not handle (see comms_gates.py's handler registration).
+      log "RUN SUSPECT: no run-time gate summary — the watcher never reported"
+      GATE_VERDICT=SUSPECT
     else
       log "comms gates: clean for the whole run"
       GATE_VERDICT=CLEAN

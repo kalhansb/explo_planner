@@ -527,9 +527,31 @@ def main():
     tripped = False
     polls = 0
     ever_outage = False
-    # SIGTERM as well as SIGINT: the harness teardown escalates to SIGTERM, and
-    # without this the summary line — the only record that the watcher ran at
-    # all — is lost exactly on the normal exit path.
+    # SIGINT must be registered EXPLICITLY, and the reason is not obvious.
+    #
+    # The harness starts this watcher as a background job of a non-interactive
+    # shell, and POSIX says such a job inherits SIGINT (and SIGQUIT) as SIG_IGN.
+    # CPython honours an inherited SIG_IGN: it installs its default
+    # KeyboardInterrupt handler only when the disposition it inherits is not
+    # already "ignore". So the `except KeyboardInterrupt` below was unreachable —
+    # the process ignored SIGINT outright. Teardown then waited 60 s and
+    # escalated to SIGKILL, which cannot be caught, so the summary was never
+    # written. signal.signal() here overrides the inherited SIG_IGN, which is
+    # the whole fix; verified by sending SIGINT to the process group before and
+    # after (before: still alive, empty report / after: "stopped; polls=2" and
+    # both summary lines present).
+    #
+    # Measured cost of the bug: all 10 runs on disk logged "gateswatch ignored
+    # SIGINT" and not one wrote a `watch` or `outage` line. The only run that
+    # ever produced a run-time verdict was one killed with SIGTERM by hand.
+    #
+    # What that cost: gate_outage_occurred is the check that the INDEPENDENT
+    # VARIABLE ACTUALLY VARIED — that a COMMS arm's link really dropped. It has
+    # therefore never adjudicated a real run, while runs carried
+    # run_gates_verdict=CLEAN earned entirely by bring-up gates. Same lesson as
+    # plan §3.14 for the third time: a validity gate that cannot fail the run is
+    # a log message.
+    signal.signal(signal.SIGINT, _raise_stop)
     signal.signal(signal.SIGTERM, _raise_stop)
     try:
         while True:
