@@ -46,8 +46,13 @@ OUT="${OUT:-/tmp/hmr_calib_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT"
 
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v miniconda | paste -sd:)
+# set +u around the sourcing: the ROS setup scripts read unbound variables
+# (AMENT_TRACE_SETUP_FILES and friends), which under `set -u` aborts the script
+# before it does anything. Same dance as run_explo_sim_rviz.sh.
+set +u
 source /opt/ros/humble/setup.bash
 source "$WS/install/setup.bash"
+set -u
 # Own domain, and NOT the live-run domain 42: a sweep point publishes /clock from
 # the bag, and a second /clock on a domain where a real run is in flight would
 # corrupt every use_sim_time consumer in it. Sim time is not recoverable.
@@ -74,9 +79,25 @@ sweep_point() {
   local logger_pid=$!
   sleep 6
 
-  # --clock is deliberately NOT passed: the bag already carries /clock from the
-  # live run, and letting `bag play` synthesise a second one would race it.
-  ros2 bag play "$bagdir" --rate "${CALIB_RATE:-5.0}" \
+  # Play ONLY the clock and the poses. This is not an optimisation, it is
+  # correctness: the bag also contains /hmr_comms_sim/link_states recorded
+  # during the control run, and replaying that publishes the ORIGINAL run's
+  # link rows onto the same topic the logger is subscribed to. The trace then
+  # interleaves rows computed at the control's tx_power_dbm with rows computed
+  # at the swept one, and since the control was deliberately run at a power
+  # where the link never drops, every sweep point reads far more connected than
+  # it is. Caught by the implied tx: a row's snr_db + path_loss_db - 101 gives
+  # the transmit power it was computed at, and the first row of every trace
+  # read 160.0 instead of the swept value.
+  #
+  # --clock is deliberately NOT passed: the bag carries the live run's /clock
+  # and letting `bag play` synthesise a second one would race it.
+  local play_topics="/clock"
+  local rname
+  for rname in ${ROBOTS//,/ }; do
+    play_topics="$play_topics /$rname/odom_ground_truth"
+  done
+  ros2 bag play "$bagdir" --rate "${CALIB_RATE:-5.0}" --topics $play_topics \
       > "$logdir/play.log" 2>&1
   sleep 3
 

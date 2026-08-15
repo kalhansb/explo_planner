@@ -28,6 +28,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT=""; CELLS=""; ARMS=""; SEEDS=""; TAG="run"
 DURATION="${DURATION_S:-3600}"; TX="30.0"; REC="2"; EXPECT_OUT="1"
 EXTRA_ENV=""
+# Coverage-termination threshold, passed through so every cell in a campaign
+# shares one value. It defines the primary endpoint, so a campaign that mixed
+# two of them would be comparing different experiments.
+DONE_UNKNOWN="${DONE_UNKNOWN:-0.55}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --root)     ROOT="$2"; shift 2;;
@@ -39,6 +43,7 @@ while [ $# -gt 0 ]; do
     --record)   REC="$2"; shift 2;;
     --tag)      TAG="$2"; shift 2;;
     --expect-outage) EXPECT_OUT="$2"; shift 2;;
+    --done-unknown) DONE_UNKNOWN="$2"; shift 2;;
     --env)      EXTRA_ENV="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -92,6 +97,7 @@ for cell in "${CELL_LIST[@]}"; do
   env OUTDIR="$out" COMMS=1 TX_POWER="$TX" EXPECT_OUTAGE="$EXPECT_OUT" \
       RECONNECT_MODE="$arm" EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
+      DONE_UNKNOWN="$DONE_UNKNOWN" \
       $EXTRA_ENV \
       "$HERE/run_explo_sim_rviz.sh" > "$ROOT/$name.console.log" 2>&1
   rc=$?

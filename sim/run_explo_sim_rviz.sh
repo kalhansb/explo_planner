@@ -312,6 +312,26 @@ VISITED_TTL="$(flt "${VISITED_TTL:-180.0}")"
 # The §4 severity calibration must be run at the resolution the campaign runs
 # at; a tx_power_dbm calibrated at another resolution does not transfer.
 VOXEL_RES="$(flt "${VOXEL_RES:-0.20}")"
+# Coverage-termination threshold. The yaml ships 0.05, which this scenario
+# cannot reach: measured on a full-length control run, the ROI unknown fraction
+# fell to 0.4922 by t=2900 and then did not move for the remaining 2600 sim-s
+# while both robots drove a further ~950 m each. That is a floor, not a plateau
+# on the way somewhere — the frontier utility is info/(eps+cost) with info
+# near-constant, so the planner is a diffusive nearest-frontier crawler: trunk
+# shadows keep regenerating frontiers inside the region it has already covered,
+# and a distant unexplored corner never wins on cost. It saturates at roughly
+# half of a +-50 ROI and then cycles there indefinitely.
+#
+# So this follows plan §2.1's own prescription — measure the floor, set the
+# criterion above it — rather than chasing a threshold that cannot be hit. With
+# 0.55 the criterion lands in the fast early phase, where map sharing is what
+# separates the arms, and the runs terminate naturally instead of every arm
+# censoring at T and reporting the same non-answer.
+#
+# It MUST be identical across arms: it is the definition of the primary
+# endpoint, so a run at a different value is not comparable to one at this one.
+# Recorded in the manifest for exactly that reason.
+DONE_UNKNOWN="$(flt "${DONE_UNKNOWN:-0.55}")"
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, NOT the default 0. This box runs other ROS work (the scovox
 # replay harnesses) on domain 0, and a second /clock publisher appearing there
@@ -751,6 +771,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "visited_goal_radius_m=$VISITED_RADIUS"
   echo "visited_goal_ttl_sec=$VISITED_TTL"
   echo "voxel_resolution_m=$VOXEL_RES"
+  echo "done_unknown_fraction=$DONE_UNKNOWN"
   echo "done_coverage_source=scovox"
   echo "prox_hold_m=$PROX_HOLD_M"
   echo "prox_resume_m=$PROX_RESUME_M"
@@ -823,6 +844,7 @@ for r in $ROBOTS; do
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
       -p map_resolution:=$VOXEL_RES \
+      -p done_unknown_fraction:=$DONE_UNKNOWN \
       -p frontier_z_lo_offset_m:=$FRONTIER_Z_LO_OFF \
       -p frontier_z_hi_offset_m:=$FRONTIER_Z_HI_OFF \
       -p visited_goal_radius_m:=$VISITED_RADIUS \
