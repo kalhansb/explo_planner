@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Phase 7 -- the reconnection-mode pilot, in the DENSE forest.
+#
+# This is the experiment sections 3.16 through 3.22 kept failing to run. The
+# manoeuvre arms were never the problem; the WORLD was. Across the whole
+# campaign history only 8 firings ever drove a route (section 3.22), because in
+# the 81 stems/ha stand at the shipped 30 dBm the link almost never breaks:
+# Phase 5 measured 97-99% connected, 3-9 outages per run, longest 19.4 s. A
+# manoeuvre that arms on a 180 s stale peer record cannot fire against a link
+# that reconnects in 20 s, so every mode collapsed to the same behaviour and the
+# arms were measuring nothing.
+#
+# The lever is the forest, not the radio. tx_power_dbm stays at 30.0 on both
+# robots in every cell here -- it is fixed hardware, identical on every robot,
+# and no field experiment can turn it down. Section 3.19 withdrew the entire
+# earlier severity ladder for exactly that reason. What changes is the stand:
+#
+#   flatforest         81 stems/ha    97.4% connected   longest outage    19 s
+#   flatforest_dense  250 stems/ha    44.5% connected   longest outage   861 s
+#
+# 250 stems/ha is not an arbitrary bump. The link budget puts the 2 dB cutoff at
+# 50 m separation at roughly 247 stems/ha, so this stand is the first one where
+# a typical inter-robot path is marginal rather than comfortable. Measured over
+# two full runs it delivers 37-38 outages, several minutes long -- past the
+# 180 s pursuit staleness bound, past the 5 s claim TTL, deep into the region
+# where the four modes must actually differ.
+#
+# Both dense cells so far still reached all_done with CLEAN gates, so the
+# coverage endpoint survives the denser stand; the pilot is not being run into a
+# world that cannot terminate.
+#
+# DEFAULTS EVERYWHERE ON THE PLANNER. pursuit_staleness_max_sec stays at 180,
+# coord_claim_ttl_sec at 5, reconnect_confirm_sec at 3, rendezvous_max_wait_sec
+# at 600. Dense outages run past 180 s, so pursuit WILL decline on staleness in
+# some episodes. That is a result about the policy at its shipped settings, not
+# a misconfiguration to tune away -- and tuning it here would confound the mode
+# comparison with a parameter sweep.
+#
+# 12 cells at roughly 45-55 min each is a 10-hour job. run_campaign.sh is
+# resumable and orders cells seed-major, so an interruption leaves a COMPLETE
+# paired block at every seed it reached rather than a matrix missing one arm.
+#
+# Read out with:
+#   sim/manoeuvre_events.py  <-- the primary readout: scores FIRINGS, not runs
+#   sim/comms_metrics.py --a '...off*' --b '...hybrid*'
+#   sim/analyze_runs.py --threshold 0.55
+#
+# NOT set -e; see run_phase5.sh. A failed cell is a cell to re-run, not a reason
+# to abandon the rest of the matrix.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-/tmp/hmr_campaign}"
+SEEDS="${SEEDS:-1,2,3}"
+ARMS="${ARMS:-off,rendezvous,pursuit,hybrid}"
+DUR="${DUR:-5800}"
+SC="${SC:-flatforest_dense_2robot_lidar.yaml}"
+
+log() { echo "[phase7] $*"; }
+
+log "=== p7modes: dense forest, shipped 30 dBm radio, four reconnection modes ==="
+log "arms=$ARMS seeds=$SEEDS scenario=$SC"
+"$HERE/run_campaign.sh" --root "$ROOT" --tag p7modes --comms 1 --tx 30.0 \
+    --scenario "$SC" --expect-outage 1 --arms "$ARMS" --seeds "$SEEDS" \
+    --duration "$DUR" --record 0 \
+  || log "p7modes had failed cell(s) -- the completed cells are still analysable"
+
+log "=== firings (the readout that matters: per event, not per run) ==="
+"$HERE/manoeuvre_events.py" "$ROOT"/p7modes_* || true
+log "=== divergence across the four modes ==="
+"$HERE/map_divergence.py" "$ROOT"/p7modes_* || true
