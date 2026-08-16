@@ -27,6 +27,7 @@ Deliberate choices, each of which the plan calls out explicitly:
 
 import argparse
 import csv
+import glob
 import os
 import re
 import statistics
@@ -208,6 +209,27 @@ def state_at(rows, t):
 MANOEUVRE = {"RETURN_NAV", "RETURN_SYNC", "PURSUE"}
 
 
+def count_firings_from_logs(run_dir):
+    """Authoritative firing count for a run (section 3.22).
+
+    Delegates to manoeuvre_events, which reads the planner logs rather than the
+    sampled state column. Returns None if that module is not importable, so
+    this file keeps working standalone.
+    """
+    try:
+        import manoeuvre_events
+    except ImportError:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import manoeuvre_events
+        except ImportError:
+            return None
+    n = 0
+    for p in sorted(glob.glob(os.path.join(run_dir, "planner_*.log"))):
+        n += sum(1 for e in manoeuvre_events.parse_log(p) if e["type"] == "fire")
+    return n
+
+
 def classify_contact(states):
     """Merge attribution (§5.3). One class per contact, per the plan's list."""
     if any(s in MANOEUVRE for s in states):
@@ -267,6 +289,14 @@ def analyse_run(run_dir, thresh):
     makespan = None if censored else max(hits)
 
     # Manoeuvre accounting straight off the state column.
+    #
+    # NOTE (section 3.22): this UNDERCOUNTS. The CSV is sampled on a ~5-10 s
+    # timer and manoeuvre episodes are routinely shorter, so 6 of the 22
+    # firings on disk leave no row here at all — and they are the FAST ones,
+    # which is the worst possible bias for a mode comparison. The count below
+    # is retained because reconnect_secs is derived from it and needs the
+    # in-episode rows, but the authoritative firing census is the log-derived
+    # one in manoeuvre_events.py; `n_firings_log` is reported beside it.
     # reconnect_elapsed_sec must be read from INSIDE the episode, not from the
     # row that leaves it: the planner's transitionTo clears reconnect_active_
     # before that row is emitted, so the exit row always reads -1 and the old
@@ -329,6 +359,7 @@ def analyse_run(run_dir, thresh):
         "n_contacts": len(contacts),
         "attribution": attribution,
         "n_manoeuvres": manoeuvres,
+        "n_firings_log": count_firings_from_logs(run_dir),
         "reconnect_secs": reconnect_secs,
         "trees": man.get("comms_trees_loaded", "?"),
     }
@@ -361,8 +392,9 @@ def main():
 
     print(f"threshold (unknown_fraction) = {args.threshold}")
     print(f"{'run':<28} {'arm':<11} {'seed':>4} {'tx':>6} {'makespan':>9} "
-          f"{'cens':>5} {'duty':>6} {'nout':>5} {'ncon':>5} {'nman':>5}")
-    print("-" * 100)
+          f"{'cens':>5} {'duty':>6} {'nout':>5} {'ncon':>5} {'nman':>5} "
+          f"{'nfire':>6}")
+    print("-" * 107)
     for r in runs:
         ms = f"{r['makespan']:9.0f}" if r["makespan"] is not None else f"{'--':>9}"
         duty = f"{r['realised_duty']:6.3f}" if r["realised_duty"] == r["realised_duty"] else f"{'--':>6}"
@@ -370,9 +402,23 @@ def main():
         # of the median because its duration is only a lower bound. Without it
         # a permanently-down link prints "0 outages" next to duty 1.000.
         nout = f"{r['n_outages']}" + ("+1" if r.get("open_outage_s") else "")
+        nfire = "--" if r["n_firings_log"] is None else str(r["n_firings_log"])
         print(f"{r['run']:<28} {r['arm']:<11} {r['seed']:>4} {r['tx_power']:>6} "
               f"{ms} {str(r['censored']):>5} {duty} {nout:>5} "
-              f"{r['n_contacts']:>5} {r['n_manoeuvres']:>5}")
+              f"{r['n_contacts']:>5} {r['n_manoeuvres']:>5} {nfire:>6}")
+
+    # nman is the sampled state column; nfire is the log. Where they disagree,
+    # nfire is right — see section 3.22 and the note above the nman loop.
+    miss = [r for r in runs if r["n_firings_log"] is not None
+            and r["n_firings_log"] != r["n_manoeuvres"]]
+    if miss:
+        print(f"\n{len(miss)} run(s) where the sampled state column missed "
+              f"firings the log recorded (nman < nfire):")
+        for r in miss:
+            print(f"    {r['run']:<28} state column {r['n_manoeuvres']}, "
+                  f"log {r['n_firings_log']}")
+        print("  The CSV timer cannot see episodes shorter than its period, and"
+              "\n  those are the fast reconnections. Use nfire.")
 
     print()
     # Group by the CELL, not the arm alone. Keying on reconnect_mode_requested
