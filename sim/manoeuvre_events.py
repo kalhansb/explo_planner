@@ -105,6 +105,9 @@ RE_FULLTEAM = re.compile(r"exploration ended \[[^\]]*\] with full team present")
 # RESUME, so the episode it reports is [stamp - dur, stamp].
 RE_SUPPRESS = re.compile(r"Heartbeat resumed after ([\d.]+) s suppressed")
 RE_STAMP = re.compile(r"^\[[A-Z]+\] \[(\d+\.\d+)\]")
+# The time-base anchor: one per exploration step, with a matching LOG_STEP row
+# in the CSV carrying that step's sim time.
+RE_STEP_LOGGED = re.compile(r"Step (\d+) logged:")
 
 
 def _f(row, key, default=None):
@@ -136,8 +139,13 @@ def read_planner_csv(path):
                 t = _f(r, "sim_time_sec")
                 if t is None:
                     continue
+                try:
+                    step = int(r.get("step", ""))
+                except (ValueError, TypeError):
+                    step = None
                 rows.append({
                     "t": t,
+                    "step": step,
                     "state": (r.get("state") or "").strip(),
                     "elapsed": _f(r, "reconnect_elapsed_sec", -1.0),
                     "dist": _f(r, "distance_traveled", 0.0),
@@ -184,8 +192,12 @@ def csv_episodes(rows):
     return out
 
 
-def parse_log(path):
-    """Ordered manoeuvre events from one planner log, stamped in WALL seconds."""
+def parse_log(path, steps=None):
+    """Ordered manoeuvre events from one planner log, stamped in WALL seconds.
+
+    `steps`, when given, is filled with {step_index: wall_stamp} for the
+    time-base fit.
+    """
     events = []
     pending_decline = None
     try:
@@ -198,6 +210,11 @@ def parse_log(path):
             if not m:
                 continue
             w = float(m.group(1))
+            if steps is not None:
+                ms = RE_STEP_LOGGED.search(line)
+                if ms:
+                    steps.setdefault(int(ms.group(1)), w)
+                    continue
             if RE_FULLTEAM.search(line):
                 events.append({"w": w, "type": "no_fire"})
                 continue
@@ -325,48 +342,39 @@ def align_episodes(durations, episodes, tol=25.0):
 
 
 def fit_wall_to_sim(per_robot):
-    """Affine wall->sim for one RUN, from every robot's anchors pooled.
+    """Affine wall->sim for one RUN, least squares over step anchors.
 
     The map belongs to the run, not the robot: both planners log against the
-    same system clock and observe the same /clock. Pooling matters because a
-    robot whose only firing was too short to be sampled has no anchor of its own
-    and would otherwise be unplaceable.
+    same system clock and observe the same /clock, so anchors pool.
 
-    slope comes from episodes that report a sim duration against a wall duration
-    ("ended after X s sim"); offset from CSV-visible episodes, whose arm time is
-    known exactly. Returns (slope, offset, n_slope, n_offset, residual_s).
+    The anchors are the per-step log lines. `Step N logged: ...` is emitted once
+    per exploration step and the CSV writes a matching LOG_STEP row carrying
+    that step's sim time, which gives 55-75 (wall, sim) pairs spread across the
+    whole run for every robot — independent of whether any manoeuvre happened.
+    That independence is the point: a run whose only firings were too short to
+    be sampled still gets a time base, and the earlier scheme (pair firings to
+    CSV manoeuvre episodes by duration) could not place those runs at all.
+
+    Returns (slope, offset, n_anchors, residual_s).
     """
-    slopes = []
+    xs, ys = [], []
     for robot in per_robot.values():
-        ev = robot["events"]
-        for i, e in enumerate(ev):
-            if e["type"] != "fire":
-                continue
-            for j in range(i + 1, len(ev)):
-                if ev[j]["type"] == "ended":
-                    dw = ev[j]["w"] - e["w"]
-                    if dw > 5.0 and ev[j]["dur"] > 5.0:
-                        slopes.append(ev[j]["dur"] / dw)
-                    break
-                if ev[j]["type"] == "fire":
-                    break
-    slope = st.median(slopes) if slopes else 1.0
-
-    offsets = []
-    for robot in per_robot.values():
-        fires = [e for e in robot["events"] if e["type"] == "fire"]
-        eps = robot["episodes"]
-        if not fires or not eps:
-            continue
-        match = align_episodes(fire_durations(robot["events"]), eps)
-        robot["match"] = match
-        for j, i in match.items():
-            offsets.append(eps[j]["t_arm"] - slope * fires[i]["w"])
-    if not offsets:
-        return slope, None, len(slopes), 0, None
-    offset = st.median(offsets)
-    resid = max(abs(o - offset) for o in offsets) if len(offsets) > 1 else 0.0
-    return slope, offset, len(slopes), len(offsets), resid
+        for step, w in robot["steps"].items():
+            t = robot["step_times"].get(step)
+            if t is not None:
+                xs.append(w)
+                ys.append(t)
+    if len(xs) < 3:
+        return 1.0, None, len(xs), None
+    n = len(xs)
+    mx, my = st.mean(xs), st.mean(ys)
+    denom = sum((a - mx) ** 2 for a in xs)
+    if denom <= 0:
+        return 1.0, None, n, None
+    slope = sum((a - mx) * (b - my) for a, b in zip(xs, ys)) / denom
+    offset = my - slope * mx
+    resid = max(abs(slope * a + offset - b) for a, b in zip(xs, ys))
+    return slope, offset, n, resid
 
 
 RE_RELAY = re.compile(r"relay totals: (\d+) delivered, (\d+) dropped")
@@ -488,12 +496,22 @@ def analyse_run(run_dir):
         robot = os.path.basename(p)[len("planner_"):-len(".csv")]
         rows = read_planner_csv(p)
         log = os.path.join(run_dir, f"planner_{robot}.log")
+        steps = {}
+        events = parse_log(log, steps)
+        # sim time of each LOG_STEP row, keyed by step index
+        step_times = {r["step"]: r["t"] for r in rows
+                      if r["state"] == "LOG_STEP" and r["step"] is not None}
         per_robot[robot] = {"rows": rows, "episodes": csv_episodes(rows),
-                            "events": parse_log(log)}
+                            "events": events, "steps": steps,
+                            "step_times": step_times}
     if not per_robot:
         return None
 
-    slope, offset, n_sl, n_off, resid = fit_wall_to_sim(per_robot)
+    slope, offset, n_off, resid = fit_wall_to_sim(per_robot)
+    for R in per_robot.values():
+        fires = [e for e in R["events"] if e["type"] == "fire"]
+        if fires and R["episodes"]:
+            R["match"] = align_episodes(fire_durations(R["events"]), R["episodes"])
     link = read_link(run_dir)
     relay = read_relay_totals(run_dir)
 
@@ -596,7 +614,7 @@ def analyse_run(run_dir):
                   for e in R["events"] if e["type"] == "no_fire")
     return {
         "name": name, "events": out, "declines": declines, "no_fire": no_fire,
-        "fit": (slope, offset, n_sl, n_off, resid),
+        "fit": (slope, offset, n_off, resid),
         "usable": man.get("run_end_reason", "") != "",
         "gates": man.get("run_gates_verdict", ""),
         "tx": man.get("tx_power_dbm", "?"),
@@ -827,16 +845,15 @@ def main():
 
     print("\n=== time-base fit quality (per run) ===")
     for r in runs:
-        slope, offset, n_sl, n_off, resid = r["fit"]
+        slope, offset, n_off, resid = r["fit"]
         if not r["events"]:
             continue
         if offset is None:
             print(f"    {r['name']:<24} NO ANCHOR — sim times unavailable, "
                   f"link columns dropped")
         else:
-            print(f"    {r['name']:<24} slope={slope:.4f} (n={n_sl})  "
-                  f"anchors={n_off}  max residual="
-                  f"{'--' if resid is None else f'{resid:.1f} s'}")
+            print(f"    {r['name']:<24} slope={slope:.6f}  step anchors={n_off:<4}"
+                  f"max residual={'--' if resid is None else f'{resid:.2f} s'}")
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
