@@ -10,24 +10,44 @@ Usage:
     ./comms_metrics.py --a /tmp/hmr_campaign/p6denseperfect_* \
                        --b /tmp/hmr_campaign/p6dense_* --label-a perfect --label-b real
 
-THE PRIMARY ENDPOINT IS `laggard_lag`. Degraded comms does not slow exploration
-down -- across every condition measured, from a 97%-connected link to a
-27%-connected one, the LEADER reaches the coverage criterion at 1336-1845 s and
-the ranges overlap completely. What comms slows is exploration COMPLETION. The
-run cannot end until the SECOND robot independently reaches the criterion, and a
-robot that never received its partner's deltas has to go and re-learn that ground
-by driving over it:
+THE COVERAGE CRITERION REWARDS REDUNDANT COVERAGE. Read this before reading any
+crossing time out of this file.
+
+`unknown_fraction` is measured on each robot's OWN map. A robot cut off from its
+partner therefore has CHEAP unknown sitting right beside it -- the ground the
+partner already covered -- and drives it down fast, while a robot that already
+holds the union has only the hard, far-away voxels left. Measured late in a dense
+run, t = 1400 -> 2200:
+
+    condition             robot    drove    new voxels   voxels/m
+    dense perfect         atlas   253.7 m       31 912        126
+    dense perfect         bestla  168.2 m       23 183        138
+    dense realistic s1    bestla  174.3 m      142 823        820
+    dense realistic s2    bestla   73.5 m      132 099       1796
+
+The ideal-comms robots drive FURTHER for a sixth of the information, and the
+first dense ideal cell sat at unknown 0.5504 -> 0.5502 for 1000 s while its
+robots drove 254 m. It crossed the criterion at 2700 s against 1365-1845 s for
+the REALISTIC dense runs. So crossing times systematically favour the degraded
+arm, and a shared-map arm must not be read against a partitioned-map arm off
+crossing times alone. `vox_per_m_late` is the tell; `unknown_at_dist` is the
+effort-matched endpoint that charges for the driving.
+
+WHAT `laggard_lag` STILL MEASURES. Within a condition it is real and it is the
+cost of an outage: the run cannot end until the SECOND robot reaches the
+criterion, and under realistic comms in the dense forest that robot trails by
+10-1060 s. It is not blocked on the radio waiting for a backlog to drain --
+during its lag window it drives at 0.357-0.364 m/s against a 0.320-0.352 m/s
+whole-run average, full speed the entire time, and `lag_dist` prices that at up
+to 378 m. What it CANNOT do is rank a shared-map arm against a partitioned-map
+one, because the two arms' laggards face different amounts of cheap ground.
 
     condition                leader crosses     laggard trails by
     sparse perfect            1336-1701 s              0-10 s
     sparse realistic 30 dBm   1440-1800 s               0-4 s
     dense realistic 30 dBm    1365-1845 s            10-1060 s
+    dense perfect             2700 s (n=1)               0 s
     sparse detuned -14 dBm    1365-1385 s            10-2045 s
-
-The laggard is not blocked on the radio waiting for a backlog to drain. Measured
-during its lag window it drives at 0.357-0.364 m/s against a 0.320-0.352 m/s
-whole-run average -- full speed, the entire time. `lag_dist` prices that in robot
-metres: 2-5 m under perfect comms, 378 m in the dense forest, 737 m detuned.
 
 Three design decisions that the numbers depend on.
 
@@ -79,6 +99,8 @@ METRICS = [
     ("unknown_lead",      "unknown (leader)",  "worse",      ""),
     ("unknown_lag",       "unknown (laggard)", "worse",      ""),
     ("unknown_auc",       "unknown AUC",       "worse",      ""),
+    ("unknown_at_dist",   "unknown @ matched m", "worse",    "effort-matched; see docstring"),
+    ("vox_per_m_late",    "voxels per m late", "cheaper ground", "duplication tell"),
     ("dist_team",         "team distance m",   "more effort", ""),
     ("t_to_level",        "t to level s",      "slower",     "matched on coverage"),
     ("dist_to_level",     "m to level",        "less efficient", "matched on coverage"),
@@ -145,7 +167,7 @@ def load_run(run_dir):
     }
 
 
-def measure(run, horizon, thresh, level, step=100.0, start=200.0):
+def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.0):
     """The battery for one run, every time-indexed quantity read at `horizon`."""
     a, b = run["a"], run["b"]
     ra, rb = _at(a, horizon), _at(b, horizon)
@@ -265,12 +287,61 @@ def measure(run, horizon, thresh, level, step=100.0, start=200.0):
 
     t_cross = t_lead
 
+    # EFFORT-MATCHED KNOWLEDGE, and the reason it exists. The coverage criterion
+    # above is measured on each robot's OWN map, so it REWARDS REDUNDANT
+    # COVERAGE: a robot cut off from its partner has cheap unknown right beside
+    # it -- the ground the partner already covered -- and drives it down fast,
+    # while a robot that already holds the union has only the hard, far-away
+    # voxels left. Measured late in a dense run that is 820-1796 voxels per metre
+    # against 126-138. So crossing times favour the degraded arm, and this metric
+    # exists to charge for the driving: what does the team KNOW once every run
+    # has spent the same robot-metres?
+    #
+    # It is a BOUND, not a measurement, and the bound leans the other way.
+    # min(u_A, u_B) is an upper bound on the union's unknown fraction (the union
+    # contains each robot's map, so it can only know more). Under perfect comms
+    # the two maps are identical and the bound is TIGHT -- it is the union. Under
+    # degraded comms it is loose, and loose in the pessimistic direction: the
+    # degraded team really knows at least this much and possibly more. So a
+    # result where the DEGRADED arm still wins on this metric is conclusive,
+    # while one where the perfect arm wins is suggestive and partly the bound.
+    #
+    # The unbiased version needs the union map itself, which means bags. These
+    # --record 0 runs cannot reconstruct it; a union-coverage re-run is the
+    # outstanding fix.
+    u_at_dist = None
+    if dist_match:
+        for t_row, r in a:
+            pb = _at(b, t_row)
+            if pb is None:
+                continue
+            team = (_num(r, "distance_traveled") or 0.0) + \
+                   (_num(pb[1], "distance_traveled") or 0.0)
+            if team >= dist_match:
+                u_at_dist = min(_num(r, "unknown_fraction") or 1.0,
+                                _num(pb[1], "unknown_fraction") or 1.0)
+                break
+
+    # The duplication tell itself: voxels observed per metre driven over the last
+    # third of the matched window. Cheap ground reads high.
+    lo, hi = start + (horizon - start) * 2.0 / 3.0, horizon
+    yields = []
+    for series in (a, b):
+        p0, p1 = _at(series, lo), _at(series, hi)
+        if p0 and p1:
+            dm = (_num(p1[1], "distance_traveled") or 0.0) - (_num(p0[1], "distance_traveled") or 0.0)
+            dv = (_num(p1[1], "total_observed_voxels") or 0.0) - (_num(p0[1], "total_observed_voxels") or 0.0)
+            if dm > 5.0:
+                yields.append(dv / dm)
+
     return {
         "peer_visible_frac": (peer_seen / tot) if tot else None,
         "divergence_med": st.median(div) if div else None,
         "unknown_lead": lead,
         "unknown_lag": max(ua, ub),
         "unknown_auc": st.mean(mean_u) if mean_u else None,
+        "unknown_at_dist": u_at_dist,
+        "vox_per_m_late": st.median(yields) if yields else None,
         "dist_team": dist,
         "t_to_level": t_level,
         "dist_to_level": dist_level,
@@ -367,12 +438,25 @@ def main():
         _num(_at(r["b"], horizon)[1], "unknown_fraction")))
     print(f"matched coverage level = {level:.4f} unknown "
           f"(set by {worst['name']}; every run reaches it)")
+
+    # Matched team distance for the effort-matched endpoint: the largest budget
+    # every run actually spent, so no run is scored past the end of its own data.
+    budgets = []
+    for r in all_runs:
+        ra2, rb2 = _at(r["a"], horizon), _at(r["b"], horizon)
+        if ra2 and rb2:
+            budgets.append((_num(ra2[1], "distance_traveled") or 0.0) +
+                           (_num(rb2[1], "distance_traveled") or 0.0))
+    dist_match = min(budgets) if budgets else None
+    if dist_match:
+        print(f"matched team distance  = {dist_match:.0f} m "
+              f"(smallest budget any run spent by T)")
     print()
 
     vals = {}
     for label, runs in groups.items():
         for r in runs:
-            m = measure(r, horizon, args.threshold, level, args.step)
+            m = measure(r, horizon, args.threshold, level, dist_match, args.step)
             if m:
                 vals[(label, r["name"])] = m
 
