@@ -10,6 +10,25 @@ Usage:
     ./comms_metrics.py --a /tmp/hmr_campaign/p6denseperfect_* \
                        --b /tmp/hmr_campaign/p6dense_* --label-a perfect --label-b real
 
+THE PRIMARY ENDPOINT IS `laggard_lag`. Degraded comms does not slow exploration
+down -- across every condition measured, from a 97%-connected link to a
+27%-connected one, the LEADER reaches the coverage criterion at 1336-1845 s and
+the ranges overlap completely. What comms slows is exploration COMPLETION. The
+run cannot end until the SECOND robot independently reaches the criterion, and a
+robot that never received its partner's deltas has to go and re-learn that ground
+by driving over it:
+
+    condition                leader crosses     laggard trails by
+    sparse perfect            1336-1701 s              0-10 s
+    sparse realistic 30 dBm   1440-1800 s               0-4 s
+    dense realistic 30 dBm    1365-1845 s            10-1060 s
+    sparse detuned -14 dBm    1365-1385 s            10-2045 s
+
+The laggard is not blocked on the radio waiting for a backlog to drain. Measured
+during its lag window it drives at 0.357-0.364 m/s against a 0.320-0.352 m/s
+whole-run average -- full speed, the entire time. `lag_dist` prices that in robot
+metres: 2-5 m under perfect comms, 378 m in the dense forest, 737 m detuned.
+
 Three design decisions that the numbers depend on.
 
 MATCHED HORIZON, not run end. Every run stops at a different sim time because
@@ -53,6 +72,9 @@ import statistics as st
 # (key, label, higher_is, note) -- higher_is describes what a LARGER value means
 METRICS = [
     ("peer_visible_frac", "peer visible frac", "more comms", "MANIPULATION CHECK"),
+    ("laggard_lag",       "laggard lag s",     "worse",      "PRIMARY"),
+    ("lag_dist",          "laggard drove m",   "worse",      "cost in robot-metres"),
+    ("t_team_cross",      "t team complete s", "worse",      "censored -> blank"),
     ("divergence_med",    "map divergence",    "worse",      ""),
     ("unknown_lead",      "unknown (leader)",  "worse",      ""),
     ("unknown_lag",       "unknown (laggard)", "worse",      ""),
@@ -61,7 +83,7 @@ METRICS = [
     ("t_to_level",        "t to level s",      "slower",     "matched on coverage"),
     ("dist_to_level",     "m to level",        "less efficient", "matched on coverage"),
     ("minpos_rej_frac",   "deconflict rej frac", "more conflict", ""),
-    ("t_to_thresh",       "t to threshold s",  "slower",     "censored -> blank"),
+    ("t_to_thresh",       "t LEADER cross s",  "slower",     "near-invariant"),
     ("makespan",          "makespan s",        "slower",     "confounded by stop rule"),
     ("plan_ms_p50",       "plan ms p50",       "slower CPU", "NEGATIVE CONTROL"),
 ]
@@ -184,15 +206,64 @@ def measure(run, horizon, thresh, level, step=100.0, start=200.0):
                          (_num(pb[1], "distance_traveled") or 0.0)
             break
 
-    # Time the team first reached the coverage threshold (leader), uncensored
-    # only. A censored run has no crossing and must stay blank rather than be
-    # scored at the horizon, which would score it as if it had just arrived.
-    t_cross = None
+    # THE PRIMARY ENDPOINT: when did each robot reach the coverage criterion?
+    #
+    # Degraded comms does not slow exploration down -- the LEADER's crossing time
+    # barely moves between conditions. What it slows is exploration COMPLETION,
+    # because the run cannot end until the second robot independently reaches the
+    # criterion, and a robot that never received its partner's deltas has to go
+    # and re-learn that ground by driving over it. So the quantity that carries
+    # the effect is the gap between the two, not either one alone:
+    #
+    #   t_lead_cross   first robot to the criterion    (near-invariant)
+    #   t_team_cross   LAST robot to the criterion     (the run's real end)
+    #   laggard_lag    the difference                  (the cost of the outage)
+    #
+    # Measured over the whole run, not clipped to the matched horizon. The lag is
+    # a within-run difference, so unequal run lengths do not bias it the way they
+    # bias a level read at a fixed time -- but they DO censor it, which is
+    # handled below.
+    crossings = []
     for series in (a, b):
+        hit = None
         for t_row, r in series:
             if (_num(r, "unknown_fraction") or 1.0) <= thresh:
-                t_cross = t_row if t_cross is None else min(t_cross, t_row)
+                hit = t_row
                 break
+        crossings.append(hit)
+
+    t_lead = min([c for c in crossings if c is not None], default=None)
+    # CENSORING, and it matters more than anything else in this file. A run whose
+    # laggard never reached the criterion is the WORST case for the condition
+    # under test, not a missing observation. Dropping it would bias the whole
+    # comparison towards "no effect" exactly when the effect is largest. So the
+    # lag is recorded as a lower bound (last logged time minus the leader's
+    # crossing) and flagged, and any group containing one reports a median that
+    # is itself a lower bound.
+    censored = any(c is None for c in crossings)
+    if t_lead is None:
+        t_team = lag = None
+    elif censored:
+        t_team = None
+        lag = max(a[-1][0], b[-1][0]) - t_lead
+    else:
+        t_team = max(crossings)
+        lag = t_team - t_lead
+
+    # What the laggard actually DID with that time. It is not idling on the
+    # radio: measured at 0.357-0.364 m/s against a 0.320-0.352 m/s whole-run
+    # average, it drives at full speed the entire window. This is the cost in
+    # robot-metres of knowledge that never arrived.
+    lag_dist = None
+    if t_lead is not None and lag is not None:
+        slow = b if (crossings[0] is not None and
+                     (crossings[1] is None or crossings[1] > crossings[0])) else a
+        p0, p1 = _at(slow, t_lead), _at(slow, t_lead + lag)
+        if p0 and p1:
+            lag_dist = (_num(p1[1], "distance_traveled") or 0.0) - \
+                       (_num(p0[1], "distance_traveled") or 0.0)
+
+    t_cross = t_lead
 
     return {
         "peer_visible_frac": (peer_seen / tot) if tot else None,
@@ -205,6 +276,10 @@ def measure(run, horizon, thresh, level, step=100.0, start=200.0):
         "dist_to_level": dist_level,
         "minpos_rej_frac": (rej / tot) if tot else None,
         "t_to_thresh": t_cross,
+        "t_team_cross": t_team,
+        "laggard_lag": lag,
+        "lag_dist": lag_dist,
+        "censored": censored,
         "makespan": run["makespan"],
         "plan_ms_p50": st.median(plan_ms) if plan_ms else None,
     }
@@ -335,13 +410,27 @@ def main():
         sep = separation(xs, ys)
         p = perm_p(xs, ys)
         rel = (mb - ma) / abs(ma) * 100.0 if ma else float("nan")
+        # Ranges are printed because "CLEAN" is a statement about ORDER, not
+        # about magnitude: two groups at 1.9 m and 4.5 m separate perfectly and
+        # mean nothing. Without the spreads beside them, a clean split at a
+        # negligible effect size reads as a finding.
+        rng = f"[{min(xs):.4g}..{max(xs):.4g}] vs [{min(ys):.4g}..{max(ys):.4g}]"
         print(f"{label:<22}{direction:<16}{ma:>11.4f}{mb:>11.4f}{mb - ma:>11.4f}"
               f"{sep:>9}{p:>9.3f}  {note}{'' if not note else ' '}"
-              f"{'' if abs(rel) != abs(rel) else f'({rel:+.0f}%)'}")
+              f"{'' if abs(rel) != abs(rel) else f'({rel:+.0f}%)'}  {rng}")
         if sep == "CLEAN":
             verdict.append((label, ma, mb, note))
 
     print()
+    for label in (args.label_a, args.label_b):
+        cens = [r["name"] for r in groups[label]
+                if vals.get((label, r["name"])) and vals[(label, r["name"])]["censored"]]
+        if cens:
+            print(f"CENSORED in {label} ({len(cens)}/{len(groups[label])}): "
+                  + ", ".join(cens))
+            print(f"  their laggard never reached the criterion, so their lag is a "
+                  f"LOWER BOUND and {label}'s median lag is a lower bound too. "
+                  f"These are the worst cases for the condition, not missing data.")
     p_floor = 2.0 / len(list(itertools.combinations(
         range(len(groups[args.label_a]) + len(groups[args.label_b])),
         len(groups[args.label_a]))))
