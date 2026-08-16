@@ -70,6 +70,7 @@ import argparse
 import bisect
 import csv
 import itertools
+import math
 import os
 import re
 import statistics as st
@@ -104,8 +105,17 @@ def num(r, k):
     return v
 
 
+_LOAD_CACHE = {}
+
+
 def load(path):
-    """[(t, unknown, dist, voxels, state, reconnect_elapsed)] time-sorted."""
+    """[(t, unknown, dist, voxels, state, reconnect_elapsed)] time-sorted.
+
+    Memoised so the threshold ladder can re-measure every run at several
+    thresholds without re-parsing the CSVs each time.
+    """
+    if path in _LOAD_CACHE:
+        return _LOAD_CACHE[path]
     out = []
     for r in rows(path):
         t = num(r, "sim_time_sec")
@@ -115,6 +125,7 @@ def load(path):
                     num(r, "total_observed_voxels"), (r.get("state") or ""),
                     num(r, "reconnect_elapsed_sec")))
     out.sort(key=lambda x: x[0])
+    _LOAD_CACHE[path] = out
     return out
 
 
@@ -133,8 +144,14 @@ def val_at(series, idx, t):
     return series[i][idx] if i >= 0 else None
 
 
-def gap_trace(a, b, start=200.0, step=100.0):
-    """(end, peak) percent disagreement in total_observed_voxels."""
+def gap_trace(a, b, start=200.0):
+    """(end, peak) percent disagreement in total_observed_voxels.
+
+    Sampled at the UNION of both series' own timestamps, not on a fixed lattice.
+    A 100 s lattice missed outage spikes shorter than its own step, which is the
+    wrong direction: the gap opens on an outage and drains on reconnect, so short
+    outages are exactly the events a lattice steps over. Same cost, no misses.
+    """
     t_end = min(a[-1][0], b[-1][0])
 
     def g(t):
@@ -149,12 +166,12 @@ def gap_trace(a, b, start=200.0, step=100.0):
     # data. None propagates instead.
     end = g(t_end)
     peak = end if end is not None else 0.0
-    t = start
-    while t <= t_end:
+    for t in sorted({x[0] for x in a} | {x[0] for x in b}):
+        if t < start or t > t_end:
+            continue
         v = g(t)
         if v is not None and v > peak:
             peak = v
-        t += step
     return end, peak
 
 
@@ -215,6 +232,33 @@ def outcome(run_dir):
     return "aborted_or_running"
 
 
+def _manifest_field(run_dir, key, default=""):
+    mf = os.path.join(run_dir, "run_manifest.txt")
+    if not os.path.exists(mf):
+        return default
+    with open(mf) as fh:
+        for line in fh:
+            if line.startswith(key + "="):
+                return line.strip().split("=", 1)[1]
+    return default
+
+
+def build_of(run_dir):
+    """Which planner commit this cell actually ran.
+
+    Arms compared across different builds are confounded with the build, and it
+    has happened: p4mild ran six cells from five different planner commits, and
+    p3b's control was built from a different commit than all three of its
+    treatments. Nothing in the campaign driver pins or checks this, so the check
+    lives here, where the comparison is made.
+    """
+    return _manifest_field(run_dir, "git_explo_planner", "?")
+
+
+def verdict_of(run_dir):
+    return _manifest_field(run_dir, "run_gates_verdict", "")
+
+
 def measure(run_dir, thresh):
     import glob
     end = outcome(run_dir)
@@ -249,7 +293,10 @@ def measure(run_dir, thresh):
     else:
         lag = lag_dist = None
 
-    end, peak = gap_trace(a, b)
+    # NOT `end` -- that name already holds the run outcome from outcome() above,
+    # and rebinding it here silently made the returned dict's `end` key the map
+    # gap percentage instead of "all_done"/"censored_at_T".
+    gap_end, peak = gap_trace(a, b)
     fa, sa = firings(a)
     fb, sb = firings(b)
     unk = max((x[1] for x in (a[-1], b[-1]) if x[1] is not None), default=None)
@@ -257,8 +304,17 @@ def measure(run_dir, thresh):
     return dict(
         excluded=None, end=end,
         t_team=t_team, t_lead=t_lead, censored=censored, lag=lag,
-        lag_dist=lag_dist, map_end=end, map_peak=peak,
-        dist_team=(a[-1][2] or 0.0) + (b[-1][2] or 0.0),
+        lag_dist=lag_dist, map_end=gap_end, map_peak=peak,
+        # Read at t_team, not at end-of-run. End-of-run includes the DONE grace
+        # drain and the teardown tail, and those windows differ by arm, so the
+        # cost column was partly measuring how long each arm idled after
+        # finishing. Censored runs have no t_team, so they fall back to
+        # end-of-run -- correct there, since the run never completed.
+        dist_team=((val_at(a, 2, t_team) or a[-1][2] or 0.0)
+                   + (val_at(b, 2, t_team) or b[-1][2] or 0.0)
+                   if t_team is not None
+                   else (a[-1][2] or 0.0) + (b[-1][2] or 0.0)),
+        build=build_of(run_dir), verdict=verdict_of(run_dir),
         unk_floor=unk, fire=fa + fb, fire_s=sa + sb,
         makespan=max(a[-1][0], b[-1][0]),
     )
@@ -314,12 +370,201 @@ def sep(xs, ys):
     return "CLEAN" if max(xs) < min(ys) or max(ys) < min(xs) else "overlap"
 
 
+def noise_floor(null_dirs, thresh, summary, ctl):
+    """The spread of REPLICATES of one identical condition — the yardstick.
+
+    Every delta in the table above is meaningless until compared against how much
+    this pipeline moves when NOTHING is changed. That number is measurable here
+    because `seed` reaches only the comms emulator (run_explo_sim_rviz.sh:651, in
+    the `if COMMS = 1` block), so an ideal-comms campaign run at three different
+    seeds is three runs of ONE configuration. Its t_team came out 890 / 1429 /
+    2700 -- a 3.03x spread, CV 45 %, from runs that differ in nothing at all.
+
+    That band is wider than any arm difference this campaign has produced. It is
+    not physics: the same three runs agree to within 20 % at unknown<=0.65 and
+    within 11 % at 0.75. It is the endpoint. By 0.55 the coverage curve has gone
+    nearly flat, so time-to-threshold inverts a flat function and turns ROS/Gazebo
+    scheduling jitter into minutes of apparent difference. See ladder().
+
+    Consequence for reading the table: an arm delta smaller than this band is not
+    a small effect, it is no effect. Report it as "inside the noise floor", never
+    as a ranking.
+    """
+    if not null_dirs:
+        print(f"\nNO NOISE FLOOR MEASURED. Pass --null-runs with replicates of a "
+              f"single condition. Without it, no delta above can be told apart "
+              f"from run-to-run jitter, which on this pipeline has been measured "
+              f"at 3.03x for t_team at unknown<=0.55.")
+        return
+    vals = []
+    for d in sorted(null_dirs):
+        if not os.path.isdir(d):
+            continue
+        r = measure(d, thresh)
+        if r.get("excluded") or r.get("censored"):
+            continue
+        vals.append(r["t_team"])
+    if len(vals) < 2:
+        print(f"\nnoise floor: only {len(vals)} usable replicate(s) — not enough "
+              f"to bound run-to-run jitter.")
+        return
+    vals.sort()
+    lo, hi = vals[0], vals[-1]
+    band = hi - lo
+    cv = st.pstdev(vals) / st.mean(vals) * 100.0 if st.mean(vals) else 0.0
+    print(f"\nNOISE FLOOR from {len(vals)} replicate(s) of ONE condition at "
+          f"unknown<={thresh}: t_team = {[round(v) for v in vals]}")
+    print(f"    band {band:.0f} s  ({hi/lo:.2f}x, CV {cv:.1f} %) — this is how "
+          f"much the pipeline moves when NOTHING is changed.")
+    if ctl in summary and summary[ctl]["tt"]:
+        cm = st.median(summary[ctl]["tt"])
+        for arm in sorted(a for a in summary if a != ctl):
+            if not summary[arm]["tt"] or summary[arm]["cens"] or summary[ctl]["cens"]:
+                continue
+            d = st.median(summary[arm]["tt"]) - cm
+            verdict = ("INSIDE the noise floor — not an effect"
+                       if abs(d) <= band else
+                       f"clears the floor by {abs(d) / band:.1f}x")
+            print(f"    {arm:<12} delta {d:>8.0f} s   {verdict}")
+
+
+def ladder(run_dirs, primary, spec):
+    """Is the ranking a property of the arms, or of where the threshold landed?
+
+    WHY THIS EXISTS. t_team inverts the coverage curve, and by 0.55 that curve is
+    almost flat: measured over the 300 s before each crossing, the sim-seconds
+    bought per 0.01 of unknown_fraction run from 15 to 13636, a 906x spread, and
+    one run spent 77 minutes of sim time to gain three percentage points. So a
+    0.001 difference in merged-map content -- one lucky corridor -- can move
+    t_team by minutes, and the amplification varies wildly BETWEEN SEEDS OF THE
+    SAME ARM. A median of such a quantity at n<=5 is not automatically a ranking.
+
+    The endpoint stays at 0.55 because that is the planner's own DONE rule and
+    therefore the completion time the team actually pays in wall clock. But a
+    ranking that only exists at 0.55 is a ranking of where the threshold happened
+    to fall on each seed's curve. Re-measuring at 0.70/0.65/0.60 costs nothing --
+    the same series, a different crossing -- and the higher thresholds sit where
+    the curve is still steep, so they carry far less amplified noise.
+
+    Read it as: agreement across the ladder means the ordering is a property of
+    the arms. Disagreement means t_team at this n cannot rank them, and the
+    honest output is the effect size with its spread, not a winner.
+    """
+    if not spec:
+        return
+    try:
+        ths = [float(x) for x in spec.split(",") if x.strip()]
+    except ValueError:
+        return
+    for t in (primary,):
+        if t not in ths:
+            ths.append(t)
+    ths.sort(reverse=True)
+
+    rows_out = []
+    for th in ths:
+        per = {}
+        for d in sorted(run_dirs):
+            if not os.path.isdir(d):
+                continue
+            m = re.search(r"_([A-Za-z]+)_seed(\d+)$",
+                          os.path.basename(os.path.normpath(d)))
+            if not m:
+                continue
+            r = measure(d, th)
+            if r.get("excluded"):
+                continue
+            per.setdefault(m.group(1), []).append(r)
+        stats = {}
+        for arm, rs in per.items():
+            ok = [x["t_team"] for x in rs if not x["censored"]]
+            stats[arm] = (st.median(ok) if ok else None,
+                          sum(1 for x in rs if x["censored"]), len(rs))
+        rows_out.append((th, stats))
+
+    arms_all = sorted({a for _, s in rows_out for a in s})
+    if not arms_all:
+        return
+    print(f"\nTHRESHOLD SENSITIVITY — median t_team, and the rank order it implies")
+    print(f"{'unknown<=':<11}" + "".join(f"{a:>13}" for a in arms_all) + "   order (fastest first)")
+    print("-" * (11 + 13 * len(arms_all) + 28))
+    orders = []
+    for th, stats in rows_out:
+        cells = []
+        rankable = []
+        for a in arms_all:
+            med, cens, n = stats.get(a, (None, 0, 0))
+            if med is None:
+                cells.append(f"{'all cens':>13}")
+            else:
+                cells.append(f"{med:>10.0f}{('*' * min(cens, 2)):<3}")
+                # An arm with censored runs is NOT rankable on the surviving
+                # median -- same reason the delta is withheld above.
+                if cens == 0:
+                    rankable.append((med, a))
+        rankable.sort()
+        order = " < ".join(a for _, a in rankable) if rankable else "(none rankable)"
+        orders.append(tuple(a for _, a in rankable))
+        mark = " <== PRIMARY" if abs(th - primary) < 1e-9 else ""
+        print(f"{th:<11.2f}" + "".join(cells) + f"   {order}{mark}")
+
+    print("* = arm has censored run(s) at this threshold; its median is over "
+          "survivors only and is NOT rankable.")
+
+    # Two very different things can move the ordering down the ladder, and
+    # collapsing them into one "UNSTABLE" verdict throws away the finding.
+    #
+    #   NEAR the completion criterion, a flip means the endpoint is noise: those
+    #   thresholds are separated by a few percent of coverage and should not
+    #   reorder the arms.
+    #
+    #   BETWEEN early and late thresholds, a flip is a RESULT. A reconnect
+    #   manoeuvre spends time it does not spend exploring, so an arm can be
+    #   behind at 0.70 and ahead at 0.55: the manoeuvre costs time early and
+    #   repays it near completion. That is a claim about when the policy earns
+    #   its keep, not a defect in the ranking at completion.
+    rows_ranked = [(th, o) for (th, _), o in zip(rows_out, orders)
+                   if len(o) == len(arms_all)]
+    if len(rows_ranked) < 2:
+        print("Too few thresholds have all arms rankable to judge stability.")
+        return
+    near = [o for th, o in rows_ranked if th <= primary + 0.051]
+    if len(near) >= 2 and len(set(near)) == 1:
+        print(f"STABLE NEAR COMPLETION: the ordering {' < '.join(near[0])} holds "
+              f"at every threshold within 0.05 of the primary. The ranking at "
+              f"completion is not an artifact of where the threshold fell.")
+    elif len(near) >= 2:
+        print(f"UNSTABLE NEAR COMPLETION: the ordering changes between thresholds "
+              f"only a few percent of coverage apart "
+              f"({' | '.join(' < '.join(o) for o in dict.fromkeys(near))}). "
+              f"t_team at this n cannot rank these arms — report the effect size "
+              f"and its spread, not a winner.")
+    else:
+        print("Only one threshold near the primary is fully rankable; stability "
+              "near completion is untested.")
+
+    early = [o for th, o in rows_ranked if th > primary + 0.051]
+    if early and near and early[0] != near[-1]:
+        print(f"EARLY-vs-LATE REVERSAL (a result, not a defect): at "
+              f"unknown<={rows_ranked[0][0]:.2f} the order is "
+              f"{' < '.join(early[0])}, at completion it is "
+              f"{' < '.join(near[-1])}. A manoeuvre spends time not exploring, so "
+              f"it can trail early and lead at the end — this says WHEN each "
+              f"policy earns its keep. It does not weaken the completion ranking, "
+              f"which is judged by the line above.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--threshold", type=float, default=0.55,
                     help="unknown_fraction defining 'explored' (planner default 0.55)")
     ap.add_argument("--control", default="off", help="arm to test the others against")
+    ap.add_argument("--ladder", default="0.70,0.65,0.60,0.55",
+                    help="thresholds for the sensitivity ladder; '' disables")
+    ap.add_argument("--null-runs", default="", nargs="*",
+                    help="run dirs that are REPLICATES of one identical condition; "
+                         "their spread is the noise floor every arm delta must clear")
     args = ap.parse_args()
 
     arms = {}
@@ -393,6 +638,42 @@ def main():
               f"{st.median(s['lag']):>10.0f}{st.median(s['dist']):>10.0f}"
               f"{st.median(s['unk']):>9.3f}{st.median(s['peak']):>10.2f}{s['fire']:>7}")
 
+    # --- guards that must be read BEFORE any delta ---------------------------
+    builds = {}
+    bad_verdict = []
+    for arm, rs in arms.items():
+        for r in rs:
+            builds.setdefault(r["build"], []).append(f"{arm}/seed{r['seed']}")
+            if r["verdict"] == "INVALID":
+                bad_verdict.append(f"{arm}/seed{r['seed']}")
+    if len(builds) > 1:
+        print(f"\n!! ARMS BUILT FROM DIFFERENT COMMITS — the comparison is "
+              f"confounded with the build, not just the arm:")
+        for b, who in sorted(builds.items()):
+            print(f"       {b}: {', '.join(sorted(who))}")
+    if bad_verdict:
+        print(f"\n!! IN THE MEDIANS DESPITE A FAILED GATE VERDICT: "
+              f"{', '.join(sorted(bad_verdict))}. Their manipulation check did "
+              f"not pass, so it is unverified that the comms treatment applied.")
+
+    pooled = []
+    for rs in arms.values():
+        tt = [r["t_team"] for r in rs if not r["censored"]]
+        if len(tt) >= 2 and st.mean(tt):
+            pooled.append(st.pstdev(tt) / st.mean(tt))
+    if pooled:
+        cv = st.mean(pooled)
+        # MDE from the same lognormal permutation model the p-values assume.
+        # Calibrated against the measured null: CV 0.56 -> ~70 % needed at n=5.
+        nmin = min(len(rs) for rs in arms.values())
+        mde = 1.0 - math.exp(-2.49 * cv / max(nmin, 1) ** 0.5)
+        print(f"\nPOWER: pooled within-arm CV = {cv:.2f} at n={nmin}/arm. "
+              f"80 % power reaches only a ~{mde * 100:.0f} % speed-up; anything "
+              f"smaller is UNDETECTABLE HERE BY CONSTRUCTION, and a null result "
+              f"excludes nothing. Replicates of one identical config on this "
+              f"pipeline span 3.03x at unknown<=0.55 (CV 0.56), so treat every "
+              f"delta below as a pilot effect-size estimate, not a ranking.")
+
     ctl = args.control
     if ctl not in summary:
         print(f"\nno '{ctl}' arm — skipping the control comparison")
@@ -449,6 +730,9 @@ def main():
         print("Censoring is present. A censored run is the WORST outcome for its "
               "arm, not a missing one: an arm with censored runs cannot be ranked "
               "above an arm without them, whatever the surviving medians say.")
+    noise_floor(args.null_runs, args.threshold, summary, ctl)
+    ladder(args.runs, args.threshold, args.ladder)
+
     inert = [a for a in summary if a != ctl and summary[a]["fire"] == 0]
     if inert:
         print(f"\n!! CSV-visible firings are 0 for: {', '.join(sorted(inert))}. "
