@@ -27,6 +27,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROOT=""; CELLS=""; ARMS=""; SEEDS=""; TAG="run"
 DURATION="${DURATION_S:-3600}"; TX="30.0"; REC="2"; EXPECT_OUT="1"
+# --comms 0 runs the IDEAL-COMMS CONTROL: run_explo_sim_rviz.sh leaves both
+# robots on their direct topics, one broadcast domain, emulator never launched.
+# That is the honest way to express "assume comms never fails" -- the earlier
+# control instead ran COMMS=1 at tx_power_dbm=160, which does not describe any
+# radio a robot could carry. Transmit power is fixed hardware and identical on
+# both robots; it is not an experimental variable. Severity belongs to the
+# environment (tree density, separation), never to the radio.
+# With --comms 0, --tx and --expect-outage are inert and the gate watcher is
+# told not to demand an outage.
+COMMS_ON="1"
 EXTRA_ENV=""
 # Coverage-termination threshold, passed through so every cell in a campaign
 # shares one value. It defines the primary endpoint, so a campaign that mixed
@@ -43,6 +53,7 @@ while [ $# -gt 0 ]; do
     --record)   REC="$2"; shift 2;;
     --tag)      TAG="$2"; shift 2;;
     --expect-outage) EXPECT_OUT="$2"; shift 2;;
+    --comms)    COMMS_ON="$2"; shift 2;;
     --done-unknown) DONE_UNKNOWN="$2"; shift 2;;
     --env)      EXTRA_ENV="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
@@ -75,7 +86,12 @@ INDEX="$ROOT/campaign_index.csv"
 log() { echo "[$(date +%H:%M:%S)] [campaign] $*"; }
 
 IFS=',' read -ra CELL_LIST <<< "$CELLS"
-log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (tx=$TX duration=${DURATION}s record=$REC)"
+if [ "$COMMS_ON" = "0" ]; then
+  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (IDEAL COMMS, no emulator;" \
+      "duration=${DURATION}s record=$REC)"
+else
+  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (tx=$TX duration=${DURATION}s record=$REC)"
+fi
 
 n_ok=0; n_fail=0; n_skip=0; consec_fail=0
 for cell in "${CELL_LIST[@]}"; do
@@ -102,7 +118,12 @@ for cell in "${CELL_LIST[@]}"; do
 
   log "START $name"
   t0=$(date +%s)
-  env OUTDIR="$out" COMMS=1 TX_POWER="$TX" EXPECT_OUTAGE="$EXPECT_OUT" \
+  # An ideal-comms cell has no link to drop, so demanding an outage would fail
+  # every gate; force expect_outage off rather than trusting the caller.
+  cell_expect="$EXPECT_OUT"
+  [ "$COMMS_ON" = "0" ] && cell_expect=0
+
+  env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$arm" EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
       DONE_UNKNOWN="$DONE_UNKNOWN" \
