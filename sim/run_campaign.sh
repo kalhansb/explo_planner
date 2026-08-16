@@ -42,6 +42,12 @@ EXTRA_ENV=""
 # shares one value. It defines the primary endpoint, so a campaign that mixed
 # two of them would be comparing different experiments.
 DONE_UNKNOWN="${DONE_UNKNOWN:-0.55}"
+# The world. It sets BOTH the link budget (stems in the Fresnel corridor) and
+# the coverage floor, so it is not a free knob: a campaign that changes it is a
+# different experiment and needs its own DONE_UNKNOWN. Passed explicitly rather
+# than inherited from the environment so a stale exported SCENARIO cannot
+# silently relabel a campaign.
+SCENARIO="${SCENARIO:-flatforest_2robot_lidar.yaml}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --root)     ROOT="$2"; shift 2;;
@@ -52,6 +58,7 @@ while [ $# -gt 0 ]; do
     --tx)       TX="$2"; shift 2;;
     --record)   REC="$2"; shift 2;;
     --tag)      TAG="$2"; shift 2;;
+    --scenario) SCENARIO="$2"; shift 2;;
     --expect-outage) EXPECT_OUT="$2"; shift 2;;
     --comms)    COMMS_ON="$2"; shift 2;;
     --done-unknown) DONE_UNKNOWN="$2"; shift 2;;
@@ -90,7 +97,7 @@ if [ "$COMMS_ON" = "0" ]; then
   log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (IDEAL COMMS, no emulator;" \
       "duration=${DURATION}s record=$REC)"
 else
-  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (tx=$TX duration=${DURATION}s record=$REC)"
+  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (tx=$TX duration=${DURATION}s record=$REC scenario=$SCENARIO)"
 fi
 
 n_ok=0; n_fail=0; n_skip=0; consec_fail=0
@@ -126,7 +133,7 @@ for cell in "${CELL_LIST[@]}"; do
   env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$arm" EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
-      DONE_UNKNOWN="$DONE_UNKNOWN" \
+      DONE_UNKNOWN="$DONE_UNKNOWN" SCENARIO="$SCENARIO" \
       $EXTRA_ENV \
       "$HERE/run_explo_sim_rviz.sh" > "$ROOT/$name.console.log" 2>&1
   rc=$?

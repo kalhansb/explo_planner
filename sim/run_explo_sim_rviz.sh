@@ -67,7 +67,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # <repo>/sim
 # ws overlay root is three levels up from this sim/ directory.
 WS="$(cd "$HERE/../../.." && pwd)"           # …/hmr_explo/ws
 ROBOTS="atlas bestla"
-SCENARIO="flatforest_2robot_lidar.yaml"
+# Overridable so a denser stand can be run without editing the harness. The
+# scenario picks the WORLD, and the world sets both the link budget (stems in
+# the Fresnel corridor) and the coverage floor — so a scenario change
+# invalidates the calibrated done_unknown_fraction and is recorded in the
+# manifest for exactly that reason. Any replacement must keep two robots named
+# atlas and bestla, since ROBOTS above and the topic wiring below assume them.
+SCENARIO="${SCENARIO:-flatforest_2robot_lidar.yaml}"
+if [ ! -f "$WS/install/hmr_sim/share/hmr_sim/config/scenarios/$SCENARIO" ]; then
+  echo "FATAL: scenario '$SCENARIO' is not installed. Rebuild hmr_sim, or pick"\
+       "one of:" >&2
+  ls "$WS/install/hmr_sim/share/hmr_sim/config/scenarios/" 2>/dev/null >&2
+  exit 2
+fi
 DURATION_S="${DURATION_S:-0}"                # 0 = until Ctrl-C
 RVIZ="${RVIZ:-1}"
 GZ_GUI="${GZ_GUI:-0}"                        # 1 => ignition GUI as well
