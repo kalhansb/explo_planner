@@ -31,7 +31,19 @@ Measured (median divergence over the run):
 
 No overlap; the worst realistic run is 41x the best ideal one.
 
-Two cautions the numbers above hide.
+The link is what causes it, tested inside single runs rather than inferred from
+the between-condition gap. Pooled over the 8 p3b cells, sustained outage onsets
+raise divergence (n=22, mean +0.0128, 16/22 rose, sign p~0.026) and sustained
+reconnects lower it (n=7, mean -0.0089, 5/7 fell -- right sign, too few events
+to establish). Note the timescale: interval-by-interval the correlation between
+connectivity and change in divergence is -0.043, i.e. nothing. A delta queued
+during an outage only moves unknown_fraction once the robot covers ground, so
+the response lags by minutes.
+
+    Divergence is an integrator, not a live link monitor. Do not read a single
+    sample of it as an instantaneous connectivity signal.
+
+Three cautions the numbers above hide.
 
 Aggregate over the run, do not classify an instant. Under realistic comms
 divergence collapses to zero on every reconnect, so single-sample divergence is
