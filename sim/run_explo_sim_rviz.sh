@@ -155,6 +155,22 @@ case "$RECONNECT_MODE" in
 rendezvous|pursuit|hybrid|off. The planner would silently fall back to \
 rendezvous and the run would be mislabelled." >&2; exit 2 ;;
 esac
+# Barrier cap. The planner's code default is 0 = wait forever, which is the
+# right field behaviour and the wrong experiment: a robot that gives up on the
+# chase raises the barrier at its current pose and never lowers it, so the run
+# ends at the horizon and its time-to-reconnect is undefined — in exactly the
+# arm where the modes differ most. Observed in p4mild_pursuit_seed1: both
+# robots declined a stale chase, held, and censored the run at 5807 s.
+# A finite cap makes the ending observable ("gave up after N s") instead of
+# indistinguishable from "still waiting". Set 0 to restore the field default.
+# flt() per the warning above: these are doubles in the planner and a bare
+# integer makes ros2 infer int and abort the node at startup.
+RDV_MAX_WAIT="$(flt "${RDV_MAX_WAIT:-600}")"
+# The pre-arm confirmation window (planner param reconnect_confirm_sec). The
+# claim table can lag intents that were already delivered, so a manoeuvre armed
+# on one read of it may be released by the next tick; 8 of 24 recorded firings
+# ended within 5 s having moved under a metre. 0 restores arm-on-first-read.
+RECONNECT_CONFIRM="$(flt "${RECONNECT_CONFIRM:-3.0}")"
 # COMMS=1 puts the message-level radio emulator (hmr_comms_sim_node) between the
 # two robots, which is what turns the NOTE above from a caveat into a runnable
 # experiment: with it, "peer out of comms" is produced by distance through trees
@@ -762,6 +778,7 @@ EXPLOIT_ARG="true"; [ "$EXPLOIT" = "0" ] && EXPLOIT_ARG="false"
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
 log "reconnect_mode=$MODE_ARG rendezvous_enabled=$RDV_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
+log "reconnect gates: confirm=${RECONNECT_CONFIRM}s barrier_max_wait=${RDV_MAX_WAIT}s"
 log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field site's ROI)"
 # done_coverage_source is pinned to scovox, NOT left on "auto". auto switches to
 # the 2D planning_map the instant one is received, so enabling the planning map
@@ -792,6 +809,8 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_mode_requested=$RECONNECT_MODE"
   echo "reconnect_mode_param=$MODE_ARG"
   echo "rendezvous_enabled=$RDV_ENABLED"
+  echo "rendezvous_max_wait_sec=$RDV_MAX_WAIT"
+  echo "reconnect_confirm_sec=$RECONNECT_CONFIRM"
   echo "comms=$COMMS"
   echo "seed=$SEED"
   echo "tx_power_dbm=$TX_POWER"
@@ -880,6 +899,8 @@ for r in $ROBOTS; do
       -p exploit_dwell_sync_enabled:=$DWELL_SYNC_ARG \
       -p reconnect_mode:=$MODE_ARG \
       -p rendezvous_enabled:=$RDV_ENABLED \
+      -p rendezvous_max_wait_sec:=$RDV_MAX_WAIT \
+      -p reconnect_confirm_sec:=$RECONNECT_CONFIRM \
       -p exploitation_enabled:=$EXPLOIT_ARG \
       -p rendezvous_expected_peers:=1 \
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \

@@ -189,7 +189,10 @@ private:
   // point); doReturnNav drives there; doReturnSync holds until the whole team
   // is in comms. `reason` is the termination cause, for logging only — EVERY
   // termination path must route through here, not just coverage saturation.
-  void finishOrRendezvous(const char* reason);
+  /// Decide the ending at exhaustion. Returns false when the decision was
+  /// DEFERRED by the reconnect confirmation gate and no transition happened —
+  /// the caller must then leave the node somewhere that re-runs this check.
+  bool finishOrRendezvous(const char* reason);
   void startReturnTo(const Eigen::Vector3f& dest, const char* what,
                      const char* reason);
   void doReturnNav();
@@ -474,6 +477,33 @@ private:
   // pursuit is skipped outright; freshness scales the budget linearly down to
   // zero across this window. <= 0 = no staleness gate.
   double pursuit_staleness_max_sec_ = 180.0;
+  // How long the team must have been INCOMPLETE before a manoeuvre may arm.
+  //
+  // Without this the arm test (peer missing, one read of the claim table) and
+  // the release test (peer live, the same read one tick later) disagree inside
+  // a single cycle, and the manoeuvre fires and dissolves before the robot
+  // moves. Measured across the p3b/p4mild campaigns: 8 of 24 firings ended
+  // within 5 s having travelled under a metre, two of them logging "ended
+  // after 0.0 s sim", and 9 of 24 armed while the emulator had the pair
+  // connected with 5-12 messages/s flowing. The cause is that the decision is
+  // taken on a claim table which has not absorbed already-delivered intents:
+  // the planner has just spent a long tick in PLAN (which is also what
+  // suppresses its OWN beacon, see heartbeatTick), and drains the queue
+  // immediately afterwards.
+  //
+  // This is the same guard the coverage criterion already carries
+  // (done_min_consecutive_steps_): do not act on one sample of a noisy test.
+  // The wait is on top of coord_claim_ttl_sec, so the peer must be silent for
+  // ttl + this before a manoeuvre commits. <= 0 restores the old
+  // arm-on-first-read behaviour.
+  double reconnect_confirm_sec_ = 3.0;
+  // Last time the team was observed complete, and whether that ever happened.
+  // Maintained on the heartbeat timer so it advances in every state, including
+  // the long PLAN ticks that cause the race. A run whose team was NEVER
+  // complete (total blackout) must not be made to wait for a confirmation that
+  // can never arrive, hence the flag.
+  rclcpp::Time team_last_complete_time_;
+  bool         team_seen_complete_ = false;
 
   // --- Proximity stop (coordinated yield) params ---
   // Thresholds/staleness live in the guard's Config; these are the node-side
@@ -1261,6 +1291,13 @@ ExploPlannerNode::ExploPlannerNode()
   }
   pursuit_budget_max_sec_    = dp("pursuit_budget_max_sec", 240.0);
   pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 180.0);
+  reconnect_confirm_sec_     = dp("reconnect_confirm_sec", 3.0);
+  if (reconnect_confirm_sec_ <= 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "reconnect_confirm_sec <= 0: manoeuvres arm on a single read of the "
+        "claim table. Expect firings that dissolve before the robot moves, "
+        "and treat any reconnection timing from this run as unusable.");
+  }
 
   // Proximity stop (coordinated yield). ON by default and deliberately NOT
   // tied to coordination_enabled: the guard is inert until it actually tracks
@@ -2836,7 +2873,7 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // reconnect_mode_ manoeuvre; otherwise finish. When the whole team is
 // already present the map is already merged, so exhaustion here means the team
 // is genuinely done — everyone reaches this together and lands in DONE.
-void ExploPlannerNode::finishOrRendezvous(const char* reason) {
+bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   // livePeerCount, not the raw table size: exploit claims are retained past
   // expiry by the grace window (vantage-contest lenience), and a graced claim
   // must not count a 10-s-silent teammate as "present" for the barrier.
@@ -2844,6 +2881,28 @@ void ExploPlannerNode::finishOrRendezvous(const char* reason) {
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
+    // Confirmation gate. `active` above is one read of a claim table that may
+    // not yet have absorbed intents already delivered to this node, so a
+    // manoeuvre committed on it can be released by the very next tick. Require
+    // the team to have been continuously incomplete for reconnect_confirm_sec
+    // first. Returning here leaves the node in PLAN with the coverage streak
+    // already satisfied, so the next tick re-runs this check: the deferral
+    // resolves either into a manoeuvre (peer still gone) or into DONE (peer
+    // was there all along), and cannot loop, because team_last_complete_time_
+    // only advances while the team IS complete — in which case
+    // shouldRendezvous is false and we never reach this branch.
+    if (reconnect_confirm_sec_ > 0.0 && team_seen_complete_) {
+      const double missing_for =
+          (this->now() - team_last_complete_time_).seconds();
+      if (missing_for < reconnect_confirm_sec_) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+            "Reconnect: team incomplete (%d/%d) for only %.1fs of the %.1fs "
+            "confirmation window [%s] — deferring the manoeuvre.",
+            active, rendezvous_expected_peers_, missing_for,
+            reconnect_confirm_sec_, reason);
+        return false;
+      }
+    }
     // Mode dispatch (mesh radios). Pursuit and hybrid try the chase first;
     // startPursuit declines when the missing peer's record is too stale for
     // its trail head to mean anything (pursuitBudgetSec == 0), and each mode
@@ -2856,21 +2915,21 @@ void ExploPlannerNode::finishOrRendezvous(const char* reason) {
     const LastContact* rec = missingPeerRecord(&peer_id);
     if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
         startPursuit(peer_id, *rec, reason)) {
-      return;
+      return true;
     }
     if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
       startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
                     "meeting point", reason);
-      return;
+      return true;
     }
     if (reconnect_mode_ == ReconnectMode::PURSUIT) {
       // Pure pursuit has no agreed fallback point by design (that is the
       // A/B against hybrid): a chase that never started waits right here.
       holdForTeam(reason);
-      return;
+      return true;
     }
     startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
-    return;
+    return true;
   }
   if (rendezvous_enabled_ && rendezvous_expected_peers_ > 0) {
     RCLCPP_INFO(get_logger(),
@@ -2888,6 +2947,7 @@ void ExploPlannerNode::finishOrRendezvous(const char* reason) {
     publishPresenceIntent();
   }
   transitionTo(State::DONE);
+  return true;
 }
 
 // Shared barrier-entry stand-down. The rendezvous/pursuit barrier is HARD:
@@ -3380,6 +3440,21 @@ void ExploPlannerNode::publishPresenceIntent() {
 // Stamps the message with the current time so peer expiry resets.
 void ExploPlannerNode::heartbeatTick() {
   if (!coord_enabled_) return;
+  // Team-presence clock for the reconnect confirmation gate. It lives here, on
+  // the heartbeat timer, rather than at the exhaustion check, because the whole
+  // point is to have a reading that predates the long PLAN tick — sampling it
+  // inside finishOrRendezvous would sample exactly the stale table the gate
+  // exists to distrust. Note this timer is serialised behind the state machine
+  // on a single-threaded executor, so it too can be starved; that is the
+  // conservative direction (a starved clock looks older, so the gate waits).
+  if (coord_) {
+    const auto pres_now = this->now();
+    if (teamComplete(static_cast<int>(coord_->livePeerCount(pres_now)),
+                     rendezvous_expected_peers_)) {
+      team_last_complete_time_ = pres_now;
+      team_seen_complete_ = true;
+    }
+  }
   // Suppression accounting (comms experiments). The beacon is STATE-GATED, so
   // a planner busy longer than coord_claim_ttl_sec in a non-beaconing state —
   // PLAN above all, which can loop indefinitely when every candidate is
@@ -3903,7 +3978,15 @@ void ExploPlannerNode::doLogStep() {
     // its step budget shut down wherever it happened to stop — never returning
     // to last_connected_anchor_ and never releasing its teammate's barrier.
     // The return drive happens after the budget is spent, so it costs no steps.
-    finishOrRendezvous("step-budget");
+    //
+    // On a DEFERRED decision go to PLAN, never stay here: doLogStep is
+    // dispatched every tick and writes a metrics row and increments step_ on
+    // each call, so idling in LOG_STEP would forge duplicate steps. PLAN
+    // re-checks the same budget at its head and calls this again, where a
+    // deferral costs nothing.
+    if (!finishOrRendezvous("step-budget")) {
+      transitionTo(State::PLAN);
+    }
   } else {
     // Route by phase: exploitation steps loop back to the vantage planner,
     // exploration steps to the exploration planner.
