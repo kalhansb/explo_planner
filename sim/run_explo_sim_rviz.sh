@@ -488,6 +488,20 @@ teardown() {
   # is a control run wearing a treatment label, and nothing before this point
   # can tell.
   if [ "$COMMS" = "1" ] && [ -f "$OUTDIR/comms_gates.txt" ]; then
+    # Merged-map convergence, decided only now because it reads the finished
+    # CSVs. Both robots merge both scovox_bin streams, so with the deltas in
+    # reliable_topics their two copies must agree at the end. Three dense-world
+    # runs finished 1.5-1.8% apart with every other gate green: a KeepLast
+    # reader overflowing on the reconnect burst discards the excess with no
+    # error and no counter, and scovox_node's new-subscriber resnapshot cannot
+    # heal it because the emulator's DDS subscription never drops. Appended
+    # before the verdict is computed so a holed map counts as a FAIL like any
+    # other. `|| true` so a broken checker cannot abort the trap; it emits UNRUN
+    # on its own failure paths, which scores as SUSPECT rather than silent PASS.
+    if [ -x "$HERE/map_agreement.py" ]; then
+      python3 "$HERE/map_agreement.py" "$OUTDIR" \
+        --max-pct "${MAP_AGREE_MAX_PCT:-0.5}" >> "$OUTDIR/comms_gates.txt" 2>&1 || true
+    fi
     # teardown is trapped long before GATES_STRICT is assigned, and `set -u` is
     # on, so an early die() would abort IN the trap on an unbound variable.
     GATE_VERDICT=UNKNOWN
