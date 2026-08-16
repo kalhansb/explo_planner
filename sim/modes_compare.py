@@ -12,11 +12,21 @@ quantity the experiment actually pays for in wall clock.
 
 CENSORING IS DATA, NOT MISSINGNESS. A run whose laggard never reaches the
 threshold inside the duration is the WORST outcome for its arm, not an absent
-one. Dropping it biases toward "no effect" exactly in the cells where the effect
-is largest. Censored runs are counted, listed, and excluded from the median with
-that exclusion stated -- never silently dropped. An arm with censored runs cannot
-be ranked above one without them on median alone; the censored count column is
-part of the result.
+one. So when ANY run in either arm is censored, the t_team delta is WITHHELD
+rather than computed over the survivors. Reporting it was not merely optimistic,
+it could reverse the ranking: with off = {1500,1600,1700,1800} (median 1650) and
+an arm scoring {1400,1450,>5800,>5800} (true median >=3625, about 2000 s WORSE),
+dropping the two censored runs leaves {1400,1450} and the table called that arm
+225 s FASTER and stamped it CLEAN -- because the deleted runs are exactly the
+ones that would have overlapped. A footnote cannot repair a wrong-signed headline
+number, so the number is not printed. Read the `cens` count and `lag` instead.
+
+THREE OUTCOMES, NOT TWO. `all_done` and `censored_at_T` are both data. A run
+whose sim process DIED is not: it says nothing about the policy, and scoring it
+as censored charges an infrastructure failure to whichever arm was running.
+Aborted runs, in-flight runs, and runs missing a planner CSV are excluded and
+listed by name under EXCLUDED. Read the run's own manifest, never infer the
+outcome from how the CSV happens to end.
 
 SECONDARY, in the order they are worth reading:
   lag        t_team - t_lead. The completion delay itself, isolated from how fast
@@ -46,12 +56,15 @@ SECONDARY, in the order they are worth reading:
              manoeuvre_events.py before calling an arm inert.
 
 STATISTICS. Exact permutation over the arm-vs-`off` split, two-sided on the
-median. The floor is 2/C(2n,n): at n=3 that is p>=0.10 and NOTHING can reach
-0.05, at n=4 it is 0.029, at n=5 it is 0.008. The floor is printed so a large
-p is never mistaken for evidence of no effect when it is arithmetic. With four
-arms there are three comparisons against control, so read 0.05 as ~0.017 if you
-want a family-wise reading; separation (do the ranges overlap at all?) is the
-more honest small-n summary and is printed alongside.
+median. Each row also prints its own FLOOR: the smallest p that row could ever
+return at its group sizes, obtained from the same enumeration as the p-value.
+It is not the closed form 2/C(2n,n), which is only valid for EQUAL groups -- and
+groups become unequal precisely when censoring bites, so the formula misfired
+exactly when it mattered, once printing `perm p = 0.200` directly beneath
+`floor is 0.333`. Where floor >= 0.05 the p-value is arithmetic, not evidence.
+With four arms there are three comparisons against control, so read 0.05 as
+~0.017 family-wise; separation (do the ranges overlap at all?) is the more honest
+small-n summary and is printed alongside.
 """
 import argparse
 import bisect
@@ -126,13 +139,16 @@ def gap_trace(a, b, start=200.0, step=100.0):
 
     def g(t):
         xa, xb = val_at(a, 3, t), val_at(b, 3, t)
-        if not xa or not xb:
+        if xa is None or xb is None:
             return None
         hi = max(xa, xb)
         return abs(xa - xb) / hi * 100.0 if hi > 0 else 0.0
 
-    end = g(t_end) or 0.0
-    peak = end
+    # `or 0.0` here used to turn an UNMEASURABLE gap into a reported 0.00 %, i.e.
+    # into perfect agreement -- the most flattering possible reading of missing
+    # data. None propagates instead.
+    end = g(t_end)
+    peak = end if end is not None else 0.0
     t = start
     while t <= t_end:
         v = g(t)
@@ -173,14 +189,47 @@ def firings(series):
     return eps, secs
 
 
+def outcome(run_dir):
+    """How the run ENDED, from its own manifest. Three outcomes, not two.
+
+    A run that hit the horizon with work left (`censored_at_T`) is DATA: it is
+    the worst result its arm can produce. A run whose sim process died is NOT --
+    it says nothing about the policy, and scoring it as censored charges an
+    infrastructure failure to whichever arm happened to be running.
+    p4mild_rendezvous_seed2 is exactly that: its console log reads "sim died
+    mid-run", it stops at t_sim=160 with unknown still 0.817, and treating it as
+    a censored rendezvous run would have made rendezvous look catastrophic on the
+    strength of a crashed process.
+
+    Runs still in flight also land here (no end reason written yet), and must be
+    excluded rather than counted as censored -- the campaign writes this line
+    only at teardown.
+    """
+    mf = os.path.join(run_dir, "run_manifest.txt")
+    if not os.path.exists(mf):
+        return "no_manifest"
+    with open(mf) as fh:
+        for line in fh:
+            if line.startswith("run_end_reason="):
+                return line.strip().split("=", 1)[1] or "unknown"
+    return "aborted_or_running"
+
+
 def measure(run_dir, thresh):
     import glob
+    end = outcome(run_dir)
+    if end not in ("all_done", "censored_at_T"):
+        return dict(excluded=end)
     paths = sorted(glob.glob(os.path.join(run_dir, "planner_*.csv")))
     if len(paths) != 2:
-        return None
+        # Previously a silent `return None`. A run that produced no CSV is an
+        # infrastructure failure exactly like a dead sim, and dropping it without
+        # a word while scoring its half-written sibling as censored gave two
+        # identical failures opposite treatment.
+        return dict(excluded=f"{len(paths)} planner CSV(s), expected 2")
     a, b = (load(p) for p in paths)
     if not a or not b:
-        return None
+        return dict(excluded="planner CSV present but empty")
 
     cr = [cross(a, thresh), cross(b, thresh)]
     censored = any(c is None for c in cr)
@@ -206,6 +255,7 @@ def measure(run_dir, thresh):
     unk = max((x[1] for x in (a[-1], b[-1]) if x[1] is not None), default=None)
 
     return dict(
+        excluded=None, end=end,
         t_team=t_team, t_lead=t_lead, censored=censored, lag=lag,
         lag_dist=lag_dist, map_end=end, map_peak=peak,
         dist_team=(a[-1][2] or 0.0) + (b[-1][2] or 0.0),
@@ -214,19 +264,50 @@ def measure(run_dir, thresh):
     )
 
 
-def perm_p(xs, ys):
-    """Exact two-sided permutation on the difference of medians."""
+def perm_all(xs, ys):
+    """Every |median difference| reachable by relabelling, and the observed one.
+
+    Returned together so the p-value and its own attainable FLOOR come from the
+    same enumeration. They used to be computed separately -- p by enumerating
+    C(nx+ny, nx), the floor by a hardcoded 2/C(2n,n) that assumes EQUAL group
+    sizes -- and the two disagreed the moment censoring made the groups unequal.
+    The tool printed `perm p = 0.200` directly beneath `floor is 0.333`, a
+    p-value below its own stated minimum.
+    """
     pool = list(xs) + list(ys)
-    n = len(xs)
+    nx = len(xs)
     obs = abs(st.median(xs) - st.median(ys))
-    hits = tot = 0
-    for combo in itertools.combinations(range(len(pool)), n):
+    diffs = []
+    for combo in itertools.combinations(range(len(pool)), nx):
         left = [pool[i] for i in combo]
         right = [pool[i] for i in range(len(pool)) if i not in combo]
-        tot += 1
-        if abs(st.median(left) - st.median(right)) >= obs - 1e-12:
-            hits += 1
-    return hits / tot if tot else 1.0
+        diffs.append(abs(st.median(left) - st.median(right)))
+    return obs, diffs
+
+
+def perm_p(xs, ys):
+    """Exact two-sided permutation on the difference of medians."""
+    obs, diffs = perm_all(xs, ys)
+    if not diffs:
+        return 1.0
+    return sum(1 for d in diffs if d >= obs - 1e-12) / len(diffs)
+
+
+def perm_floor(xs, ys):
+    """Smallest p this comparison could EVER return, given these group sizes.
+
+    Computed by enumeration rather than from a formula, because the closed form
+    2/C(2n,n) is only correct for equal groups: with nx != ny the label-swapped
+    arrangement is not itself a valid relabelling, so the attainable minimum is
+    whatever share of arrangements ties the most extreme one. If this equals or
+    exceeds 0.05, no data in that row can be significant and the p-value is
+    reporting arithmetic, not evidence.
+    """
+    _, diffs = perm_all(xs, ys)
+    if not diffs:
+        return 1.0
+    mx = max(diffs)
+    return sum(1 for d in diffs if d >= mx - 1e-12) / len(diffs)
 
 
 def sep(xs, ys):
@@ -242,6 +323,7 @@ def main():
     args = ap.parse_args()
 
     arms = {}
+    dropped = []
     for d in sorted(args.runs):
         if not os.path.isdir(d):
             continue
@@ -253,12 +335,26 @@ def main():
         if not m:
             continue
         r = measure(d, args.threshold)
-        if r:
-            r["seed"] = int(m.group(2))
-            arms.setdefault(m.group(1), []).append(r)
+        if r.get("excluded"):
+            dropped.append((os.path.basename(os.path.normpath(d)), r["excluded"]))
+            continue
+        r["seed"] = int(m.group(2))
+        arms.setdefault(m.group(1), []).append(r)
     if not arms:
         print("no runs matched <tag>_<arm>_seed<n>")
+        if dropped:
+            print("(runs found but excluded: "
+                  + ", ".join(f"{n} [{w}]" for n, w in dropped) + ")")
         return 1
+
+    if dropped:
+        # Named, never silent. These are infrastructure failures and runs still
+        # in flight -- neither is evidence about a policy, but a reader must be
+        # able to see that an arm is short a cell and why.
+        print("EXCLUDED (not evidence about any arm — infrastructure or in flight):")
+        for n, w in dropped:
+            print(f"    {n}: {w}")
+        print()
 
     print(f"threshold: unknown_fraction <= {args.threshold}   "
           f"PRIMARY = t_team (BOTH robots across)\n")
@@ -268,9 +364,10 @@ def main():
     for arm in sorted(arms):
         for r in sorted(arms[arm], key=lambda x: x["seed"]):
             tt = "CENSORED" if r["censored"] else f"{r['t_team']:.0f}"
+            me = "--" if r["map_end"] is None else f"{r['map_end']:.2f}"
             print(f"{arm+'/seed'+str(r['seed']):<26}{r['t_lead'] or 0:>9.0f}{tt:>9}"
                   f"{r['lag'] or 0:>9.0f}{r['lag_dist'] or 0:>8.0f}"
-                  f"{r['map_end']:>9.2f}{r['map_peak']:>8.2f}{r['dist_team']:>9.0f}"
+                  f"{me:>9}{r['map_peak']:>8.2f}{r['dist_team']:>9.0f}"
                   f"{r['unk_floor'] or 0:>7.3f}{r['fire']:>6}{r['fire_s']:>8.0f}")
 
     print(f"\n{'arm':<12}{'n':>3}{'cens':>6}{'t_team med':>12}{'range':>18}"
@@ -302,47 +399,56 @@ def main():
         return 0
 
     print(f"\nvs control '{ctl}'   (negative delta = FASTER completion = better)")
-    print(f"{'arm':<12}{'metric':<12}{'delta':>11}{'sep':>9}{'perm p':>9}  note")
-    print("-" * 78)
+    print(f"{'arm':<12}{'metric':<12}{'delta':>11}{'sep':>9}{'perm p':>9}{'floor':>8}  note")
+    print("-" * 96)
     for arm in sorted(a for a in summary if a != ctl):
+        ncens = summary[arm]["cens"] + summary[ctl]["cens"]
         for key, label in (("tt", "t_team"), ("lag", "lag"), ("dist", "dist_team")):
             xs, ys = summary[ctl][key], summary[arm][key]
+            # A t_team median built from the survivors of censoring is not a
+            # conservative estimate, it is a WRONG-SIGNED one. Worked example:
+            # off = {1500,1600,1700,1800} (median 1650) versus an arm scoring
+            # {1400,1450,>5800,>5800} (true median >=3625, i.e. ~2000 s WORSE).
+            # Dropping the two censored runs leaves {1400,1450}, median 1425, and
+            # the table reports the arm 225 s FASTER and stamps it CLEAN --
+            # because the runs deleted are exactly the ones that would have
+            # overlapped. The separation is manufactured by the exclusion. A
+            # footnote cannot repair a reversed headline number, so the number is
+            # withheld instead.
+            if key == "tt" and ncens:
+                print(f"{arm:<12}{label:<12}{'WITHHELD':>11}{'--':>9}{'--':>9}{'--':>8}  "
+                      f"{summary[arm]['cens']} censored ({arm}) + "
+                      f"{summary[ctl]['cens']} ({ctl}); a median over the "
+                      f"survivors can invert the true ranking — read 'cens' and "
+                      f"'lag' instead")
+                continue
             if len(xs) < 2 or len(ys) < 2:
-                print(f"{arm:<12}{label:<12}{'--':>11}{'--':>9}{'--':>9}  too few complete runs")
+                print(f"{arm:<12}{label:<12}{'--':>11}{'--':>9}{'--':>9}{'--':>8}  "
+                      f"too few complete runs")
                 continue
             d = st.median(ys) - st.median(xs)
             note = ""
-            ncens = summary[arm]["cens"] + summary[ctl]["cens"]
-            if key == "tt" and ncens:
-                note = (f"EXCLUDES {summary[arm]['cens']} censored ({arm}), "
-                        f"{summary[ctl]['cens']} ({ctl}) — worst cases dropped")
-            elif key == "lag" and ncens:
+            if key == "lag" and ncens:
                 # Censored lags run to the end of the run, so they UNDERSTATE the
-                # true lag. Keeping them in is the conservative choice, but the
-                # delta is then a lower bound and must not be read as a point
-                # estimate.
+                # true lag. Keeping them in is the conservative direction here --
+                # unlike t_team, nothing is deleted -- but the delta is then a
+                # bound, not a point estimate.
                 note = (f"includes {ncens} censored lag(s), each a LOWER bound — "
                         f"delta understates")
+            fl = perm_floor(xs, ys)
+            if fl > 0.05 and not note:
+                note = f"floor {fl:.3f} > 0.05: p cannot be significant at this n"
             print(f"{arm:<12}{label:<12}{d:>11.1f}{sep(xs, ys):>9}"
-                  f"{perm_p(xs, ys):>9.3f}  {note}")
+                  f"{perm_p(xs, ys):>9.3f}{fl:>8.3f}  {note}")
 
-    ns = sorted({len(s['tt']) for s in summary.values()} | {len(s['lag']) for s in summary.values()})
-    n = ns[0] if ns else 0
-    if n >= 1:
-        import math
-        floor = 2.0 / math.comb(2 * n, n)
-        print(f"\npermutation p floor at n={n} per arm is {floor:.3f} — "
-              f"{'nothing here can reach 0.05' if floor > 0.05 else 'p<0.05 is attainable'}. "
-              f"Three arms vs control: three comparisons, so read 0.05 as ~0.017 "
-              f"family-wise.")
-    else:
-        # Never silently omit this line: n hits 0 when an arm is entirely
-        # censored, which is exactly when a reader most needs telling that no
-        # p-value in the table above means anything.
-        print("\nat least one arm has NO uncensored run, so its median rests on "
-              "nothing — the deltas above are not interpretable for that arm. "
-              "The censored count IS the result there: a manoeuvre whose laggard "
-              "never finished is the worst outcome, not a missing one.")
+    print(f"\n'floor' is the smallest p THAT row could ever return at its group "
+          f"sizes, enumerated not assumed. Where floor >= 0.05 the p-value is "
+          f"arithmetic, not evidence — read 'sep'. Three arms vs one control is "
+          f"three comparisons, so read 0.05 as ~0.017 family-wise.")
+    if any(s["cens"] for s in summary.values()):
+        print("Censoring is present. A censored run is the WORST outcome for its "
+              "arm, not a missing one: an arm with censored runs cannot be ranked "
+              "above an arm without them, whatever the surviving medians say.")
     inert = [a for a in summary if a != ctl and summary[a]["fire"] == 0]
     if inert:
         print(f"\n!! CSV-visible firings are 0 for: {', '.join(sorted(inert))}. "
