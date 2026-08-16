@@ -35,11 +35,15 @@ SECONDARY, in the order they are worth reading:
              this column is the only place it shows up.
   unk_floor  final unknown fraction of the laggard. Guards the comparison: an arm
              is not faster if it stopped at less coverage.
-  fire       reconnect-manoeuvre episodes, and seconds spent in them. The
-             mechanism check. An arm whose manoeuvre never fired is not evidence
-             about that manoeuvre -- it is another copy of `off`, and the whole
-             reason this campaign moved to the dense forest was that at 81
-             stems/ha every arm collapsed into exactly that.
+  fire       reconnect-manoeuvre episodes, and seconds spent in them, as far as
+             the CSV can see them. The mechanism check, and a LOWER BOUND on
+             both counts -- see firings(). An arm whose manoeuvre never fired is
+             not evidence about that manoeuvre; it is another copy of `off`, and
+             the whole reason this campaign moved to the dense forest was that at
+             81 stems/ha every arm collapsed into exactly that. But fire == 0
+             here does NOT establish that: it is equally consistent with every
+             episode being shorter than the sample period. Confirm against
+             manoeuvre_events.py before calling an arm inert.
 
 STATISTICS. Exact permutation over the arm-vs-`off` split, two-sided on the
 median. The floor is 2/C(2n,n): at n=3 that is p>=0.10 and NOTHING can reach
@@ -58,7 +62,19 @@ import re
 import statistics as st
 import sys
 
-RECON_RE = re.compile(r"recon|pursu|rendez", re.I)
+# The planner's actual manoeuvre states. Verified against the CSVs, not guessed:
+# the full state vocabulary is {WAIT_FOR_MAP, NAVIGATE, PLAN, INTEGRATE,
+# LOG_STEP, DONE, PURSUE, RETURN_NAV, RETURN_SYNC}.
+#
+# This replaces a regex `recon|pursu|rendez`, which was wrong in the worst
+# possible direction. It matched PURSUE but NOT RETURN_NAV or RETURN_SYNC -- the
+# states rendezvous and hybrid spend their manoeuvre in. p3b_rendezvous_seed1's
+# bestla has 4 RETURN_NAV rows and 0 PURSUE, so the regex scored the rendezvous
+# arm fire=0 while its manoeuvre was demonstrably firing, and this file's own
+# closing warning would then have condemned a working arm as a relabelled
+# control. A mechanism check that reports "mechanism absent" when the mechanism
+# ran is worse than no check.
+MANOEUVRE_STATES = {"PURSUE", "RETURN_NAV", "RETURN_SYNC"}
 
 
 def rows(path):
@@ -76,23 +92,25 @@ def num(r, k):
 
 
 def load(path):
-    """[(t, unknown, dist, voxels, state)] time-sorted."""
+    """[(t, unknown, dist, voxels, state, reconnect_elapsed)] time-sorted."""
     out = []
     for r in rows(path):
         t = num(r, "sim_time_sec")
         if t is None:
             continue
         out.append((t, num(r, "unknown_fraction"), num(r, "distance_traveled"),
-                    num(r, "total_observed_voxels"), (r.get("state") or "")))
+                    num(r, "total_observed_voxels"), (r.get("state") or ""),
+                    num(r, "reconnect_elapsed_sec")))
     out.sort(key=lambda x: x[0])
     return out
 
 
 def cross(series, thresh):
     """First sim time unknown_fraction <= thresh, or None if never."""
-    for t, unk, _, _, _ in series:
+    for row in series:
+        unk = row[1]
         if unk is not None and unk <= thresh:
-            return t
+            return row[0]
     return None
 
 
@@ -125,13 +143,28 @@ def gap_trace(a, b, start=200.0, step=100.0):
 
 
 def firings(series):
-    """(episodes, seconds) spent in a reconnect manoeuvre state."""
+    """(episodes, seconds) visible in the CSV -- a LOWER BOUND on both.
+
+    The CSV samples on a ~5-10 s timer while manoeuvre episodes are routinely
+    shorter than that (p3b_hybrid_seed1 holds chases of 7.1, 6.4 and 3.7 s, and
+    p3b_hybrid_seed2's atlas firing leaves no manoeuvre row at all). So this
+    undercounts, and it undercounts precisely the FAST reconnections -- the ones
+    a good mode is supposed to produce. manoeuvre_events.py parses the planner
+    log, which emits one line per decision, and is the authority on firings; this
+    column exists only so the mechanism can be sanity-checked in the same table
+    as the outcome.
+
+    Two independent signals are OR'd because either alone can miss an episode:
+    the state label, and reconnect_elapsed_sec, which the planner counts up from
+    zero at the arm row.
+    """
     eps = 0
     secs = 0.0
     prev_in = False
     prev_t = None
-    for t, _, _, _, state in series:
-        cur = bool(RECON_RE.search(state))
+    for t, _, _, _, state, elapsed in series:
+        cur = (state.strip().upper() in MANOEUVRE_STATES
+               or (elapsed is not None and elapsed > 0.0))
         if cur and not prev_in:
             eps += 1
         if cur and prev_t is not None:
@@ -212,7 +245,11 @@ def main():
     for d in sorted(args.runs):
         if not os.path.isdir(d):
             continue
-        m = re.search(r"_([A-Za-z]+)_seed(\d+)$", os.path.basename(d))
+        # normpath first: a shell glob of `p7modes_*/` hands us a TRAILING
+        # SLASH, and basename("/a/b/") is "", so every directory silently failed
+        # to match and the tool printed "no runs matched" over a complete
+        # campaign. The overnight chain calls it with exactly that glob.
+        m = re.search(r"_([A-Za-z]+)_seed(\d+)$", os.path.basename(os.path.normpath(d)))
         if not m:
             continue
         r = measure(d, args.threshold)
@@ -275,9 +312,17 @@ def main():
                 continue
             d = st.median(ys) - st.median(xs)
             note = ""
-            if key == "tt" and (summary[arm]["cens"] or summary[ctl]["cens"]):
+            ncens = summary[arm]["cens"] + summary[ctl]["cens"]
+            if key == "tt" and ncens:
                 note = (f"EXCLUDES {summary[arm]['cens']} censored ({arm}), "
                         f"{summary[ctl]['cens']} ({ctl}) — worst cases dropped")
+            elif key == "lag" and ncens:
+                # Censored lags run to the end of the run, so they UNDERSTATE the
+                # true lag. Keeping them in is the conservative choice, but the
+                # delta is then a lower bound and must not be read as a point
+                # estimate.
+                note = (f"includes {ncens} censored lag(s), each a LOWER bound — "
+                        f"delta understates")
             print(f"{arm:<12}{label:<12}{d:>11.1f}{sep(xs, ys):>9}"
                   f"{perm_p(xs, ys):>9.3f}  {note}")
 
@@ -285,12 +330,28 @@ def main():
     n = ns[0] if ns else 0
     if n >= 1:
         import math
-        floor = 2.0 / math.comb(2 * n, n) if n else 1.0
+        floor = 2.0 / math.comb(2 * n, n)
         print(f"\npermutation p floor at n={n} per arm is {floor:.3f} — "
               f"{'nothing here can reach 0.05' if floor > 0.05 else 'p<0.05 is attainable'}. "
-              f"Three arms vs control: read 0.05 as ~0.017 family-wise.")
-    print("Any arm whose 'fire' total is 0 did not execute its manoeuvre and is a "
-          "relabelled control, not evidence about that policy.")
+              f"Three arms vs control: three comparisons, so read 0.05 as ~0.017 "
+              f"family-wise.")
+    else:
+        # Never silently omit this line: n hits 0 when an arm is entirely
+        # censored, which is exactly when a reader most needs telling that no
+        # p-value in the table above means anything.
+        print("\nat least one arm has NO uncensored run, so its median rests on "
+              "nothing — the deltas above are not interpretable for that arm. "
+              "The censored count IS the result there: a manoeuvre whose laggard "
+              "never finished is the worst outcome, not a missing one.")
+    inert = [a for a in summary if a != ctl and summary[a]["fire"] == 0]
+    if inert:
+        print(f"\n!! CSV-visible firings are 0 for: {', '.join(sorted(inert))}. "
+              f"That is a LOWER BOUND (the CSV samples every ~5-10 s and short "
+              f"episodes leave no row), so it does not by itself prove the "
+              f"manoeuvre never ran. Settle it with manoeuvre_events.py, which "
+              f"parses the planner log. If the log agrees the arm never fired, "
+              f"it is a relabelled '{ctl}' and its rows above are not evidence "
+              f"about that policy.")
     return 0
 
 
