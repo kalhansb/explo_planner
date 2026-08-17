@@ -208,7 +208,15 @@ MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
 MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
 # Release flicker guard: the team must read complete this long before a
 # manoeuvre releases (and the silence clock resets). 0 = first-read (legacy).
-RECONNECT_RELEASE_CONFIRM="$(flt "${RECONNECT_RELEASE_CONFIRM:-3}")"
+# MUST exceed coord_claim_ttl_sec (5.0), which the old default of 3 did not:
+# one packet holds a peer live for the whole TTL, so a 3 s window was satisfied
+# by that single packet and the guard admitted the very flicker it was written
+# to reject. The planner warns at startup if this is set at or below the TTL.
+RECONNECT_RELEASE_CONFIRM="$(flt "${RECONNECT_RELEASE_CONFIRM:-6}")"
+# Arrival tolerance for a manoeuvre destination (m), and the ceiling on one
+# manoeuvre drive leg (s). See shared_params.yaml for the sizing argument.
+RECONNECT_ARRIVE_TOL="$(flt "${RECONNECT_ARRIVE_TOL:-4.0}")"
+RECONNECT_NAV_MAX="$(flt "${RECONNECT_NAV_MAX:-600}")"
 # Pursuit gates. The old 180 s staleness vetoed every chase in the dense world
 # (outage tail 861 s ~ staleness at a terminal trigger), so the chase was dead
 # code here; 900 clears that tail. What keeps the wider window honest is
@@ -932,6 +940,8 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_midrun_max_wait_sec=$MIDRUN_MAX_WAIT"
   echo "reconnect_midrun_max_attempts=$MIDRUN_MAX_ATTEMPTS"
   echo "reconnect_release_confirm_sec=$RECONNECT_RELEASE_CONFIRM"
+  echo "reconnect_arrive_tol_m=$RECONNECT_ARRIVE_TOL"
+  echo "reconnect_nav_max_sec=$RECONNECT_NAV_MAX"
   echo "pursuit_staleness_max_sec=$PURSUIT_STALENESS"
   echo "pursuit_budget_max_sec=$PURSUIT_BUDGET_MAX"
   echo "pursuit_goal_stale_sec=$PURSUIT_GOAL_STALE"
@@ -1063,6 +1073,8 @@ for r in $ROBOTS; do
       -p reconnect_midrun_max_wait_sec:=$MIDRUN_MAX_WAIT \
       -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \
       -p reconnect_release_confirm_sec:=$RECONNECT_RELEASE_CONFIRM \
+      -p reconnect_arrive_tol_m:=$RECONNECT_ARRIVE_TOL \
+      -p reconnect_nav_max_sec:=$RECONNECT_NAV_MAX \
       -p pursuit_staleness_max_sec:=$PURSUIT_STALENESS \
       -p pursuit_budget_max_sec:=$PURSUIT_BUDGET_MAX \
       -p pursuit_goal_stale_sec:=$PURSUIT_GOAL_STALE \

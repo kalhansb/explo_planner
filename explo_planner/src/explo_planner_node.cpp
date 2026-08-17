@@ -687,14 +687,47 @@ private:
   bool   hold_escalate_          = true;
   double hold_escalate_wait_sec_ = 300.0;
   bool   hold_escalated_         = false;
+  // (reconnect_rec_, the pair the current manoeuvre was armed from, is declared
+  // with the other LastContact members below — the struct is only forward
+  // declared here.)
+  //
+  // Arrival tolerance for a manoeuvre destination. NOT goal_xy_tolerance (0.4 m,
+  // an exploration figure): a manoeuvre destination's whole value is
+  // CONNECTIVITY, not position, and 0.4 m demands a precision the point does not
+  // deserve. Two robots that each stop within this of the same meeting point are
+  // at most 2x this apart — 8 m at the default, against a link that was still
+  // carrying traffic at 54 m in the run that motivated the meeting point.
+  //
+  // This is also what makes an unreachable meeting point cheap. The midpoint is
+  // synthetic and never checked against the map, and the comms emulator kills a
+  // link by counting trunks within the Fresnel radius of the segment BETWEEN the
+  // pair — so a foliage-killed link puts the trunks on that segment and the
+  // midpoint at their centre. Demanding 0.4 m there means grinding against an
+  // obstacle until the budget expires; 4 m means arriving beside it and waiting,
+  // which is all the manoeuvre ever needed.
+  double reconnect_arrive_tol_m_ = 4.0;
+  // Ceiling on ONE manoeuvre drive leg. The distance-true budget in
+  // startReturnTo is deliberately exempt from nav_max_timeout_sec (see there),
+  // but "exempt" was unbounded: at nav_speed_estimate 0.15 x safety 3.0 = 20 s/m
+  // a 40 m leg authorises 800 s, and the meeting point sits about half the pair
+  // separation further out than the own-pose anchor it replaced. The invariant
+  // this restores: no single leg may cost more than the barrier it is driving
+  // toward, so a manoeuvre cannot outspend its own purpose. <= 0 = unbounded.
+  double reconnect_nav_max_sec_ = 600.0;
   // --- Release confirmation (flicker guard) ---
   // A single live claim releases a manoeuvre and resets the silence clock,
   // crediting a "reconnection" on a range-edge flicker that drained no map
   // deltas. A positive value requires the release condition to hold
-  // continuously this long. 0 = release on first read (legacy). Default 3 s,
-  // matching reconnect_confirm_sec: the same evidence standard is applied to
-  // ending a manoeuvre as to starting one.
-  double reconnect_release_confirm_sec_ = 3.0;
+  // continuously this long.
+  //
+  // MUST EXCEED coord_claim_ttl_sec, and the old default (3 s, matched to
+  // reconnect_confirm_sec) did not. Liveness is `receipt + ttl > now`, so ONE
+  // packet at t holds the peer live until t+5 unaided — and a 3 s window is
+  // satisfied at t+3 by that single packet. The guard let through exactly the
+  // flicker it was written to stop. 6 s needs the claim genuinely refreshed at
+  // least once (the beacon is 1 Hz), which a real reconnection does and a
+  // range-edge blip does not. 0 = release on first read (legacy).
+  double reconnect_release_confirm_sec_ = 6.0;
   rclcpp::Time release_ok_since_;
   bool         release_ok_armed_ = false;
 
@@ -942,6 +975,20 @@ private:
   // a one-way packet heard mid-chase would move our midpoint away from the
   // one the peer computes from its own (un-refreshed) record of us.
   LastContact  pursue_rec_;
+
+  // The pair the CURRENT manoeuvre was armed from — the same discipline as
+  // pursue_rec_, applied to the whole manoeuvre rather than just the chase.
+  // Every target a manoeuvre steers to is derived from THIS snapshot and never
+  // from a re-read of last_contact_: the peer computes its midpoint from its
+  // own record of the SAME contact event, so a one-way packet heard while we
+  // drove or waited would move our midpoint off the one the peer is driving to
+  // — which is exactly the non-convergence the meeting point exists to remove.
+  // The hold escalation is the site that needed it: it re-queried live, and a
+  // refresh between dispatch and barrier expiry made it escalate to a point
+  // the peer had no reason to be at. One snapshot per manoeuvre, taken by
+  // dispatchReconnect, cleared in transitionTo when reconnect_active_ falls.
+  LastContact  reconnect_rec_;
+  bool         have_reconnect_rec_ = false;
 
   // Human label of the current RETURN_NAV destination ("last-connected
   // anchor" or "meeting point"), set by startReturnTo for doReturnNav's logs.
@@ -1614,9 +1661,26 @@ ExploPlannerNode::ExploPlannerNode()
   reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
-  reconnect_release_confirm_sec_ = dp("reconnect_release_confirm_sec", 3.0);
+  reconnect_release_confirm_sec_ = dp("reconnect_release_confirm_sec", 6.0);
   hold_escalate_                 = dp("hold_escalate", true);
   hold_escalate_wait_sec_        = dp("hold_escalate_wait_sec", 300.0);
+  reconnect_arrive_tol_m_        = dp("reconnect_arrive_tol_m", 4.0);
+  reconnect_nav_max_sec_         = dp("reconnect_nav_max_sec", 600.0);
+  // A release window at or below the claim TTL is not a flicker guard: one
+  // packet keeps the peer live for the whole TTL, so any window inside it is
+  // satisfied without the claim ever being refreshed. Warn rather than clamp —
+  // 0 is a legitimate "legacy behaviour" setting for an A/B, and silently
+  // moving a configured value would make the manifest a lie.
+  if (reconnect_release_confirm_sec_ > 0.0 &&
+      reconnect_release_confirm_sec_ <= coord_claim_ttl_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "reconnect_release_confirm_sec=%.1f is <= coord_claim_ttl_sec=%.1f: a "
+        "SINGLE packet holds the peer live for the whole TTL, so this window "
+        "is satisfied without the claim being refreshed and the flicker guard "
+        "is inert. Use a value above %.1f.",
+        reconnect_release_confirm_sec_, coord_claim_ttl_sec_,
+        coord_claim_ttl_sec_);
+  }
   if (reconnect_midrun_silence_sec_ > 0.0 &&
       reconnect_midrun_silence_sec_ < 200.0) {
     RCLCPP_WARN(get_logger(),
@@ -1800,6 +1864,20 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamStr("node_name", std::string(this->get_name()));
     exp_log_->addParamStr("robot_name", robot_name_);
     exp_log_->addParamStr("reconnect_mode", reconnectModeName(reconnect_mode_));
+    // THE arm this run belongs to, and the field an analysis must group by.
+    //
+    // reconnect_mode alone is NOT the arm. The control arm is "no reconnection
+    // at all", which is not a reconnect_mode value — it is expressed as
+    // rendezvous_enabled=false, and the harness has to pass SOME mode alongside
+    // it (it passes "hybrid"). So a control run is stamped reconnect_mode
+    // "hybrid", and anything grouping on that column pools the control into the
+    // hybrid cell: the hybrid mean becomes the average of treatment and
+    // control, and the control arm ceases to exist. The information was always
+    // in the file, split across two fields; nothing was reading both. This
+    // collapses them once, here, where the planner knows the answer.
+    exp_log_->addParamStr("arm", rendezvous_enabled_
+                                     ? reconnectModeName(reconnect_mode_)
+                                     : "off");
     exp_log_->addParamBool("use_sim_time", this->get_parameter("use_sim_time")
                                                .as_bool());
     exp_log_->addParamStr("output_csv", output_csv_);
@@ -1833,6 +1911,8 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("pursuit_explore_max", pursuit_explore_max_);
     exp_log_->addParamBool("hold_escalate", hold_escalate_);
     exp_log_->addParamNum("hold_escalate_wait_sec", hold_escalate_wait_sec_);
+    exp_log_->addParamNum("reconnect_arrive_tol_m", reconnect_arrive_tol_m_);
+    exp_log_->addParamNum("reconnect_nav_max_sec", reconnect_nav_max_sec_);
     exp_log_->addParamNum("done_unknown_fraction", done_unknown_fraction_);
     exp_log_->addParamNum("done_min_consecutive_steps",
                           done_min_consecutive_steps_);
@@ -2605,6 +2685,9 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
     }
     reconnect_active_ = false;
     hold_escalated_ = false;
+    // The armed-from pair belongs to the manoeuvre that just ended; the next
+    // dispatch takes its own snapshot from its own query.
+    have_reconnect_rec_ = false;
     // Mid-run cooldown starts HERE, at manoeuvre end — missing_for stays
     // satisfied for the whole outage, so a dispatch-stamped cooldown would
     // expire during the manoeuvre and re-dispatch on the first PLAN tick.
@@ -3551,6 +3634,13 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   dispatch_peer_age_sec_ =
       rec ? (this->now() - rec->stamp).seconds() : -1.0;
   reconnect_decline_reason_.clear();
+  // Freeze the pair THIS manoeuvre is armed from. Everything downstream that
+  // needs a meeting point — the RENDEZVOUS/HYBRID dispatch below, and the hold
+  // escalation when this manoeuvre's barrier expires — reads the snapshot, so a
+  // packet arriving mid-manoeuvre cannot move our midpoint away from the one
+  // the peer computes from the same contact event. See reconnect_rec_.
+  have_reconnect_rec_ = (rec != nullptr);
+  if (rec != nullptr) reconnect_rec_ = *rec;
   if (rec == nullptr) {
     // The missing teammate was never heard at all (the anchor came from a
     // different peer), so there is nothing to chase and no pair to midpoint.
@@ -3722,10 +3812,18 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   // to it dies tens of metres short of a destination whose whole value is
   // ARRIVING (the connected geometry). Distance-true budget, floor kept; the
   // no-progress window remains the stuck-robot watchdog.
+  //
+  // Exempt from THAT ceiling, but not unbounded — reconnect_nav_max_sec stops a
+  // leg outspending the barrier it drives toward. The 20 s/m model rate is 3x
+  // conservative, so this binds only on a leg failing SLOWLY; one failing fast
+  // still exits on the 15 s no-progress window, the primary guard, unchanged.
   nav_budget_sec_ = std::max(
       nav_min_timeout_sec_,
       static_cast<double>(dist) * nav_safety_factor_ /
           std::max(nav_speed_est_mps_, 1e-3));
+  if (reconnect_nav_max_sec_ > 0.0) {
+    nav_budget_sec_ = std::min(nav_budget_sec_, reconnect_nav_max_sec_);
+  }
   progress_check_time_ = state_enter_time_;
   progress_check_dist_ = cumulative_distance_;
 }
@@ -3759,10 +3857,14 @@ void ExploPlannerNode::doReturnNav() {
   const float dx = robot_pos.x() - current_goal_.position.x();
   const float dy = robot_pos.y() - current_goal_.position.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
-  if (dist < goal_xy_tol_) {
+  // reconnect_arrive_tol_m_, NOT goal_xy_tol_: the destination's value is
+  // connectivity, not position (see the member). Both robots stopping within
+  // this of the same meeting point leaves them <= 2x it apart, and it turns an
+  // obstructed midpoint from a budget burn into an arrival beside it.
+  if (dist < static_cast<float>(reconnect_arrive_tol_m_)) {
     RCLCPP_INFO(get_logger(),
-        "Rendezvous: reached %s (dist=%.2f) -> waiting for team.",
-        return_dest_label_.c_str(), dist);
+        "Rendezvous: reached %s (dist=%.2f, tol=%.1f) -> waiting for team.",
+        return_dest_label_.c_str(), dist, reconnect_arrive_tol_m_);
     transitionTo(State::RETURN_SYNC, "return-arrived");
     return;
   }
@@ -3849,31 +3951,53 @@ void ExploPlannerNode::doReturnSync() {
     if (hold_escalate_ && !hold_escalated_) {
       hold_escalated_ = true;  // sticky: an unreachable target must not
                                // re-escalate on every expiry forever
-      // Escalate to the SAME point the dispatch would pick — the midpoint of
-      // the last-contact pair when there is one. Escalating to this robot's own
-      // anchor sent a waiting robot to a point one comms range from where its
-      // waiting peer would go, which is the non-convergence documented in
-      // dispatchReconnect; it has to be fixed in both places or a hold simply
-      // reintroduces it after the dispatch avoided it.
-      std::string esc_peer;
-      const LastContact* esc_rec = missingPeerRecord(&esc_peer);
-      const Eigen::Vector3f esc_target =
-          esc_rec ? meetingPoint(esc_rec->self_pose, esc_rec->peer_pose)
-                  : last_connected_anchor_;
-      const char* esc_what = esc_rec ? "meeting point" : "last-connected anchor";
-      const float dx = esc_target.x() - latest_pos_.x();
-      const float dy = esc_target.y() - latest_pos_.y();
-      if (std::sqrt(dx * dx + dy * dy) > goal_xy_tol_ * 2.0f) {
-        RCLCPP_WARN(get_logger(),
-            "Rendezvous: waited %.0fs for team (%d/%d present) -> escalating "
-            "to the %s (%.2f, %.2f) before giving up.",
-            waited, active, rendezvous_expected_peers_, esc_what,
-            esc_target.x(), esc_target.y());
-        startReturnTo(esc_target, esc_what, "hold-escalate");
-        return;
+      // Escalate to the SAME point the dispatch picked — the midpoint of the
+      // pair THIS manoeuvre was armed from (reconnect_rec_, not a re-read:
+      // a packet heard while we waited must not move the target off the one
+      // the peer is driving to). Escalating to this robot's own anchor sent a
+      // waiting robot to a point one comms range from where its waiting peer
+      // would go, which is the non-convergence documented in dispatchReconnect;
+      // it has to be fixed in both places or a hold reintroduces it after the
+      // dispatch avoided it.
+      //
+      // EXCEPT under pure PURSUIT, which has no agreed fallback point BY
+      // DESIGN — that absence is the A/B against hybrid (see dispatchReconnect
+      // and pursuitFallback, which both say so). A mode-blind escalation makes
+      // pursuit perform hybrid's fallback ~300 s later and erases the contrast
+      // the arm exists to measure, so pursuit keeps the own-anchor escalation
+      // it had before the meeting point existed and is unchanged by it.
+      const bool use_meeting =
+          reconnect_mode_ != ReconnectMode::PURSUIT && have_reconnect_rec_;
+      Eigen::Vector3f esc_target = Eigen::Vector3f::Zero();
+      const char* esc_what = nullptr;
+      if (use_meeting) {
+        esc_target = meetingPoint(reconnect_rec_.self_pose,
+                                  reconnect_rec_.peer_pose);
+        esc_what = "meeting point";
+      } else if (have_anchor_) {
+        esc_target = last_connected_anchor_;
+        esc_what = "last-connected anchor";
       }
-      // Already there: escalating would just re-wait in place — fall through
-      // and give up now.
+      // No anchor at all means the peer was never heard this run; there is
+      // nowhere to escalate TO, and the zero vector is the world origin, not a
+      // destination. Fall through and give up.
+      if (esc_what != nullptr) {
+        const float dx = esc_target.x() - latest_pos_.x();
+        const float dy = esc_target.y() - latest_pos_.y();
+        // Same arrival tolerance the drive would use: escalating to a point we
+        // are already "at" by that standard would re-wait in place.
+        if (std::sqrt(dx * dx + dy * dy) >
+            static_cast<float>(reconnect_arrive_tol_m_)) {
+          RCLCPP_WARN(get_logger(),
+              "Rendezvous: waited %.0fs for team (%d/%d present) -> escalating "
+              "to the %s (%.2f, %.2f) before giving up.",
+              waited, active, rendezvous_expected_peers_, esc_what,
+              esc_target.x(), esc_target.y());
+          startReturnTo(esc_target, esc_what, "hold-escalate");
+          return;
+        }
+      }
+      // Already there (or nowhere to go): fall through and give up now.
     }
     RCLCPP_WARN(get_logger(),
         "Rendezvous: waited %.0fs for team (%d/%d present); "
@@ -4088,10 +4212,17 @@ void ExploPlannerNode::armPursuitWaypoint() {
   // to it dies tens of metres short of a destination whose whole value is
   // ARRIVING (the connected geometry). Distance-true budget, floor kept; the
   // no-progress window remains the stuck-robot watchdog.
+  //
+  // Same reconnect_nav_max_sec ceiling as startReturnTo. Usually slack here —
+  // pursue_budget_sec_ caps the whole chase and normally binds first — but a
+  // single waypoint leg must not be able to exceed it either.
   nav_budget_sec_ = std::max(
       nav_min_timeout_sec_,
       static_cast<double>(dist) * nav_safety_factor_ /
           std::max(nav_speed_est_mps_, 1e-3));
+  if (reconnect_nav_max_sec_ > 0.0) {
+    nav_budget_sec_ = std::min(nav_budget_sec_, reconnect_nav_max_sec_);
+  }
   progress_check_time_ = state_enter_time_;
   progress_check_dist_ = cumulative_distance_;
 }

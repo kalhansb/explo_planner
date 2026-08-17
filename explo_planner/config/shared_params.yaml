@@ -408,13 +408,44 @@
     ground_search_above_m: 1.0      # ... and above
     ground_stack_max_m: 0.6         # max occupied stack still treated as ground
 
-    # FOV evaluation (matches simulated RGBD: 320x240, 60deg HFOV)
-    fov_hfov: 1.047              # 60 degrees
-    fov_vfov: 0.785              # ~45 degrees (from 320x240 aspect)
+    # FOV evaluation: the sensor geometry the EIG raycast SIMULATES when it
+    # scores a candidate viewpoint. This is the planner's model of the sensor,
+    # not the sensor -- nothing here configures a driver.
+    #
+    # It used to be a 60x45 deg RGB-D frustum, which was never the sensor these
+    # runs use. Every shipped exploration arm is lidar: mapping:=dscovox_lidar
+    # off /<r>/velodyne_points, the sim husky's SDF is 1800 azimuth samples over
+    # +-pi by 16 elevation samples over +-0.261799 rad, and the campaign that
+    # produced the 2026_08_02 ablation recorded sensors: lidar_only. The field
+    # a_occ/a_free being scored here was built by that lidar. So the evaluator
+    # was scoring viewpoints for a camera nobody carries.
+    #
+    # VERTICAL is now faithful: 0.5236 rad is the VLP-16's +-15 deg, matching
+    # the SDF's +-0.261799 exactly, and 16 rays is one per beam. This narrows
+    # the modelled wedge -- at 10 m it now rises 2.68 m rather than 4.14 m, so
+    # roi_max_z (4.0) still contains it with margin.
+    #
+    # HORIZONTAL IS STILL WRONG AND DELIBERATELY UNTOUCHED. 1.047 rad is a
+    # 60 deg stand-in for a sensor that sees 360 deg, so the model credits a
+    # viewpoint for one sixth of what it would actually observe and makes yaw
+    # carry information it does not carry. Fixing it is not a config edit: under
+    # a full-azimuth model every candidate_n_yaw sample at one position scores
+    # identically, inter-candidate ray bundles overlap far more (which shrinks
+    # the very spread the utility needs -- see info_gain_std in the step CSV),
+    # and the ray count per candidate goes up ~8x. It needs a measured branch,
+    # not a number change here.
+    #
+    # DO NOT raise fov_max_range to match scovox's 20 m ingest. It is overloaded
+    # three ways: it sets the coordination claim radius when
+    # coord_claim_radius_m is 0/auto, clamps the exploitation vantage standoff,
+    # and sizes the Burgard discount kernel. Raising it silently triples the
+    # claim disc.
+    fov_hfov: 1.047              # 60 deg -- stand-in, see above
+    fov_vfov: 0.5236             # +-15 deg, VLP-16
     fov_min_range: 0.3
     fov_max_range: 10.0
     fov_h_rays: 16
-    fov_v_rays: 12
+    fov_v_rays: 16               # one ray per VLP-16 beam
     fov_occ_stop: 0.7
 
     # ----------------------------------------------------------------
@@ -523,9 +554,16 @@
     # per-peer last-contact record (my pose, the peer's advertised pose, its
     # declared goal) and this mode picks the manoeuvre when exploration
     # exhausts with a teammate out of comms:
-    #   "rendezvous" — the legacy return-to-own-anchor barrier (pre-mesh
-    #     behaviour, still sound by symmetry: every robot at its own
-    #     last-contact pose restores the pair distance the link had).
+    #   "rendezvous" — both robots drive to the deterministic meeting point
+    #     (same construction hybrid falls back to) and wait, so the arms
+    #     differ in WHEN they go to a meeting point, not in where it is.
+    #     It used to be return-to-own-anchor, justified "by symmetry" — every
+    #     robot at its own last-contact pose restores the pair distance the
+    #     link had. That reasoning was wrong: the link dies at the EDGE of
+    #     range, so the two anchors are one comms range apart by construction
+    #     and the robots wait at opposite ends of the gap that separated them.
+    #     Measured in p9log_rendezvous_seed1: 54 m apart, five manoeuvres,
+    #     none reconnected, 918 s + 1137 s of a 3439 s run spent on it.
     #   "pursuit"    — chase the missing peer's last declared goal (trail
     #     head), then its last heard pose, on the budget below; budget spent
     #     -> hold in place and beacon. No agreed fallback point (that is the
@@ -572,6 +610,48 @@
     # the plot — so past three minutes the guaranteed fallback beats any
     # chase. <= 0 = no gate.
     pursuit_staleness_max_sec: 180.0
+    # Arrival tolerance for a MANOEUVRE destination (m). Deliberately not
+    # goal_xy_tolerance (0.4): that is an exploration figure, and a manoeuvre
+    # destination's value is CONNECTIVITY, not position. Two robots each within
+    # 4 m of the same meeting point are <= 8 m apart, against a link that was
+    # still carrying traffic at 54 m in the run that motivated the meeting
+    # point — so the extra precision buys nothing and costs a great deal.
+    #
+    # It costs a great deal because the meeting point is a synthetic coordinate
+    # that is never checked against the map, and the comms emulator kills a link
+    # by counting trunks within the Fresnel radius of the segment BETWEEN the
+    # pair: a foliage-killed link puts the trunks on that segment and the
+    # midpoint at their centre. At 0.4 m the robot grinds against an obstacle
+    # until its budget expires; at 4 m it arrives beside it and waits, which is
+    # all the manoeuvre ever needed. Also keeps the pair outside
+    # proximity_hold_dist_m (5.0) at rest, so two arriving robots do not sit in
+    # each other's yield disc.
+    reconnect_arrive_tol_m: 4.0
+    # Ceiling on ONE manoeuvre drive leg (s). <= 0 = unbounded.
+    #
+    # startReturnTo exempts manoeuvre legs from nav_max_timeout_sec on purpose
+    # (a return clipped to 180 s = 9 m at the model rate dies short of a
+    # destination whose whole value is arriving), but "exempt" was unbounded: at
+    # nav_speed_estimate 0.15 x safety 3.0 = 20 s/m a 40 m leg authorises 800 s,
+    # and the meeting point sits ~half the pair separation further out than the
+    # own-pose anchor it replaced. 600 s restores an invariant — no single leg
+    # may cost more than the barrier it drives toward. It is a backstop, not the
+    # primary guard: the huskys do ~0.8 m/s against a 0.15 m/s model, so this
+    # binds only on a leg failing SLOWLY, and one failing fast still exits on
+    # the 15 s / 0.2 m no-progress window.
+    reconnect_nav_max_sec: 600.0
+    # Flicker guard: how long the release condition must hold CONTINUOUSLY
+    # before a manoeuvre ends. 0 = release on first read (legacy).
+    #
+    # MUST EXCEED coord_claim_ttl_sec (5.0) — the node warns at startup if it
+    # does not. Liveness is `receipt + ttl > now`, so one packet at t holds the
+    # peer live until t+5 unaided, and the old 3 s default was satisfied at t+3
+    # by that single packet: the guard admitted exactly the range-edge flicker
+    # it was written to reject, ending the manoeuvre, resetting the silence
+    # clock and logging outcome="reconnected" on a blip that drained no map
+    # deltas. 6 s requires the claim genuinely refreshed at least once (the
+    # beacon is 1 Hz), which a real reconnection does and a blip does not.
+    reconnect_release_confirm_sec: 6.0
 
     # ----------------------------------------------------------------
     # Proximity stop (coordinated yield)
