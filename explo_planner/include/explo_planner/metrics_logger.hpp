@@ -34,6 +34,15 @@ struct StepMetrics {
   // candidates; selected_* are the components for the chosen candidate
   // (so post-hoc analysis can attribute the pick to either term).
   float  mean_info_gain        = 0.0f;
+  // Population std of info_gain ACROSS the candidate set on this step — how
+  // much the viewpoints actually disagree about information, which the mean
+  // cannot show. U = info/(eps+cost) degenerates to argmin-cost as this goes
+  // to zero: with every candidate scoring alike, the numerator stops
+  // discriminating and only distance decides. It is therefore the quantity
+  // that says whether a change to the FOV model helped or flattened the
+  // field. NOTE: this is NOT adjacent to mean_info_gain in the CSV — see the
+  // append-only note in metrics_logger.cpp.
+  float  info_gain_std         = 0.0f;
   float  mean_path_cost        = 0.0f;
   float  selected_info_gain    = 0.0f;
   float  selected_path_cost    = 0.0f;

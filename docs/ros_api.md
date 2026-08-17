@@ -572,6 +572,7 @@ to `output_csv`. Columns, in order:
 | `distance_traveled` | Integrated from tf, teleport-guarded (`max_pose_jump_m`). |
 | `selected_score`, `plan_time_ms`, `mean_eig`, `mean_entropy`, `mean_variance` | Selection diagnostics. |
 | `mean_info_gain`, `mean_path_cost`, `selected_info_gain`, `selected_path_cost`, `selected_utility` | Utility decomposition (`U = gain / (0.1 + cost)`) for post-hoc attribution. |
+| `info_gain_std` | Population std of `info_gain` across this step's candidates (last column, not beside `mean_info_gain` — the schema only grows at the end). Small relative to `mean_info_gain` means the candidates barely differ in information and the selection has degenerated to argmin-cost. |
 | `coord_active_peers`, `rejected_by_minpos`, `rejected_by_unreachable` | Coordination diagnostics; `coord_active_peers` should read team size − 1 in a healthy run. |
 | `prox_hold_count`, `prox_hold_total_sec` | Cumulative proximity holds (difference consecutive rows for per-step deltas). |
 

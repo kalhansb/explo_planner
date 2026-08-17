@@ -977,6 +977,7 @@ private:
   // Per-tick utility / coord diagnostics (filled by doPlan, drained by
   // doLogStep into the StepMetrics row).
   float pending_mean_info_gain_       = 0.0f;
+  float pending_info_gain_std_        = 0.0f;
   float pending_mean_path_cost_       = 0.0f;
   float pending_selected_info_gain_   = 0.0f;
   float pending_selected_path_cost_   = 0.0f;
@@ -3082,6 +3083,25 @@ void ExploPlannerNode::doPlan() {
       candidates.empty()
           ? 0.0f
           : sum_info / static_cast<float>(candidates.size());
+  // Spread of info_gain across the candidate set. Second pass over the vector
+  // already built above — no extra raycast — and deliberately two-pass rather
+  // than the sum-of-squares shortcut: info_gain runs ~2.5e3 with a spread two
+  // orders of magnitude smaller, so E[x^2] - E[x]^2 in float cancels away most
+  // of the answer. Population (not sample) std, over the same denominator as
+  // the mean above, so the two are directly comparable.
+  {
+    double ss = 0.0;
+    const double mean = pending_mean_info_gain_;
+    for (float g : info_gain) {
+      const double d = static_cast<double>(g) - mean;
+      ss += d * d;
+    }
+    pending_info_gain_std_ =
+        info_gain.empty()
+            ? 0.0f
+            : static_cast<float>(std::sqrt(ss / static_cast<double>(
+                                                    info_gain.size())));
+  }
   pending_mean_path_cost_ =
       n_cost_finite > 0
           ? sum_cost_finite / static_cast<float>(n_cost_finite)
@@ -3098,11 +3118,16 @@ void ExploPlannerNode::doPlan() {
 
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
-      "info=%.2f cost=%.2f [%zu cand, close=%d map=%d unreach=%d blk=%d "
+      "info=%.2f cost=%.2f field=%.2f±%.2f "
+      "[%zu cand, close=%d map=%d unreach=%d blk=%d "
       "minpos=%d, peers=%zu, %.1fms]",
       step_, current_goal_.position.x(), current_goal_.position.y(),
       current_goal_.yaw, current_goal_.score,
       pending_selected_info_gain_, pending_selected_path_cost_,
+      // `field` is mean±std of info_gain over ALL candidates, against which
+      // `info` (the winner's) reads as a z-score by eye. A std that collapses
+      // toward zero means the utility has stopped choosing on information.
+      pending_mean_info_gain_, pending_info_gain_std_,
       candidates.size(), rejected_too_close, rejected_map,
       rejected_unreachable, rejected_blacklist, rejected_minpos,
       coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
@@ -5063,6 +5088,7 @@ void ExploPlannerNode::doLogStep() {
 
   // Drain utility / coord diagnostics from doPlan().
   m.mean_info_gain      = pending_mean_info_gain_;
+  m.info_gain_std       = pending_info_gain_std_;
   m.mean_path_cost      = pending_mean_path_cost_;
   m.selected_info_gain  = pending_selected_info_gain_;
   m.selected_path_cost  = pending_selected_path_cost_;
@@ -5874,6 +5900,7 @@ void ExploPlannerNode::doExploitPlan() {
       pending_plan_ms_ = static_cast<float>(
           (this->now() - plan_start).nanoseconds() * 1e-6);
       pending_mean_info_gain_          = 0.0f;
+      pending_info_gain_std_           = 0.0f;
       pending_mean_path_cost_          = 0.0f;
       pending_selected_info_gain_      = 0.0f;
       pending_selected_path_cost_      = 0.0f;
@@ -5927,6 +5954,7 @@ void ExploPlannerNode::doExploitPlan() {
   // don't carry stale exploration values: path-cost columns hold the travel
   // cost to the chosen vantage; info-gain is not meaningful here.
   pending_mean_info_gain_          = 0.0f;
+  pending_info_gain_std_           = 0.0f;
   pending_mean_path_cost_          = best_cost;
   pending_selected_info_gain_      = 0.0f;
   pending_selected_path_cost_      = best_cost;

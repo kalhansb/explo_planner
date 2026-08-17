@@ -39,7 +39,10 @@ void MetricsLogger::writeHeader() {
         // run archives are read positionally by more than one script, and
         // widening the middle of the schema silently re-labels every one of them.
         << "state,reconnect_range_to_goal_m,reconnect_elapsed_sec,"
-        << "unknown_fraction,coverage_source\n";
+        << "unknown_fraction,coverage_source,"
+        // Same rule: belongs beside mean_info_gain by meaning, but goes here
+        // because the schema only ever grows at the right-hand end.
+        << "info_gain_std\n";
   header_written_ = true;
 }
 
@@ -75,7 +78,8 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.reconnect_range_to_goal_m << ","
         << m.reconnect_elapsed_sec << ","
         << m.unknown_fraction << ","
-        << m.coverage_source << "\n";
+        << m.coverage_source << ","
+        << m.info_gain_std << "\n";
   file_.flush();
 }
 
