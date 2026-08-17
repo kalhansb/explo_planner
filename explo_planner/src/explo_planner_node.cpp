@@ -223,6 +223,13 @@ private:
   void doPursue();
   void pursuitFallback(const char* why);
   void holdForTeam(const char* why);
+  // Abandon the current manoeuvre and go back to exploring. Shared by pure
+  // pursuit's fallback and the mid-run barrier expiry — both mean "this
+  // attempt is over and there is still map to cover".
+  void resumeExploring(const char* why);
+  // Pure pursuit's fallback, tried before holdForTeam. Returns false when the
+  // fallback is disabled or its budget is spent, and the caller holds.
+  bool pursuitExploreFallback(const char* why);
   void standDownExploitation();
   // Presence-only intent (goal = own pose), kept fresh by the heartbeat.
   // Published at every barrier hold and at DONE-idle entry: a parked robot
@@ -506,6 +513,29 @@ private:
   // trail (an uncoverable trail ends the chase at an arbitrary disconnected
   // point — worse than the mode's own fallback). <= 0 = never split.
   double pursuit_goal_stale_sec_ = 180.0;
+  // Pure pursuit's fallback when the chase cannot start or is spent: keep
+  // EXPLORING rather than park.
+  //
+  // Parking is a fixed point. Two robots that both hold cannot reconnect —
+  // neither is moving, so the geometry that broke the link never changes —
+  // and p7modes measured exactly that: 5 of 6 holds never reconnected, the
+  // single recovery came from the PEER still driving, and one mutual hold
+  // cost a mission whose maps were complete but split. A robot that goes
+  // back to exploring is still covering ground, still earning the mission's
+  // objective, and can regain the link by luck; a parked one can only be
+  // found. Strictly dominated, so pursuit stops doing it.
+  //
+  // Bounded, because the terminal dispatch is the run's ending: reaching DONE
+  // needs coverage saturation AND a complete team, so an unbounded
+  // explore-fallback would re-saturate, re-dispatch and re-explore until the
+  // duration cap, converting runs that would have finished into censored
+  // ones. After this many fallbacks the robot reverts to holdForTeam and the
+  // barrier (plus hold_escalate) guarantees an ending. The default matches
+  // reconnect_midrun_max_attempts so a mid-run chase that declines can resume
+  // exploring on every one of its attempts.
+  bool pursuit_explore_fallback_ = true;
+  int  pursuit_explore_max_      = 6;
+  int  pursuit_explores_         = 0;
   // How long the team must have been INCOMPLETE before a manoeuvre may arm.
   //
   // Without this the arm test (peer missing, one read of the claim table) and
@@ -1384,6 +1414,8 @@ ExploPlannerNode::ExploPlannerNode()
   pursuit_budget_max_sec_    = dp("pursuit_budget_max_sec", 240.0);
   pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 900.0);
   pursuit_goal_stale_sec_    = dp("pursuit_goal_stale_sec", 180.0);
+  pursuit_explore_fallback_  = dp("pursuit_explore_fallback", true);
+  pursuit_explore_max_       = dp("pursuit_explore_max", 6);
   reconnect_confirm_sec_     = dp("reconnect_confirm_sec", 3.0);
   if (reconnect_confirm_sec_ <= 0.0) {
     RCLCPP_WARN(get_logger(),
@@ -3121,8 +3153,12 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
     return true;
   }
   if (reconnect_mode_ == ReconnectMode::PURSUIT) {
-    // Pure pursuit has no agreed fallback point by design (that is the
-    // A/B against hybrid): a chase that never started waits right here.
+    // Pure pursuit has no agreed fallback point by design (that is the A/B
+    // against hybrid). A chase that never started therefore goes back to
+    // exploring while its fallback budget lasts, and only parks here once
+    // that is spent — parking early is the mutual-hold fixed point that cost
+    // a p7modes mission (see pursuit_explore_fallback_).
+    if (pursuitExploreFallback(reason)) return true;
     holdForTeam(reason);
     return true;
   }
@@ -3689,7 +3725,54 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
                   "meeting point", why);
     return;
   }
+  if (pursuitExploreFallback(why)) return;
   holdForTeam(why);
+}
+
+// Abandon the manoeuvre and go back to exploring. Mirrors holdForTeam's exit
+// hygiene (a driving state must be stopped explicitly; an open vantage claim
+// must be demoted) but lands in PLAN instead of at a barrier. The coverage
+// streak is cleared because the robot is genuinely resuming, not finishing:
+// leaving it satisfied would re-trigger the same dispatch on the next tick.
+void ExploPlannerNode::resumeExploring(const char* why) {
+  standDownExploitation();
+  abandonNavGoal(why);
+  // Close the mid-run bookkeeping HERE and not only in transitionTo. That
+  // clock block is gated on reconnect_active_, and a fallback whose chase was
+  // DECLINED never armed a manoeuvre, so reconnect_active_ is false and the
+  // block does not run. Without this the cooldown would never stamp — every
+  // PLAN tick still sees missing_for past the threshold, so the robot would
+  // re-dispatch and re-decline until it had burned all its attempts within
+  // seconds — and reconnect_terminal_ would stay false, letting a LATER
+  // terminal barrier resume exploring instead of ending the run.
+  if (!reconnect_terminal_) {
+    midrun_last_end_    = this->now();
+    midrun_end_armed_   = true;
+    reconnect_terminal_ = true;
+  }
+  coverage_done_streak_ = 0;
+  have_active_intent_   = false;
+  transitionTo(State::PLAN);
+}
+
+// See pursuit_explore_fallback_ for why parking is the dominated option.
+bool ExploPlannerNode::pursuitExploreFallback(const char* why) {
+  if (!pursuit_explore_fallback_) return false;
+  if (pursuit_explores_ >= pursuit_explore_max_) {
+    RCLCPP_INFO(get_logger(),
+        "Pursuit: explore-fallback budget spent (%d/%d) [%s] -> holding for "
+        "the team instead.",
+        pursuit_explores_, pursuit_explore_max_, why);
+    return false;
+  }
+  ++pursuit_explores_;
+  RCLCPP_INFO(get_logger(),
+      "Pursuit: no chase available [%s] -> resuming exploration "
+      "(fallback %d/%d). A moving robot can still regain the link; a parked "
+      "one can only be found.",
+      why, pursuit_explores_, pursuit_explore_max_);
+  resumeExploring(why);
+  return true;
 }
 
 // Raise the RETURN_SYNC barrier at the CURRENT pose. Used by pure-pursuit

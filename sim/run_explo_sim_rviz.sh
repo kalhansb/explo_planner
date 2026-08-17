@@ -213,6 +213,14 @@ PURSUIT_STALENESS="$(flt "${PURSUIT_STALENESS:-900}")"
 # RDV_MAX_WAIT (600) would let a chase outlive the wait that justified it.
 PURSUIT_BUDGET_MAX="$(flt "${PURSUIT_BUDGET_MAX:-600}")"
 PURSUIT_GOAL_STALE="$(flt "${PURSUIT_GOAL_STALE:-180}")"
+# Pure pursuit's fallback: keep exploring rather than park. Parking is a fixed
+# point (two held robots cannot reconnect — p7modes: 5 of 6 holds never did,
+# and one mutual hold cost a mission). Bounded, then it reverts to the hold so
+# the terminal barrier still guarantees an ending.
+PURSUIT_EXPLORE_FALLBACK="${PURSUIT_EXPLORE_FALLBACK:-1}"
+PURSUIT_EXPLORE_FALLBACK_ARG=$([ "$PURSUIT_EXPLORE_FALLBACK" = "1" ] \
+  && echo true || echo false)
+PURSUIT_EXPLORE_MAX="${PURSUIT_EXPLORE_MAX:-6}"
 # Terminal-hold escalation: on barrier expiry drive once to the last-connected
 # anchor and wait HOLD_ESCALATE_WAIT more before giving up (breaks the
 # mutual-hold deadlock that cost the p7modes pursuit_seed2 mission).
@@ -880,6 +888,8 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "pursuit_staleness_max_sec=$PURSUIT_STALENESS"
   echo "pursuit_budget_max_sec=$PURSUIT_BUDGET_MAX"
   echo "pursuit_goal_stale_sec=$PURSUIT_GOAL_STALE"
+  echo "pursuit_explore_fallback=$PURSUIT_EXPLORE_FALLBACK_ARG"
+  echo "pursuit_explore_max=$PURSUIT_EXPLORE_MAX"
   echo "hold_escalate=$HOLD_ESCALATE_ARG"
   echo "hold_escalate_wait_sec=$HOLD_ESCALATE_WAIT"
   echo "comms=$COMMS"
@@ -993,6 +1003,8 @@ for r in $ROBOTS; do
       -p pursuit_staleness_max_sec:=$PURSUIT_STALENESS \
       -p pursuit_budget_max_sec:=$PURSUIT_BUDGET_MAX \
       -p pursuit_goal_stale_sec:=$PURSUIT_GOAL_STALE \
+      -p pursuit_explore_fallback:=$PURSUIT_EXPLORE_FALLBACK_ARG \
+      -p pursuit_explore_max:=$PURSUIT_EXPLORE_MAX \
       -p hold_escalate:=$HOLD_ESCALATE_ARG \
       -p hold_escalate_wait_sec:=$HOLD_ESCALATE_WAIT \
       -p exploitation_enabled:=$EXPLOIT_ARG \
