@@ -10,6 +10,38 @@ LEADER's crossing time near-invariant to comms while the laggard's moved by
 minutes. t_team is also what the run's own stop rule fires on, so it is the
 quantity the experiment actually pays for in wall clock.
 
+BUT READ `lag` FIRST -- IT IS THE ONLY THING THE TREATMENT CAN TOUCH.
+
+    t_team = t_lead + lag
+
+The manoeuvre under test is TERMINAL. finishOrRendezvous() is the sole entry
+point to all three modes -- startPursuit is called from inside it
+(explo_planner_node.cpp:2917) -- and it has exactly three call sites, at :2191,
+:2244 and :3987, reached on "step-budget" and "coverage-saturated". Every one of
+them means THIS ROBOT HAS FINISHED EXPLORING. There is no mid-exploration
+trigger: nothing any arm does can alter the leader's own exploration, so t_lead
+is identical in expectation across arms by construction.
+
+The manoeuvre can therefore only act inside the window between the leader
+finishing and the laggard finishing, by carrying a map backlog to the laggard.
+That window has been 10-62 s against a t_team of ~1100 s -- about 5 %. Measuring
+t_team adds t_lead as PURE UNTREATABLE NOISE over the 95 % of the run the
+treatment cannot influence, and t_lead is the noisiest part (see the noise-floor
+banner). This is the mechanical reason every phase of this campaign has found
+nothing: not that the modes are equivalent, but that the endpoint is ~95 %
+composed of a quantity they cannot move.
+
+So t_team stays the headline because it is the completion time the team actually
+pays, but `lag` is the mechanism-aligned endpoint and any claim about a mode
+belongs there.
+
+AND CHECK THE ARM FIRED AT ALL. Because the trigger is terminal, an arm declines
+whenever the team happens to be together at the finish -- p7modes_rendezvous_seed1
+logged "full team present -> DONE" twice and executed ZERO manoeuvres, making it
+a relabelled control despite the peer being invisible 56 % of the run. Its
+completion time is not evidence about rendezvous. manoeuvre_events.py is the
+authority; see `fire` below.
+
 CENSORING IS DATA, NOT MISSINGNESS. A run whose laggard never reaches the
 threshold inside the duration is the WORST outcome for its arm, not an absent
 one. So when ANY run in either arm is censored, the t_team delta is WITHHELD
@@ -673,6 +705,23 @@ def main():
               f"excludes nothing. Replicates of one identical config on this "
               f"pipeline span 3.03x at unknown<=0.55 (CV 0.56), so treat every "
               f"delta below as a pilot effect-size estimate, not a ranking.")
+
+    # How much of the endpoint the treatment can physically reach. The manoeuvre
+    # only triggers once a robot has FINISHED exploring (finishOrRendezvous, the
+    # sole entry point, is reached only on step-budget / coverage-saturated), so
+    # it can act inside `lag` and nowhere else. Everything before t_lead is
+    # untreatable by construction, and it is the bulk of the run.
+    all_rs = [r for rs in arms.values() for r in rs]
+    lags = [r["lag"] for r in all_rs if r["lag"] is not None]
+    tts = [r["t_team"] for r in all_rs if r["t_team"] is not None]
+    if lags and tts:
+        frac = st.median(lags) / st.median(tts) * 100.0
+        print(f"\nMECHANISM WINDOW: median lag {st.median(lags):.0f} s of a median "
+              f"t_team {st.median(tts):.0f} s = {frac:.1f} % of the endpoint.\n"
+              f"    The manoeuvre is TERMINAL — it can only fire once a robot has "
+              f"finished exploring — so it can act inside `lag` and nowhere else.\n"
+              f"    The other {100 - frac:.1f} % of t_team is untreatable by "
+              f"construction and enters the comparison as pure noise. Read `lag`.")
 
     ctl = args.control
     if ctl not in summary:
