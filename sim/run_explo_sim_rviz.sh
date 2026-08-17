@@ -944,6 +944,20 @@ MANIFEST="$OUTDIR/run_manifest.txt"
       echo "git_$name=not-a-repo"
     fi
   done
+  # The commit hashes above identify the SOURCE; this identifies what actually
+  # ran. p7modes recorded four planner commits for one binary, and settling
+  # that after the fact took six pairwise diffs plus an mtime that turned out
+  # to be a symlink's (this is a symlink-install workspace: the executable
+  # lives in build/, and `stat` does not dereference by default). Hash the
+  # binary and the question becomes a lookup.
+  planner_bin="$WS/install/explo_planner/lib/explo_planner/explo_planner_node"
+  if [ -e "$planner_bin" ]; then
+    echo "sha256_explo_planner_node=$(sha256sum -b "$planner_bin" 2>/dev/null \
+      | cut -c1-16)"
+    echo "mtime_explo_planner_node=$(stat -Lc '%y' "$planner_bin" 2>/dev/null)"
+  else
+    echo "sha256_explo_planner_node=missing"
+  fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
 for r in $ROBOTS; do
