@@ -52,6 +52,17 @@ ReconnectMode reconnectModeFromString(const std::string& s, bool* known) {
   return ReconnectMode::RENDEZVOUS;
 }
 
+const char* reconnectModeName(ReconnectMode m) {
+  // No default case, deliberately: adding a mode without a name here is a
+  // compile warning rather than an unlabelled arm at analysis time.
+  switch (m) {
+    case ReconnectMode::RENDEZVOUS: return "rendezvous";
+    case ReconnectMode::PURSUIT:    return "pursuit";
+    case ReconnectMode::HYBRID:     return "hybrid";
+  }
+  return "unknown";
+}
+
 double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
                         double speed_est_mps, double safety_factor,
                         double staleness_max_sec, double min_sec,

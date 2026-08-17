@@ -698,6 +698,23 @@ if [ "$COMMS" = "1" ]; then
   sleep 3
   log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
       "relay_queue=${RELAY_QUEUE_BYTES}B) ahead of the mappers"
+  # Per-run connectivity trace. link_states is published at link_rate_hz and
+  # kept nowhere else: the gate watcher reads the aggregate `stats` topic, and
+  # recovering it from the bag afterwards means decoding a bag per run. Every
+  # §5 metric that mentions the radio -- realised disconnection fraction,
+  # outage durations, contact events and their attribution to a planner state
+  # -- is derived from this file.
+  #
+  # Started HERE, one publisher-startup behind the emulator, rather than down in
+  # §6b with the gate watcher. From §6b the trace began at t_sim~48 while the
+  # planners had been running since ~27, so the first ~21 s of every run had no
+  # connectivity record at all — and that is the window in which the robots are
+  # closest together and the link is certain to be up, i.e. the part a
+  # disconnection fraction most needs in its denominator. The logger simply
+  # waits for the topic, so starting it before the mappers costs nothing.
+  start linklog "$OUTDIR/link_logger.log" \
+    python3 "$HERE/link_logger.py" --out "$OUTDIR/link_states.csv" \
+      --ros-args -p use_sim_time:=true
 fi
 
 # --- 3. nav + lidar mapping, mergers cross-wired ----------------------------
@@ -876,6 +893,9 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "ros_domain_id=${ROS_DOMAIN_ID:-unset}"
   echo
   echo "# --- arm / independent variables ---"
+  # Per-robot JSONL event stream: the run's primary record. The manifest names
+  # it so a reader knows to look for it (and knows it is missing if it is).
+  echo "experiment_log=<robot>.events.jsonl"
   echo "reconnect_mode_requested=$RECONNECT_MODE"
   echo "reconnect_mode_param=$MODE_ARG"
   echo "rendezvous_enabled=$RDV_ENABLED"
@@ -988,6 +1008,7 @@ for r in $ROBOTS; do
       --params-file "$PLANNER_SHARE/config/shared_params.yaml" \
       -p use_sim_time:=true -p robot_name:=$r -p max_steps:=$MAX_STEPS \
       -p terrain_relative_z:=false \
+      -p experiment_log_path:="$OUTDIR/$r.events.jsonl" \
       -p candidate_enable_polar:=$POLAR_ARG \
       -p proximity_hold_dist_m:=$PROX_HOLD_M \
       -p proximity_resume_dist_m:=$PROX_RESUME_M \
@@ -1093,15 +1114,9 @@ if [ "$COMMS" = "1" ]; then
   # emulator (so the relay hop, delay_ms and rx QoS are all present) at a
   # tx_power_dbm where the link is meant to stay up, and the outage gate would
   # otherwise fail every single control run for behaving as designed.
-  # Per-run connectivity trace. link_states is published at link_rate_hz and
-  # kept nowhere else: the gate watcher reads the aggregate `stats` topic, and
-  # recovering it from the bag afterwards means decoding a bag per run. Every
-  # §5 metric that mentions the radio -- realised disconnection fraction,
-  # outage durations, contact events and their attribution to a planner state
-  # -- is derived from this file.
-  start linklog "$OUTDIR/link_logger.log" \
-    python3 "$HERE/link_logger.py" --out "$OUTDIR/link_states.csv" \
-      --ros-args -p use_sim_time:=true
+  # The link trace itself now starts with the emulator, up in §2 — see the note
+  # there. Only the gate watcher, which needs the planners' intent endpoints to
+  # exist before it can judge anything, still starts here.
   start gateswatch "$OUTDIR/gates_watch.log" \
     python3 "$HERE/comms_gates.py" watch --robots "$ROBOT_CSV" \
       --report "$GATE_REPORT" \

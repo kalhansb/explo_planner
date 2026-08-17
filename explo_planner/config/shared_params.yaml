@@ -49,6 +49,54 @@
     # the ROS clock: it bounds executor-thread work, which is wall-clock work
     # whatever use_sim_time says.
     metrics_max_duty: 0.2
+
+    # --- Experiment event log (newline-delimited JSON, one file per robot per
+    #     run). See include/explo_planner/experiment_log.hpp for the schema and
+    #     for the six concrete failures of the old CSV+log-scraping arrangement
+    #     it exists to make structurally impossible.
+    #
+    # The CSV above is UNCHANGED and stays: this is an additional, authoritative
+    # event stream stamped on the node's own SIM clock, so nothing downstream
+    # has to reconstruct sim time from wall-clock log lines against a real-time
+    # factor that drifts within a run.
+    experiment_log_enabled: true
+    # Empty = derive from output_csv: <csv without .csv>.events.jsonl, i.e. the
+    # event log lands beside the CSV of the same run with no harness change. Set
+    # an explicit path to override. NB a FIXED path here would make every robot
+    # of every arm truncate the same file — leave it empty unless you mean it.
+    experiment_log_path: ""
+    # clock_anchor cadence in SIM seconds. Each anchor is a (sim, wall) pair plus
+    # the real-time factor since the previous one, which makes this file the
+    # sim<->wall conversion table for every other log in the run directory (they
+    # carry wall stamps only). Fitting one line across a whole run is wrong by
+    # 10-54 s because the RTF drifts within it. 0 disables the anchors; every
+    # other event still carries its own pair.
+    experiment_log_anchor_period_sec: 10.0
+    # Descending unknown-fraction ladder. Each rung fires ONCE, the first time
+    # this robot's coverage measurement crosses it, recording the sim time — so
+    # "time to reach coverage X" is directly readable and means the same thing in
+    # every arm, unlike a run duration, which measures each arm's own stopping
+    # rule. Sized from the campaign data: across 100 planner CSVs the first
+    # measured unknown fraction is 0.930-1.000 (so a 0.95 rung would fire at t0
+    # by construction for half the robots and measure the initial map, not
+    # exploration).
+    #
+    # The bottom of the ladder was wrong and is now corrected. The earlier
+    # [.., 0.55, 0.50, 0.45] tail was justified as "0.50 is the deepest rung
+    # that fires in practice"; measured, 92 of 100 CSVs reach 0.55, exactly 1
+    # reaches 0.50 and NONE reaches 0.45 (global minimum 0.4965). Two of ten
+    # rungs were dead columns. Worse, 0.55 is numerically done_unknown_fraction
+    # below — so the deepest rung that fired was the stopping rule itself, and
+    # an "arm-independent endpoint" that is the stopping test in disguise is not
+    # independent of anything.
+    #
+    # The replacement spends those rungs where the arms actually separate: the
+    # endgame above the stopping threshold. No rung equals done_unknown_fraction
+    # and every rung is reachable on the observed data.
+    # Rungs that are never reached simply never appear in the file.
+    coverage_milestones: [0.90, 0.85, 0.80, 0.75, 0.70,
+                          0.65, 0.62, 0.60, 0.58, 0.56]
+
     map_resolution: 0.10
 
     # Frames — planner reads dscovox map (in map_frame) and uses TF

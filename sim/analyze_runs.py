@@ -159,7 +159,12 @@ def time_to_criterion(rows, thresh):
 
 def duty_and_outages(trace):
     if len(trace) < 2:
-        return float("nan"), [], float("nan")
+        # FOUR values, like the normal return below. This branch returned three,
+        # so any run with a missing or short link trace (read_link_trace returns
+        # [] on OSError, and the path_loss_db <= 0 startup mask can empty a
+        # short one) raised ValueError at the call site and took the whole batch
+        # down with it rather than skipping the one bad run.
+        return float("nan"), [], float("nan"), None
     down = total = 0.0
     for (t0, up0, _), (t1, _, _) in zip(trace, trace[1:]):
         dt = t1 - t0

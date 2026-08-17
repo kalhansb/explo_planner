@@ -63,6 +63,13 @@ enum class ReconnectMode { RENDEZVOUS, PURSUIT, HYBRID };
 ReconnectMode reconnectModeFromString(const std::string& s,
                                       bool* known = nullptr);
 
+/// Stable, machine-readable mode name — the inverse of
+/// reconnectModeFromString, and the arm label the experiment event log stamps
+/// into every run. Treat it as an interface exactly like stateName(): these
+/// strings are what an analysis groups runs by, so renaming one silently
+/// re-buckets every past run. Round-trips through reconnectModeFromString.
+const char* reconnectModeName(ReconnectMode m);
+
 /// Pursuit spend limit (seconds). 0 means "do not pursue" — the caller falls
 /// straight through to its fallback. Non-zero budgets follow the navBudgetSec
 /// shape (distance to the trail head at the conservative speed estimate,

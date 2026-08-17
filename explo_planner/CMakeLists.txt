@@ -21,6 +21,35 @@ find_package(nav2_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
 # ==================================================================
+# Provenance
+# ==================================================================
+# Stamp the source revision into the planner binary so every experiment event
+# log can say which code produced it. No derived artefact in this project
+# carried provenance before, and the metrics CSV's schema changed silently
+# between campaigns with nothing in the data to date it.
+#
+# Configure-time, so it identifies the checkout the build tree was CONFIGURED
+# from: editing a source file and rebuilding without re-running cmake leaves it
+# stale. That is why the event log also records the translation unit's compile
+# timestamp, which is always exactly right. Degrades to "unknown" outside a git
+# checkout (release tarball, vendored copy) rather than failing the build.
+set(EXPLO_PLANNER_GIT_REV "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} describe --always --dirty --tags
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE _explo_git_rev
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _explo_git_rc)
+  if(_explo_git_rc EQUAL 0 AND NOT _explo_git_rev STREQUAL "")
+    set(EXPLO_PLANNER_GIT_REV "${_explo_git_rev}")
+  endif()
+endif()
+message(STATUS "explo_planner git revision: ${EXPLO_PLANNER_GIT_REV}")
+
+# ==================================================================
 # Library
 # ==================================================================
 
@@ -30,6 +59,7 @@ add_library(explo_planner_lib
   src/candidate_generator.cpp
   src/fov_evaluator.cpp
   src/metrics_logger.cpp
+  src/experiment_log.cpp
   src/cost_grid.cpp
   src/coordination.cpp
   src/proximity_guard.cpp
@@ -67,6 +97,11 @@ add_executable(explo_planner_node
 
 target_link_libraries(explo_planner_node
   explo_planner_lib
+)
+
+# Provenance for the experiment event log's run_start event (see above).
+target_compile_definitions(explo_planner_node PRIVATE
+  EXPLO_PLANNER_GIT_REV="${EXPLO_PLANNER_GIT_REV}"
 )
 
 ament_target_dependencies(explo_planner_node

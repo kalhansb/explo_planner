@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -66,6 +67,7 @@
 #include "explo_planner/fov_evaluator.hpp"
 #include "explo_planner/scoring.hpp"
 #include "explo_planner/metrics_logger.hpp"
+#include "explo_planner/experiment_log.hpp"
 #include "explo_planner/cost_grid.hpp"
 #include "explo_planner/coordination.hpp"
 #include "explo_planner/plan_map_query.hpp"
@@ -147,6 +149,12 @@ enum class Phase { EXPLORE, EXPLOIT };
 class ExploPlannerNode : public rclcpp::Node {
 public:
   ExploPlannerNode();
+  /// Last chance to close the event log. rclcpp::shutdown() (SIGTERM from the
+  /// campaign harness, or the DONE-shutdown path) unwinds spin() and destroys
+  /// the node, and a run that ends that way would otherwise have no run_end
+  /// line at all — indistinguishable, from the file alone, from a truncated
+  /// one. Never throws (see the definition).
+  ~ExploPlannerNode() override;
 
 private:
   // ----------------------------------------------------------------
@@ -167,7 +175,12 @@ private:
   // State machine
   // ----------------------------------------------------------------
   void tick();
-  void transitionTo(State s);
+  /// `reason` names WHY the transition happened and is recorded verbatim in the
+  /// event log's state_change event. Defaulted so a new call site compiles, but
+  /// every existing one passes a stable, machine-readable tag: these strings are
+  /// an analysis interface exactly as stateName() is (see the event log header
+  /// on why grepping prose was the thing this replaces).
+  void transitionTo(State s, const char* reason = "");
   void doPlan();
   void doNavigate();
   void doIntegrate();
@@ -181,6 +194,49 @@ private:
   // sampler that runs in every state.
   void fillCommonMetrics(StepMetrics& m);
   void metricsTick();
+
+  // Experiment event log (experiment_log.hpp). The CSV above is unchanged and
+  // stays the per-step record; this is the authoritative, machine-readable
+  // event stream on the node's own sim clock.
+  //
+  // expCtx() is the per-event envelope (sim stamp + state + step) and is the
+  // ONLY place the log's time axis is read, so no event can be stamped from a
+  // clock the planner does not make decisions on.
+  ExperimentContext expCtx();
+  /// Emit run_start on the first tick with a live clock — NOT in the
+  /// constructor. Under use_sim_time this->now() reads 0 until the first
+  /// /clock message, and a t0 of 0 would silently turn every t_rel_sec in the
+  /// file into an absolute sim time. No-op once started.
+  void startExperimentLog();
+  /// Emit clock_anchor on a pure SIM-TIME schedule. Never consults a wall clock
+  /// to decide whether to fire — that is the failure mode next door in
+  /// metricsTick, where a wall deadline armed after the tick's own work
+  /// suppresses whole sim-time ticks at some real-time factors and none at
+  /// others, silently changing the realised rate between campaigns.
+  void expClockAnchorTick();
+  /// Peer-belief bookkeeping behind peer_seen / peer_lost. expPeerHeard is
+  /// called from the intent callback (every teammate broadcast, in every arm —
+  /// the subscription is wired even with coordination off); expPeerSweep runs
+  /// on the state-machine tick and flips a peer to LOST once its last intent is
+  /// older than the claim TTL. Deliberately computed from the intent stream
+  /// rather than Coordination's table so the control arm, which runs with
+  /// coordination_enabled=false, still records outage timing.
+  void expPeerHeard(const std::string& peer_id);
+  void expPeerSweep();
+  /// Emit reconnect_dispatch for the manoeuvre just chosen. Called from the
+  /// leaf that COMMITS the action (startPursuit / startReturnTo / holdForTeam /
+  /// pursuitExploreFallback), never from the branch that contemplates it, so
+  /// the event set and the behaviour cannot disagree. `dest` is null for
+  /// actions with no destination.
+  void logReconnectDispatch(const char* action, const Eigen::Vector3f* dest,
+                            double budget_sec, const char* reason);
+  /// Re-read the missing-peer context (id and record age) from the CURRENT
+  /// contact table, for leaves that commit out of band from
+  /// dispatchReconnect's branch walk and would otherwise report the age that
+  /// walk saw — stale by a whole barrier wait or a whole chase budget.
+  void refreshDispatchContext();
+  /// Emit run_end exactly once (later calls are ignored by the logger).
+  void logRunEnd(const char* reason);
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
   // exploration exhaustion, between DONE and the reconnect_mode_ manoeuvre
@@ -345,6 +401,21 @@ private:
   // --- Parameters ---
   std::string robot_name_;
   std::string output_csv_;
+  // Event-log output (newline-delimited JSON, one file per robot per run).
+  // Empty path = derive from output_csv (see the param load); enabled by
+  // default because this file, not the CSV, is what the experiment's primary
+  // metric is read from.
+  std::string experiment_log_path_;
+  bool        experiment_log_enabled_ = true;
+  // Descending unknown-fraction ladder for coverage_milestone events. See the
+  // param load for the range real runs actually traverse.
+  std::vector<double> coverage_milestones_;
+  // clock_anchor cadence, in SIM seconds, and the next due stamp. Compared
+  // against this->now() and nothing else: gating a sim-time schedule on a wall
+  // deadline is the bug that silently halved the CSV sampler's realised rate
+  // between campaigns (see experiment_log.hpp).
+  double experiment_log_anchor_period_sec_ = 10.0;
+  double next_anchor_sim_sec_ = -1.0;
   std::string map_frame_;
   std::string base_frame_;
   int    max_steps_;
@@ -728,6 +799,7 @@ private:
   std::unique_ptr<FovEvaluator> fov_eval_;
   ScoreFn score_fn_;
   std::unique_ptr<MetricsLogger> logger_;
+  std::unique_ptr<ExperimentLog> exp_log_;
   std::unique_ptr<CostGrid> cost_grid_;
   std::unique_ptr<Coordination> coord_;
   std::unique_ptr<ProximityGuard> prox_guard_;
@@ -988,6 +1060,58 @@ private:
   double metrics_effective_period_ = 5.0;
   int    metrics_backoffs_ = 0;
   std::chrono::steady_clock::time_point metrics_next_{};
+  // REALISED sampling accounting for the periodic CSV sampler. The configured
+  // period is not what it achieves: the sim-time timer above is gated by the
+  // steady-clock deadline in metricsTick, so at some real-time factors whole
+  // ticks are suppressed and at others none are — a realised period of 10 s
+  // against a configured 5 s was measured in an earlier campaign, with every
+  // log line still asserting 5 s. Counted here and reported in run_end so the
+  // rate of an archived run is a recorded fact.
+  int    metrics_rows_written_ = 0;
+  double metrics_first_row_sim_sec_ = -1.0;
+  double metrics_last_row_sim_sec_  = -1.0;
+
+  // --- Event-log bookkeeping (see experiment_log.hpp) ---
+  // state_enter_time_ is default-constructed on the SYSTEM clock and only
+  // becomes a sim-time stamp at the first transitionTo, and subtracting times
+  // from two different sources THROWS. This flag is what lets the state_change
+  // event report the dwell in the state being left without that landing in a
+  // ROS callback as an exception. Same bool-guard pattern as midrun_end_armed_.
+  bool have_state_enter_ = false;
+  // exploration_complete de-duplication. finishOrRendezvous is re-entered every
+  // tick while the reconnect confirmation gate defers, and again if a robot
+  // re-saturates after a manoeuvre delivered a merged map. Keying on step_
+  // emits exactly one event per exhaustion EPISODE (step_ cannot advance during
+  // a deferral) while still recording a genuine second exhaustion later.
+  int exp_complete_step_  = -1;
+  int exp_complete_count_ = 0;
+  // Why the node reached DONE, kept for the run_end the destructor writes in
+  // done_action=idle (where DONE is not the end of the file). Empty = DONE was
+  // never reached, i.e. the run was cut short from outside.
+  std::string done_reason_;
+  // The peer + record age the current dispatch was decided from, stashed by
+  // dispatchReconnect so the leaf that commits the action can report them
+  // without re-querying a table that may have changed in between.
+  std::string dispatch_peer_id_;
+  double      dispatch_peer_age_sec_ = -1.0;
+  // Why a richer manoeuvre was NOT taken, set by whichever guard declined
+  // (startPursuit's staleness / trail-length gates, the spent explore-fallback
+  // budget) and consumed by the next reconnect_dispatch event. Cleared at every
+  // dispatch entry so a decline can never be attributed to a later manoeuvre.
+  std::string reconnect_decline_reason_;
+  // Per-peer belief behind peer_lost / peer_seen: when this robot last heard
+  // the peer, and whether it currently believes it live. Bounded by the team
+  // size (one entry per robot id ever heard).
+  struct PeerBelief {
+    rclcpp::Time last_heard;   ///< local receipt time of its last intent
+    bool         live = false;
+  };
+  std::map<std::string, PeerBelief> peer_belief_;
+  // Latest coverage measurement seen by fillCommonMetrics, so the terminal
+  // events can report the same number the milestones were judged against
+  // instead of paying for another whole-grid measurement at shutdown.
+  double      last_unknown_fraction_ = -1.0;
+  const char* last_coverage_source_  = "none";
 };
 
 // ==================================================================
@@ -1006,6 +1130,65 @@ ExploPlannerNode::ExploPlannerNode()
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
   output_csv_   = dp("output_csv", std::string("/tmp/exploration.csv"));
+  // Experiment event log — one newline-delimited JSON file per robot per run.
+  // See experiment_log.hpp for what it exists to fix; in short, the CSV plus
+  // the ROS log could not answer "when did this robot reach coverage X" without
+  // reconstructing sim time from wall-clock log stamps against a drifting RTF.
+  //
+  // The path DEFAULTS TO EMPTY, meaning "derive from output_csv": <csv without
+  // its .csv suffix>.events.jsonl. That is deliberate and is the one place this
+  // pair diverges from output_csv's flat default. Every harness already passes
+  // a per-run, per-robot output_csv (run_explo_sim_rviz.sh: -p
+  // output_csv:=$OUTDIR/planner_$r.csv), so deriving puts the event log beside
+  // its own CSV automatically — whereas a fixed default like
+  // /tmp/exploration_events.jsonl would have every robot of every arm truncate
+  // the same file, which is exactly the silent data loss this class is about.
+  // An explicit value is always used verbatim.
+  experiment_log_path_    = dp("experiment_log_path", std::string(""));
+  experiment_log_enabled_ = dp("experiment_log_enabled", true);
+  if (experiment_log_path_.empty()) {
+    experiment_log_path_ = output_csv_;
+    const std::string suffix = ".csv";
+    if (experiment_log_path_.size() >= suffix.size() &&
+        experiment_log_path_.compare(experiment_log_path_.size() - suffix.size(),
+                                     suffix.size(), suffix) == 0) {
+      experiment_log_path_.erase(experiment_log_path_.size() - suffix.size());
+    }
+    experiment_log_path_ += ".events.jsonl";
+  }
+  // Descending unknown-fraction ladder for the coverage_milestone events, which
+  // are how time-to-coverage is made comparable ACROSS ARMS: each arm stops on
+  // its own criterion, so run duration measures a different thing per arm,
+  // while "sim time this robot first drove unknown fraction below X" means the
+  // same thing everywhere.
+  //
+  // The default is sized from the campaign data rather than guessed. Across 98
+  // planner CSVs under /tmp/hmr_campaign the first measured unknown fraction is
+  // 0.930-1.000 and the final one is 0.497-0.554 in 97 of them (the exception
+  // is a 21-row run aborted at 0.817). So: 0.95 is degenerate — for the robots
+  // whose first sample is already 0.93 it would fire at t0 by construction and
+  // measure the initial map, not exploration — and nothing below 0.50 is ever
+  // reached. 0.90 down to 0.50 is the informative band (in the p8trigger runs
+  // 0.90 lands at ~35-43 s and 0.55 at ~820-1490 s, a spread that separates the
+  // arms), and 0.45 is carried as a guard rung so a future arm that covers more
+  // ground still records the crossing instead of silently having no data point.
+  // Rungs that never fire simply never appear in the file.
+  // Ladder rationale (and why the tail is NOT 0.55/0.50/0.45) in
+  // config/shared_params.yaml — measured, those bottom rungs were dead columns
+  // and the deepest one that fired was done_unknown_fraction itself.
+  coverage_milestones_ = dp("coverage_milestones",
+      std::vector<double>{0.90, 0.85, 0.80, 0.75, 0.70,
+                          0.65, 0.62, 0.60, 0.58, 0.56});
+  // clock_anchor cadence in SIM seconds. Each anchor is a (sim, wall) pair plus
+  // the real-time factor since the previous one, which turns this file into the
+  // conversion table for every other log in the run directory — they carry wall
+  // stamps only, and the current practice of fitting one line through the whole
+  // run is wrong by 10-54 s because the RTF drifts within a run (0.89 -> 0.81
+  // measured). 10 s bounds the interpolation error to well under a second at
+  // any plausible drift rate and costs one short line per anchor. <= 0
+  // disables anchors (every other event still carries its own pair).
+  experiment_log_anchor_period_sec_ =
+      dp("experiment_log_anchor_period_sec", 10.0);
   // Wall-clock CSV sampling period. The end-of-step row is the only row a
   // pre-experiment run produced, and steps do not advance during a reconnect
   // manoeuvre — so a run that spent four minutes chasing a peer recorded that
@@ -1571,6 +1754,104 @@ ExploPlannerNode::ExploPlannerNode()
   // Fixed SCovox Beta EIG scorer — this node has no planner_type knob.
   score_fn_ = scoring::eig;
   logger_ = std::make_unique<MetricsLogger>(output_csv_);
+  // Experiment event log. Constructed here, but run_start is NOT emitted yet:
+  // under use_sim_time the clock reads 0 until the first /clock message, and
+  // t0 must be a real sim time (see startExperimentLog).
+  if (experiment_log_enabled_) {
+    exp_log_ = std::make_unique<ExperimentLog>(
+        experiment_log_path_, robot_name_, get_logger());
+    if (!exp_log_->open()) {
+      // The logger already emitted the ERROR with errno; say what it costs, so
+      // an operator watching the console knows the run is scientifically
+      // degraded before it burns an hour of battery.
+      RCLCPP_ERROR(get_logger(),
+          "Experiment event log DISABLED by open failure ('%s'). The CSV is "
+          "unaffected, but this run will have no coverage milestones and no "
+          "structured reconnect events.", experiment_log_path_.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(),
+          "Experiment event log: %s (%zu coverage milestone(s); sim-clock "
+          "stamped, flushed per event).",
+          experiment_log_path_.c_str(), coverage_milestones_.size());
+    }
+    // The independent variables of the experiment, recorded IN the data file
+    // rather than only in the harness manifest — a file that cannot say which
+    // arm produced it has to be trusted to a directory name.
+    // PROVENANCE. No derived artefact in this project currently carries any:
+    // the CSV schema changed silently between campaigns and nothing in the data
+    // recorded which version produced it. schema_version (written by the logger
+    // itself) covers the event format; these identify the binary.
+    //
+    // EXPLO_PLANNER_GIT_REV is injected by CMake at configure time — so it
+    // identifies the checkout the build was CONFIGURED from, and a source edit
+    // without a reconfigure leaves it stale. It is a strong hint, not a
+    // guarantee; the build stamp below is what disambiguates two binaries built
+    // from the same revision.
+#ifdef EXPLO_PLANNER_GIT_REV
+    exp_log_->addParamStr("git_rev", EXPLO_PLANNER_GIT_REV);
+#else
+    exp_log_->addParamStr("git_rev", "unknown");
+#endif
+    // Compile time of THIS translation unit: the one identifier that is always
+    // exactly right about which binary is running.
+    exp_log_->addParamStr("build_stamp",
+                          std::string(__DATE__) + " " + __TIME__);
+    exp_log_->addParamStr("node_name", std::string(this->get_name()));
+    exp_log_->addParamStr("robot_name", robot_name_);
+    exp_log_->addParamStr("reconnect_mode", reconnectModeName(reconnect_mode_));
+    exp_log_->addParamBool("use_sim_time", this->get_parameter("use_sim_time")
+                                               .as_bool());
+    exp_log_->addParamStr("output_csv", output_csv_);
+    exp_log_->addParamNum("max_steps", max_steps_);
+    exp_log_->addParamNum("metrics_period_sec", metrics_period_sec_);
+    exp_log_->addParamNum("metrics_max_duty", metrics_max_duty_);
+    exp_log_->addParamNum("experiment_log_anchor_period_sec",
+                          experiment_log_anchor_period_sec_);
+    exp_log_->addParamBool("coordination_enabled", coord_enabled_);
+    exp_log_->addParamNum("coord_claim_ttl_sec", coord_claim_ttl_sec_);
+    exp_log_->addParamNum("coord_heartbeat_hz", coord_heartbeat_hz_);
+    exp_log_->addParamBool("rendezvous_enabled", rendezvous_enabled_);
+    exp_log_->addParamNum("rendezvous_expected_peers",
+                          rendezvous_expected_peers_);
+    exp_log_->addParamNum("rendezvous_max_wait_sec", rendezvous_max_wait_sec_);
+    exp_log_->addParamNum("reconnect_confirm_sec", reconnect_confirm_sec_);
+    exp_log_->addParamNum("reconnect_release_confirm_sec",
+                          reconnect_release_confirm_sec_);
+    exp_log_->addParamNum("reconnect_midrun_silence_sec",
+                          reconnect_midrun_silence_sec_);
+    exp_log_->addParamNum("reconnect_midrun_max_wait_sec",
+                          reconnect_midrun_max_wait_sec_);
+    exp_log_->addParamNum("reconnect_midrun_max_attempts",
+                          reconnect_midrun_max_attempts_);
+    exp_log_->addParamNum("pursuit_budget_max_sec", pursuit_budget_max_sec_);
+    exp_log_->addParamNum("pursuit_staleness_max_sec",
+                          pursuit_staleness_max_sec_);
+    exp_log_->addParamNum("pursuit_goal_stale_sec", pursuit_goal_stale_sec_);
+    exp_log_->addParamBool("pursuit_explore_fallback",
+                           pursuit_explore_fallback_);
+    exp_log_->addParamNum("pursuit_explore_max", pursuit_explore_max_);
+    exp_log_->addParamBool("hold_escalate", hold_escalate_);
+    exp_log_->addParamNum("hold_escalate_wait_sec", hold_escalate_wait_sec_);
+    exp_log_->addParamNum("done_unknown_fraction", done_unknown_fraction_);
+    exp_log_->addParamNum("done_min_consecutive_steps",
+                          done_min_consecutive_steps_);
+    exp_log_->addParamStr("done_coverage_source", done_coverage_source_);
+    exp_log_->addParamStr("done_action", done_action_);
+    exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
+    exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
+    exp_log_->addParamBool("terrain_relative_z", terrain_relative_z_);
+    // From ccfg, not the roi_*_ members: those are cached from it further down
+    // (with the ROS interfaces) and are still at their in-class defaults here.
+    exp_log_->addParamNum("roi_min_x", ccfg.roi_min_x);
+    exp_log_->addParamNum("roi_max_x", ccfg.roi_max_x);
+    exp_log_->addParamNum("roi_min_y", ccfg.roi_min_y);
+    exp_log_->addParamNum("roi_max_y", ccfg.roi_max_y);
+  } else {
+    RCLCPP_WARN(get_logger(),
+        "Experiment event log DISABLED by parameter "
+        "(experiment_log_enabled=false): no coverage milestones, no structured "
+        "events. Only the per-step CSV will be written.");
+  }
   cost_grid_ = std::make_unique<CostGrid>();
   // Bound peer-advertised claim radii by our own exploration disc — the largest
   // claim this planner considers legitimate. Resolved above, so the auto
@@ -1717,6 +1998,11 @@ ExploPlannerNode::ExploPlannerNode()
     auto on_intent =
         [this](explo_planner_msgs::msg::RobotIntent::SharedPtr msg) {
           if (coord_) coord_->onIntent(*msg, this->now());
+          // Event log: this is the ONE place a teammate broadcast is received,
+          // in every arm and whether or not coordination consumes it, so it is
+          // where peer_seen / peer_lost belief is maintained from. Self-echo is
+          // filtered here as onIntent does it internally.
+          if (msg->robot_id != robot_name_) expPeerHeard(msg->robot_id);
           // Rendezvous: record where we were the last time we heard a
           // teammate. That pose is inside the comms bubble, so it is the
           // cheapest point to return to for reconnection. onIntent already
@@ -2122,6 +2408,15 @@ bool ExploPlannerNode::scoreTrajectory(
 // ==================================================================
 
 void ExploPlannerNode::tick() {
+  // Event log first: run_start must be the file's first line, and it can only
+  // be emitted once the clock is live (see startExperimentLog). The peer sweep
+  // rides the same tick rather than the coordination heartbeat, which returns
+  // early when coordination_enabled is false — the control arm needs its
+  // outage timing recorded too.
+  startExperimentLog();
+  expClockAnchorTick();
+  expPeerSweep();
+
   updatePoseFromTF();
   trackDistance();
 
@@ -2174,7 +2469,7 @@ void ExploPlannerNode::tick() {
                 "(use_planning_map=false) — straight-line costs, no 2D "
                 "obstacle/reachability filtering. Starting exploration.");
           }
-          transitionTo(State::PLAN);
+          transitionTo(State::PLAN, "startup-preconditions-met");
         } else {
           // Name the missing precondition so a stuck startup (wrong topic /
           // namespace / QoS, dead mapper, no TF) is diagnosable instead of a
@@ -2245,7 +2540,7 @@ void ExploPlannerNode::tick() {
           RCLCPP_INFO(get_logger(),
               "Target arrived while DONE-idle (%zu pending) -> EXPLOIT.",
               target_queue_.pendingCount());
-          transitionTo(State::EXPLOIT_PLAN);
+          transitionTo(State::EXPLOIT_PLAN, "target-arrived-done-idle");
         } else {
           RCLCPP_INFO_ONCE(get_logger(),
               "Exploration finished; idling (done_action=idle). Planner "
@@ -2272,7 +2567,8 @@ void ExploPlannerNode::tick() {
   }
 }
 
-void ExploPlannerNode::transitionTo(State s) {
+void ExploPlannerNode::transitionTo(State s, const char* reason) {
+  const State from = state_;
   // Reconnect clock. The manoeuvre owns RETURN_NAV / RETURN_SYNC / PURSUE, plus
   // any PROXIMITY_HOLD taken while already inside one. Staying within that set
   // keeps the clock running, which is what lets a single manoeuvre span the
@@ -2282,9 +2578,30 @@ void ExploPlannerNode::transitionTo(State s) {
   const bool manoeuvre = (s == State::RETURN_NAV || s == State::RETURN_SYNC ||
                           s == State::PURSUE || s == State::PROXIMITY_HOLD);
   if (reconnect_active_ && !manoeuvre) {
+    const double manoeuvre_sec = (this->now() - reconnect_start_time_).seconds();
     RCLCPP_INFO(get_logger(),
         "Reconnect manoeuvre ended after %.1f s sim (-> %s).",
-        (this->now() - reconnect_start_time_).seconds(), stateName(s));
+        manoeuvre_sec, stateName(s));
+    if (exp_log_) {
+      const int live =
+          coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+      ReconnectEndEvent e;
+      // Classified mechanically from the two facts that decide it, with the
+      // raw fields alongside so an analysis can re-classify: the team being
+      // complete AT THIS INSTANT is what "reconnected" means (every release
+      // path in the manoeuvre states tests exactly that), and landing in DONE
+      // instead of PLAN is what "gave up" means.
+      e.outcome = teamComplete(live, rendezvous_expected_peers_)
+                      ? "reconnected"
+                      : (s == State::DONE ? "gave_up" : "abandoned");
+      e.to_state       = stateName(s);
+      e.reason         = reason;
+      e.duration_sec   = manoeuvre_sec;
+      e.terminal       = reconnect_terminal_;
+      e.peers_live     = live;
+      e.expected_peers = rendezvous_expected_peers_;
+      exp_log_->logReconnectEnd(expCtx(), e);
+    }
     reconnect_active_ = false;
     hold_escalated_ = false;
     // Mid-run cooldown starts HERE, at manoeuvre end — missing_for stays
@@ -2300,8 +2617,39 @@ void ExploPlannerNode::transitionTo(State s) {
   // straddles e.g. a PROXIMITY_HOLD must restart its window.
   release_ok_armed_ = false;
 
+  // state_change, emitted before the new state is installed so `from_dwell_sec`
+  // still measures the state being LEFT. -1 when the dwell is unknowable: the
+  // very first transition of the run, where state_enter_time_ is still the
+  // default-constructed SYSTEM-clock value and subtracting it from a sim-time
+  // now() would throw inside a timer callback.
+  if (exp_log_) {
+    exp_log_->logStateChange(
+        expCtx(), stateName(from), stateName(s), reason,
+        have_state_enter_ ? (this->now() - state_enter_time_).seconds() : -1.0);
+  }
+
   state_ = s;
   state_enter_time_ = this->now();
+  have_state_enter_ = true;
+  // DONE is the single funnel for every ending the node reaches while running
+  // (coverage, step budget, barrier give-up), so the ending's REASON is
+  // captured here rather than at each of those sites.
+  //
+  // Whether run_end is written here depends on what DONE means for this
+  // configuration, because run_end must be the LAST line of the file — an
+  // analysis reads it to decide whether the file is complete, and lines after
+  // it would make `events_written` a lie:
+  //   done_action=shutdown — DONE is terminal, the node exits within a tick, so
+  //     write it now while the run totals are still meaningful.
+  //   done_action=idle     — the node stays up and a target arriving later
+  //     pulls it back into the exploit sub-loop, which produces more events.
+  //     Defer to the destructor, which the last of them precedes by
+  //     construction, and carry this reason there so the ending is still named
+  //     properly rather than degrading to "node-destroyed".
+  if (s == State::DONE) {
+    done_reason_ = reason;
+    if (done_action_ != "idle") logRunEnd(reason);
+  }
   // The post-arrival rotation deadline is per-NAVIGATE-cycle and is armed
   // lazily on arrival at the XY goal; disarm it on every entry.
   if (s == State::NAVIGATE) rotate_deadline_armed_ = false;
@@ -2363,7 +2711,7 @@ void ExploPlannerNode::doPlan() {
     RCLCPP_INFO(get_logger(),
         "Target queued (%zu pending) -> switching to EXPLOIT.",
         target_queue_.pendingCount());
-    transitionTo(State::EXPLOIT_PLAN);
+    transitionTo(State::EXPLOIT_PLAN, "target-queued");
     return;
   }
   phase_ = Phase::EXPLORE;
@@ -2775,7 +3123,7 @@ void ExploPlannerNode::doPlan() {
     have_active_intent_ = true;
   }
 
-  transitionTo(State::NAVIGATE);
+  transitionTo(State::NAVIGATE, "goal-selected");
 
   // Initialise smart-timeout state for this NAVIGATE cycle. Budget the DRIVEN
   // distance, not the straight line: the selected candidate's Dijkstra path
@@ -2863,7 +3211,7 @@ void ExploPlannerNode::doNavigate() {
     // would drive out the abandoned exploration hop underneath it (invariant:
     // see abandonNavGoal).
     abandonNavGoal("target released mid-hop");
-    transitionTo(State::EXPLOIT_PLAN);
+    transitionTo(State::EXPLOIT_PLAN, "target-released-mid-hop");
     return;
   }
 
@@ -2884,7 +3232,7 @@ void ExploPlannerNode::doNavigate() {
     // and until it does nav2 is still driving INTO a now-mapped obstacle
     // (invariant: see abandonNavGoal).
     abandonNavGoal("goal inside obstacle");
-    transitionTo(State::PLAN);
+    transitionTo(State::PLAN, "goal-inside-obstacle");
     return;
   }
 
@@ -2930,7 +3278,7 @@ void ExploPlannerNode::doNavigate() {
       // standing on it.
       have_active_intent_ = false;
       abandonNavGoal("yielded vantage");
-      transitionTo(State::EXPLOIT_PLAN);
+      transitionTo(State::EXPLOIT_PLAN, "vantage-yielded");
       return;
     }
   }
@@ -2965,7 +3313,7 @@ void ExploPlannerNode::doNavigate() {
           RCLCPP_INFO(get_logger(),
               "Reached approach waypoint for target %d (dist=%.2f) -> "
               "re-planning vantages.", pending_exploit_target_id_, dist);
-          transitionTo(State::EXPLOIT_PLAN);
+          transitionTo(State::EXPLOIT_PLAN, "approach-waypoint-reached");
           return;
         }
         // Reached a vantage: dwell. Hold the MinPos claim through the dwell so a
@@ -2975,7 +3323,7 @@ void ExploPlannerNode::doNavigate() {
             "Reached vantage %d of target %d (dist=%.2f) -> dwelling %.1fs.",
             current_vantage_index_, pending_exploit_target_id_, dist,
             exploit_dwell_sec_);
-        transitionTo(State::EXPLOIT_DWELL);
+        transitionTo(State::EXPLOIT_DWELL, "vantage-reached");
         return;
       }
       // Exploration goal reached: integrate the new observation.
@@ -2991,7 +3339,7 @@ void ExploPlannerNode::doNavigate() {
       RCLCPP_INFO(get_logger(),
           "Goal reached: dist=%.2f yaw_err=%.1f deg", dist,
           yaw_err * 180.0f / static_cast<float>(M_PI));
-      transitionTo(State::INTEGRATE);
+      transitionTo(State::INTEGRATE, "goal-reached");
       return;
     }
     // At XY, waiting for the controller to finish rotating. This gets its OWN
@@ -3061,7 +3409,7 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
   // know that — the goal is still accepted and still driving (invariant: see
   // abandonNavGoal), and INTEGRATE is one of the states presumed stationary.
   abandonNavGoal(reason);
-  transitionTo(State::INTEGRATE);
+  transitionTo(State::INTEGRATE, reason);
 }
 
 // ==================================================================
@@ -3079,6 +3427,33 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   // must not count a 10-s-silent teammate as "present" for the barrier.
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+
+  // exploration_complete — THIS ROBOT declaring its own exploration exhausted,
+  // recorded here and not at any of the endings below. That is the point: what
+  // happens next is the independent variable (finish / return / chase / hold),
+  // so an event emitted at the ending would measure a different thing in every
+  // arm, while this instant means the same thing in all of them.
+  //
+  // Keyed on step_ rather than a plain once-per-run latch: this function is
+  // re-entered on every tick while the reconnect confirmation gate defers
+  // (step_ cannot advance during a deferral, so that is still ONE event), and
+  // again if a manoeuvre delivers a merged map with new frontiers in it and the
+  // robot explores on and re-saturates (which is a genuine second declaration
+  // and gets its own event, with occurrence > 1).
+  if (exp_log_ && exp_complete_step_ != step_) {
+    exp_complete_step_ = step_;
+    ExplorationCompleteEvent e;
+    e.reason            = reason;
+    e.unknown_fraction  = last_unknown_fraction_;
+    e.coverage_source   = last_coverage_source_;
+    e.steps             = step_;
+    e.distance_m        = cumulative_distance_;
+    e.team_complete     = teamComplete(active, rendezvous_expected_peers_);
+    e.peers_live        = active;
+    e.expected_peers    = rendezvous_expected_peers_;
+    e.occurrence        = ++exp_complete_count_;
+    exp_log_->logExplorationComplete(expCtx(), e);
+  }
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
     // Confirmation gate. `active` above is one read of a claim table that may
@@ -3124,7 +3499,7 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   if (done_action_ == "idle") {
     publishPresenceIntent();
   }
-  transitionTo(State::DONE);
+  transitionTo(State::DONE, reason);
   return true;
 }
 
@@ -3143,6 +3518,19 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
 bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   std::string peer_id;
   const LastContact* rec = missingPeerRecord(&peer_id);
+  // Event-log context for whichever leaf commits the action below. Stashed
+  // from the query the DECISION was taken on, so the event can never report a
+  // peer or a record age the dispatch did not actually see; cleared decline
+  // reason so a decline from an earlier dispatch cannot be charged to this one.
+  dispatch_peer_id_      = peer_id;
+  dispatch_peer_age_sec_ =
+      rec ? (this->now() - rec->stamp).seconds() : -1.0;
+  reconnect_decline_reason_.clear();
+  if (rec == nullptr) {
+    // The missing teammate was never heard at all (the anchor came from a
+    // different peer), so there is nothing to chase and no pair to midpoint.
+    reconnect_decline_reason_ = "no-peer-record";
+  }
   if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
       startPursuit(peer_id, *rec, reason)) {
     return true;
@@ -3162,6 +3550,32 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
     holdForTeam(reason);
     return true;
   }
+  // RENDEZVOUS. Both robots drive to the SAME point: the midpoint of the two
+  // poses at last contact, which each end computes from its own last_contact_
+  // record without any further exchange (I hold my pose and the peer's; it
+  // holds the mirror image of the same pair, so both midpoints agree to
+  // whatever the robots moved between the two receipt instants).
+  //
+  // It used to be last_connected_anchor_ — each robot returning to where IT was
+  // standing at last contact. That cannot converge, and measurably did not:
+  // the link dies at the edge of range, so the two anchors are one comms range
+  // apart BY CONSTRUCTION. In p9log_rendezvous_seed1 atlas returned to
+  // (3.50, -26.23) and bestla to (-3.22, 27.46) — 54 m apart — five times
+  // between them, every manoeuvre timed out to PLAN having reconnected
+  // nothing, and the pair burned 918 s and 1137 s of a 3439 s run doing it.
+  // Two robots waiting for each other at opposite ends of the gap that
+  // separated them is the failure mode, not bad luck.
+  //
+  // The midpoint is the same construction HYBRID's fallback already uses
+  // above; sharing it is deliberate, so the arms differ in WHEN they go to a
+  // meeting point and not in where the meeting point is.
+  if (rec != nullptr) {
+    startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
+                  "meeting point", reason);
+    return true;
+  }
+  // No last-contact record (the peer was never heard, so there is no pair to
+  // take a midpoint of). The own-pose anchor is all this robot has.
   startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
   return true;
 }
@@ -3251,6 +3665,16 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
       rendezvous_expected_peers_, what, dest.x(), dest.y());
 
+  // startReturnTo has exactly two destinations across all three call sites (the
+  // hybrid fallback's meeting point; the own-pose anchor, both at dispatch and
+  // on hold-escalation), and `what` is what already distinguishes them in the
+  // log line above — so it is what the event's action is derived from.
+  refreshDispatchContext();
+  logReconnectDispatch(
+      std::strcmp(what, "meeting point") == 0 ? "meeting_point"
+                                              : "anchor_return",
+      &dest, /*budget_sec=*/-1.0, reason);
+
   publishGoal(current_goal_);
 
   if (intent_pub_ && coord_) {
@@ -3263,7 +3687,7 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
     have_active_intent_ = true;
   }
 
-  transitionTo(State::RETURN_NAV);
+  transitionTo(State::RETURN_NAV, reason);
 
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
@@ -3302,7 +3726,7 @@ void ExploPlannerNode::doReturnNav() {
     // off the pre-barrier streak on the first PLAN tick.
     coverage_done_streak_ = 0;
     have_active_intent_ = false;
-    transitionTo(State::PLAN);
+    transitionTo(State::PLAN, "return-released");
     return;
   }
 
@@ -3314,7 +3738,7 @@ void ExploPlannerNode::doReturnNav() {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: reached %s (dist=%.2f) -> waiting for team.",
         return_dest_label_.c_str(), dist);
-    transitionTo(State::RETURN_SYNC);
+    transitionTo(State::RETURN_SYNC, "return-arrived");
     return;
   }
 
@@ -3332,7 +3756,7 @@ void ExploPlannerNode::doReturnNav() {
         "-> waiting for team from current pose.",
         return_dest_label_.c_str(), elapsed, dist);
     abandonNavGoal("return-budget");
-    transitionTo(State::RETURN_SYNC);
+    transitionTo(State::RETURN_SYNC, "return-budget");
     return;
   }
   const double window_elapsed = (now - progress_check_time_).seconds();
@@ -3343,7 +3767,7 @@ void ExploPlannerNode::doReturnNav() {
           "Rendezvous: no progress toward %s -> waiting for team from "
           "current pose.", return_dest_label_.c_str());
       abandonNavGoal("return-no-progress");
-      transitionTo(State::RETURN_SYNC);
+      transitionTo(State::RETURN_SYNC, "return-no-progress");
       return;
     }
     progress_check_time_ = now;
@@ -3369,7 +3793,7 @@ void ExploPlannerNode::doReturnSync() {
     // off the pre-barrier streak on the first PLAN tick.
     coverage_done_streak_ = 0;
     have_active_intent_ = false;
-    transitionTo(State::PLAN);
+    transitionTo(State::PLAN, "barrier-released");
     return;
   }
 
@@ -3394,26 +3818,37 @@ void ExploPlannerNode::doReturnSync() {
           waited, active, rendezvous_expected_peers_);
       coverage_done_streak_ = 0;
       have_active_intent_ = false;
-      transitionTo(State::PLAN);
+      transitionTo(State::PLAN, "midrun-barrier-expired");
       return;
     }
     if (hold_escalate_ && !hold_escalated_) {
-      hold_escalated_ = true;  // sticky: an unreachable anchor must not
+      hold_escalated_ = true;  // sticky: an unreachable target must not
                                // re-escalate on every expiry forever
-      const float dx = last_connected_anchor_.x() - latest_pos_.x();
-      const float dy = last_connected_anchor_.y() - latest_pos_.y();
+      // Escalate to the SAME point the dispatch would pick — the midpoint of
+      // the last-contact pair when there is one. Escalating to this robot's own
+      // anchor sent a waiting robot to a point one comms range from where its
+      // waiting peer would go, which is the non-convergence documented in
+      // dispatchReconnect; it has to be fixed in both places or a hold simply
+      // reintroduces it after the dispatch avoided it.
+      std::string esc_peer;
+      const LastContact* esc_rec = missingPeerRecord(&esc_peer);
+      const Eigen::Vector3f esc_target =
+          esc_rec ? meetingPoint(esc_rec->self_pose, esc_rec->peer_pose)
+                  : last_connected_anchor_;
+      const char* esc_what = esc_rec ? "meeting point" : "last-connected anchor";
+      const float dx = esc_target.x() - latest_pos_.x();
+      const float dy = esc_target.y() - latest_pos_.y();
       if (std::sqrt(dx * dx + dy * dy) > goal_xy_tol_ * 2.0f) {
         RCLCPP_WARN(get_logger(),
             "Rendezvous: waited %.0fs for team (%d/%d present) -> escalating "
-            "to the last-connected anchor (%.2f, %.2f) before giving up.",
-            waited, active, rendezvous_expected_peers_,
-            last_connected_anchor_.x(), last_connected_anchor_.y());
-        startReturnTo(last_connected_anchor_, "last-connected anchor",
-                      "hold-escalate");
+            "to the %s (%.2f, %.2f) before giving up.",
+            waited, active, rendezvous_expected_peers_, esc_what,
+            esc_target.x(), esc_target.y());
+        startReturnTo(esc_target, esc_what, "hold-escalate");
         return;
       }
-      // Already at the anchor: escalating would just re-wait in place — fall
-      // through and give up now.
+      // Already there: escalating would just re-wait in place — fall through
+      // and give up now.
     }
     RCLCPP_WARN(get_logger(),
         "Rendezvous: waited %.0fs for team (%d/%d present); "
@@ -3427,7 +3862,7 @@ void ExploPlannerNode::doReturnSync() {
     } else {
       have_active_intent_ = false;
     }
-    transitionTo(State::DONE);
+    transitionTo(State::DONE, "barrier-gave-up");
     return;
   }
 
@@ -3478,6 +3913,10 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
         "Pursuit: record of '%s' is %.0fs old (max %.0fs) — trail head "
         "worthless, skipping the chase.",
         peer_id.c_str(), staleness, pursuit_staleness_max_sec_);
+    // Carried on the fallback's own dispatch event: "this arm held instead of
+    // chasing" and "this arm chose to hold" are different results, and only the
+    // decline reason separates them.
+    reconnect_decline_reason_ = "record-stale";
     return false;
   }
 
@@ -3521,6 +3960,7 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
           "mid-trail, skipping to the fallback.",
           peer_id.c_str(), staleness, trail_m, trail_model_sec,
           pursuit_budget_max_sec_);
+      reconnect_decline_reason_ = "trail-exceeds-budget-cap";
       return false;
     }
     budget = std::max(std::min(nav_min_timeout_sec_, pursuit_budget_max_sec_),
@@ -3538,6 +3978,11 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
           "Pursuit: record of '%s' is %.0fs old (max %.0fs) — trail head "
           "worthless, skipping the chase.",
           peer_id.c_str(), staleness, pursuit_staleness_max_sec_);
+      // Zero budget is either the staleness discount eating it or pursuit
+      // disabled outright (pursuit_budget_max_sec <= 0); name which, because
+      // the second means the arm never chased at all.
+      reconnect_decline_reason_ = pursuit_budget_max_sec_ <= 0.0
+          ? "pursuit-disabled" : "budget-zero-stale";
       return false;
     }
   }
@@ -3567,6 +4012,14 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
       goal_stale ? ", goal stale — contact pose only" : "",
       pursue_waypoints_.front().x(), pursue_waypoints_.front().y(),
       pursue_budget_sec_, pursue_waypoints_.size());
+
+  // The chase is committed here (state is armed, nothing below can decline it).
+  // dispatch_peer_id_ is normally already this peer, but a pursuit re-armed
+  // from anywhere else must still name its quarry, so set it from the argument.
+  dispatch_peer_id_      = peer_id;
+  dispatch_peer_age_sec_ = staleness;
+  logReconnectDispatch("chase", &pursue_waypoints_.front(), pursue_budget_sec_,
+                       reason);
 
   armPursuitWaypoint();
   return true;
@@ -3600,7 +4053,7 @@ void ExploPlannerNode::armPursuitWaypoint() {
     have_active_intent_ = true;
   }
 
-  transitionTo(State::PURSUE);
+  transitionTo(State::PURSUE, "pursuit-waypoint");
 
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
@@ -3654,7 +4107,7 @@ void ExploPlannerNode::doPursue() {
     // off the pre-chase streak on the first PLAN tick.
     coverage_done_streak_ = 0;
     have_active_intent_ = false;
-    transitionTo(State::PLAN);
+    transitionTo(State::PLAN, "pursuit-released");
     return;
   }
   const double chased = (now - pursue_start_time_).seconds();
@@ -3716,6 +4169,10 @@ void ExploPlannerNode::doPursue() {
 // PURSUIT waits wherever the chase ended: no agreed point is part of that
 // method, which is exactly the A/B against hybrid.
 void ExploPlannerNode::pursuitFallback(const char* why) {
+  // A fresh decision point: the chase ran and ended (`why` says how), so
+  // whatever was declined when it was ARMED is no longer the explanation for
+  // what happens next.
+  reconnect_decline_reason_.clear();
   if (reconnect_mode_ == ReconnectMode::HYBRID) {
     // pursue_rec_ is the pair the chase was armed from (snapshotted in
     // startPursuit): the midpoint must come from the SAME contact event the
@@ -3737,6 +4194,9 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
 void ExploPlannerNode::resumeExploring(const char* why) {
   standDownExploitation();
   abandonNavGoal(why);
+  coverage_done_streak_ = 0;
+  have_active_intent_   = false;
+  transitionTo(State::PLAN, why);
   // Close the mid-run bookkeeping HERE and not only in transitionTo. That
   // clock block is gated on reconnect_active_, and a fallback whose chase was
   // DECLINED never armed a manoeuvre, so reconnect_active_ is false and the
@@ -3745,24 +4205,38 @@ void ExploPlannerNode::resumeExploring(const char* why) {
   // re-dispatch and re-decline until it had burned all its attempts within
   // seconds — and reconnect_terminal_ would stay false, letting a LATER
   // terminal barrier resume exploring instead of ending the run.
+  //
+  // AFTER the transition, not before: transitionTo stamps reconnect_end with
+  // reconnect_terminal_, so setting it here first would label a mid-run
+  // manoeuvre that actually ran (chase armed, budget spent, then fell back to
+  // exploring) as terminal — contradicting its own dispatch event and moving
+  // its duration into the wrong bucket. Idempotent by construction: when the
+  // chase DID arm, transitionTo's block has already stamped and the guard
+  // below is false.
   if (!reconnect_terminal_) {
     midrun_last_end_    = this->now();
     midrun_end_armed_   = true;
     reconnect_terminal_ = true;
   }
-  coverage_done_streak_ = 0;
-  have_active_intent_   = false;
-  transitionTo(State::PLAN);
 }
 
 // See pursuit_explore_fallback_ for why parking is the dominated option.
 bool ExploPlannerNode::pursuitExploreFallback(const char* why) {
-  if (!pursuit_explore_fallback_) return false;
+  if (!pursuit_explore_fallback_) {
+    // Appended, not overwritten: the chase's own decline (record stale, trail
+    // too long) is why we are here at all, and the hold that follows should
+    // carry both halves of the explanation.
+    if (!reconnect_decline_reason_.empty()) reconnect_decline_reason_ += "+";
+    reconnect_decline_reason_ += "explore-fallback-disabled";
+    return false;
+  }
   if (pursuit_explores_ >= pursuit_explore_max_) {
     RCLCPP_INFO(get_logger(),
         "Pursuit: explore-fallback budget spent (%d/%d) [%s] -> holding for "
         "the team instead.",
         pursuit_explores_, pursuit_explore_max_, why);
+    if (!reconnect_decline_reason_.empty()) reconnect_decline_reason_ += "+";
+    reconnect_decline_reason_ += "explore-fallback-budget-spent";
     return false;
   }
   ++pursuit_explores_;
@@ -3771,6 +4245,11 @@ bool ExploPlannerNode::pursuitExploreFallback(const char* why) {
       "(fallback %d/%d). A moving robot can still regain the link; a parked "
       "one can only be found.",
       why, pursuit_explores_, pursuit_explore_max_);
+  // No destination: the manoeuvre is being given up in favour of exploring,
+  // and the next goal is whatever PLAN picks. NB a resume_exploring dispatch
+  // has no matching reconnect_end when the chase was DECLINED — there was no
+  // manoeuvre clock running to stop (see resumeExploring).
+  logReconnectDispatch("resume_exploring", nullptr, /*budget_sec=*/-1.0, why);
   resumeExploring(why);
   return true;
 }
@@ -3800,7 +4279,11 @@ void ExploPlannerNode::holdForTeam(const char* why) {
   RCLCPP_INFO(get_logger(),
       "Reconnect: holding for the team at the current pose (%.2f, %.2f) "
       "[%s].", latest_pos_.x(), latest_pos_.y(), why);
-  transitionTo(State::RETURN_SYNC);
+  // The hold's "destination" is where it holds, which is where the robot
+  // already is — recorded so a hold and an arrival are comparable geometry.
+  refreshDispatchContext();
+  logReconnectDispatch("hold", &latest_pos_, /*budget_sec=*/-1.0, why);
+  transitionTo(State::RETURN_SYNC, why);
 }
 
 // Presence-only intent: goal = own pose. The claim disc this puts on the
@@ -4029,7 +4512,7 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
   std::snprintf(buf, sizeof(buf), "hold peer=%s dist=%.2f n=%d",
                 d.peer_id.c_str(), d.dist_m, prox_hold_count_);
   publishProxState(buf);
-  transitionTo(State::PROXIMITY_HOLD);
+  transitionTo(State::PROXIMITY_HOLD, "proximity-hold");
 }
 
 // Stop the platform on a transition that ABANDONS the in-flight hop instead of
@@ -4151,7 +4634,7 @@ void ExploPlannerNode::doProximityHold() {
   char buf[160];
   std::snprintf(buf, sizeof(buf), "clear reason=%s held=%.1f", why, held);
   publishProxState(buf);
-  transitionTo(prox_resume_state_);
+  transitionTo(prox_resume_state_, "proximity-hold-released");
   state_enter_time_ =
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
   progress_check_time_ = now;
@@ -4173,7 +4656,7 @@ void ExploPlannerNode::publishProxState(const std::string& state) {
 void ExploPlannerNode::doIntegrate() {
   double elapsed = (this->now() - state_enter_time_).seconds();
   if (elapsed >= integrate_wait_) {
-    transitionTo(State::LOG_STEP);
+    transitionTo(State::LOG_STEP, "integrate-complete");
   }
 }
 
@@ -4233,6 +4716,22 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
   const double uf = coverageUnknownFraction(&cov_src);
   m.unknown_fraction = static_cast<float>(uf);
   m.coverage_source  = cov_src;
+  last_unknown_fraction_ = uf;
+  last_coverage_source_  = cov_src;
+
+  // Coverage milestones ride the SAME measurement the CSV row and the DONE
+  // criterion use, taken on the same tick — so "time to reach coverage X" can
+  // never disagree with the curve it is read off. This is the hook, not a
+  // separate sampler: every emitter of a CSV row (the end-of-step row and the
+  // periodic timer row, which runs in every state including the whole of a
+  // reconnect manoeuvre) passes through here, so the ladder is evaluated at the
+  // sampling period even while the step counter is frozen.
+  if (exp_log_) {
+    exp_log_->noteCoverage(expCtx(), uf, cov_src,
+                           static_cast<double>(cumulative_distance_),
+                           static_cast<double>(latest_pos_.x()),
+                           static_cast<double>(latest_pos_.y()));
+  }
 
   // Aggregate map stats from map_cache_ (the fused ROI grid). The dscovox node
   // no longer computes these — scoring and stats both live in the planner now.
@@ -4293,6 +4792,18 @@ void ExploPlannerNode::metricsTick() {
   fillCommonMetrics(m);
   logger_->logStep(m);
 
+  // Realised-rate accounting for this sampler, reported in the event log's
+  // run_end. The configured period is NOT what it achieves: the gate above is a
+  // steady-clock deadline armed after the previous tick's work, so at RTF ~1
+  // every second sim-time tick is suppressed and at RTF ~0.83 none are, and the
+  // realised period changed from 10 s to 5 s between campaigns with no config
+  // change and no log line saying so. Measured from the sim stamps of the rows
+  // actually written, which is the quantity an analysis needs.
+  ++metrics_rows_written_;
+  if (metrics_first_row_sim_sec_ < 0.0)
+    metrics_first_row_sim_sec_ = m.sim_time_sec;
+  metrics_last_row_sim_sec_ = m.sim_time_sec;
+
   const double cost_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - mt_now).count();
   // Steady clock throughout: this bounds work on the executor thread, which is
@@ -4317,6 +4828,227 @@ void ExploPlannerNode::metricsTick() {
   metrics_next_ = std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
           std::chrono::duration<double>(eff_period));
+}
+
+// ==================================================================
+// Experiment event log — see experiment_log.hpp
+// ==================================================================
+
+ExperimentContext ExploPlannerNode::expCtx() {
+  ExperimentContext c;
+  // The node's OWN clock, which is sim time under use_sim_time. The single
+  // reason this file exists: every event in the log shares the axis the planner
+  // actually makes decisions on, so nothing downstream has to map wall-clock
+  // log stamps onto sim time through a real-time factor that drifts within a
+  // run.
+  c.sim_time_sec = this->now().seconds();
+  c.state = stateName(state_);
+  c.step  = step_;
+  return c;
+}
+
+void ExploPlannerNode::startExperimentLog() {
+  if (!exp_log_ || exp_log_->started()) return;
+  // Under use_sim_time this->now() reads exactly 0 until the first /clock
+  // message lands, and t0 = 0 would turn every t_rel_sec in the file into an
+  // absolute sim time wearing a relative name — the precise class of silent
+  // axis error this log replaces. Wait for a real stamp instead; the tick timer
+  // itself only fires on that same clock, so this costs nothing.
+  const auto now = this->now();
+  if (now.nanoseconds() <= 0) return;
+  ExperimentContext ctx = expCtx();
+  exp_log_->startRun(ctx, coverage_milestones_);
+  RCLCPP_INFO(get_logger(),
+      "Experiment event log started at sim t0=%.3f s; all event times in "
+      "'%s' are on this clock.", ctx.sim_time_sec,
+      experiment_log_path_.c_str());
+}
+
+void ExploPlannerNode::expClockAnchorTick() {
+  if (!exp_log_ || !exp_log_->started()) return;
+  if (experiment_log_anchor_period_sec_ <= 0.0) return;
+  const double now_sec = this->now().seconds();
+  if (next_anchor_sim_sec_ < 0.0) {
+    // First anchor goes out immediately after run_start, so the very first
+    // interval of the run is bracketed like every other one.
+    next_anchor_sim_sec_ = now_sec;
+  }
+  if (now_sec < next_anchor_sim_sec_) return;
+  exp_log_->logClockAnchor(expCtx());
+  // Scheduled forward from NOW, not from the missed deadline: a sim clock that
+  // jumps (a paused or fast-forwarded simulator) must not produce a burst of
+  // back-dated anchors, all of which would carry the same wall stamp and so
+  // report an infinite real-time factor.
+  next_anchor_sim_sec_ = now_sec + experiment_log_anchor_period_sec_;
+}
+
+// Peer belief. Deliberately maintained from the intent stream itself rather
+// than read out of Coordination's claim table: the control arm runs with
+// coordination_enabled=false, where that table is never consulted, and outage
+// timing is exactly what the control arm exists to provide a baseline for. The
+// threshold is coord_claim_ttl_sec, so the belief means the same thing the
+// barrier's presence test means — and peers_live (which IS read from
+// Coordination) rides on every peer event so the two can be cross-checked.
+void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
+  if (!exp_log_) return;
+  const auto now = this->now();
+  auto it = peer_belief_.find(peer_id);
+  if (it == peer_belief_.end()) {
+    // First time this teammate has ever been heard. Worth an event of its own
+    // (first_contact=true): it is when the pair's link came up, which is not
+    // recoverable from anything else in the file.
+    PeerBelief b;
+    b.last_heard = now;
+    b.live = true;
+    peer_belief_.emplace(peer_id, b);
+    PeerEvent e;
+    e.peer = peer_id;
+    e.silent_sec = 0.0;
+    e.last_contact_age_sec = -1.0;
+    e.first_contact = true;
+    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.expected_peers = rendezvous_expected_peers_;
+    exp_log_->logPeerSeen(expCtx(), e);
+    return;
+  }
+  if (!it->second.live) {
+    PeerEvent e;
+    e.peer = peer_id;
+    // The outage this message ends, measured from the last one that preceded
+    // it — NOT from when the sweep noticed, which lags by up to a claim TTL.
+    e.silent_sec = (now - it->second.last_heard).seconds();
+    const auto rec = last_contact_.find(peer_id);
+    e.last_contact_age_sec = (rec != last_contact_.end())
+        ? (now - rec->second.stamp).seconds() : -1.0;
+    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.expected_peers = rendezvous_expected_peers_;
+    exp_log_->logPeerSeen(expCtx(), e);
+    it->second.live = true;
+  }
+  it->second.last_heard = now;
+}
+
+void ExploPlannerNode::expPeerSweep() {
+  if (!exp_log_ || peer_belief_.empty()) return;
+  const auto now = this->now();
+  for (auto& [peer_id, belief] : peer_belief_) {
+    if (!belief.live) continue;
+    const double silent = (now - belief.last_heard).seconds();
+    if (silent < coord_claim_ttl_sec_) continue;
+    belief.live = false;
+    PeerEvent e;
+    e.peer = peer_id;
+    e.silent_sec = silent;
+    const auto rec = last_contact_.find(peer_id);
+    e.last_contact_age_sec = (rec != last_contact_.end())
+        ? (now - rec->second.stamp).seconds() : -1.0;
+    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.expected_peers = rendezvous_expected_peers_;
+    exp_log_->logPeerLost(expCtx(), e);
+  }
+}
+
+// One event per manoeuvre DECISION, emitted by the leaf that commits the
+// action. The alternative — logging inside dispatchReconnect's branch walk —
+// cannot see the hold-escalation dispatch (which re-enters startReturnTo
+// straight from the barrier) or the hybrid chase -> meeting-point handoff, and
+// would drift out of step with the behaviour the first time a branch moved.
+// dispatchReconnect stashes the peer context at the top of its branch walk, so
+// the leaf it reaches reports exactly what the decision saw. Two leaves are
+// reached WITHOUT that walk — hold escalation re-enters startReturnTo straight
+// from the barrier, and pursuitFallback commits once a chase has run — and for
+// those the stashed age is old by the entire wait or the entire chase budget,
+// always in the flattering direction. Re-querying here costs one map lookup and
+// makes "how stale was the record when the robot committed to this manoeuvre"
+// mean the same thing on every dispatch event.
+void ExploPlannerNode::refreshDispatchContext() {
+  std::string peer_id;
+  const LastContact* rec = missingPeerRecord(&peer_id);
+  dispatch_peer_id_      = peer_id;
+  dispatch_peer_age_sec_ = rec ? (this->now() - rec->stamp).seconds() : -1.0;
+}
+
+void ExploPlannerNode::logReconnectDispatch(const char* action,
+                                            const Eigen::Vector3f* dest,
+                                            double budget_sec,
+                                            const char* reason) {
+  if (!exp_log_) return;
+  const auto now = this->now();
+  ReconnectDispatchEvent e;
+  e.mode     = reconnectModeName(reconnect_mode_);
+  e.terminal = reconnect_terminal_;
+  e.reason   = reason;
+  e.peer     = dispatch_peer_id_;
+  e.peer_record_age_sec = dispatch_peer_age_sec_;
+  e.action   = action;
+  if (dest != nullptr) {
+    e.have_dest = true;
+    e.dest_x = dest->x();
+    e.dest_y = dest->y();
+  }
+  e.budget_sec     = budget_sec;
+  e.decline_reason = reconnect_decline_reason_;
+  // Consumed, not just read. A decline belongs to the dispatch that produced
+  // it; dispatchReconnect clears the field on entry, but the two out-of-band
+  // leaves (hold escalation re-entering startReturnTo from the barrier, and
+  // pursuitFallback committing after a spent chase) never pass through that
+  // entry and would otherwise re-report a decline from minutes earlier as
+  // though it were the reason for THIS manoeuvre.
+  reconnect_decline_reason_.clear();
+  e.attempt        = reconnect_terminal_ ? 0 : midrun_attempts_;
+  e.peers_live     = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+  e.expected_peers = rendezvous_expected_peers_;
+  exp_log_->logReconnectDispatch(expCtx(), e);
+}
+
+void ExploPlannerNode::logRunEnd(const char* reason) {
+  if (!exp_log_) return;
+  RunEndEvent e;
+  e.reason     = reason;
+  e.steps      = step_;
+  e.distance_m = cumulative_distance_;
+  // The last measured coverage rather than a fresh measurement: this runs on
+  // the DONE transition and (via the destructor) during shutdown, where
+  // map_cache_ may be mid-teardown and a whole-grid walk is the last thing to
+  // start. fillCommonMetrics refreshes it at the sampling period, so it is at
+  // most one metrics period old.
+  e.unknown_fraction = last_unknown_fraction_;
+  e.coverage_source  = last_coverage_source_;
+  e.peers_live =
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  e.expected_peers = rendezvous_expected_peers_;
+  // Configured vs REALISED CSV sampling rate. The realised value needs two rows
+  // to be a period at all; -1 says "not measurable", never a fabricated 0.
+  e.metrics_period_param_sec     = metrics_period_sec_;
+  e.metrics_effective_period_sec = metrics_effective_period_;
+  e.metrics_rows                 = metrics_rows_written_;
+  e.metrics_backoffs             = metrics_backoffs_;
+  e.metrics_realised_period_sec =
+      (metrics_rows_written_ >= 2)
+          ? (metrics_last_row_sim_sec_ - metrics_first_row_sim_sec_) /
+                static_cast<double>(metrics_rows_written_ - 1)
+          : -1.0;
+  exp_log_->logRunEnd(expCtx(), e);
+}
+
+ExploPlannerNode::~ExploPlannerNode() {
+  // The campaign stops runs with SIGTERM (docker stop), which unwinds spin()
+  // and destroys the node without ever reaching DONE — so without this the file
+  // would end mid-stream and be indistinguishable from a truncated one. The
+  // logger ignores a second run_end, so a node that DID reach DONE keeps its
+  // real reason.
+  //
+  // Nothing here may throw: a destructor that escapes during shutdown
+  // terminates the process and would lose the flush it was called to perform.
+  try {
+    // A DONE-idle robot already knows why it finished; only a node killed
+    // before ever reaching DONE (the duration cap, i.e. a censored run) falls
+    // back to the signal itself as the reason.
+    logRunEnd(done_reason_.empty() ? "node-destroyed" : done_reason_.c_str());
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(get_logger(), "ExperimentLog: run_end failed: %s", e.what());
+  } catch (...) {
+  }
 }
 
 // ==================================================================
@@ -4350,6 +5082,26 @@ void ExploPlannerNode::doLogStep() {
   }
 
   logger_->logStep(m);
+  // The same row into the event log. Deliberate redundancy with the CSV, which
+  // is unchanged and stays: two independently written files that must agree is
+  // what lets either be validated against the other, and the JSON copy carries
+  // the pose and the sim-clock envelope the CSV has no columns for.
+  if (exp_log_) {
+    StepEvent e;
+    e.unknown_fraction = m.unknown_fraction;
+    e.coverage_source  = m.coverage_source.c_str();
+    e.observed_voxels  = m.total_observed_voxels;
+    e.frontier_voxels  = m.frontier_voxels;
+    e.distance_m       = m.distance_traveled;
+    e.x   = latest_pos_.x();
+    e.y   = latest_pos_.y();
+    e.z   = latest_pos_.z();
+    e.yaw = latest_yaw_;
+    e.phase = m.phase.c_str();
+    e.peers_live = m.coord_active_peers;
+    e.plan_time_ms = m.plan_time_ms;
+    exp_log_->logStep(expCtx(), e);
+  }
   RCLCPP_INFO(get_logger(),
       "Step %d logged: voxels=%d frontiers=%d dist=%.2f mean_eig=%.4f",
       step_, m.total_observed_voxels, m.frontier_voxels,
@@ -4373,13 +5125,14 @@ void ExploPlannerNode::doLogStep() {
     // re-checks the same budget at its head and calls this again, where a
     // deferral costs nothing.
     if (!finishOrRendezvous("step-budget")) {
-      transitionTo(State::PLAN);
+      transitionTo(State::PLAN, "finish-deferred");
     }
   } else {
     // Route by phase: exploitation steps loop back to the vantage planner,
     // exploration steps to the exploration planner.
-    transitionTo(phase_ == Phase::EXPLOIT ? State::EXPLOIT_PLAN
-                                          : State::PLAN);
+    transitionTo(
+        phase_ == Phase::EXPLOIT ? State::EXPLOIT_PLAN : State::PLAN,
+        "step-logged");
   }
 }
 
@@ -4494,12 +5247,12 @@ void ExploPlannerNode::finishActiveTarget(bool success) {
       id, success ? "COMPLETE" : "PARTIAL", clear, min_vantages_required_);
 
   if (target_queue_.hasPending()) {
-    transitionTo(State::EXPLOIT_PLAN);  // doExploitPlan activates the next one
+    transitionTo(State::EXPLOIT_PLAN, "target-closed-next-pending");  // doExploitPlan activates the next one
   } else {
     phase_ = Phase::EXPLORE;
     RCLCPP_INFO(get_logger(),
         "Target queue empty -> reverting to EXPLORE.");
-    transitionTo(State::PLAN);
+    transitionTo(State::PLAN, "target-queue-empty");
   }
 }
 
@@ -4659,7 +5412,7 @@ void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
     have_active_intent_ = true;
   }
 
-  transitionTo(State::NAVIGATE);
+  transitionTo(State::NAVIGATE, "exploit-goal-selected");
 
   // Initialise the smart-timeout state for this NAVIGATE cycle (same as doPlan).
   const float dx = current_goal_.position.x() - robot_pos.x();
@@ -4847,7 +5600,7 @@ void ExploPlannerNode::doExploitPlan() {
     tgt = target_queue_.activate();
     if (!tgt) {  // queue drained
       phase_ = Phase::EXPLORE;
-      transitionTo(State::PLAN);
+      transitionTo(State::PLAN, "exploit-queue-drained");
       return;
     }
   }
@@ -5415,7 +6168,7 @@ void ExploPlannerNode::doExploitDwell() {
       elapsed, current_vantage_index_, pending_exploit_target_id_,
       los_clear ? "clear" : "BLOCKED",
       t ? t->clear_los_dwells : 0, min_vantages_required_);
-  transitionTo(State::LOG_STEP);
+  transitionTo(State::LOG_STEP, "dwell-complete");
 }
 
 // ==================================================================
