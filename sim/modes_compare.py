@@ -679,10 +679,21 @@ def main():
             if r["verdict"] == "INVALID":
                 bad_verdict.append(f"{arm}/seed{r['seed']}")
     if len(builds) > 1:
-        print(f"\n!! ARMS BUILT FROM DIFFERENT COMMITS — the comparison is "
-              f"confounded with the build, not just the arm:")
+        # A differing hash is necessary but NOT sufficient evidence of
+        # confounding: this repo carries the analysis scripts alongside the
+        # planner, so committing a change to sim/*.py mid-campaign moves the
+        # recorded hash without touching the binary that ran. That happened
+        # during Phase 7 and would have discarded a perfectly good matrix.
+        # Name the check rather than the verdict.
+        print(f"\n!! ARMS RECORD DIFFERENT COMMITS. This is confounded with the "
+              f"build ONLY IF the difference reaches compiled code:")
         for b, who in sorted(builds.items()):
             print(f"       {b}: {', '.join(sorted(who))}")
+        pair = " ".join(sorted(builds))
+        print(f"   Settle it, do not assume:  git diff --stat {pair} -- "
+              f"'*.cpp' '*.hpp' 'config/'")
+        print(f"   Empty diff (plus an install tree older than the first cell) "
+              f"means the same binary ran everywhere and the matrix stands.")
     if bad_verdict:
         print(f"\n!! IN THE MEDIANS DESPITE A FAILED GATE VERDICT: "
               f"{', '.join(sorted(bad_verdict))}. Their manipulation check did "
