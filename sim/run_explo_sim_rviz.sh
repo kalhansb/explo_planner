@@ -48,6 +48,13 @@
 #                                           # exploration exhaustion
 #                                           # (rendezvous | pursuit | hybrid)
 #                                           # — see below
+#   FOV_VFOV=0.785 FOV_V_RAYS=12 ./run_explo_sim_rviz.sh
+#                                           # A/B: override the EIG evaluator's
+#                                           # modelled sensor geometry for this
+#                                           # run (FOV_HFOV / FOV_VFOV /
+#                                           # FOV_H_RAYS / FOV_V_RAYS /
+#                                           # CAND_N_YAW). Unset = whatever
+#                                           # shared_params.yaml says — see below
 # Ctrl-C tears the whole stack down in reverse start order (SIGINT to each
 # process group, then SIGKILL to stragglers), the same teardown the campaign
 # driver used.
@@ -371,6 +378,26 @@ MIN_GOAL_DIST="$(flt "${MIN_GOAL_DIST:-4.0}")"
 # which prints the ROI band it was applied to.
 FRONTIER_Z_LO_OFF="$(flt "${FRONTIER_Z_LO_OFF:-5.7}")"
 FRONTIER_Z_HI_OFF="$(flt "${FRONTIER_Z_HI_OFF:-2.5}")"
+# EIG sensor-model overrides. ALL UNSET BY DEFAULT — with none of them set the
+# harness passes nothing and shared_params.yaml remains the single point of
+# control for the evaluator's geometry, which is what it was before these
+# existed. They exist so an A/B on that geometry does not have to edit an
+# installed build artifact (install/.../shared_params.yaml) and then remember to
+# rebuild, which is unreproducible and invisible in the run manifest.
+#
+# fov_hfov/fov_vfov are doubles in the node and go through flt(); the *_RAYS and
+# CAND_N_YAW are declared as integers and must NOT get a decimal point, or the
+# node aborts at startup on the type mismatch (see the flt() note at the top —
+# the trap runs in both directions).
+#
+# CAND_N_YAW only bites with POLAR on: FRONTIER_ONLY=1 (the default here) turns
+# the polar grid off entirely, and frontier candidates take their yaw from the
+# centroid direction, not from this count.
+FOV_HFOV="${FOV_HFOV:-}"
+FOV_VFOV="${FOV_VFOV:-}"
+FOV_H_RAYS="${FOV_H_RAYS:-}"
+FOV_V_RAYS="${FOV_V_RAYS:-}"
+CAND_N_YAW="${CAND_N_YAW:-}"
 # Recently-visited goal suppression. The yaml ships 0.0 (off, field behaviour);
 # this scenario needs it, and it is the third and last piece of the same defect.
 # MIN_GOAL_DIST stops the planner picking a goal too close to observe from, the
@@ -990,6 +1017,21 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
+# Built once, outside the loop. Empty unless the caller set something, and
+# expanded with the ${a[@]+"${a[@]}"} guard because `set -u` treats an empty
+# array expansion as an unbound variable on bash < 4.4.
+FOV_ARGS=()
+if [ -n "$FOV_HFOV" ];   then FOV_ARGS+=( -p fov_hfov:="$(flt "$FOV_HFOV")" ); fi
+if [ -n "$FOV_VFOV" ];   then FOV_ARGS+=( -p fov_vfov:="$(flt "$FOV_VFOV")" ); fi
+if [ -n "$FOV_H_RAYS" ]; then FOV_ARGS+=( -p fov_h_rays:="$FOV_H_RAYS" ); fi
+if [ -n "$FOV_V_RAYS" ]; then FOV_ARGS+=( -p fov_v_rays:="$FOV_V_RAYS" ); fi
+if [ -n "$CAND_N_YAW" ]; then FOV_ARGS+=( -p candidate_n_yaw:="$CAND_N_YAW" ); fi
+if [ ${#FOV_ARGS[@]} -gt 0 ]; then
+  log "EIG sensor-model OVERRIDE: ${FOV_ARGS[*]}"
+  echo "fov_override=${FOV_ARGS[*]}" >> "$MANIFEST"
+else
+  echo "fov_override=none (shared_params.yaml)" >> "$MANIFEST"
+fi
 for r in $ROBOTS; do
   # COMMS=1 splits the intent stream: publish to a per-robot topic the emulator
   # can see, subscribe to the relayed copy of the peer's. Both defaults are
@@ -1043,6 +1085,7 @@ for r in $ROBOTS; do
       -p frontier_z_hi_offset_m:=$FRONTIER_Z_HI_OFF \
       -p visited_goal_radius_m:=$VISITED_RADIUS \
       -p visited_goal_ttl_sec:=$VISITED_TTL \
+      ${FOV_ARGS[@]+"${FOV_ARGS[@]}"} \
       ${EXTRA[@]+"${EXTRA[@]}"} \
       -p output_csv:="$OUTDIR/planner_$r.csv"
 done
