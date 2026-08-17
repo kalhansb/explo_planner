@@ -83,21 +83,43 @@ import statistics as st
 MANOEUVRE_STATES = {"PURSUE", "RETURN_NAV", "RETURN_SYNC"}
 
 # Decision lines. Each marks one firing; the kind is fixed by which line hit.
+# The 2026-08-17 planner renamed the dispatch prefix ("exploration ended" ->
+# "dispatched": with the mid-run trigger the manoeuvre no longer implies the
+# end of exploration); both spellings are accepted so old campaigns keep
+# parsing.
 RE_CHASE = re.compile(
-    r"Pursuit: exploration ended \[([^\]]*)\], '([^']+)' out of comms "
-    r"\(record (\d+)s old\) -> chasing")
+    r"Pursuit: (?:exploration ended|dispatched) \[([^\]]*)\], '([^']+)' "
+    r"out of comms \(record (\d+)s old[^)]*\) -> chasing")
+# Two decline shapes: the staleness-gate veto ("max Ns") and the goal-stale
+# cover-check veto ("goal stale ... chase would die mid-trail").
 RE_DECLINE = re.compile(
-    r"Pursuit: record of '([^']+)' is (\d+)s old \(max (\d+)s\)")
+    r"Pursuit: record of '([^']+)' is (\d+)s old "
+    r"\((?:max (\d+)s|goal stale)\)")
 RE_RETURN = re.compile(
-    r"Rendezvous: exploration ended \[([^\]]*)\], team incomplete "
+    r"Rendezvous: (?:exploration ended|dispatched) \[([^\]]*)\], "
+    r"team incomplete "
     r"\((\d+)/(\d+) peers\) -> returning to (meeting point|last-connected anchor)")
 RE_HOLD = re.compile(r"Reconnect: holding for the team at the current pose")
+# Mid-run trigger context (2026-08-17). The dispatch marker precedes the
+# firing line and tags it; the resume/exhaustion lines are their own events.
+RE_MIDRUN_DISPATCH = re.compile(
+    r"Reconnect \(mid-run\): peer silent (\d+)s >= \d+s \(attempt (\d+)/(\d+)\)")
+RE_MIDRUN_RESUME = re.compile(
+    r"Reconnect \(mid-run\): gave up after (\d+)s at the barrier")
+RE_MIDRUN_EXHAUSTED = re.compile(
+    r"Reconnect \(mid-run\): attempt budget exhausted")
+# Hold escalation is a CONTINUATION of the running manoeuvre (reconnect_active_
+# persists across the escalated leg), never a second firing.
+RE_ESCALATE = re.compile(
+    r"-> escalating to the last-connected anchor")
 # Outcomes.
 RE_REJOIN = re.compile(
-    r"(?:Pursuit: team reconnected mid-chase|Rendezvous: team reconnected en route"
+    r"(?:Pursuit: (?:team reconnected|chased peer back in comms) mid-chase"
+    r"|Rendezvous: team reconnected en route"
     r"|Rendezvous: full team connected)")
 RE_ARRIVED = re.compile(r"Rendezvous: reached (last-connected anchor|meeting point)")
 RE_UNREACH = re.compile(r"Rendezvous: (meeting point|last-connected anchor) unreachable")
+RE_GIVEUP = re.compile(r"max_wait=[\d.]+s reached -> giving up and finishing")
 RE_ENDED = re.compile(r"Reconnect manoeuvre ended after ([\d.]+) s sim")
 # The non-firing that looks like one.
 RE_FULLTEAM = re.compile(r"exploration ended \[[^\]]*\] with full team present")
@@ -200,6 +222,7 @@ def parse_log(path, steps=None):
     """
     events = []
     pending_decline = None
+    pending_midrun = False
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -218,11 +241,29 @@ def parse_log(path, steps=None):
             if RE_FULLTEAM.search(line):
                 events.append({"w": w, "type": "no_fire"})
                 continue
+            m2 = RE_MIDRUN_DISPATCH.search(line)
+            if m2:
+                # Context marker: the fire line that follows carries the kind;
+                # this tags it as a mid-run (vs terminal) dispatch.
+                pending_midrun = True
+                events.append({"w": w, "type": "midrun_dispatch",
+                               "silent": float(m2.group(1)),
+                               "attempt": int(m2.group(2))})
+                continue
+            m2 = RE_MIDRUN_RESUME.search(line)
+            if m2:
+                events.append({"w": w, "type": "resumed",
+                               "waited": float(m2.group(1))})
+                continue
+            if RE_MIDRUN_EXHAUSTED.search(line):
+                events.append({"w": w, "type": "midrun_exhausted"})
+                continue
             m2 = RE_DECLINE.search(line)
             if m2:
                 # Not a firing on its own: the fallback line that follows is.
                 pending_decline = {"stale": float(m2.group(2)),
-                                   "max": float(m2.group(3))}
+                                   "max": (float(m2.group(3))
+                                           if m2.group(3) else None)}
                 events.append({"w": w, "type": "decline",
                                "peer": m2.group(1), "stale": float(m2.group(2))})
                 continue
@@ -230,25 +271,41 @@ def parse_log(path, steps=None):
             if m2:
                 events.append({"w": w, "type": "fire", "kind": "chase",
                                "reason": m2.group(1), "peer": m2.group(2),
-                               "stale": float(m2.group(3)), "declined": False})
+                               "stale": float(m2.group(3)), "declined": False,
+                               "midrun": pending_midrun})
                 pending_decline = None
+                pending_midrun = False
+                continue
+            # Escalation must be tested BEFORE RE_RETURN: the escalated leg
+            # also logs a "dispatched [hold-escalate] ... returning to
+            # last-connected anchor" line, which would otherwise double-count
+            # the manoeuvre as a second firing.
+            if RE_ESCALATE.search(line):
+                events.append({"w": w, "type": "escalate"})
                 continue
             m2 = RE_RETURN.search(line)
             if m2:
+                if m2.group(1) == "hold-escalate":
+                    events.append({"w": w, "type": "escalate_leg"})
+                    continue
                 kind = ("meeting_point" if m2.group(4) == "meeting point"
                         else "anchor_return")
                 events.append({"w": w, "type": "fire", "kind": kind,
                                "reason": m2.group(1), "peer": "",
                                "stale": pending_decline["stale"] if pending_decline else None,
-                               "declined": pending_decline is not None})
+                               "declined": pending_decline is not None,
+                               "midrun": pending_midrun})
                 pending_decline = None
+                pending_midrun = False
                 continue
             if RE_HOLD.search(line):
                 events.append({"w": w, "type": "fire", "kind": "hold",
                                "reason": "", "peer": "",
                                "stale": pending_decline["stale"] if pending_decline else None,
-                               "declined": pending_decline is not None})
+                               "declined": pending_decline is not None,
+                               "midrun": pending_midrun})
                 pending_decline = None
+                pending_midrun = False
                 continue
             if RE_REJOIN.search(line):
                 events.append({"w": w, "type": "rejoin"})
@@ -259,6 +316,9 @@ def parse_log(path, steps=None):
                 continue
             if RE_UNREACH.search(line):
                 events.append({"w": w, "type": "unreachable"})
+                continue
+            if RE_GIVEUP.search(line):
+                events.append({"w": w, "type": "gaveup"})
                 continue
             m2 = RE_ENDED.search(line)
             if m2:
@@ -552,8 +612,15 @@ def analyse_run(run_dir):
             if e["type"] != "fire":
                 continue
             t_arm = to_sim(e["w"])
-            # Walk forward to the resolution of THIS firing.
+            # Walk forward to the resolution of THIS firing. The LAST decisive
+            # event before the next firing wins, not the first: an escalated
+            # hold can arrive at the anchor and STILL give up later, and a
+            # mid-run barrier can arrive and still resume — "arrived_waiting"
+            # is only the outcome when nothing further resolved it. escalate /
+            # escalate_leg / midrun context rows are continuations, never
+            # resolutions.
             outcome, t_out, dur = "open_at_horizon", None, None
+            arrived_at = None
             for j in range(i + 1, len(ev)):
                 nxt = ev[j]
                 if nxt["type"] == "fire":
@@ -561,12 +628,20 @@ def analyse_run(run_dir):
                 if nxt["type"] == "rejoin":
                     outcome, t_out = "reconnected", to_sim(nxt["w"])
                     break
-                if nxt["type"] == "arrived":
-                    outcome, t_out = "arrived_waiting", to_sim(nxt["w"])
+                if nxt["type"] == "resumed":
+                    outcome, t_out = "resumed_exploring", to_sim(nxt["w"])
                     break
+                if nxt["type"] == "gaveup":
+                    outcome, t_out = "gave_up", to_sim(nxt["w"])
+                    break
+                if nxt["type"] == "arrived":
+                    arrived_at = to_sim(nxt["w"])
+                    continue
                 if nxt["type"] == "unreachable":
                     outcome, t_out = "unreachable", to_sim(nxt["w"])
                     break
+            if outcome == "open_at_horizon" and arrived_at is not None:
+                outcome, t_out = "arrived_waiting", arrived_at
             for j in range(i + 1, len(ev)):
                 if ev[j]["type"] == "ended":
                     dur = ev[j]["dur"]
@@ -590,6 +665,7 @@ def analyse_run(run_dir):
                 "end_reason": man.get("run_end_reason", ""),
                 "robot": robot,
                 "kind": e["kind"],
+                "midrun": int(bool(e.get("midrun"))),
                 "after_decline": int(bool(e.get("declined"))),
                 "staleness_s": e.get("stale"),
                 "t_arm_sim": t_arm,
@@ -623,7 +699,8 @@ def analyse_run(run_dir):
 
 
 FIELDS = ["run", "arm", "seed", "tx_power_dbm", "gates", "end_reason", "robot",
-          "kind", "after_decline", "staleness_s", "t_arm_sim", "link_up_at_arm",
+          "kind", "midrun", "after_decline", "staleness_s", "t_arm_sim",
+          "link_up_at_arm",
           "link_up_frac_10s", "delivered_per_s", "dropped_per_s",
           "peer_suppressed", "separation_m_at_arm",
           "trees_on_link_at_arm", "outcome", "t_outcome_sim", "dt_to_outcome_s",
@@ -669,12 +746,13 @@ def main():
         print("no manoeuvre firings found")
         return 0
 
-    print(f"{'run':<24}{'rob':<7}{'kind':<14}{'stale':>7}{'t_arm':>8}"
+    print(f"{'run':<24}{'rob':<7}{'kind':<14}{'mid':>4}{'stale':>7}{'t_arm':>8}"
           f"{'up10s':>7}{'supp':>5}{'sep_m':>7}{'trees':>6}{'outcome':>17}"
           f"{'dt':>7}{'dist':>7}{'csv':>4}")
-    print("-" * 121)
+    print("-" * 125)
     for e in events:
         print(f"{e['run']:<24}{e['robot']:<7}{e['kind']:<14}"
+              f"{e['midrun']:>4}"
               f"{fmt(e['staleness_s'], 0):>7}{fmt(e['t_arm_sim'], 0):>8}"
               f"{fmt(e['link_up_frac_10s'], 2):>7}{fmt(e['peer_suppressed']):>5}"
               f"{fmt(e['separation_m_at_arm']):>7}"

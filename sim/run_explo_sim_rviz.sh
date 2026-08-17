@@ -183,6 +183,42 @@ RDV_MAX_WAIT="$(flt "${RDV_MAX_WAIT:-600}")"
 # on one read of it may be released by the next tick; 8 of 24 recorded firings
 # ended within 5 s having moved under a metre. 0 restores arm-on-first-read.
 RECONNECT_CONFIRM="$(flt "${RECONNECT_CONFIRM:-3.0}")"
+# --- Mid-run trigger + pursuit-gate family (2026-08-17 redesign) -------------
+# These now default ON and match the planner's own code defaults, so a bare
+# invocation of this script runs the same policy the robots run. To reproduce
+# the p7modes (pre-redesign) behaviour bit-for-bit, export MIDRUN_SILENCE=0
+# RECONNECT_RELEASE_CONFIRM=0 PURSUIT_STALENESS=180 HOLD_ESCALATE=0.
+# Every one of these is echoed into the manifest below: the p7modes campaign
+# taught that an un-recorded planner param makes runs post-hoc
+# indistinguishable, which the mode comparison then has to treat as a confound.
+# Silence (s) of continuous peer absence before a robot interrupts exploration
+# to run its arm's reconnect manoeuvre. 0 = terminal-only (legacy). Must stay
+# above the measured heartbeat-suppression tail (~180 s) or the trigger fires
+# at healthy, silently-planning teammates.
+MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-240}")"
+# Barrier give-up for mid-run attempts (terminal barriers keep RDV_MAX_WAIT).
+MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
+MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
+# Release flicker guard: the team must read complete this long before a
+# manoeuvre releases (and the silence clock resets). 0 = first-read (legacy).
+RECONNECT_RELEASE_CONFIRM="$(flt "${RECONNECT_RELEASE_CONFIRM:-3}")"
+# Pursuit gates. The old 180 s staleness vetoed every chase in the dense world
+# (outage tail 861 s ~ staleness at a terminal trigger), so the chase was dead
+# code here; 900 clears that tail. What keeps the wider window honest is
+# PURSUIT_GOAL_STALE: past 180 s the chase drops the peer's declared goal and
+# drives to its last contact pose instead.
+PURSUIT_STALENESS="$(flt "${PURSUIT_STALENESS:-900}")"
+# INVARIANT: chase budget <= waiter patience. A teammate at the barrier treats
+# this as the worst case it may assume about its pursuer, so a budget above
+# RDV_MAX_WAIT (600) would let a chase outlive the wait that justified it.
+PURSUIT_BUDGET_MAX="$(flt "${PURSUIT_BUDGET_MAX:-600}")"
+PURSUIT_GOAL_STALE="$(flt "${PURSUIT_GOAL_STALE:-180}")"
+# Terminal-hold escalation: on barrier expiry drive once to the last-connected
+# anchor and wait HOLD_ESCALATE_WAIT more before giving up (breaks the
+# mutual-hold deadlock that cost the p7modes pursuit_seed2 mission).
+HOLD_ESCALATE="${HOLD_ESCALATE:-1}"
+HOLD_ESCALATE_ARG=$([ "$HOLD_ESCALATE" = "1" ] && echo true || echo false)
+HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
 # COMMS=1 puts the message-level radio emulator (hmr_comms_sim_node) between the
 # two robots, which is what turns the NOTE above from a caveat into a runnable
 # experiment: with it, "peer out of comms" is produced by distance through trees
@@ -837,6 +873,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "rendezvous_enabled=$RDV_ENABLED"
   echo "rendezvous_max_wait_sec=$RDV_MAX_WAIT"
   echo "reconnect_confirm_sec=$RECONNECT_CONFIRM"
+  echo "reconnect_midrun_silence_sec=$MIDRUN_SILENCE"
+  echo "reconnect_midrun_max_wait_sec=$MIDRUN_MAX_WAIT"
+  echo "reconnect_midrun_max_attempts=$MIDRUN_MAX_ATTEMPTS"
+  echo "reconnect_release_confirm_sec=$RECONNECT_RELEASE_CONFIRM"
+  echo "pursuit_staleness_max_sec=$PURSUIT_STALENESS"
+  echo "pursuit_budget_max_sec=$PURSUIT_BUDGET_MAX"
+  echo "pursuit_goal_stale_sec=$PURSUIT_GOAL_STALE"
+  echo "hold_escalate=$HOLD_ESCALATE_ARG"
+  echo "hold_escalate_wait_sec=$HOLD_ESCALATE_WAIT"
   echo "comms=$COMMS"
   echo "seed=$SEED"
   echo "tx_power_dbm=$TX_POWER"
@@ -927,6 +972,15 @@ for r in $ROBOTS; do
       -p rendezvous_enabled:=$RDV_ENABLED \
       -p rendezvous_max_wait_sec:=$RDV_MAX_WAIT \
       -p reconnect_confirm_sec:=$RECONNECT_CONFIRM \
+      -p reconnect_midrun_silence_sec:=$MIDRUN_SILENCE \
+      -p reconnect_midrun_max_wait_sec:=$MIDRUN_MAX_WAIT \
+      -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \
+      -p reconnect_release_confirm_sec:=$RECONNECT_RELEASE_CONFIRM \
+      -p pursuit_staleness_max_sec:=$PURSUIT_STALENESS \
+      -p pursuit_budget_max_sec:=$PURSUIT_BUDGET_MAX \
+      -p pursuit_goal_stale_sec:=$PURSUIT_GOAL_STALE \
+      -p hold_escalate:=$HOLD_ESCALATE_ARG \
+      -p hold_escalate_wait_sec:=$HOLD_ESCALATE_WAIT \
       -p exploitation_enabled:=$EXPLOIT_ARG \
       -p rendezvous_expected_peers:=1 \
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \

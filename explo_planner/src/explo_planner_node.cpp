@@ -193,6 +193,16 @@ private:
   /// DEFERRED by the reconnect confirmation gate and no transition happened —
   /// the caller must then leave the node somewhere that re-runs this check.
   bool finishOrRendezvous(const char* reason);
+  /// The manoeuvre dispatch itself (mode -> pursuit / meeting point / anchor /
+  /// hold), factored out of finishOrRendezvous so the mid-run trigger in
+  /// doPlan can arm the same manoeuvres without the DONE fallthrough. Always
+  /// transitions into a manoeuvre state and returns true (kept boolean for
+  /// call-site symmetry with startPursuit).
+  bool dispatchReconnect(const char* reason);
+  /// Flicker guard for manoeuvre release: true once `eligible` has held
+  /// continuously for reconnect_release_confirm_sec (immediately when the
+  /// window is 0). Resets whenever eligible drops or the state changes.
+  bool releaseConfirmed(bool eligible);
   void startReturnTo(const Eigen::Vector3f& dest, const char* what,
                      const char* reason);
   void doReturnNav();
@@ -476,7 +486,26 @@ private:
   // Last-contact record age (s) beyond which the trail head is worthless and
   // pursuit is skipped outright; freshness scales the budget linearly down to
   // zero across this window. <= 0 = no staleness gate.
-  double pursuit_staleness_max_sec_ = 180.0;
+  //
+  // Sized to real outages, not to goal freshness: dense-forest separations of
+  // 186-861 s were measured, and at the old 180 s the chase declined every
+  // single time it was asked — pursuit was dead code in the world it was
+  // written for. What makes the wider window safe is pursuit_goal_stale_sec
+  // below: past 180 s the chase stops trusting the peer's declared goal and
+  // drives to its last CONTACT POSE, a target whose value does not decay with
+  // age, and declines outright when the budget cannot cover that trail.
+  double pursuit_staleness_max_sec_ = 900.0;
+  // Record age beyond which the peer's declared GOAL is a dead hypothesis
+  // (the peer has re-planned since) but its CONTACT POSE is still worth
+  // driving to: two chasers that both complete a contact-pose trail end at
+  // the swapped contact pair, which was mutually within link range — the same
+  // geometric argument the anchor return rests on, and one that does not
+  // decay with staleness. Past this age the chase drops the goal waypoint,
+  // targets peer_pose alone, and budgets by distance (no freshness discount);
+  // it declines instead when that distance-true budget would not cover the
+  // trail (an uncoverable trail ends the chase at an arbitrary disconnected
+  // point — worse than the mode's own fallback). <= 0 = never split.
+  double pursuit_goal_stale_sec_ = 180.0;
   // How long the team must have been INCOMPLETE before a manoeuvre may arm.
   //
   // Without this the arm test (peer missing, one read of the claim table) and
@@ -504,6 +533,69 @@ private:
   // can never arrive, hence the flag.
   rclcpp::Time team_last_complete_time_;
   bool         team_seen_complete_ = false;
+  // --- Mid-exploration reconnect trigger ---
+  // 0 (the field default) keeps the manoeuvre strictly terminal: a robot only
+  // considers reconnection once its own exploration is exhausted. A positive
+  // value arms the same dispatch DURING exploration, whenever the team has
+  // been continuously incomplete for this long — the point being that a
+  // mid-run reconnection delivers the peer's queued map deltas while they can
+  // still prune this robot's remaining frontiers. Must exceed the worst
+  // heartbeat-suppression episode (measured ~180 s in the sim campaigns, see
+  // heartbeatTick): below that, a healthy teammate stuck in a long PLAN loop
+  // reads as missing and the trigger drives a manoeuvre at a robot that is in
+  // range and fine. 0 restores the legacy terminal-only trigger.
+  //
+  // Default 240: comfortably above that 180 s suppression tail (measured max
+  // over 2307 heartbeat episodes) and well below the outage tail, so it fires
+  // on genuine separation and not on a busy teammate.
+  double reconnect_midrun_silence_sec_  = 240.0;
+  // Barrier give-up for MID-RUN manoeuvres only. A mid-run attempt that waits
+  // rendezvous_max_wait_sec (600 in the sim harness) costs 2.5x its own
+  // trigger threshold in lost exploration per failure; a short cap keeps the
+  // attempt proportionate. Terminal manoeuvres keep rendezvous_max_wait_sec.
+  double reconnect_midrun_max_wait_sec_ = 240.0;
+  // Per-run cap on mid-run attempts. Every dispatch costs exploration time;
+  // after this many failures the policy has had its chance and the robot
+  // reverts to terminal-only behaviour (logged, so the analysis can see it).
+  int    reconnect_midrun_max_attempts_ = 6;
+  // True while the CURRENT manoeuvre was dispatched from exploration
+  // exhaustion (the only kind that may end in DONE); false for mid-run
+  // dispatches, which must always resume exploring instead. Default true so
+  // every pre-existing path behaves exactly as before.
+  bool   reconnect_terminal_ = true;
+  int    midrun_attempts_    = 0;
+  // Cooldown stamped when a mid-run manoeuvre ENDS (transitionTo, where
+  // reconnect_active_ falls) — never at dispatch: missing_for stays satisfied
+  // for the whole outage, so a dispatch-stamped cooldown expires DURING the
+  // manoeuvre and the "resume" becomes a one-tick interlude in an endless
+  // re-dispatch loop. Bool-guarded: rclcpp::Time default-constructs on the
+  // system clock and subtracting it from a sim-time now() throws.
+  rclcpp::Time midrun_last_end_;
+  bool         midrun_end_armed_ = false;
+  // --- Hold escalation (mutual-hold deadlock break) ---
+  // When a TERMINAL barrier wait expires, drive once to the last-connected
+  // anchor and wait hold_escalate_wait_sec more before giving up. Both robots
+  // converging on their own last-contact poses restores the pair geometry the
+  // link last worked at, which breaks the pure-hold fixed point (observed: 5
+  // of 6 holds never reconnected; the parked pair can only be rescued by peer
+  // motion). Sticky per-manoeuvre flag, NOT a position test: an unreachable
+  // anchor must not re-escalate on every expiry forever. Inert under the
+  // field default rendezvous_max_wait_sec=0 (wait forever, so no terminal
+  // barrier ever expires): it can only act where an escape hatch is already
+  // configured, and there it converts a give-up into one more attempt.
+  bool   hold_escalate_          = true;
+  double hold_escalate_wait_sec_ = 300.0;
+  bool   hold_escalated_         = false;
+  // --- Release confirmation (flicker guard) ---
+  // A single live claim releases a manoeuvre and resets the silence clock,
+  // crediting a "reconnection" on a range-edge flicker that drained no map
+  // deltas. A positive value requires the release condition to hold
+  // continuously this long. 0 = release on first read (legacy). Default 3 s,
+  // matching reconnect_confirm_sec: the same evidence standard is applied to
+  // ending a manoeuvre as to starting one.
+  double reconnect_release_confirm_sec_ = 3.0;
+  rclcpp::Time release_ok_since_;
+  bool         release_ok_armed_ = false;
 
   // --- Proximity stop (coordinated yield) params ---
   // Thresholds/staleness live in the guard's Config; these are the node-side
@@ -1290,13 +1382,33 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
   pursuit_budget_max_sec_    = dp("pursuit_budget_max_sec", 240.0);
-  pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 180.0);
+  pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 900.0);
+  pursuit_goal_stale_sec_    = dp("pursuit_goal_stale_sec", 180.0);
   reconnect_confirm_sec_     = dp("reconnect_confirm_sec", 3.0);
   if (reconnect_confirm_sec_ <= 0.0) {
     RCLCPP_WARN(get_logger(),
         "reconnect_confirm_sec <= 0: manoeuvres arm on a single read of the "
         "claim table. Expect firings that dissolve before the robot moves, "
         "and treat any reconnection timing from this run as unusable.");
+  }
+  // Mid-run trigger family (see the member comments). ON by default: the
+  // terminal-only trigger it replaces could not reconnect a team before its
+  // exploration was already over, which is the whole value of reconnecting.
+  // Set reconnect_midrun_silence_sec to 0 to restore the legacy behaviour.
+  reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
+  reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
+  reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
+  reconnect_release_confirm_sec_ = dp("reconnect_release_confirm_sec", 3.0);
+  hold_escalate_                 = dp("hold_escalate", true);
+  hold_escalate_wait_sec_        = dp("hold_escalate_wait_sec", 300.0);
+  if (reconnect_midrun_silence_sec_ > 0.0 &&
+      reconnect_midrun_silence_sec_ < 200.0) {
+    RCLCPP_WARN(get_logger(),
+        "reconnect_midrun_silence_sec=%.0f is below the measured "
+        "heartbeat-suppression tail (~180 s): a healthy teammate stuck in a "
+        "long PLAN loop can read as missing that long, and the trigger would "
+        "drive a manoeuvre at a robot that is in range and fine.",
+        reconnect_midrun_silence_sec_);
   }
 
   // Proximity stop (coordinated yield). ON by default and deliberately NOT
@@ -2142,7 +2254,19 @@ void ExploPlannerNode::transitionTo(State s) {
         "Reconnect manoeuvre ended after %.1f s sim (-> %s).",
         (this->now() - reconnect_start_time_).seconds(), stateName(s));
     reconnect_active_ = false;
+    hold_escalated_ = false;
+    // Mid-run cooldown starts HERE, at manoeuvre end — missing_for stays
+    // satisfied for the whole outage, so a dispatch-stamped cooldown would
+    // expire during the manoeuvre and re-dispatch on the first PLAN tick.
+    if (!reconnect_terminal_) {
+      midrun_last_end_ = this->now();
+      midrun_end_armed_ = true;
+      reconnect_terminal_ = true;
+    }
   }
+  // The release-confirm dwell never survives a state change: a flicker that
+  // straddles e.g. a PROXIMITY_HOLD must restart its window.
+  release_ok_armed_ = false;
 
   state_ = s;
   state_enter_time_ = this->now();
@@ -2258,6 +2382,50 @@ void ExploPlannerNode::doPlan() {
             "planning_map / degenerate ROI); stopping only at max_steps=%d.",
             done_unknown_fraction_, cov_src, max_steps_);
       }
+    }
+  }
+
+  // Mid-exploration reconnect trigger (off unless reconnect_midrun_silence_sec
+  // > 0). Sits AFTER the exploit branch (targets are the mission deliverable
+  // and defer the trigger — remember that when reading firing times) and AFTER
+  // the coverage check (a saturated robot must route through the terminal
+  // path). Only evaluated in PLAN, i.e. between hops: detection latency past
+  // the silence crossing is one residual hop (typically 15-60 s), which is
+  // per-robot jitter the analysis inherits. livePeerCount is re-read here
+  // because the heartbeat-maintained clock is quantized at 1 Hz and starvable
+  // — without the re-check a peer that reconnected within the last heartbeat
+  // period still reads missing and we brake for a manoeuvre that dissolves on
+  // its first tick.
+  if (reconnect_midrun_silence_sec_ > 0.0 && rendezvous_enabled_ &&
+      have_anchor_ && team_seen_complete_) {
+    if (midrun_attempts_ < reconnect_midrun_max_attempts_) {
+      const auto trig_now = this->now();
+      const int live =
+          coord_ ? static_cast<int>(coord_->livePeerCount(trig_now)) : 0;
+      const double missing_for =
+          (trig_now - team_last_complete_time_).seconds();
+      const bool cooldown_ok =
+          !midrun_end_armed_ ||
+          (trig_now - midrun_last_end_).seconds() >=
+              reconnect_midrun_silence_sec_;
+      if (!teamComplete(live, rendezvous_expected_peers_) &&
+          missing_for >= reconnect_midrun_silence_sec_ && cooldown_ok) {
+        ++midrun_attempts_;
+        reconnect_terminal_ = false;
+        hold_escalated_ = false;
+        RCLCPP_INFO(get_logger(),
+            "Reconnect (mid-run): peer silent %.0fs >= %.0fs (attempt %d/%d) "
+            "-> interrupting exploration for the reconnect manoeuvre.",
+            missing_for, reconnect_midrun_silence_sec_, midrun_attempts_,
+            reconnect_midrun_max_attempts_);
+        if (dispatchReconnect("peer-lost")) return;
+      }
+    } else if (midrun_attempts_ == reconnect_midrun_max_attempts_) {
+      ++midrun_attempts_;  // log the exhaustion exactly once
+      RCLCPP_WARN(get_logger(),
+          "Reconnect (mid-run): attempt budget exhausted (%d) — reverting to "
+          "terminal-only reconnection for the rest of the run.",
+          reconnect_midrun_max_attempts_);
     }
   }
 
@@ -2903,33 +3071,11 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
         return false;
       }
     }
-    // Mode dispatch (mesh radios). Pursuit and hybrid try the chase first;
-    // startPursuit declines when the missing peer's record is too stale for
-    // its trail head to mean anything (pursuitBudgetSec == 0), and each mode
-    // then falls through to its fallback. rec can be null even here: the
-    // missing teammate may never have been heard at all (the anchor came from
-    // a DIFFERENT peer) — then there is nothing to chase and no pair to
-    // midpoint, so hybrid and rendezvous degrade to the own-anchor return
-    // while pure pursuit holds in place (below).
-    std::string peer_id;
-    const LastContact* rec = missingPeerRecord(&peer_id);
-    if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
-        startPursuit(peer_id, *rec, reason)) {
-      return true;
-    }
-    if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
-      startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
-                    "meeting point", reason);
-      return true;
-    }
-    if (reconnect_mode_ == ReconnectMode::PURSUIT) {
-      // Pure pursuit has no agreed fallback point by design (that is the
-      // A/B against hybrid): a chase that never started waits right here.
-      holdForTeam(reason);
-      return true;
-    }
-    startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
-    return true;
+    // This is the only dispatch that may end the run: mark the manoeuvre
+    // terminal so a failed barrier wait is allowed to reach DONE.
+    reconnect_terminal_ = true;
+    hold_escalated_ = false;
+    return dispatchReconnect(reason);
   }
   if (rendezvous_enabled_ && rendezvous_expected_peers_ > 0) {
     RCLCPP_INFO(get_logger(),
@@ -2948,6 +3094,61 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   }
   transitionTo(State::DONE);
   return true;
+}
+
+// Mode dispatch (mesh radios). Pursuit and hybrid try the chase first;
+// startPursuit declines when the missing peer's record is too stale for
+// its trail head to mean anything (pursuitBudgetSec == 0), and each mode
+// then falls through to its fallback. rec can be null even here: the
+// missing teammate may never have been heard at all (the anchor came from
+// a DIFFERENT peer) — then there is nothing to chase and no pair to
+// midpoint, so hybrid and rendezvous degrade to the own-anchor return
+// while pure pursuit holds in place (below).
+//
+// Callers own reconnect_terminal_: finishOrRendezvous sets true (its barrier
+// may end in DONE), the mid-run trigger in doPlan sets false (its barrier
+// must resume exploring).
+bool ExploPlannerNode::dispatchReconnect(const char* reason) {
+  std::string peer_id;
+  const LastContact* rec = missingPeerRecord(&peer_id);
+  if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
+      startPursuit(peer_id, *rec, reason)) {
+    return true;
+  }
+  if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
+    startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
+                  "meeting point", reason);
+    return true;
+  }
+  if (reconnect_mode_ == ReconnectMode::PURSUIT) {
+    // Pure pursuit has no agreed fallback point by design (that is the
+    // A/B against hybrid): a chase that never started waits right here.
+    holdForTeam(reason);
+    return true;
+  }
+  startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
+  return true;
+}
+
+// Flicker guard: a single live claim (one intent inside the 5 s TTL) is
+// enough to read the team complete for a tick, release a manoeuvre and reset
+// the silence clock — crediting a "reconnection" on a range-edge flicker that
+// drained no map deltas. With a positive confirm window the release condition
+// must hold continuously that long. The dwell is cheap where it runs: PURSUE
+// keeps driving (budget still ticking), the barriers keep waiting.
+bool ExploPlannerNode::releaseConfirmed(bool eligible) {
+  if (!eligible) {
+    release_ok_armed_ = false;
+    return false;
+  }
+  if (reconnect_release_confirm_sec_ <= 0.0) return true;
+  const auto now = this->now();
+  if (!release_ok_armed_) {
+    release_ok_armed_ = true;
+    release_ok_since_ = now;
+    return false;
+  }
+  return (now - release_ok_since_).seconds() >= reconnect_release_confirm_sec_;
 }
 
 // Shared barrier-entry stand-down. The rendezvous/pursuit barrier is HARD:
@@ -3008,7 +3209,7 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   current_goal_.yaw = latest_yaw_;
 
   RCLCPP_INFO(get_logger(),
-      "Rendezvous: exploration ended [%s], team incomplete (%d/%d peers) "
+      "Rendezvous: dispatched [%s], team incomplete (%d/%d peers) "
       "-> returning to %s (%.2f, %.2f).",
       reason,
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
@@ -3031,8 +3232,15 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
-  nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
-                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
+  // Manoeuvre legs are exempt from nav_max_timeout_sec: the smart-timeout
+  // ceiling was sized for exploration hops, and a cross-world return clipped
+  // to it dies tens of metres short of a destination whose whole value is
+  // ARRIVING (the connected geometry). Distance-true budget, floor kept; the
+  // no-progress window remains the stuck-robot watchdog.
+  nav_budget_sec_ = std::max(
+      nav_min_timeout_sec_,
+      static_cast<double>(dist) * nav_safety_factor_ /
+          std::max(nav_speed_est_mps_, 1e-3));
   progress_check_time_ = state_enter_time_;
   progress_check_dist_ = cumulative_distance_;
 }
@@ -3045,7 +3253,7 @@ void ExploPlannerNode::doReturnNav() {
   // livePeerCount — presence semantics, same note as finishOrRendezvous().
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (teamComplete(active, rendezvous_expected_peers_)) {
+  if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_))) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team reconnected en route (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
@@ -3117,7 +3325,7 @@ void ExploPlannerNode::doReturnSync() {
   // livePeerCount — presence semantics, same note as finishOrRendezvous().
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (teamComplete(active, rendezvous_expected_peers_)) {
+  if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_))) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: full team connected (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
@@ -3129,12 +3337,52 @@ void ExploPlannerNode::doReturnSync() {
     return;
   }
 
+  // Mid-run barriers give up on their own (short) cap; terminal barriers keep
+  // the field cap, shortened after an escalation (the second wait is a
+  // confirmation of failure, not a second full vigil).
+  const double wait_cap =
+      !reconnect_terminal_
+          ? reconnect_midrun_max_wait_sec_
+          : (hold_escalated_ ? hold_escalate_wait_sec_
+                             : rendezvous_max_wait_sec_);
   const double waited = (this->now() - state_enter_time_).seconds();
-  if (rendezvousWaitExpired(waited, rendezvous_max_wait_sec_)) {
+  if (rendezvousWaitExpired(waited, wait_cap)) {
+    if (!reconnect_terminal_) {
+      // A mid-run attempt must never end the run: the map is not saturated
+      // (the trigger only fires from an unsaturated PLAN tick), so give the
+      // manoeuvre back its time and go explore. The cooldown stamps in
+      // transitionTo when reconnect_active_ falls.
+      RCLCPP_INFO(get_logger(),
+          "Reconnect (mid-run): gave up after %.0fs at the barrier "
+          "(%d/%d present) -> resuming exploration.",
+          waited, active, rendezvous_expected_peers_);
+      coverage_done_streak_ = 0;
+      have_active_intent_ = false;
+      transitionTo(State::PLAN);
+      return;
+    }
+    if (hold_escalate_ && !hold_escalated_) {
+      hold_escalated_ = true;  // sticky: an unreachable anchor must not
+                               // re-escalate on every expiry forever
+      const float dx = last_connected_anchor_.x() - latest_pos_.x();
+      const float dy = last_connected_anchor_.y() - latest_pos_.y();
+      if (std::sqrt(dx * dx + dy * dy) > goal_xy_tol_ * 2.0f) {
+        RCLCPP_WARN(get_logger(),
+            "Rendezvous: waited %.0fs for team (%d/%d present) -> escalating "
+            "to the last-connected anchor (%.2f, %.2f) before giving up.",
+            waited, active, rendezvous_expected_peers_,
+            last_connected_anchor_.x(), last_connected_anchor_.y());
+        startReturnTo(last_connected_anchor_, "last-connected anchor",
+                      "hold-escalate");
+        return;
+      }
+      // Already at the anchor: escalating would just re-wait in place — fall
+      // through and give up now.
+    }
     RCLCPP_WARN(get_logger(),
         "Rendezvous: waited %.0fs for team (%d/%d present); "
         "max_wait=%.0fs reached -> giving up and finishing.",
-        waited, active, rendezvous_expected_peers_, rendezvous_max_wait_sec_);
+        waited, active, rendezvous_expected_peers_, wait_cap);
     // Same presence rule as finishOrRendezvous's DONE branch: a given-up
     // idle robot is still parked and countable — its late-arriving pursuer
     // must be able to release its own barrier on contact.
@@ -3188,19 +3436,74 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
                                     const char* reason) {
   const auto now = this->now();
   const double staleness = (now - rec.stamp).seconds();
-  const float dx = rec.peer_goal.x() - latest_pos_.x();
-  const float dy = rec.peer_goal.y() - latest_pos_.y();
-  const float trail_head_dist = std::sqrt(dx * dx + dy * dy);
-  const double budget = pursuitBudgetSec(
-      trail_head_dist, staleness, nav_speed_est_mps_, nav_safety_factor_,
-      pursuit_staleness_max_sec_, nav_min_timeout_sec_,
-      pursuit_budget_max_sec_);
-  if (budget <= 0.0) {
+  if (pursuit_staleness_max_sec_ > 0.0 &&
+      staleness >= pursuit_staleness_max_sec_) {
     RCLCPP_INFO(get_logger(),
         "Pursuit: record of '%s' is %.0fs old (max %.0fs) — trail head "
         "worthless, skipping the chase.",
         peer_id.c_str(), staleness, pursuit_staleness_max_sec_);
     return false;
+  }
+
+  // Trail selection (see pursuit_goal_stale_sec_): a fresh record chases the
+  // declared goal then the contact pose (the legacy trail); a stale one drops
+  // the dead goal hypothesis and drives to the contact pose alone.
+  const bool goal_stale = pursuit_goal_stale_sec_ > 0.0 &&
+                          staleness > pursuit_goal_stale_sec_;
+  std::vector<Eigen::Vector3f> trail;
+  if (!goal_stale) {
+    trail.push_back(rec.peer_goal);
+    // The last heard pose only earns a waypoint when it is meaningfully apart
+    // from the goal — a peer claiming a goal beside itself would produce two
+    // coincident hops.
+    if ((rec.peer_pose - rec.peer_goal).head<2>().norm() > 1.0f) {
+      trail.push_back(rec.peer_pose);
+    }
+  } else {
+    trail.push_back(rec.peer_pose);
+  }
+
+  double budget = 0.0;
+  if (goal_stale) {
+    // Distance-true budget: the contact-pose endpoint's value is geometric
+    // (the swapped contact pair was a connected configuration), so it earns
+    // the full model time — but ONLY if the cap covers the whole trail. A
+    // partial chase ends at an arbitrary disconnected point, which is worse
+    // than the mode's fallback (meeting point / hold-and-beacon).
+    double trail_m = 0.0;
+    Eigen::Vector3f prev = latest_pos_;
+    for (const auto& wp : trail) {
+      trail_m += (wp - prev).head<2>().norm();
+      prev = wp;
+    }
+    const double trail_model_sec =
+        trail_m * nav_safety_factor_ / std::max(nav_speed_est_mps_, 1e-3);
+    if (trail_model_sec > pursuit_budget_max_sec_) {
+      RCLCPP_INFO(get_logger(),
+          "Pursuit: record of '%s' is %.0fs old (goal stale) and the contact "
+          "pose is %.1f m away (needs %.0fs > cap %.0fs) — chase would die "
+          "mid-trail, skipping to the fallback.",
+          peer_id.c_str(), staleness, trail_m, trail_model_sec,
+          pursuit_budget_max_sec_);
+      return false;
+    }
+    budget = std::max(std::min(nav_min_timeout_sec_, pursuit_budget_max_sec_),
+                      trail_model_sec);
+  } else {
+    const float dx = rec.peer_goal.x() - latest_pos_.x();
+    const float dy = rec.peer_goal.y() - latest_pos_.y();
+    const float trail_head_dist = std::sqrt(dx * dx + dy * dy);
+    budget = pursuitBudgetSec(
+        trail_head_dist, staleness, nav_speed_est_mps_, nav_safety_factor_,
+        pursuit_staleness_max_sec_, nav_min_timeout_sec_,
+        pursuit_budget_max_sec_);
+    if (budget <= 0.0) {
+      RCLCPP_INFO(get_logger(),
+          "Pursuit: record of '%s' is %.0fs old (max %.0fs) — trail head "
+          "worthless, skipping the chase.",
+          peer_id.c_str(), staleness, pursuit_staleness_max_sec_);
+      return false;
+    }
   }
 
   standDownExploitation();
@@ -3218,21 +3521,15 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
   pursue_peer_id_ = peer_id;
   pursue_rec_ = rec;
   pursue_start_time_ = now;
-  pursue_waypoints_.clear();
-  pursue_waypoints_.push_back(rec.peer_goal);
-  // The last heard pose only earns a waypoint when it is meaningfully apart
-  // from the goal — a peer claiming a goal beside itself would produce two
-  // coincident hops.
-  if ((rec.peer_pose - rec.peer_goal).head<2>().norm() > 1.0f) {
-    pursue_waypoints_.push_back(rec.peer_pose);
-  }
+  pursue_waypoints_ = std::move(trail);
   pursue_wp_index_ = 0;
 
   RCLCPP_INFO(get_logger(),
-      "Pursuit: exploration ended [%s], '%s' out of comms (record %.0fs old) "
+      "Pursuit: dispatched [%s], '%s' out of comms (record %.0fs old%s) "
       "-> chasing its trail head (%.2f, %.2f), budget %.0fs, %zu waypoint(s).",
       reason, peer_id.c_str(), staleness,
-      rec.peer_goal.x(), rec.peer_goal.y(),
+      goal_stale ? ", goal stale — contact pose only" : "",
+      pursue_waypoints_.front().x(), pursue_waypoints_.front().y(),
       pursue_budget_sec_, pursue_waypoints_.size());
 
   armPursuitWaypoint();
@@ -3272,8 +3569,15 @@ void ExploPlannerNode::armPursuitWaypoint() {
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
-  nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
-                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
+  // Manoeuvre legs are exempt from nav_max_timeout_sec: the smart-timeout
+  // ceiling was sized for exploration hops, and a cross-world return clipped
+  // to it dies tens of metres short of a destination whose whole value is
+  // ARRIVING (the connected geometry). Distance-true budget, floor kept; the
+  // no-progress window remains the stuck-robot watchdog.
+  nav_budget_sec_ = std::max(
+      nav_min_timeout_sec_,
+      static_cast<double>(dist) * nav_safety_factor_ /
+          std::max(nav_speed_est_mps_, 1e-3));
   progress_check_time_ = state_enter_time_;
   progress_check_dist_ = cumulative_distance_;
 }
@@ -3297,7 +3601,8 @@ void ExploPlannerNode::doPursue() {
   // once saturation re-confirms, and missingPeerRecord picks the next one).
   const bool quarry_heard = coord_ && !pursue_peer_id_.empty() &&
                             coord_->peerLive(pursue_peer_id_, now);
-  if (teamComplete(active, rendezvous_expected_peers_) || quarry_heard) {
+  if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_) ||
+                       quarry_heard)) {
     RCLCPP_INFO(get_logger(),
         "Pursuit: %s mid-chase (%d/%d) -> re-planning against merged map.",
         quarry_heard && !teamComplete(active, rendezvous_expected_peers_)
