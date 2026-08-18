@@ -2,9 +2,15 @@
 # p14 smoke: 2 cells at DONE_UNKNOWN=0.60, before committing to the 40-cell run.
 #
 # Everything except the criterion is byte-identical to p13: same scenario, same
-# binary (built 2026-08-06, older than every p13 cell, and nothing has been
-# rebuilt since), tx 30.0, duration 5400, record 2, FRONTIER_ONLY=1,
-# PURSUIT_BUDGET_MAX=2400. So any difference is the criterion and nothing else.
+# binary (built 2026-08-17 19:08, older than every p12 and p13 cell -- the first
+# was written 2026-08-17 23:40 -- and nothing has been rebuilt since), tx 30.0,
+# duration 5400, record 2, FRONTIER_ONLY=1, PURSUIT_BUDGET_MAX=2400. So any
+# difference is the criterion and nothing else.
+#
+# 2026-08-06 15:15 appears on install/.../explo_planner_node but that is the
+# SYMLINK's own mtime, not the binary's: --symlink-install creates the link once
+# and later builds rewrite the target in place, leaving the link untouched.
+# Follow it to build/ before dating a build.
 #
 # Same two cells as p13smoke -- hybrid:1 and pursuit:3 -- so the comparison is
 # paired rather than against an arm median. hybrid also exercises both halves of
