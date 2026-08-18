@@ -29,12 +29,21 @@
 # coverage endpoint survives the denser stand; the pilot is not being run into a
 # world that cannot terminate.
 #
-# DEFAULTS EVERYWHERE ON THE PLANNER. pursuit_staleness_max_sec stays at 180,
-# coord_claim_ttl_sec at 5, reconnect_confirm_sec at 3, rendezvous_max_wait_sec
-# at 600. Dense outages run past 180 s, so pursuit WILL decline on staleness in
-# some episodes. That is a result about the policy at its shipped settings, not
-# a misconfiguration to tune away -- and tuning it here would confound the mode
-# comparison with a parameter sweep.
+# DEFAULTS EVERYWHERE ON THE PLANNER, AS THEY STOOD WHEN p7modes RAN.
+# pursuit_staleness_max_sec was 180, coord_claim_ttl_sec 5, reconnect_confirm_sec
+# 3, rendezvous_max_wait_sec 600. Dense outages ran past 180 s, so pursuit
+# declined on staleness in some episodes. At the time that was taken as a result
+# about the policy at its shipped settings rather than a misconfiguration to
+# tune away, since tuning it here would have confounded the mode comparison with
+# a parameter sweep.
+#
+# That reading did not survive. A 180 s gate does not decline in SOME episodes,
+# it declines in every mid-run one: the trigger fires at 240 s of silence, so a
+# mid-run dispatch carries a record age of ~240-251 s BY CONSTRUCTION and is
+# always past the gate. pursuit and hybrid's chase were unreachable, not merely
+# selective, so p7modes measured pursuit-as-off and hybrid-as-rendezvous. The
+# gate is 900 everywhere since 2026-08-18; see shared_params.yaml for the
+# evidence. Read any p7modes mode contrast with that in mind.
 #
 # !! STALE AS OF THE 2026-08-17 REDESIGN -- THIS SCRIPT NO LONGER REPRODUCES
 # THE p7modes RUNS. The paragraph above was true when the campaign ran, but the
