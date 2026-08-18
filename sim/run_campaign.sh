@@ -112,7 +112,17 @@ for cell in "${CELL_LIST[@]}"; do
   # quietly hand the analysis a matrix of corrupted maps.
   if [ -f "$out/run_manifest.txt" ] && grep -q '^run_end_reason=' "$out/run_manifest.txt" 2>/dev/null; then
     if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then
-      log "REDO $name (previous attempt failed its gates)"
+      # Keep the evidence. A gate can fail *because the link never dropped*, so
+      # re-rolling preferentially discards mild-outage realisations; deleting the
+      # attempt makes a cell that needed four tries indistinguishable from one
+      # that passed first time, and the retained sample ends up silently
+      # conditioned on outage severity. Copy the two small files that record what
+      # the discarded attempt saw before the retry overwrites it.
+      att="$ROOT/${name}.attempts"; mkdir -p "$att"
+      k=$(( $(ls -1 "$att" 2>/dev/null | grep -c '_manifest.txt$') + 1 ))
+      cp "$out/run_manifest.txt" "$att/attempt${k}_manifest.txt" 2>/dev/null || true
+      cp "$out/comms_gates.txt"  "$att/attempt${k}_gates.txt"    2>/dev/null || true
+      log "REDO $name (attempt $k failed its gates; evidence kept in ${name}.attempts/)"
     else
       log "SKIP $name (already complete)"
       n_skip=$((n_skip + 1))

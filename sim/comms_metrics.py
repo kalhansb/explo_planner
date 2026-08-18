@@ -88,6 +88,7 @@ import glob
 import itertools
 import os
 import statistics as st
+import sys
 
 # (key, label, higher_is, note) -- higher_is describes what a LARGER value means
 METRICS = [
@@ -106,7 +107,15 @@ METRICS = [
     ("dist_to_level",     "m to level",        "less efficient", "matched on coverage"),
     ("minpos_rej_frac",   "deconflict rej frac", "more conflict", ""),
     ("t_to_thresh",       "t LEADER cross s",  "slower",     "near-invariant"),
-    ("makespan",          "makespan s",        "slower",     "confounded by stop rule"),
+    # The planner's own statement of when the team stopped trying. Prefer this
+    # over makespan: makespan is the HARNESS's run-end, it is run-relative
+    # rather than absolute sim, and it carries the done-grace drain plus one
+    # poll period of slop -- windows whose length differs by arm, so ranking on
+    # it partly ranks how long each arm idled after finishing. Blank when any
+    # robot never declared; a censored run has no completion time and imputing
+    # the horizon for it makes an unfinished run the fastest in its arm.
+    ("t_done_team",       "t team done s",     "slower",     "PRIMARY; blank = censored"),
+    ("makespan",          "makespan s",        "slower",     "harness run-end, NOT completion"),
     ("plan_ms_p50",       "plan ms p50",       "slower CPU", "NEGATIVE CONTROL"),
 ]
 
@@ -158,12 +167,27 @@ def load_run(run_dir):
                     end_t = float(line.split("=", 1)[1].strip())
                 except ValueError:
                     pass
+    # Read from the planner's event log, where completion is stated rather than
+    # inferred. None both when the log is absent (runs predating it) and when a
+    # robot was censored; the metric column is blank either way, which is the
+    # honest rendering of "this run has no completion time".
+    t_done_team = None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import event_log
+        s = event_log.summarise_run(run_dir)
+        if "excluded" not in s:
+            t_done_team = s["t_team"]
+    except Exception:
+        pass
+
     return {
         "name": os.path.basename(run_dir),
         "a": a, "b": b,
         "t_max": min(a[-1][0], b[-1][0]),
         "end_reason": reason,
         "makespan": end_t,
+        "t_done_team": t_done_team,
     }
 
 
@@ -352,6 +376,7 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
         "lag_dist": lag_dist,
         "censored": censored,
         "makespan": run["makespan"],
+        "t_done_team": run["t_done_team"],
         "plan_ms_p50": st.median(plan_ms) if plan_ms else None,
     }
 

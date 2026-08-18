@@ -534,18 +534,36 @@
 
     # Rendezvous reconnection (multi-robot). ON by default: a robot that
     # exhausts its exploration goals does NOT stop while a teammate is still out
-    # of comms: it drives back to its last-connected anchor (the pose where it
-    # last heard a teammate — inside the router's coverage bubble) and holds
-    # there until the whole team is back in range, then re-plans against the
-    # merged map. It only activates with coordination_enabled AND a positive
+    # of comms: it drives to the MEETING POINT (the midpoint of the last-contact
+    # pose pair, which both sides compute from records they already hold) and
+    # holds there until the whole team is back in range, then re-plans against
+    # the merged map. It only activates with coordination_enabled AND a positive
     # expected-peer count, so single-robot runs are unaffected (it stays inert).
     # The multi_robot launch sets rendezvous_expected_peers from the team size;
     # set it here for a hand-launched hardware trial (team size - 1).
+    #
+    # It drove back to this robot's OWN last-connected anchor until 2026-08-17.
+    # With the radios carried on the robots that cannot converge: the link dies
+    # at the edge of range, so the two anchors are one comms range apart BY
+    # CONSTRUCTION (measured 54 m, five manoeuvres, none reconnected). The own
+    # anchor now survives only for the case where the peer was never heard at
+    # all this run, and there is no pose pair to midpoint.
+    #
+    # Reconnection is also no longer terminal-only: reconnect_midrun_silence_sec
+    # (node default 240) interrupts exploration after continuous peer silence.
+    # That family is NOT set here — it runs at the node defaults documented in
+    # docs/ros_api.md. Pin any of it here before a campaign that A/Bs it.
     rendezvous_enabled: true
     rendezvous_expected_peers: 0      # teammates to wait for; 0 = inert
-    # Barrier give-up (seconds). 0 = wait forever (STAY until all connected).
-    # A positive value is a field escape hatch so a robot whose teammate died
-    # doesn't hold the anchor indefinitely.
+    # TERMINAL barrier give-up (seconds). 0 = wait forever (STAY until all
+    # connected). A positive value is a field escape hatch so a robot whose
+    # teammate died doesn't hold indefinitely; on expiry the robot escalates
+    # once to the meeting point (hold_escalate) and then finishes in DONE,
+    # logged outcome=gave_up. Mid-run attempts ignore this and give up on
+    # reconnect_midrun_max_wait_sec (240) by RESUMING EXPLORATION instead —
+    # a mid-run attempt fires from an unsaturated map and must never end a run.
+    # At 0 the terminal barrier never expires, so hold_escalate stays latent.
+    # The sim harness ships 600.
     rendezvous_max_wait_sec: 0.0
 
     # Mesh reconnection (robot-carried radios, peer-to-peer — no base
@@ -605,11 +623,46 @@
     # (nav_speed_estimate 0.15 x safety 3.0 = 20 s/m) any trail head past
     # ~12 m saturates the 240 s ceiling, so the effective budget is the
     # ceiling for most of the window, ramps briefly, floors at
-    # nav_min_timeout_sec, then gates to 0 here. Flatforest sizing: at
-    # ~0.8 m/s a teammate silent for 180 s can be ~140 m away — anywhere in
-    # the plot — so past three minutes the guaranteed fallback beats any
-    # chase. <= 0 = no gate.
-    pursuit_staleness_max_sec: 180.0
+    # nav_min_timeout_sec, then gates to 0 here. <= 0 = no gate.
+    #
+    # RESOLVED 2026-08-18 at 900, matching the node default and the sim
+    # harness, so there is now ONE value on every path. It read 180 here, and
+    # because a key PRESENT in this file overrides the node default it governed
+    # every launch-file run including hardware.
+    #
+    # 180 is not a mild setting, it is an off switch. The mid-run trigger fires
+    # at reconnect_midrun_silence_sec (240), so a mid-run dispatch carries a
+    # record age of ~240-251 s BY CONSTRUCTION. Every one of them is therefore
+    # older than a 180 s gate and declines. Pursuit and the chase half of
+    # hybrid are unreachable at mid-run, which is the defect campaign p13 was
+    # run to fix.
+    #
+    # The sizing argument this replaces was: at ~0.8 m/s a teammate silent for
+    # 180 s can be ~140 m away, so past three minutes the guaranteed fallback
+    # beats any chase. Its premise is false at exactly the moment the gate is
+    # consulted. Past the shared silence timeout the peer is NOT still
+    # exploring away — it is running its own manoeuvre toward this robot.
+    # Observed in p13: in 3 of 5 cells with a mid-run trigger both robots
+    # dispatched within 11-26 s of each other.
+    #
+    # Measured at 900, 9 chases over 8 cells (p13, flatforest_dense):
+    #   - all 9 ended outcome=reconnected, 36-106 s, median 53 s
+    #   - none ran to its destination. They released 7-63% of the way (median
+    #     ~30%), median 20.6 m travelled against a 52-80 m planned leg, because
+    #     two robots driving to each other's last-contact poses converge and
+    #     reconnect en route. The "both traverse the full separation to a pose
+    #     the other has left" failure mode does not occur.
+    #   - cost is indistinguishable from the meeting-point fallback it displaces
+    #     (55/72 s, 17.5/32.0 m, n=2)
+    # pursuit_goal_stale_sec (180) is what keeps the wider window honest: past
+    # three minutes the peer's declared goal is dropped as a dead hypothesis
+    # while its last contact pose, which stays geometrically meaningful, is
+    # still driven to.
+    #
+    # Scope: sim only, one world (250 stems/ha), 3 m spawn separation, 9 chases
+    # across 2 seeds. NOT validated on hardware. Re-check on the first hardware
+    # pursuit run rather than assuming this transfers.
+    pursuit_staleness_max_sec: 900.0
     # Arrival tolerance for a MANOEUVRE destination (m). Deliberately not
     # goal_xy_tolerance (0.4): that is an exploration figure, and a manoeuvre
     # destination's value is CONNECTIVITY, not position. Two robots each within

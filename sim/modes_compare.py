@@ -291,6 +291,42 @@ def verdict_of(run_dir):
     return _manifest_field(run_dir, "run_gates_verdict", "")
 
 
+def declared_of(run_dir):
+    """The planner's OWN completion, from its event log, or None.
+
+    This file reconstructs completion by scanning the CSV for the first crossing
+    of unknown_fraction <= thresh. The planner separately STATES when it stopped
+    trying, in explore_done_sim_sec. The two are different constructs and only
+    coincide when the stop rule is that same threshold:
+
+      the crossing     is sampled at plan cadence, so it lands on the first plan
+                       tick at or after the true crossing, and it exists even in
+                       a run the planner never called finished.
+      the declaration  is the decision the robot ACTED on. It is also the LAST
+                       one, not the first: a robot pulled into a reconnect
+                       manoeuvre and resuming afterwards declares twice, and the
+                       first declaration is not when it finished.
+
+    So the reconnecting arms are exactly where these can separate, which is
+    exactly where the result lives. Reported, not reconciled: silently swapping
+    one for the other would change every number this file has ever printed
+    without saying so, and a disagreement is a finding about the run rather than
+    a defect in either measure.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import event_log
+    except ImportError:
+        return None
+    try:
+        s = event_log.summarise_run(run_dir)
+    except Exception:
+        return None
+    if "excluded" in s:
+        return None
+    return s
+
+
 def measure(run_dir, thresh):
     import glob
     end = outcome(run_dir)
@@ -333,9 +369,30 @@ def measure(run_dir, thresh):
     fb, sb = firings(b)
     unk = max((x[1] for x in (a[-1], b[-1]) if x[1] is not None), default=None)
 
+    # The planner's own account of the same run, for the cross-check. `arm` is
+    # taken from here too: it is the only place the control arm is distinguished
+    # from hybrid, since a control run carries reconnect_mode "hybrid".
+    dec = declared_of(run_dir)
+    t_team_decl = dec["t_team"] if dec else None
+    decl_delta = (t_team_decl - t_team
+                  if (t_team_decl is not None and t_team is not None) else None)
+    # Censoring can disagree in EITHER direction and each direction means
+    # something different: crossing-only means the map hit the threshold but the
+    # planner kept going; declaration-only means it stopped without the CSV ever
+    # showing the crossing (frontier exhaustion, or a cadence miss).
+    decl_censor_split = (None if dec is None
+                         else ("crossing-only" if (t_team is not None and
+                                                   t_team_decl is None)
+                               else "declaration-only" if (t_team is None and
+                                                           t_team_decl is not None)
+                               else None))
+
     return dict(
         excluded=None, end=end,
         t_team=t_team, t_lead=t_lead, censored=censored, lag=lag,
+        t_team_decl=t_team_decl, decl_delta=decl_delta,
+        decl_censor_split=decl_censor_split,
+        arm_stamped=(dec.get("arm") if dec else None),
         lag_dist=lag_dist, map_end=gap_end, map_peak=peak,
         # Read at t_team, not at end-of-run. End-of-run includes the DONE grace
         # drain and the teardown tail, and those windows differ by arm, so the
@@ -635,17 +692,56 @@ def main():
 
     print(f"threshold: unknown_fraction <= {args.threshold}   "
           f"PRIMARY = t_team (BOTH robots across)\n")
-    hdr = (f"{'run':<26}{'t_lead':>9}{'t_team':>9}{'lag':>9}{'lag_m':>8}"
+    hdr = (f"{'run':<26}{'t_lead':>9}{'t_team':>9}{'Δdecl':>8}{'lag':>9}{'lag_m':>8}"
            f"{'map_end':>9}{'map_pk':>8}{'dist_m':>9}{'unk':>7}{'fire':>6}{'fire_s':>8}")
     print(hdr); print("-" * len(hdr))
     for arm in sorted(arms):
         for r in sorted(arms[arm], key=lambda x: x["seed"]):
             tt = "CENSORED" if r["censored"] else f"{r['t_team']:.0f}"
             me = "--" if r["map_end"] is None else f"{r['map_end']:.2f}"
+            # Blank when the two definitions agree to under a plan tick, which
+            # is the resolution the crossing is sampled at; a number here is a
+            # real separation, not rounding.
+            dd = r.get("decl_delta")
+            if r.get("decl_censor_split"):
+                dcol = "SPLIT"
+            elif dd is None:
+                dcol = "--"
+            elif abs(dd) < 5.0:
+                dcol = ""
+            else:
+                dcol = f"{dd:+.0f}"
             print(f"{arm+'/seed'+str(r['seed']):<26}{r['t_lead'] or 0:>9.0f}{tt:>9}"
-                  f"{r['lag'] or 0:>9.0f}{r['lag_dist'] or 0:>8.0f}"
+                  f"{dcol:>8}{r['lag'] or 0:>9.0f}{r['lag_dist'] or 0:>8.0f}"
                   f"{me:>9}{r['map_peak']:>8.2f}{r['dist_team']:>9.0f}"
                   f"{r['unk_floor'] or 0:>7.3f}{r['fire']:>6}{r['fire_s']:>8.0f}")
+
+    # The cross-check, stated loudly rather than left as a column to notice.
+    split = [(a, r) for a in sorted(arms) for r in arms[a]
+             if r.get("decl_censor_split")]
+    drift = [(a, r) for a in sorted(arms) for r in arms[a]
+             if r.get("decl_delta") is not None and abs(r["decl_delta"]) >= 5.0]
+    mislabel = [(a, r) for a in sorted(arms) for r in arms[a]
+                if r.get("arm_stamped") and r["arm_stamped"] != a]
+    if split or drift or mislabel:
+        print("\nCOMPLETION CROSS-CHECK — this table's t_team is the CSV "
+              "crossing of unknown_fraction;")
+        print("the planner separately states when it stopped trying "
+              "(explore_done_sim_sec). Where they")
+        print("disagree, the table's number is a reconstruction and the "
+              "planner's is what the robot did:")
+        for a, r in drift:
+            print(f"    {a}/seed{r['seed']}: crossing {r['t_team']:.0f}s vs "
+                  f"declaration {r['t_team_decl']:.0f}s "
+                  f"({r['decl_delta']:+.0f}s)")
+        for a, r in split:
+            print(f"    {a}/seed{r['seed']}: {r['decl_censor_split']} — one "
+                  f"measure has a completion time and the other does not")
+        for a, r in mislabel:
+            print(f"    {a}/seed{r['seed']}: event log stamps this run "
+                  f"arm={r['arm_stamped']!r}, but it is filed under {a!r} — "
+                  f"one of the two is wrong and the arm means nothing until "
+                  f"you know which")
 
     print(f"\n{'arm':<12}{'n':>3}{'cens':>6}{'t_team med':>12}{'range':>18}"
           f"{'lag med':>10}{'dist med':>10}{'unk med':>9}{'peak med':>10}{'fire':>7}")

@@ -131,12 +131,26 @@ default `done_action: idle`; `shutdown` would make the first finisher
 invisible and the node warns about it at startup).
 
 The modes, with the radios carried on the robots (no base station):
-`rendezvous` returns to the **last-connected anchor** (own pose at last
-contact); `pursuit` chases the missing teammate's last declared goal and then
-its last heard pose, on a time budget (`pursuit_budget_max_sec`, skipped
-entirely once the record is older than `pursuit_staleness_max_sec`); `hybrid`
-— the shipped yaml default — chases on the budget, then waits at the midpoint
-of the last-contact pose pair, which both robots compute independently.
+`rendezvous` drives to the **meeting point** — the midpoint of the
+last-contact pose pair — and waits there; `pursuit` chases the missing
+teammate's last declared goal and then its last heard pose, on a time budget
+(`pursuit_budget_max_sec`, skipped entirely once the record is older than
+`pursuit_staleness_max_sec`), then resumes exploring or parks; `hybrid` — the
+shipped yaml default — chases on the budget, then falls back to the same
+meeting point. Both robots compute that point independently from records each
+already holds, so it needs no negotiation.
+
+`rendezvous` returned to the **last-connected anchor** (own pose at last
+contact) until 2026-08-17. With the radios on the robots that could not
+converge: the link dies at the edge of range, so the two anchors are one comms
+range apart by construction — measured 54 m apart across five manoeuvres, none
+of which reconnected. The own anchor is now used only when the missing peer
+was never heard at all this run.
+
+Reconnection is no longer terminal-only. A robot also interrupts exploration
+to run its manoeuvre after `reconnect_midrun_silence_sec` (240 s) of
+continuous peer silence, up to `reconnect_midrun_max_attempts` (6) times; a
+mid-run attempt that times out resumes exploring rather than ending the run.
 
 The records need no configuration; they build automatically from incoming
 peer intents. **`rendezvous_expected_peers` must be set to 1 by hand on a

@@ -36,6 +36,21 @@
 # a misconfiguration to tune away -- and tuning it here would confound the mode
 # comparison with a parameter sweep.
 #
+# !! STALE AS OF THE 2026-08-17 REDESIGN -- THIS SCRIPT NO LONGER REPRODUCES
+# THE p7modes RUNS. The paragraph above was true when the campaign ran, but the
+# harness defaults moved underneath it: run_explo_sim_rviz.sh now ships
+# PURSUIT_STALENESS=900, MIDRUN_SILENCE=240, RECONNECT_RELEASE_CONFIRM=6 and
+# HOLD_ESCALATE=1 to match the planner's own code defaults. A bare re-run of
+# this script therefore executes the POST-redesign policy under the p7modes
+# tag. To reproduce the original cells bit-for-bit, export:
+#
+#   MIDRUN_SILENCE=0 RECONNECT_RELEASE_CONFIRM=0 PURSUIT_STALENESS=180 \
+#   HOLD_ESCALATE=0
+#
+# Every one of these is echoed into the run manifest, so an already-collected
+# run can be checked rather than assumed -- read it before pooling any new
+# p7modes-tagged cell with the old ones.
+#
 # 12 cells at roughly 45-55 min each is a 10-hour job. run_campaign.sh is
 # resumable and orders cells seed-major, so an interruption leaves a COMPLETE
 # paired block at every seed it reached rather than a matrix missing one arm.
