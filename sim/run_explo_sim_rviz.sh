@@ -68,7 +68,19 @@ set -u
 # shell var through this rather than relying on each one being written with a
 # decimal by hand -- the failure is a hard abort seconds into a run, and it is
 # only visible in the planner log, not on the console.
-flt() { case "$1" in *.*|*e*|*E*) printf '%s' "$1";; *) printf '%s.0' "$1";; esac; }
+# Reject non-finite spellings outright: YAML/ROS accept both `nan` and `.nan`
+# as a double, and `.nan` matches the *.* passthrough below -- it would sail
+# into the planner and silently disarm every comparison against the value.
+# Emitting nothing (plus the stderr line) makes the ros2 invocation fail
+# loudly instead; `exit` here would only kill the $(...) subshell.
+flt() {
+  case "$1" in
+    *[nN][aA][nN]*|*[iI][nN][fF]*)
+      echo "FATAL: non-finite value '$1' for a float parameter" >&2 ;;
+    *.*|*e*|*E*) printf '%s' "$1" ;;
+    *) printf '%s.0' "$1" ;;
+  esac
+}
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # <repo>/sim
 # The repo is expected checked out at …/hmr_explo/ws/src/explo_planner, so the
 # ws overlay root is three levels up from this sim/ directory.
@@ -206,6 +218,34 @@ MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-240}")"
 # Barrier give-up for mid-run attempts (terminal barriers keep RDV_MAX_WAIT).
 MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
 MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
+# --- Information gate on the mid-run trigger (2026-08-19) -------------------
+# Replaces the fixed MIDRUN_SILENCE clock with "reconnect once the pair has
+# gathered RECONNECT_MIN_SHARE_VOX of map the other side has not seen", by
+# dividing that target by the pair's beaconed gathering rate and clamping the
+# quotient into [MIDRUN_MIN_SILENCE, MIDRUN_MAX_SILENCE].
+#
+# 0 (the default) keeps the legacy fixed clock EXACTLY -- midrunGateSec returns
+# reconnect_midrun_silence_sec unevaluated -- so every campaign already on disk
+# reproduces bit-for-bit and this block is inert unless a run asks for it.
+#
+# Sizing, measured on cg050's 8 cells (gate_forecast.py / gate_verdict.py):
+# the pair gathers ~9,100 vox/s in the first 200 s and ~2,900 vox/s after, so
+#   550k / 9,100 = 60 s  -> the floor is reached but never BINDS, which is the
+#                           point: every firing time is set by the information,
+#                           not by the clamp (at 400k the floor binds and the
+#                           arm would be a fixed 60 s clock wearing the gate's
+#                           name; at 700k a whole cell drops to zero triggers).
+#   550k / 2,900 = 190 s -> still inside the ceiling, so late outages still fire
+#                           EARLIER than the 240 s legacy clock.
+#   550k / 319   = ceiling -> a saturated pair drifting apart slowly is declined,
+#                           which is the gate doing its job: 200 s of silence at
+#                           that rate is only ~64k voxels, four chance merges.
+# MIDRUN_MAX_SILENCE must stay <= MIDRUN_SILENCE (240): a ceiling above it would
+# let the gated arm fire LATER than the control and confound "gated vs not"
+# with "waited longer". The planner warns at startup if it does.
+RECONNECT_MIN_SHARE_VOX="$(flt "${RECONNECT_MIN_SHARE_VOX:-0}")"
+MIDRUN_MIN_SILENCE="$(flt "${MIDRUN_MIN_SILENCE:-60}")"
+MIDRUN_MAX_SILENCE="$(flt "${MIDRUN_MAX_SILENCE:-240}")"
 # Release flicker guard: the team must read complete this long before a
 # manoeuvre releases (and the silence clock resets). 0 = first-read (legacy).
 # MUST exceed coord_claim_ttl_sec (5.0), which the old default of 3 did not:
@@ -369,6 +409,26 @@ COST_CAP="$(flt "${COST_CAP:-$(awk "BEGIN{print 10*$ROI_HALF}")}")"
 # every arm does, so it must be identical across arms and no run from before it
 # may be pooled with one after.
 MIN_GOAL_DIST="$(flt "${MIN_GOAL_DIST:-4.0}")"
+# Distance discount on the utility denominator: U = info / (eps + cost)^GAMMA.
+# 1.0 is the original SSMI form and the node short-circuits it to be
+# bit-identical. Goes through flt() because the node declares it as a double
+# and an integer literal would abort it at startup on the type mismatch (see
+# the flt() note at the top).
+#
+# The default moved 1.0 -> 0.5 on 2026-08-19 on a 6-replicate sweep: 18.9%
+# faster to the 0.60 rung (487 +/- 46 s vs 600 +/- 90 s, exact permutation
+# p = 0.0152), via 25% fewer metres driven at unchanged speed. The evidence and
+# its limits are written out at utility_cost_exponent in shared_params.yaml —
+# read that before trusting the number, because it was measured on ONE world
+# with PERFECT COMMS.
+#
+# CAMPAIGNS THAT STRADDLE THE CHANGE MAY NOT BE POOLED. This is a SCENARIO
+# CORRECTION in the sense of plan §2 exactly like MIN_GOAL_DIST: it changes
+# what every arm does. Anything compared against p14 or against any run made
+# before 2026-08-19 must set UTIL_GAMMA=1.0 explicitly rather than relying on
+# the default, which no longer reproduces those runs. It lands in the run
+# manifest below so a cell can always be attributed after the fact.
+UTIL_GAMMA="$(flt "${UTIL_GAMMA:-0.5}")"
 # Frontier search band, as an inset from the ROI z band. The yaml ROI band is
 # [-5.5, +4.0] (sized for the field site's terrain and canopy), so these insets
 # put the frontier search in absolute z [0.2, +1.5] on flatforest's flat ground
@@ -939,6 +999,9 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_midrun_silence_sec=$MIDRUN_SILENCE"
   echo "reconnect_midrun_max_wait_sec=$MIDRUN_MAX_WAIT"
   echo "reconnect_midrun_max_attempts=$MIDRUN_MAX_ATTEMPTS"
+  echo "reconnect_min_share_voxels=$RECONNECT_MIN_SHARE_VOX"
+  echo "reconnect_midrun_min_silence_sec=$MIDRUN_MIN_SILENCE"
+  echo "reconnect_midrun_max_silence_sec=$MIDRUN_MAX_SILENCE"
   echo "reconnect_release_confirm_sec=$RECONNECT_RELEASE_CONFIRM"
   echo "reconnect_arrive_tol_m=$RECONNECT_ARRIVE_TOL"
   echo "reconnect_nav_max_sec=$RECONNECT_NAV_MAX"
@@ -969,6 +1032,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "plan_map_res_m=$PLAN_MAP_RES"
   echo "cost_grid_radius_cap_m=$COST_CAP"
   echo "candidate_min_goal_dist_m=$MIN_GOAL_DIST"
+  echo "utility_cost_exponent=$UTIL_GAMMA"
   echo "frontier_z_lo_offset_m=$FRONTIER_Z_LO_OFF"
   echo "frontier_z_hi_offset_m=$FRONTIER_Z_HI_OFF"
   echo "visited_goal_radius_m=$VISITED_RADIUS"
@@ -1072,6 +1136,9 @@ for r in $ROBOTS; do
       -p reconnect_midrun_silence_sec:=$MIDRUN_SILENCE \
       -p reconnect_midrun_max_wait_sec:=$MIDRUN_MAX_WAIT \
       -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \
+      -p reconnect_min_share_voxels:=$RECONNECT_MIN_SHARE_VOX \
+      -p reconnect_midrun_min_silence_sec:=$MIDRUN_MIN_SILENCE \
+      -p reconnect_midrun_max_silence_sec:=$MIDRUN_MAX_SILENCE \
       -p reconnect_release_confirm_sec:=$RECONNECT_RELEASE_CONFIRM \
       -p reconnect_arrive_tol_m:=$RECONNECT_ARRIVE_TOL \
       -p reconnect_nav_max_sec:=$RECONNECT_NAV_MAX \
@@ -1091,6 +1158,7 @@ for r in $ROBOTS; do
       -p done_coverage_source:=scovox \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
+      -p utility_cost_exponent:=$UTIL_GAMMA \
       -p map_resolution:=$VOXEL_RES \
       -p done_unknown_fraction:=$DONE_UNKNOWN \
       -p frontier_z_lo_offset_m:=$FRONTIER_Z_LO_OFF \

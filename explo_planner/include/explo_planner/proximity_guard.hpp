@@ -24,7 +24,12 @@
 ///      re-arms it), so localisation jitter doesn't count as driving. The
 ///      release has a floor, parked_keep_dist_m: inside it "the peer parked"
 ///      is no licence to drive even closer — the hold stands until the peer
-///      moves off (or the caller's max-hold escape hatch fires).
+///      moves off (or the caller's max-hold escape hatch fires). When that
+///      hatch fires, the caller arms armEscape(): for escape_grace_sec the
+///      escaped-from peer cannot force a NEW hold, because a peer that is
+///      still static inside the disc would otherwise re-hold on the very
+///      next tick and the hatch would never actually free the robot. The
+///      immunity is per-peer, and cancels early if the peer moves.
 ///
 /// Staleness is asymmetric on purpose: data older than pose_stale_sec cannot
 /// START a hold (never brake on a ghost), but an active hold survives up to
@@ -61,6 +66,12 @@ public:
     /// An active hold with no data for this long RELEASES (peer presumed
     /// gone / out of comms).
     float hold_release_stale_sec = 10.0f;
+    /// After the caller's max-hold escape hatch fires, the escaped-from peer
+    /// cannot START a new hold for this long — long enough to drive out of
+    /// the trigger disc. 0 disables (restores the pre-hatch wedge). The
+    /// immunity ends early if the peer moves (a moving peer is alive, and
+    /// alive peers get full yields).
+    float escape_grace_sec = 30.0f;
   };
 
   /// One evaluation result. When hold is true, peer_id/dist_m name the
@@ -96,6 +107,11 @@ public:
   Decision evaluate(const Eigen::Vector3f& self_pos, const rclcpp::Time& now,
                     bool holding) const;
 
+  /// The caller's max-hold escape hatch fired against this peer: suppress new
+  /// holds against it for escape_grace_sec (see Config), so the resumed drive
+  /// can actually leave the trigger disc instead of re-holding next tick.
+  void armEscape(const std::string& peer_id, const rclcpp::Time& now);
+
   bool enabled() const { return cfg_.enabled; }
   const Config& config() const { return cfg_; }
   size_t trackedPeerCount() const { return peers_.size(); }
@@ -108,6 +124,11 @@ private:
     /// Motion anchor: pos the last time the peer had moved > move threshold.
     Eigen::Vector3f move_anchor = Eigen::Vector3f::Zero();
     rclcpp::Time last_moved;
+    /// Post-escape immunity (armEscape). Guarded by the flag, never by the
+    /// time alone: a default-constructed rclcpp::Time carries a different
+    /// clock type than the caller's, and comparing them throws.
+    bool escape_active = false;
+    rclcpp::Time escape_until;
   };
 
   Config cfg_;

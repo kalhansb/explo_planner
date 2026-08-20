@@ -453,6 +453,12 @@ private:
   // localization relocalization (NDT/EKF) corrections teleport the
   // map->base_link TF and would otherwise be counted as travel. 0 = disabled.
   float  max_pose_jump_m_ = 1.0f;
+  // A TF lookup that SUCCEEDS can still be a corpse: with a dead broadcaster
+  // tf2 serves the newest stored transform forever (TimePointZero reads never
+  // prune), so without an age gate the planner keeps planning, logging and
+  // braking against a pose frozen at the moment the localiser died.
+  // Transforms older than this (sec) read as pose lost. 0 = disabled.
+  double pose_max_age_sec_ = 5.0;
   double failed_goal_radius_m_;
   double failed_goal_ttl_sec_;
   double done_unknown_fraction_;
@@ -483,6 +489,11 @@ private:
 
   // Utility / coordination params (cached so doPlan() doesn't re-query).
   double cost_grid_radius_cap_m_ = 0.0;
+  // Exponent on the path-cost denominator of the utility. 1.0 reproduces the
+  // shipped SSMI form exactly (and is short-circuited to do so bit-for-bit);
+  // below 1.0 discounts distance so a far-but-informative candidate can win.
+  // See the derivation at the utility itself.
+  double utility_cost_exponent_ = 1.0;
   bool   trajectory_scoring_   = false;
   double trajectory_sample_spacing_m_ = 1.5;
   bool   coord_enabled_        = false;
@@ -659,6 +670,43 @@ private:
   // after this many failures the policy has had its chance and the robot
   // reverts to terminal-only behaviour (logged, so the analysis can see it).
   int    reconnect_midrun_max_attempts_ = 6;
+  // --- Info-gated mid-run trigger (voxels, not seconds) ---
+  // 0 (the default) keeps the fixed silence clock above, bit-identical legacy
+  // behaviour. Positive: the trigger time becomes "when the pair's estimated
+  // unshared map crosses this many voxels", dead-reckoned from the last
+  // contact: T = min_share / (my_rate + peer_rate), both rates frozen in the
+  // LastContact snapshot so the two robots derive (approximately) the SAME
+  // trigger time with no in-outage communication — asymmetric firing is the
+  // lone-waiter failure p7modes measured (5 of 6 holds never reconnected).
+  // T is clamped to [min_silence, max_silence]; rates that read 0 (peer
+  // predates the beacon field, or no samples yet) push T to max_silence, i.e.
+  // "nothing known to share -> wait for the backstop", never a divide-by-0.
+  //
+  // Calibrated against p14 (36 comms-on cells, dense world): a chance merge
+  // delivers ~16k voxels median, a commanded one ~332k; by the 240 s clock
+  // the pair is ALWAYS 300-850k apart — so as a deferral filter this gate is
+  // inert in that world, and its live use is EARLIER, timeliness-driven
+  // triggering. Sizing follows from the measured pair divergence (~2.3k
+  // vox/s under this estimator): T ~ V*/2300, so 200k ~ 84 s, 300k ~ 126 s,
+  // 500k ~ 210 s. Anything below ~140k lands under the 60 s floor and the
+  // clamp — not V* — becomes the trigger, which is a fixed clock wearing the
+  // gate's name; pick V* above that or the arm tests nothing.
+  double reconnect_min_share_voxels_     = 0.0;
+  // Clamp bounds for the derived trigger time. The floor guards the radio-
+  // flicker regime the release-confirm machinery expects (a healthy teammate
+  // in a long PLAN loop can read missing ~180 s; an info trigger BELOW that
+  // knowingly accepts some chases at busy-not-lost teammates — that is the
+  // eager variant's cost, so the floor is a parameter and not 200 hardcoded).
+  // The ceiling is the insurance policy: the ONE effect p14 proved is that
+  // mid-run reconnection caps the worst outage (515 -> 308 s, p=0.0095), and
+  // no info gate is allowed to trade that away by deferring forever. It
+  // therefore defaults to the LEGACY CLOCK, not above it: at 240 the gated
+  // arm can only ever fire earlier than the control, so the proven cap is a
+  // floor on its behaviour and the comparison carries no "gated runs waited
+  // longer" confound. A ceiling above reconnect_midrun_silence_sec is a
+  // deliberate choice to give that up.
+  double reconnect_midrun_min_silence_sec_ = 60.0;
+  double reconnect_midrun_max_silence_sec_ = 240.0;
   // True while the CURRENT manoeuvre was dispatched from exploration
   // exhaustion (the only kind that may end in DONE); false for mid-run
   // dispatches, which must always resume exploring instead. Default true so
@@ -931,6 +979,10 @@ private:
   // radius-bounded flood, which overwrites the same grid.
   bool exploit_flood_valid_ = false;
   const void* exploit_flood_map_ = nullptr;
+  // Pointer identity alone is an ABA hazard: the allocator can hand a new
+  // OccupancyGrid the address a freed one had, and the cache would then skip
+  // the rebuild against a genuinely different map. The stamp breaks the tie.
+  builtin_interfaces::msg::Time exploit_flood_stamp_;
   Eigen::Vector3f exploit_flood_pos_ = Eigen::Vector3f::Zero();
   size_t exploit_flood_reached_ = 0;
 
@@ -956,6 +1008,16 @@ private:
     Eigen::Vector3f peer_pose = Eigen::Vector3f::Zero();
     Eigen::Vector3f peer_goal = Eigen::Vector3f::Zero();
     rclcpp::Time    stamp;
+    // Map-size half of the snapshot (info-gated mid-run trigger). Both sides
+    // of the pair at the moment of contact: my cached count/rate and the
+    // peer's beaconed ones. The peer's record of ME holds my last-BEACONED
+    // values while mine holds my cached-at-receipt values — up to one beacon
+    // period apart, which is noise against the ~metrics-period sampling both
+    // are quantized to and the 15-60 s PLAN-loop dispatch jitter. rate 0.0
+    // means "unknown" (pre-field peer or no samples yet), and the gate falls
+    // back to the time-only trigger rather than divide by it.
+    double self_voxels = 0.0, peer_voxels = 0.0;
+    double self_rate   = 0.0, peer_rate   = 0.0;
   };
   std::map<std::string, LastContact> last_contact_;
 
@@ -1044,6 +1106,52 @@ private:
   // touching planning state.
   explo_planner_msgs::msg::RobotIntent current_intent_msg_;
   bool   have_active_intent_ = false;
+
+  // Map-size beacon state (info-gated mid-run trigger). History of
+  // (t_sim_sec, total_observed_voxels) samples fed by fillCommonMetrics —
+  // i.e. at the CSV sampling period, the same series every offline analysis
+  // reads — from which the growth-rate slope is cached. stampMapInfo()
+  // copies count+rate onto every outgoing intent; the on_intent lambda
+  // snapshots both sides into LastContact. A vector trimmed in place, not a
+  // deque: it holds a few dozen samples and is touched at the metrics
+  // period, so contiguity beats pop_front.
+  //
+  // The window is 300 s, NOT the contact duration: connected windows have a
+  // median of 24 s and 72% are under 90 s (measured, p14), so a window sized
+  // to a contact contains nothing but that contact's merge inflow. Reaching
+  // back across the PRECEDING OUTAGE is what supplies samples of the robot's
+  // own unaided gathering. Validated against p14's measured pair divergence
+  // (2,134 vox/s): the pair's summed rate under this estimator reads 1.12x
+  // truth, against 1.40x for a 90 s two-point slope, at better coverage.
+  static constexpr double kRateWindowSec = 300.0;
+  static constexpr double kRateWinsorK   = 2.0;
+  std::vector<std::pair<double, double>> map_size_hist_;
+  double latest_map_voxels_ = 0.0;
+  double map_growth_rate_   = 0.0;   // voxels / sim-second, >= 0
+  void   noteMapSize(double t_sim_sec, double voxels);
+  void   stampMapInfo();
+  /// The ONLY way this node puts an intent on the wire. Stamps the map-size
+  /// beacon onto the cached message first, so a publish can never carry a
+  /// stale — or, at the sites that rebuild current_intent_msg_ via
+  /// buildIntent(), a ZEROED — count and rate. A peer that snapshots a zeroed
+  /// beacon as its last contact reads the pair as gathering nothing and defers
+  /// to the ceiling, so this is not cosmetic. Callers must have checked
+  /// intent_pub_.
+  void   publishIntent();
+  /// Effective mid-run trigger threshold (seconds of team-incomplete before
+  /// dispatch). The fixed silence clock when the info gate is off or the
+  /// snapshot is unusable; otherwise the dead-reckoned crossing time of
+  /// reconnect_min_share_voxels, clamped to [min,max] silence. Also computes
+  /// the live unshared-backlog estimate for the dispatch event's diagnostics.
+  double midrunGateSec(double missing_for, double* est_unshared_out);
+  // Gate diagnostics stashed at the trigger decision, consumed by the next
+  // reconnect_dispatch event (same discipline as dispatch_peer_id_): -1 =
+  // not applicable (terminal dispatch, or gate off); -2 = gate ON but no
+  // usable contact snapshot, so the trigger fell back to the time-only
+  // clock (otherwise that fallback logs byte-identically to a control
+  // dispatch, which also has gate_sec = the fixed silence clock).
+  double dispatch_gate_sec_     = -1.0;
+  double dispatch_est_unshared_ = -1.0;
 
   // --- ROS interfaces ---
   tf2_ros::Buffer tf_buffer_;
@@ -1340,6 +1448,11 @@ ExploPlannerNode::ExploPlannerNode()
   // this cannot reject real motion; it filters localization discontinuities so
   // they don't inflate distance_traveled or spoof the no-progress watchdog.
   max_pose_jump_m_ = static_cast<float>(dp("max_pose_jump_m", 1.0));
+  // See the member: a dead TF chain keeps "succeeding" with the same stamp,
+  // so freshness is checked explicitly in updatePoseFromTF. Sized for the
+  // slowest healthy publisher in the map->base chain (field SLAM's map->odom
+  // at well under 1 Hz), not for the 10 Hz tick.
+  pose_max_age_sec_ = dp("pose_max_age_sec", 5.0);
 
   // Failed-goal blacklist. When a navigate cycle times out before reaching
   // the goal, the goal position is parked here for `failed_goal_ttl_sec`
@@ -1547,6 +1660,31 @@ ExploPlannerNode::ExploPlannerNode()
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
 
+  // Distance discount for the utility denominator. 1.0 = shipped behaviour.
+  // Clamped rather than trusted: a negative exponent inverts the denominator
+  // into a REWARD for distance (the further the better, without bound), which
+  // is not a weaker preference but a different and unbounded objective, and a
+  // typo in a sweep script should not be able to express it. Above 2.0 the
+  // planner is more distance-averse than nearest-frontier, which the candidate
+  // filters already enforce more cheaply.
+  utility_cost_exponent_ = dp("utility_cost_exponent", 1.0);
+  if (!std::isfinite(utility_cost_exponent_)) {
+    // NaN passes both range tests below (every comparison on NaN is false)
+    // and reaches every U(c) as pow(cost, nan) = nan — an arbitrary pick per
+    // tick once the unstable sort permutes the nan-keyed candidates. YAML
+    // makes this reachable: both `nan` and `.nan` parse as double params.
+    RCLCPP_WARN(get_logger(),
+        "utility_cost_exponent=%f is not finite; using the default 1.0.",
+        utility_cost_exponent_);
+    utility_cost_exponent_ = 1.0;
+  } else if (utility_cost_exponent_ < 0.0 || utility_cost_exponent_ > 2.0) {
+    const double raw = utility_cost_exponent_;
+    utility_cost_exponent_ = std::clamp(utility_cost_exponent_, 0.0, 2.0);
+    RCLCPP_WARN(get_logger(),
+        "utility_cost_exponent=%.3f is outside [0, 2]; clamped to %.3f.",
+        raw, utility_cost_exponent_);
+  }
+
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
   // info_gain for each candidate is the sum of score_fn evaluated at sampled
   // poses along the Dijkstra path, not just the endpoint. Evaluated locally via
@@ -1661,6 +1799,45 @@ ExploPlannerNode::ExploPlannerNode()
   reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
+  // Info gate (see the member comments). 0 = off, bit-identical legacy clock.
+  reconnect_min_share_voxels_      = dp("reconnect_min_share_voxels", 0.0);
+  reconnect_midrun_min_silence_sec_ =
+      dp("reconnect_midrun_min_silence_sec", 60.0);
+  reconnect_midrun_max_silence_sec_ =
+      dp("reconnect_midrun_max_silence_sec", 240.0);
+  if (reconnect_min_share_voxels_ > 0.0 &&
+      reconnect_midrun_min_silence_sec_ >
+          reconnect_midrun_max_silence_sec_) {
+    // min(max, max(min, t)) with min > max collapses to MAX, whatever t is.
+    RCLCPP_WARN(get_logger(),
+        "reconnect_midrun_min_silence_sec=%.0f exceeds max=%.0f: the clamp "
+        "degenerates to a fixed %.0f s clock (the MAX wins) and the info gate "
+        "is inert.",
+        reconnect_midrun_min_silence_sec_, reconnect_midrun_max_silence_sec_,
+        reconnect_midrun_max_silence_sec_);
+  }
+  if (reconnect_min_share_voxels_ > 0.0 &&
+      reconnect_midrun_max_silence_sec_ > reconnect_midrun_silence_sec_ &&
+      reconnect_midrun_silence_sec_ > 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "reconnect_midrun_max_silence_sec=%.0f exceeds the legacy clock "
+        "%.0f s: a gated run can now wait LONGER than the ungated control, "
+        "so the proven longest-outage cap is no longer guaranteed and an A/B "
+        "against that control gains a confound.",
+        reconnect_midrun_max_silence_sec_, reconnect_midrun_silence_sec_);
+  }
+  if (reconnect_min_share_voxels_ > 0.0 &&
+      reconnect_midrun_silence_sec_ <= 0.0) {
+    // The info gate lives INSIDE the mid-run trigger: silence_sec = 0 turns
+    // the whole trigger off, so a configured gate silently never runs — the
+    // run then looks exactly like a control (no gated dispatches, ever)
+    // while its manifest says it was gated.
+    RCLCPP_WARN(get_logger(),
+        "reconnect_min_share_voxels=%.0f is set but "
+        "reconnect_midrun_silence_sec=0 disables the whole mid-run trigger — "
+        "the info gate can never fire in this configuration.",
+        reconnect_min_share_voxels_);
+  }
   reconnect_release_confirm_sec_ = dp("reconnect_release_confirm_sec", 6.0);
   hold_escalate_                 = dp("hold_escalate", true);
   hold_escalate_wait_sec_        = dp("hold_escalate_wait_sec", 300.0);
@@ -1713,6 +1890,8 @@ ExploPlannerNode::ExploPlannerNode()
       static_cast<float>(dp("proximity_peer_static_move_m", 0.3));
   pcfg.hold_release_stale_sec =
       static_cast<float>(dp("proximity_hold_release_stale_sec", 10.0));
+  pcfg.escape_grace_sec =
+      static_cast<float>(dp("proximity_escape_grace_sec", 30.0));
   proximity_max_hold_sec_ = dp("proximity_max_hold_sec", 120.0);
   if (pcfg.resume_dist_m < pcfg.hold_dist_m) {
     RCLCPP_WARN(get_logger(),
@@ -1902,6 +2081,12 @@ ExploPlannerNode::ExploPlannerNode()
                           reconnect_midrun_max_wait_sec_);
     exp_log_->addParamNum("reconnect_midrun_max_attempts",
                           reconnect_midrun_max_attempts_);
+    exp_log_->addParamNum("reconnect_min_share_voxels",
+                          reconnect_min_share_voxels_);
+    exp_log_->addParamNum("reconnect_midrun_min_silence_sec",
+                          reconnect_midrun_min_silence_sec_);
+    exp_log_->addParamNum("reconnect_midrun_max_silence_sec",
+                          reconnect_midrun_max_silence_sec_);
     exp_log_->addParamNum("pursuit_budget_max_sec", pursuit_budget_max_sec_);
     exp_log_->addParamNum("pursuit_staleness_max_sec",
                           pursuit_staleness_max_sec_);
@@ -2109,6 +2294,13 @@ ExploPlannerNode::ExploPlannerNode()
                                 static_cast<float>(msg->goal_pos.y),
                                 static_cast<float>(msg->goal_pos.z));
             rec.stamp = this->now();
+            // Map-size half of the snapshot: the peer's beaconed count/rate
+            // and my cached ones, frozen together so both robots derive the
+            // same info-gate trigger time from THIS contact (see LastContact).
+            rec.peer_voxels = static_cast<double>(msg->observed_voxels);
+            rec.peer_rate   = static_cast<double>(msg->map_growth_rate);
+            rec.self_voxels = latest_map_voxels_;
+            rec.self_rate   = map_growth_rate_;
           }
           // Proximity guard: the peer's advertised live pose (refreshed by
           // its 1 Hz heartbeat). Coarse but always available in multi-robot
@@ -2759,7 +2951,7 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
     if (intent_pub_ && have_active_intent_) {
       current_intent_msg_.staged = true;
       current_intent_msg_.header.stamp = state_enter_time_;
-      intent_pub_->publish(current_intent_msg_);
+      publishIntent();
     }
   }
 }
@@ -2872,17 +3064,31 @@ void ExploPlannerNode::doPlan() {
           !midrun_end_armed_ ||
           (trig_now - midrun_last_end_).seconds() >=
               reconnect_midrun_silence_sec_;
-      if (!teamComplete(live, rendezvous_expected_peers_) &&
-          missing_for >= reconnect_midrun_silence_sec_ && cooldown_ok) {
-        ++midrun_attempts_;
-        reconnect_terminal_ = false;
-        hold_escalated_ = false;
-        RCLCPP_INFO(get_logger(),
-            "Reconnect (mid-run): peer silent %.0fs >= %.0fs (attempt %d/%d) "
-            "-> interrupting exploration for the reconnect manoeuvre.",
-            missing_for, reconnect_midrun_silence_sec_, midrun_attempts_,
-            reconnect_midrun_max_attempts_);
-        if (dispatchReconnect("peer-lost")) return;
+      // Threshold from the info gate when configured (dead-reckoned unshared
+      // backlog crossing, clamped), else the legacy fixed clock — same value
+      // exactly when reconnect_min_share_voxels=0. The COOLDOWN above stays
+      // on the fixed clock either way: it paces retry pressure after a
+      // failed manoeuvre, which has nothing to do with how much map the pair
+      // holds. Gate maths runs only once the team actually reads incomplete:
+      // midrunGateSec walks the peer table, and a fully-connected gated run
+      // would otherwise pay that walk on every PLAN tick of the whole run.
+      if (!teamComplete(live, rendezvous_expected_peers_) && cooldown_ok) {
+        double est_unshared = -1.0;
+        const double gate_sec = midrunGateSec(missing_for, &est_unshared);
+        if (missing_for >= gate_sec) {
+          ++midrun_attempts_;
+          reconnect_terminal_ = false;
+          hold_escalated_ = false;
+          dispatch_gate_sec_     = gate_sec;
+          dispatch_est_unshared_ = est_unshared;
+          RCLCPP_INFO(get_logger(),
+              "Reconnect (mid-run): peer silent %.0fs >= gate %.0fs "
+              "(est unshared %.0f vox, attempt %d/%d) -> interrupting "
+              "exploration for the reconnect manoeuvre.",
+              missing_for, gate_sec, est_unshared, midrun_attempts_,
+              reconnect_midrun_max_attempts_);
+          if (dispatchReconnect("peer-lost")) return;
+        }
       }
     } else if (midrun_attempts_ == reconnect_midrun_max_attempts_) {
       ++midrun_attempts_;  // log the exhaustion exactly once
@@ -3012,16 +3218,48 @@ void ExploPlannerNode::doPlan() {
   }
 
   // SSMI-style denominator-normalised utility (Asgharivaskasi & Atanasov,
-  // TRO 2023):
+  // TRO 2023), generalised by an exponent γ on the denominator:
   //
-  //   U(c) = info_gain(c) / (ε + path_cost(c))
+  //   U(c) = info_gain(c) / (ε + path_cost(c))^γ
   //
-  // Information per unit distance — longer paths dilute their score.
+  // γ = 1 is the shipped form: information per unit distance, which at constant
+  // speed is information per SECOND. That is the correct greedy objective when
+  // the metric is time to completion, so γ = 1 is not an arbitrary default and
+  // the burden of proof is on moving it. It is also the default here, and the
+  // γ == 1 branch below skips std::pow so the shipped path stays bit-identical
+  // rather than merely close.
+  //
+  // WHY THE KNOB EXISTS. Measured over 703 logged decisions on flatforest_dense
+  // (campaign p14, off arm, to the 0.60 unknown rung): across the candidate set
+  // at a single decision, path_cost spans roughly 5.8x while info_gain spans
+  // only ~0.35 sd/mean. Cost enters linearly and varies far more, so argmax(U)
+  // collapses to argmin(cost) — the planner chose goals at a median 7.8 m when
+  // the mean candidate was 45.2 m away, i.e. it ran as nearest-frontier. The
+  // same collapse is described from the other direction in shared_params.yaml
+  // at candidate_min_goal_dist_m ("6% spread against a ninefold spread in
+  // path_cost"). Solving for the γ at which a mean+2sd-information candidate at
+  // the field's mean distance overtakes the one actually chosen gives a median
+  // of 0.25 (p10 0.15, p90 0.42).
+  //
+  // WHAT IT DOES NOT FIX, stated so γ is not mistaken for a repair. Against the
+  // map actually gained afterwards, info_gain has Spearman ρ ≈ +0.18 — real
+  // (the null, raw distance, is ≈ 0) but weak, and its ~1.7x span cannot
+  // separate outcomes that range over 600x. Lowering γ stops a nearly-flat
+  // information term from being overruled by cost; it does not make that term
+  // discriminate. The repair is the information model, not this exponent.
+  //
   // ε (0.1 m) prevents division-by-zero for candidates at the robot's
-  // feet and matches the SSMI reference implementation.
+  // feet and matches the SSMI reference implementation. It sits INSIDE the
+  // power so the guard survives any γ: at γ = 0 the denominator is exactly 1
+  // and U reduces to pure info_gain with distance ignored.
   //
   // Unreachable candidates (inf cost) get U = −∞ and sort to the bottom.
   constexpr float kCostEpsilon = 0.1f;
+  // Hoisted out of the loop: γ is fixed for the life of the node, and the
+  // equality test is on the same value the branch uses, so no candidate can
+  // take a different path from its neighbour within one planning tick.
+  const float kGamma = static_cast<float>(utility_cost_exponent_);
+  const bool  kUnitGamma = (kGamma == 1.0f);
 
   std::vector<float> info_gain(candidates.size(), 0.0f);
   std::vector<float> path_cost(candidates.size(), 0.0f);
@@ -3047,7 +3285,9 @@ void ExploPlannerNode::doPlan() {
       if (std::isfinite(c)) {
         sum_cost_finite += c;
         ++n_cost_finite;
-        candidates[i].score = info_gain[i] / (kCostEpsilon + c);
+        candidates[i].score = kUnitGamma
+            ? info_gain[i] / (kCostEpsilon + c)
+            : info_gain[i] / std::pow(kCostEpsilon + c, kGamma);
       } else {
         // Unreachable (inf cost): U = -inf, sorts to the bottom.
         candidates[i].score = -std::numeric_limits<float>::infinity();
@@ -3227,7 +3467,7 @@ void ExploPlannerNode::doPlan() {
         static_cast<float>(coord_claim_ttl_sec_),
         static_cast<float>(coord_claim_radius_m_),
         /*planner_type_id (eig)=*/0u, map_frame_);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   }
 
@@ -3623,6 +3863,113 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
 // Callers own reconnect_terminal_: finishOrRendezvous sets true (its barrier
 // may end in DONE), the mid-run trigger in doPlan sets false (its barrier
 // must resume exploring).
+// ==================================================================
+// Info-gated mid-run trigger (map-size beacon)
+// ==================================================================
+
+void ExploPlannerNode::noteMapSize(double t_sim_sec, double voxels) {
+  latest_map_voxels_ = voxels;
+  map_size_hist_.emplace_back(t_sim_sec, voxels);
+  size_t keep_from = 0;
+  while (keep_from + 1 < map_size_hist_.size() &&
+         map_size_hist_[keep_from + 1].first < t_sim_sec - kRateWindowSec) {
+    ++keep_from;
+  }
+  if (keep_from > 0) {
+    map_size_hist_.erase(map_size_hist_.begin(),
+                         map_size_hist_.begin() + keep_from);
+  }
+  // Winsorised slope: per-interval deltas, each capped at kRateWinsorK x the
+  // window's median delta, summed over the window's total elapsed time. The
+  // cap is what makes this a PRIVATE gathering rate rather than a total one:
+  // a reconnection merges the peer's map into this same cumulative count, a
+  // step of up to 243k voxels in ONE sample (measured, p14), which a plain
+  // two-point slope reports as growth this robot never sensed. Deltas are
+  // floored at 0 for the mirror artifact (a map reload shrinking the count).
+  std::vector<double> deltas;
+  deltas.reserve(map_size_hist_.size());
+  double span = 0.0;
+  for (size_t i = 1; i < map_size_hist_.size(); ++i) {
+    const double dt = map_size_hist_[i].first - map_size_hist_[i - 1].first;
+    if (dt <= 0.0) continue;
+    deltas.push_back(
+        std::max(0.0, map_size_hist_[i].second - map_size_hist_[i - 1].second));
+    span += dt;
+  }
+  if (deltas.size() < 2 || span <= 0.0) {
+    map_growth_rate_ = 0.0;
+    return;
+  }
+  std::vector<double> sorted = deltas;
+  std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2,
+                   sorted.end());
+  const double med = sorted[sorted.size() / 2];
+  const double cap = (med > 0.0) ? kRateWinsorK * med
+                                 : std::numeric_limits<double>::infinity();
+  double total = 0.0;
+  for (double d : deltas) total += std::min(d, cap);
+  map_growth_rate_ = total / span;
+}
+
+void ExploPlannerNode::publishIntent() {
+  stampMapInfo();
+  intent_pub_->publish(current_intent_msg_);
+}
+
+void ExploPlannerNode::stampMapInfo() {
+  current_intent_msg_.observed_voxels =
+      static_cast<uint64_t>(std::max(0.0, latest_map_voxels_));
+  current_intent_msg_.map_growth_rate =
+      static_cast<float>(map_growth_rate_);
+}
+
+double ExploPlannerNode::midrunGateSec(double missing_for,
+                                       double* est_unshared_out) {
+  if (est_unshared_out != nullptr) *est_unshared_out = -1.0;
+  if (reconnect_min_share_voxels_ <= 0.0) {
+    return reconnect_midrun_silence_sec_;   // gate off: legacy fixed clock
+  }
+  std::string peer_id;
+  const LastContact* rec = missingPeerRecord(&peer_id);
+  if (rec == nullptr) {
+    // No contact snapshot to reckon from (anchor predates the record) —
+    // the time-only clock is the only trigger that remains meaningful.
+    // est_unshared = -2, not -1: a gated dispatch that fell back here would
+    // otherwise log gate_sec = the fixed silence clock and est_unshared = -1,
+    // byte-identical to a control run's dispatch — the one situation these
+    // diagnostics exist to tell apart.
+    if (est_unshared_out != nullptr) *est_unshared_out = -2.0;
+    return reconnect_midrun_silence_sec_;
+  }
+  // Diagnostic backlog estimate: my delta is EXACT (own cached count), the
+  // peer's is dead-reckoned at its beaconed rate. Logged on the dispatch
+  // event so the offline analysis can score the estimator against the
+  // transfer actually measured at the merge.
+  if (est_unshared_out != nullptr) {
+    *est_unshared_out = (latest_map_voxels_ - rec->self_voxels) +
+                        std::max(0.0, rec->peer_rate) * missing_for;
+  }
+  // The TRIGGER TIME, by contrast, uses only snapshot-frozen quantities so
+  // both robots derive the same value (see LastContact). rate 0 = unknown
+  // (pre-field peer / no samples): the quotient blows past the ceiling and
+  // the clamp turns it into "wait for the backstop", which is the correct
+  // reading of "nothing known to share".
+  //
+  // SUM, not mean: once each side's rate is a PRIVATE gathering rate (the
+  // winsorised estimator in noteMapSize — a total-count rate would already
+  // include the peer's contribution and summing it would double-count), the
+  // backlog is the union of two disjoint gatherings and its growth is their
+  // sum. Checked, not assumed: summed = 1.12x p14's measured pair divergence,
+  // where the mean would read 0.56x and fire roughly twice too late.
+  const double rate_sum =
+      std::max(0.0, rec->self_rate) + std::max(0.0, rec->peer_rate);
+  const double t = (rate_sum > 1e-9)
+                       ? reconnect_min_share_voxels_ / rate_sum
+                       : reconnect_midrun_max_silence_sec_;
+  return std::min(reconnect_midrun_max_silence_sec_,
+                  std::max(reconnect_midrun_min_silence_sec_, t));
+}
+
 bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   std::string peer_id;
   const LastContact* rec = missingPeerRecord(&peer_id);
@@ -3798,7 +4145,7 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
         static_cast<float>(coord_claim_ttl_sec_),
         static_cast<float>(coord_claim_radius_m_),
         /*planner_type_id (eig)=*/0u, map_frame_);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   }
 
@@ -3865,6 +4212,12 @@ void ExploPlannerNode::doReturnNav() {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: reached %s (dist=%.2f, tol=%.1f) -> waiting for team.",
         return_dest_label_.c_str(), dist, reconnect_arrive_tol_m_);
+    // RETURN_SYNC assumes a stationary robot, but arrival-by-tolerance lands
+    // BEFORE nav2 finishes its own goal: without an explicit stop the
+    // controller keeps driving to the exact goal pose underneath the barrier
+    // — and underneath whatever state the release transitions into next.
+    // Same rationale as the release path above.
+    abandonNavGoal("return-arrived");
     transitionTo(State::RETURN_SYNC, "return-arrived");
     return;
   }
@@ -4198,7 +4551,7 @@ void ExploPlannerNode::armPursuitWaypoint() {
         static_cast<float>(coord_claim_ttl_sec_),
         static_cast<float>(coord_claim_radius_m_),
         /*planner_type_id (eig)=*/0u, map_frame_);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   }
 
@@ -4457,7 +4810,7 @@ void ExploPlannerNode::publishPresenceIntent() {
         static_cast<float>(coord_claim_ttl_sec_),
         static_cast<float>(coord_claim_radius_m_),
         /*planner_type_id (eig)=*/0u, map_frame_);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   }
 }
@@ -4581,7 +4934,10 @@ void ExploPlannerNode::heartbeatTick() {
   current_intent_msg_.robot_pos.x = latest_pos_.x();
   current_intent_msg_.robot_pos.y = latest_pos_.y();
   current_intent_msg_.robot_pos.z = latest_pos_.z();
-  intent_pub_->publish(current_intent_msg_);
+  // Map size rides the heartbeat too: this is the 1 Hz beacon that maintains
+  // peer belief, so it is the freshest value a peer can snapshot at the last
+  // exchange before an outage — exactly the sample the info gate runs on.
+  publishIntent();
 }
 
 // ==================================================================
@@ -4763,6 +5119,13 @@ void ExploPlannerNode::doProximityHold() {
         "Proximity hold: max_hold_sec=%.0f reached with '%s' still at %.2f m "
         "— resuming anyway (escape hatch).",
         proximity_max_hold_sec_, d.peer_id.c_str(), d.dist_m);
+    // Make the hatch an actual escape: the peer is (by construction of this
+    // branch) still inside the trigger disc, so without a grace window the
+    // very next tick's entry check re-holds and the "escape" is one 0.1 s
+    // tick of driving between max_hold_sec holds, forever — exactly the
+    // wedge the yaml's escape-hatch comment promises this parameter breaks.
+    // The guard drops the immunity early if the peer starts moving again.
+    prox_guard_->armEscape(d.peer_id, now);
   }
 
   // Resume the interrupted drive on the SAME goal. The re-publish is
@@ -4895,6 +5258,10 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
   // (shared with findFrontierCentroids, unit-testable in isolation).
   const auto stats = map_cache_->computeStats();
   m.total_observed_voxels = stats.total_voxels;
+  // Every CSV row passes through here (see the milestone comment above), so
+  // this is the one place the map-size beacon's count/rate cache is fed —
+  // the beacon can never disagree with the logged series.
+  noteMapSize(now.seconds(), static_cast<double>(stats.total_voxels));
   m.frontier_voxels       = stats.frontier_voxels;
   m.mean_eig              = stats.mean_eig;
   m.mean_entropy          = stats.mean_entropy;
@@ -4949,11 +5316,10 @@ void ExploPlannerNode::metricsTick() {
   logger_->logStep(m);
 
   // Realised-rate accounting for this sampler, reported in the event log's
-  // run_end. The configured period is NOT what it achieves: the gate above is a
-  // steady-clock deadline armed after the previous tick's work, so at RTF ~1
-  // every second sim-time tick is suppressed and at RTF ~0.83 none are, and the
-  // realised period changed from 10 s to 5 s between campaigns with no config
-  // change and no log line saying so. Measured from the sim stamps of the rows
+  // run_end. The configured period is still not a guarantee: the gate above
+  // is a WALL-clock deadline (it must be — it bounds executor work), so the
+  // sim-time spacing of rows scales with RTF, and the duty back-off below
+  // stretches it further under load. Measured from the sim stamps of the rows
   // actually written, which is the quantity an analysis needs.
   ++metrics_rows_written_;
   if (metrics_first_row_sim_sec_ < 0.0)
@@ -4981,9 +5347,23 @@ void ExploPlannerNode::metricsTick() {
     }
   }
   metrics_effective_period_ = eff_period;
-  metrics_next_ = std::chrono::steady_clock::now() +
+  // Arm the next deadline from THIS tick's scheduled slot, not from "now"
+  // after the row was written: post-work arming adds the tick's cost to every
+  // period, and when the tick source runs at the same period (sim-clock timer
+  // at RTF >= 1) that constant overshoot suppresses every second firing —
+  // halving the realised rate with no config change, by an amount that
+  // tracks how expensive the map walk happens to be at that point of the
+  // run. Advancing the previous deadline keeps the schedule phase-locked to
+  // the tick source; a schedule that has fallen behind re-anchors instead of
+  // firing a catch-up burst.
+  const auto eff_dur =
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
           std::chrono::duration<double>(eff_period));
+  auto next = (metrics_next_.time_since_epoch().count() != 0)
+                  ? metrics_next_ + eff_dur
+                  : mt_now + eff_dur;
+  if (next <= mt_now) next = mt_now + eff_dur;
+  metrics_next_ = next;
 }
 
 // ==================================================================
@@ -5154,6 +5534,14 @@ void ExploPlannerNode::logReconnectDispatch(const char* action,
   e.attempt        = reconnect_terminal_ ? 0 : midrun_attempts_;
   e.peers_live     = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
   e.expected_peers = rendezvous_expected_peers_;
+  // Gate diagnostics belong to the manoeuvre (same lifetime as
+  // reconnect_rec_, NOT consumed-per-event like decline_reason): an
+  // out-of-band leaf of a mid-run manoeuvre re-reports the gate decision it
+  // was armed from, while terminal dispatches never carry a stale one.
+  if (!reconnect_terminal_) {
+    e.gate_sec         = dispatch_gate_sec_;
+    e.est_unshared_vox = dispatch_est_unshared_;
+  }
   exp_log_->logReconnectDispatch(expCtx(), e);
 }
 
@@ -5565,7 +5953,7 @@ void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
         /*exploit=*/true,
         /*target_id=*/t ? t->id : 0u,
         /*dwelled_mask=*/t ? t->clear_mask : 0u);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   }
 
@@ -5723,7 +6111,7 @@ bool ExploPlannerNode::holdDwelledVantage(
         static_cast<float>(coord_vantage_claim_radius_m_),
         /*planner_type_id (eig)=*/0u, map_frame_,
         /*exploit=*/true, tgt->id, tgt->clear_mask, /*staged=*/true);
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
     have_active_intent_ = true;
   } else if (have_active_intent_) {
     // Team credit can grow while we hold (the winner's dwell lands in our
@@ -5905,12 +6293,14 @@ void ExploPlannerNode::doExploitPlan() {
     const bool stale =
         !exploit_flood_valid_ ||
         exploit_flood_map_ != latest_plan_map_.get() ||
+        exploit_flood_stamp_ != latest_plan_map_->header.stamp ||
         (robot_pos - exploit_flood_pos_).head<2>().norm() > kFloodRefreshM;
     if (stale) {
       cost_grid_->build(*latest_plan_map_);
       cost_grid_->floodFrom(robot_pos, /*radius_cap_m (unbounded)=*/0.0f);
       exploit_flood_valid_   = true;
       exploit_flood_map_     = latest_plan_map_.get();
+      exploit_flood_stamp_   = latest_plan_map_->header.stamp;
       exploit_flood_pos_     = robot_pos;
       exploit_flood_reached_ = cost_grid_->reachedCellCount();
     }
@@ -6314,7 +6704,7 @@ void ExploPlannerNode::doExploitDwell() {
   if (intent_pub_ && coord_ && have_active_intent_ && t) {
     current_intent_msg_.dwelled_mask = t->clear_mask;
     current_intent_msg_.header.stamp = this->now();
-    intent_pub_->publish(current_intent_msg_);
+    publishIntent();
   }
 
   // Reaching + dwelling a vantage is progress: reset the per-target give-up
@@ -6349,6 +6739,23 @@ void ExploPlannerNode::updatePoseFromTF() {
         "TF lookup %s -> %s failed: %s",
         map_frame_.c_str(), base_frame_.c_str(), e.what());
     return;
+  }
+  // A successful lookup is NOT a fresh pose. TimePointZero returns the newest
+  // stored transform unconditionally, and tf2 prunes only on INSERT — once a
+  // broadcaster dies this lookup keeps succeeding with the same stamp
+  // forever. Everything downstream trusts latest_pos_ (goals, the brake goal,
+  // distance, the trajectory log), so a stale transform must read as "pose
+  // lost", exactly like a failed lookup, until fresh data arrives.
+  if (pose_max_age_sec_ > 0.0) {
+    const double age = (this->now() - rclcpp::Time(tf.header.stamp)).seconds();
+    if (age > pose_max_age_sec_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "TF %s -> %s is %.1f s old (pose_max_age_sec=%.1f) — treating the "
+          "pose as lost until the transform updates.",
+          map_frame_.c_str(), base_frame_.c_str(), age, pose_max_age_sec_);
+      have_pose_ = false;
+      return;
+    }
   }
   latest_pos_ = Eigen::Vector3f(
       static_cast<float>(tf.transform.translation.x),

@@ -198,13 +198,17 @@ released while the robot is on the far side of the map.
 Candidates are ranked by information per unit distance:
 
 ```
-U(c) = EIG(c) / (ε + cost(c)),    ε = 0.1 m
+U(c) = EIG(c) / (ε + cost(c))^γ,    ε = 0.1 m
 ```
 
-The form is deliberately parameter-free. There is no weight to tune between
-information and distance: a candidate twice as far must be twice as informative
-to win, and the constant ε only prevents division by zero for candidates at the
-robot's feet. Unreachable candidates take `U = −∞` and sort last.
+γ is `utility_cost_exponent`, the one tuning weight between information and
+distance. γ = 1 is the classic information-per-metre rate (a candidate twice as
+far must be twice as informative to win); γ < 1 discounts distance, favouring
+richer-but-farther candidates over near scraps; γ = 0 ignores cost entirely.
+The C++ default is 1.0, but note `shared_params.yaml` ships γ = 0.5 — runs
+launched with the shipped config are **not** using the pure rate form. The
+constant ε only prevents division by zero for candidates at the robot's feet.
+Unreachable candidates take `U = −∞` and sort last.
 
 The planner then walks the ranking in order and takes the first candidate that
 survives a series of filters: it must not be within arrival tolerance of the

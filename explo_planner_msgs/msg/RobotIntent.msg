@@ -77,3 +77,26 @@ uint32 dwelled_mask
 # the waypoint and not a vantage at all. Peers use this flag as the
 # rendezvous-barrier staging signal, so the team's dwells start together.
 bool staged
+
+# --- Map-size beacon (info-gated reconnect trigger) ---
+# The producer's current fused-map size (observed voxels) and its recent
+# growth rate (voxels per SIM second, winsorised slope over a ~300 s window;
+# kRateWindowSec in explo_planner_node.cpp). Consumers snapshot both into
+# their per-peer last-contact record; after a link loss each side
+# dead-reckons the pair's unshared-map backlog from the SAME snapshot, so the
+# mid-run reconnect trigger time derived from it agrees across the pair
+# without any in-outage communication. Values are sampled from the metrics
+# tick (~metrics period resolution): coarse, but the trigger consumer clamps
+# to [min,max] silence bounds so quantization cannot fire it degenerately.
+#
+# Wire-compatibility warning: these fields do NOT degrade gracefully across
+# mixed builds. On Humble (no XTypes type-negotiation) a consumer built WITH
+# them cannot deserialise messages from a producer built WITHOUT them — the
+# CDR buffer underflows, rmw drops the message before user code sees it, and
+# the producer goes silently, permanently invisible to that consumer (claims,
+# heartbeats, everything — not just these fields). Rebuild every robot's
+# workspace when this file changes. Zero-as-"unknown" (consumers treat a zero
+# rate as unknown and fall back to the time-only trigger) only covers a
+# SAME-BUILD producer that has not sampled its first metrics tick yet.
+uint64 observed_voxels
+float32 map_growth_rate

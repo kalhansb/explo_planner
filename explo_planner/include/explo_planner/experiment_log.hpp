@@ -180,6 +180,27 @@ struct ReconnectDispatchEvent {
   int    attempt = 0;                     ///< mid-run attempt index (0 for terminal)
   int    peers_live = 0;
   int    expected_peers = 0;
+  /// Info-gate diagnostics (mid-run dispatches only; -1 elsewhere): the
+  /// effective trigger threshold the dispatch fired against (the fixed
+  /// silence clock when the gate is off), and the estimated unshared-map
+  /// backlog at that moment (own exact delta + peer dead-reckoned). Two
+  /// sentinels, deliberately distinct: -1 = the gate was off (time-only
+  /// trigger, control arm), -2 = the gate was ON but no contact snapshot
+  /// existed, so it fell back to the fixed silence clock. Without the
+  /// split a gated run that never got a snapshot logs identically to a
+  /// control run and the arms cannot be separated offline. Logged so the
+  /// estimator can be scored offline against the transfer actually
+  /// measured at the merge.
+  ///
+  /// Two things to know before scoring against it. (1) Both are stamped at
+  /// the TRIGGER; every later leaf of the same manoeuvre (hold,
+  /// resume_exploring) re-reports them unchanged, so they date the decision,
+  /// not the event. (2) est_unshared_vox is NOT overlap-discounted: it counts
+  /// each side's gathering in full, while the two robots often re-observe the
+  /// same region. Measured on p14, actual transfer runs ~0.38x this estimate
+  /// (median), so it is an upper bound on what a merge will deliver.
+  double gate_sec = -1.0;
+  double est_unshared_vox = -1.0;
 };
 
 /// `reconnect_end` payload.

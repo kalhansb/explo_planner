@@ -260,6 +260,7 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `nav_min_timeout_sec` / `nav_max_timeout_sec` | double | `30` / `180` | ⬑ clamp bounds (s). |
 | `progress_window_sec` / `progress_min_distance_m` | double | `15` / `0.2` | No-progress watchdog: fail the goal if the robot travels less than this in this window. |
 | `max_pose_jump_m` | double | `1.0` | Single-tick pose delta above this is a relocalisation jump, not travel (excluded from distance and the watchdog). `0` disables. |
+| `pose_max_age_sec` | double | `5.0` | Frozen-TF guard: tf2 serves the *newest stored* transform forever, so a dead localiser keeps the lookup succeeding with a stale pose. A transform older than this reads as "pose lost" until TF resumes. `0` disables. |
 | `failed_goal_radius_m` / `failed_goal_ttl_sec` | double | `2.0` / `60` | Blacklist disc and lifetime around a failed goal. |
 
 **Coverage-based termination**
@@ -284,6 +285,7 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `roi_min_x/max_x/min_y/max_y` | double | AO box | Axis-aligned XY box (map frame) candidates must lie in; also the coverage-done measurement box. |
 | `roi_min_z` / `roi_max_z` | double | `-5.5` / `4.0` | Map ingest z-band. **Robot-relative** when `terrain_relative_z`, absolute otherwise. Any upstream share/ingest z-filters must be a superset. |
 | `cost_grid_radius_cap_m` | double | `0` | Bounded-Dijkstra flood radius. *auto* → `candidate_max_radius + 2`. |
+| `utility_cost_exponent` | double | `1.0` | γ in `U = EIG / (ε + cost)^γ`: `1` = pure info-per-metre rate, `< 1` discounts distance (favours richer-but-farther candidates), `0` ignores cost. Clamped to [0, 2]; non-finite falls back to `1`. **`shared_params.yaml` ships `0.5`** — the C++ default and the shipped config diverge on purpose (γ is an experiment knob), so state which one a run used. |
 | `trajectory_scoring` | bool | `false` | SSMI ablation: score poses sampled along the whole Dijkstra path, not just the endpoint. Expensive. |
 | `trajectory_sample_spacing_m` | double | `1.5` | ⬑ sample spacing. |
 
@@ -332,6 +334,8 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `reconnect_confirm_sec` | double | `3.0` | The team must read incomplete continuously this long before a manoeuvre arms. `0` = arm on a single read of the claim table, which produced firings that dissolved before the robot moved (8 of 24 recorded firings ended within 5 s having travelled under a metre) — the node WARNs and the timing from such a run is unusable. |
 | `reconnect_midrun_silence_sec` | double | `240.0` | Continuous peer silence that triggers a reconnect manoeuvre **during** exploration, not only at exhaustion. `0` = terminal-only (pre-2026-08-17 behaviour). Must stay above the measured heartbeat-suppression tail (~180 s) or the trigger fires at healthy, silently-planning teammates. |
 | `reconnect_midrun_max_wait_sec` | double | `240.0` | Barrier give-up for a **mid-run** attempt. On expiry the robot resumes exploring — a mid-run attempt must never end the run, because the map is not saturated when one fires. |
+| `reconnect_min_share_voxels` | double | `0.0` | Info gate on the mid-run trigger: the estimated unshared-map backlog (dead-reckoned from the last RobotIntent beacon snapshot) must reach this many voxels before silence alone can dispatch. `0` = time-only trigger (shipped default; the gate is the experiment arm). **Only meaningful with `reconnect_midrun_silence_sec > 0`** — the node WARNs when the gate is set while mid-run triggering is off, because the gate is evaluated inside the mid-run path and can never fire. |
+| `reconnect_midrun_min_silence_sec` / `reconnect_midrun_max_silence_sec` | double | `60` / `240` | Clamp bounds (s) on the info-gated trigger time, so a degenerate backlog estimate (zero or huge growth rate) cannot fire the manoeuvre instantly or defer it forever. With the gate off they are inert. |
 | `reconnect_midrun_max_attempts` | int | `6` | Mid-run attempt budget for the whole run. Once exhausted the robot reverts to terminal-only reconnection. Cooldown between attempts is stamped at manoeuvre *end* and equals `reconnect_midrun_silence_sec`. |
 | `reconnect_release_confirm_sec` | double | `6.0` | The team (or the quarry alone) must read live continuously this long before a manoeuvre releases. **Must exceed `coord_claim_ttl_sec` (5.0)** — one packet holds a peer live for the whole TTL, so a shorter window is satisfied by that single packet and the flicker guard is inert. The node WARNs rather than clamping, so an A/B can still set `0` deliberately. |
 | `hold_escalate` / `hold_escalate_wait_sec` | bool / double | `true` / `300.0` | On terminal barrier expiry, move once to the meeting point and wait again (a shortened second vigil: a confirmation of failure, not a second full one) before giving up. Sticky — an unreachable target cannot re-escalate forever. Pure `pursuit` keeps the own-anchor escalation by design; a mode-blind escalation would make pursuit perform hybrid's fallback ~300 s later and erase the contrast the arm exists to measure. Latent at the field default `rendezvous_max_wait_sec: 0`, which never expires. |
@@ -351,6 +355,7 @@ certified safety stop. Right of way: the lexicographically smaller
 | `proximity_peer_static_sec` / `proximity_peer_static_move_m` | double | `10.0` / `0.3` | Peer moving less than this for this long is "parked" → not held against (kept above `exploit_dwell_sec` so a mid-capture dwell is waited out). |
 | `proximity_parked_keep_dist_m` | double | `1.5` | …unless parked inside this floor: the hold continues. |
 | `proximity_max_hold_sec` | double | `120.0` | Escape hatch; `0` = unbounded. |
+| `proximity_escape_grace_sec` | double | `30.0` | Post-escape immunity: after the hatch fires, the escaped-from peer cannot *start* a new hold for this long (else a peer still static inside `parked_keep_dist_m` re-holds on the next tick — 0.1 s of driving per `max_hold_sec`, forever). Cancels early if the peer moves. `0` disables. |
 | `proximity_peer_pose_topics` | string[] | `[]` | `"<robot_name>:<topic>"` localiser poses (~10 Hz). Unset = heartbeat-only (fine in sim; the node WARNs — configure on hardware). |
 | `proximity_nav_cancel_action` | string | `""` | *auto* → `/<robot_name>/navigate_to_pose`. |
 

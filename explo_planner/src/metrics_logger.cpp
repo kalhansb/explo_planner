@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
 #include <stdexcept>
 
 namespace explo_planner {
@@ -49,7 +50,12 @@ void MetricsLogger::writeHeader() {
 void MetricsLogger::logStep(const StepMetrics& m) {
   if (!header_written_) writeHeader();
   file_ << m.step << ","
-        << m.sim_time_sec << ","
+        // Fixed-point, not the default 6 SIGNIFICANT digits: on hardware
+        // sim_time_sec is a Unix epoch stamp (~1.7e9), where 6 sig figs is
+        // ±1000 s — every row of an hour-long run collapses to the same
+        // value and dt-based post-processing divides by zero.
+        << std::fixed << std::setprecision(6) << m.sim_time_sec
+        << std::defaultfloat << ","
         << m.total_observed_voxels << ","
         << m.frontier_voxels << ","
         << m.distance_traveled << ","

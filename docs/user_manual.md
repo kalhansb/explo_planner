@@ -178,11 +178,16 @@ feature (all three modes) inert.
    `explo_planner_msgs` (use `--packages-up-to`, **not** `--packages-select`).
    Release builds are mandatory; debug inflates timing 3–4×.
 
-2. **Confirm `scovox_msgs` is rebuilt to the current `RobotIntent.msg`.** The
-   exploit fields (`exploit`, `target_id`, `dwelled_mask`) are absent from a
-   stale installed interface. Without them the team-quota vantage sharing
-   degrades **and** the exploitation-contribution metric cannot be computed
-   offline.
+2. **Confirm every robot's `explo_planner_msgs` is rebuilt to the current
+   `RobotIntent.msg` — on every robot, from the same commit.** This is not a
+   graceful degradation: on a mixed fleet, a consumer built with newer fields
+   (e.g. the map-size beacon `observed_voxels`/`map_growth_rate`) cannot
+   deserialise messages from a producer built without them. The CDR buffer
+   underflows, rmw drops the message before the planner ever sees it, and the
+   stale robot goes **silently, permanently invisible** to the updated one —
+   no claims, no heartbeats, no proximity poses, and nothing in either log.
+   The docker-cp overlay build in step 1 makes this easy to hit: rebuilding
+   one robot's overlay and not the other's is exactly the mixed-version case.
 
 3. **Namespace every sensor topic per robot.** Platforms sharing a LiDAR model
    default to the same `/hesai/points` and `/imu/data` and will collide when

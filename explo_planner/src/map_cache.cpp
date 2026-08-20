@@ -206,7 +206,11 @@ std::vector<Eigen::Vector3f> MapCache::findFrontierCentroids(
 
   if (frontier_cells.empty()) return {};
 
-  // Cluster by coarse grid binning.
+  // Cluster by coarse grid binning. A zero / negative / non-finite radius
+  // would make inv_bin inf or NaN and fold every frontier cell into one bin
+  // (or none); one-voxel bins are the tightest meaningful clustering.
+  if (!(cluster_radius > 0.0f) || !std::isfinite(cluster_radius))
+    cluster_radius = static_cast<float>(resolution_);
   float inv_bin = 1.0f / cluster_radius;
   struct BinKey {
     int bx, by, bz;

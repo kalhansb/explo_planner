@@ -210,6 +210,14 @@
     # robot moves 0.1 m/tick). Set 0 to disable and reproduce raw integration.
     max_pose_jump_m: 1.0
 
+    # Frozen-TF guard (seconds; 0 = disable). tf2 lookups at TimePointZero
+    # return the NEWEST transform it has stored, forever: if the localiser
+    # dies mid-run the lookup keeps succeeding with the last pose and the
+    # planner would happily keep planning from a robot position that stopped
+    # updating. A transform older than this is treated as "pose lost"
+    # (have_pose_ = false), which parks planning until TF resumes.
+    pose_max_age_sec: 5.0
+
     # Failed-goal blacklist. After a navigate timeout, the failed goal is
     # parked for failed_goal_ttl_sec; subsequent picks reject any candidate
     # within failed_goal_radius_m of an active entry. Prevents the planner
@@ -454,13 +462,69 @@
     # Per-candidate utility is SSMI-style information-per-distance
     # (Asgharivaskasi & Atanasov, TRO 2023):
     #
-    #   U(c) = info_gain(c) / (ε + path_cost(c))      ε = 0.1 m
+    #   U(c) = info_gain(c) / (ε + path_cost(c))^γ     ε = 0.1 m, γ = 0.5
     #
     # Longer paths dilute a candidate's score; unreachable candidates
     # (infinite cost) get U = −∞ and sort last. info_gain comes from FOV
     # raycasting (EIG / entropy / frontier count); path_cost comes from
-    # CostGrid (bounded Dijkstra over planning_map). The denominator form
-    # is parameter-free — there are no separate α/β weights.
+    # CostGrid (bounded Dijkstra over planning_map). There are still no
+    # separate α/β weights — the single shape parameter is γ below. Setting
+    # γ = 1.0 recovers the parameter-free SSMI original exactly; the default
+    # is no longer 1.0, and the measurement that moved it is recorded below.
+
+    # Distance discount γ. 1.0 recovers the original SSMI behaviour, and the
+    # node short-circuits that case so it is bit-identical rather than merely
+    # close; 0.0 ignores distance entirely and ranks on raw info_gain. Clamped
+    # to [0, 2] — a negative value would turn the denominator into an unbounded
+    # REWARD for distance, which is a different objective, not a weaker
+    # preference.
+    #
+    # WHY THE DEFAULT IS 0.5 AND NOT 1.0.
+    #
+    # The argument for 1.0 is a good one and is why it was the default: U =
+    # I/(ε+c) is information per metre, which at constant speed is information
+    # per SECOND — the correct greedy objective when the endpoint is completion
+    # time. Lowering γ deliberately stops maximising that rate, so the burden of
+    # proof sat on moving it. It was met by measurement, not by argument.
+    #
+    # The rate is only worth maximising if the ranking it produces is real, and
+    # it had collapsed. Measured over 703 decisions on flatforest_dense (p14,
+    # off arm, to the 0.60 rung): within one decision path_cost spans ~5.8x
+    # across the candidate set while info_gain spans only ~0.35 sd/mean, so
+    # argmax(U) becomes argmin(cost) and the planner ran as nearest-frontier —
+    # median goal 7.8 m against a mean candidate distance of 45.2 m. (Same
+    # collapse, measured independently, in the candidate_min_goal_dist_m note
+    # above: "6% spread against a ninefold spread in path_cost".)
+    #
+    # Sweep, 2026-08-19, {1.0, 0.5, 0.25} x 6 replicates, flatforest_dense, two
+    # robots, perfect comms, endpoint = time to the 0.60 unknown rung. All 18
+    # cells ended all_done; no starvation at any level.
+    #
+    #     γ = 1.00   600 ± 90 s   416 m driven   goal median  7.7 m
+    #     γ = 0.50   487 ± 46 s   313 m driven   goal median 10.3 m
+    #     γ = 0.25   491 ± 99 s   341 m driven   goal median 16.6 m
+    #
+    # γ = 0.5 is 18.9% faster than γ = 1.0 (exact permutation p = 0.0152 over
+    # all 924 splits, 6/6 paired wins, Cohen's d = −1.59). Team speed was flat
+    # (0.69 / 0.64 / 0.69 m/s), so the entire saving is 25% fewer metres driven,
+    # not faster driving — the near-frontier ping-ponging, removed. γ = 0.25
+    # gives the same mean with twice the spread and does not clear 0.05
+    # (p = 0.074); 0.5 and 0.25 are indistinguishable from each other
+    # (p = 0.93), so 0.5 is chosen for variance, not for a proven optimum.
+    #
+    # SCOPE OF THAT EVIDENCE, because it is narrower than the default it sets:
+    # one world, one spawn, perfect comms, and the 0.60 rung rather than full
+    # completion. Under COMMS=0 the seed is inert, so the six replicates differ
+    # only by scheduling jitter. Whether the gain survives comms-on — where most
+    # measured waste is disconnection-driven redundancy that no scorer can fix —
+    # is a separate question from a separate campaign.
+    #
+    # And γ is not a repair. info_gain predicts the map actually gained with
+    # Spearman ρ ≈ +0.18: real, but far too flat (~1.7x span) to separate
+    # outcomes spanning 600x. γ keeps a weak signal from being overruled by
+    # cost; it does not make the signal informative. The repair is the
+    # information model.
+    utility_cost_exponent: 0.5
 
     # Bounded grid Dijkstra. 0 = auto = candidate_max_radius + 2 m slack
     # (so the entire candidate disc is covered, plus a margin for diagonals).
@@ -764,6 +828,14 @@
     # parked inside parked_keep_dist_m would otherwise hold forever — after
     # this long the drive resumes anyway, loudly.
     proximity_max_hold_sec: 120.0
+    # Post-escape immunity (seconds; 0 = disable). Without it the hatch above
+    # frees the robot for exactly one tick: a peer still static inside
+    # parked_keep_dist_m re-triggers the hold on the next evaluate, and the
+    # pair wedges into a 0.1 s drive per max_hold_sec cycle. After the hatch
+    # fires, the escaped-from peer cannot START a new hold for this long —
+    # enough to actually drive out of the trigger disc. Cancels early if the
+    # peer moves (a moving peer gets full yields again).
+    proximity_escape_grace_sec: 30.0
     # Extra peer pose sources, "<robot_name>:<topic>" (map frame, any rate).
     # On hardware point these at the peers' localiser poses (~10 Hz), e.g.
     #   bunker:  proximity_peer_pose_topics: ["curt:/curt/pcl_pose"]

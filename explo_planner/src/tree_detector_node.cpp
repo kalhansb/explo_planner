@@ -211,6 +211,12 @@ private:
     c.max_radius      = declare_parameter<double>("max_radius", c.max_radius);
     c.n_azimuth_bins  = declare_parameter<int>("n_azimuth_bins", c.n_azimuth_bins);
     c.n_height_bins   = declare_parameter<int>("n_height_bins", c.n_height_bins);
+    // Zero bins is not "no binning": bearingBit clamps its bin index to
+    // n_bins - 1 = -1 and writes one slot BEFORE a zero-length coverage
+    // vector — heap corruption, not an exception. One bin is the honest
+    // floor ("any angle counts as covered").
+    if (c.n_azimuth_bins < 1) c.n_azimuth_bins = 1;
+    if (c.n_height_bins < 1) c.n_height_bins = 1;
     c.w_coverage      = declare_parameter<double>("w_coverage", c.w_coverage);
     c.w_entropy       = declare_parameter<double>("w_entropy", c.w_entropy);
     c.w_vertical      = declare_parameter<double>("w_vertical", c.w_vertical);
@@ -241,6 +247,11 @@ private:
         const float N = v.a_occ + v.a_free;
         const float p = (N > 0.0f) ? v.a_occ / N : 0.5f;
         if (p < det_.config().occ_thresh) continue;  // skip the free-space bulk
+        // Same guard as MapCache::updateFromScovoxMap: a NaN position would
+        // poison the terrain grid and every distance test downstream.
+        if (!std::isfinite(v.position.x) || !std::isfinite(v.position.y) ||
+            !std::isfinite(v.position.z))
+          continue;
         SemVoxel sv;
         sv.pos = Eigen::Vector3f(v.position.x, v.position.y, v.position.z);
         sv.p_occ = p;
@@ -265,6 +276,10 @@ private:
         }
       }
       if (best != veg) continue;  // pre-filter to trees
+      // Same guard as MapCache::updateFromScovoxMap (see geometric loop).
+      if (!std::isfinite(v.position.x) || !std::isfinite(v.position.y) ||
+          !std::isfinite(v.position.z))
+        continue;
 
       const float N = v.a_occ + v.a_free;
       SemVoxel sv;

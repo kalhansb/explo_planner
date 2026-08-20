@@ -22,6 +22,7 @@ ProximityGuard::ProximityGuard(Config cfg, std::string self_id)
   fix(cfg_.parked_keep_dist_m, dflt.parked_keep_dist_m);
   fix(cfg_.peer_static_move_m, dflt.peer_static_move_m);
   fix(cfg_.hold_release_stale_sec, dflt.hold_release_stale_sec);
+  fix(cfg_.escape_grace_sec, dflt.escape_grace_sec);
   // An inverted hysteresis band (resume < hold) would release a hold at a
   // distance where the very next tick re-enters it — permanent chatter.
   if (cfg_.resume_dist_m < cfg_.hold_dist_m)
@@ -50,6 +51,10 @@ void ProximityGuard::onPeerPose(const std::string& peer_id,
     if (dx * dx + dy * dy > thresh * thresh) {
       p.move_anchor = pos;
       p.last_moved = now_local;
+      // A peer that drives again is alive, and alive peers get full yields:
+      // the post-escape immunity exists for a peer wedged static inside the
+      // trigger disc, not for one manoeuvring nearby.
+      p.escape_active = false;
     }
     return;
   }
@@ -104,7 +109,14 @@ ProximityGuard::Decision ProximityGuard::evaluate(
         (now - p.last_moved).seconds() > cfg_.peer_static_sec &&
         dist >= cfg_.parked_keep_dist_m;
 
-    if (fresh && !parked && dist < trigger) {
+    // Post-escape immunity (armEscape): after the caller's max-hold hatch
+    // fired against this peer, it must not re-hold before the robot has had
+    // a chance to drive out of the disc — otherwise the hatch frees the
+    // robot for one tick and the wedge resumes for another max_hold cycle.
+    const bool escaped =
+        p.escape_active && (now - p.escape_until).seconds() < 0.0;
+
+    if (fresh && !parked && !escaped && dist < trigger) {
       if (dist < best_hold) {
         best_hold = dist;
         d.hold = true;
@@ -114,7 +126,9 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     } else if (dist < best_near) {
       best_near = dist;
       near_id = &p.id;
-      near_note = !fresh ? "stale" : (parked ? "parked" : "clear");
+      near_note = !fresh ? "stale"
+                         : (parked ? "parked"
+                                   : (escaped ? "escaped" : "clear"));
     }
   }
   if (!d.hold) {
@@ -127,6 +141,18 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     }
   }
   return d;
+}
+
+void ProximityGuard::armEscape(const std::string& peer_id,
+                               const rclcpp::Time& now) {
+  if (cfg_.escape_grace_sec <= 0.0f) return;  // 0 = feature off
+  for (auto& p : peers_) {
+    if (p.id != peer_id) continue;
+    p.escape_active = true;
+    p.escape_until =
+        now + rclcpp::Duration::from_seconds(cfg_.escape_grace_sec);
+    return;
+  }
 }
 
 }  // namespace explo_planner

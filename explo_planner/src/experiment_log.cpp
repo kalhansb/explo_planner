@@ -424,6 +424,8 @@ void ExperimentLog::logReconnectDispatch(const ExperimentContext& ctx,
   num("budget_sec", e.budget_sec);
   text("decline_reason", e.decline_reason);
   integer("attempt", e.attempt);
+  num("gate_sec", e.gate_sec);
+  num("est_unshared_vox", e.est_unshared_vox);
   teamCounts(e.peers_live, e.expected_peers);
   end();
 }
