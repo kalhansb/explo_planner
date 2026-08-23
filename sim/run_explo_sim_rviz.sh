@@ -313,6 +313,16 @@ SEED="${SEED:-42}"
 # installed yaml, which would silently re-scope every later run and leave no
 # record of which severity any given run used.
 TX_POWER="$(flt "${TX_POWER:-30.0}")"
+# The SECOND severity dial, and the one that acts on geometry rather than
+# margin. tx_power_dbm shifts every link equally; tree_attenuation_db shifts a
+# link in proportion to how many trunks are on it, so it is what selects
+# occlusion-driven outages over distance-driven ones. Exposed here for exactly
+# the reason TX_POWER is, and it was missing: the sw-campaign design (§30) needs
+# to move it, and until now the only way to do that was to edit the installed
+# comms_sim_params.yaml — which re-scopes every later run on the machine and
+# leaves no field in any run directory saying which severity that run used.
+# Default matches the shipped yaml, so a bare invocation changes nothing.
+TREE_ATTEN="$(flt "${TREE_ATTEN:-11.98}")"
 # Does this run's arm expect the link to drop? 1 = yes (every treatment arm),
 # 0 = the control arm, deliberately run at a tx_power_dbm that keeps the link
 # up. Only affects the run-time outage gate's verdict, never the radio itself:
@@ -344,8 +354,12 @@ RELAY_QUEUE_BYTES="${RELAY_QUEUE_BYTES:-1073741824}"
 # needs. ±50 fits inside the 110x110 ground plane and covers the oak field.
 # ±50 also fits inside the global planning map derived from it just below.
 ROI_HALF="$(flt "${ROI_HALF:-50.0}")"
-# Side of scovox_node's WORLD-FIXED planning map (~/global_planning_map) — the
+# Side of the WORLD-FIXED planning map (~/global_planning_map) — the
 # 2D map the EXPLORATION planner consults for free/occupied and reachability.
+# Published by BOTH scovox_node (this robot's own measurements) and
+# dscovox_node (the fused team map); same envelope, same resolution, so the
+# two are comparable cell-for-cell. The planner reads the DSCOVOX one — see
+# the map-domain note below.
 # Both it and the ROI are centred on the world origin, so side 2*ROI_HALF
 # exactly covers the ROI and 3*ROI_HALF leaves ROI_HALF/2 of margin on each
 # side. The margin is not cosmetic: candidates are ROI-clipped but the ROBOT is
@@ -360,9 +374,22 @@ ROI_HALF="$(flt "${ROI_HALF:-50.0}")"
 # treats out-of-bounds as occupied) — on the rolling map every frontier beyond
 # ~10 m is dropped and exploration collapses to a bubble around the robot.
 # Widening that topic instead would push the whole world through the local A*
-# on the control path. dscovox_node publishes no planning_map at all (only a
-# GetOccupancyGrid service), so the planner's own default topic —
-# /<r>/dscovox_node/planning_map — has no publisher anywhere in this stack.
+# on the control path.
+#
+# THE MAP-DOMAIN FIX (2026-08-21). The planner used to read scovox_node's copy,
+# which contains only what THIS robot measured — while planning over the FUSED
+# team map for everything else. Ground the partner surveyed was therefore
+# unknown on the reachability map, so candidates in it were rejected as
+# unreachable and the planner starved. dscovox_node now publishes the same
+# world-fixed envelope over the fused grid and the planner reads that instead,
+# putting reachability in the same domain as the candidates it filters.
+#
+# Still NOT /<r>/dscovox_node/planning_map (no "global_"). simple_nav_3d's nav
+# global planner has been subscribed to that name, transient_local, with no
+# publisher, for the whole campaign history — it has never planned. Publishing
+# there would silently start it as a second, uncontrolled behavioural change in
+# the same build. Whether to wake it is a separate decision for a later
+# generation; one behavioural change at a time.
 PLAN_MAP_SIZE="$(flt "${PLAN_MAP_SIZE:-$(awk "BEGIN{print 3*$ROI_HALF}")}")"
 PLAN_MAP_RES="$(flt "${PLAN_MAP_RES:-0.40}")"
 # Dijkstra flood radius for the candidate reachability filter. MUST be set here,
@@ -789,9 +816,11 @@ if [ "$COMMS" = "1" ]; then
     ros2 launch hmr_sim comms_sim.launch.py \
       scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
       tx_power_dbm:="$TX_POWER" \
+      tree_attenuation_db:="$TREE_ATTEN" \
       reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES"
   sleep 3
   log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
+      "tree_attenuation_db=$TREE_ATTEN" \
       "relay_queue=${RELAY_QUEUE_BYTES}B) ahead of the mappers"
   # Per-run connectivity trace. link_states is published at link_rate_hz and
   # kept nowhere else: the gate watcher reads the aggregate `stats` topic, and
@@ -852,7 +881,19 @@ for r in $ROBOTS; do
     timeout 10 ros2 topic echo /$r/scovox_node/global_planning_map --once \
     || die "nav: no /$r global_planning_map after 2 min — the \
 exploration planner will never leave INIT (see $OUTDIR/nav_$r.log)"
-  log "$r global_planning_map alive (${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell)"
+  log "$r scovox global_planning_map alive (${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell)"
+  # THE ONE THE PLANNER ACTUALLY READS (2026-08-21). Gated separately from the
+  # scovox copy above because they fail for different reasons: the scovox one
+  # needs only this robot's own integration, while this one additionally needs
+  # a ScovoxMapBinary to have arrived and been fused (dscovox allocates its
+  # fused grid lazily on the first wire frame, and publishes nothing until
+  # then). A longer budget for that reason.
+  wait_for 180 "$r fused global_planning_map" -- \
+    timeout 10 ros2 topic echo /$r/dscovox_node/global_planning_map --once \
+    || die "nav: no /$r dscovox global_planning_map after 3 min — the \
+exploration planner reads THIS topic and will never leave INIT. Check that the \
+merger fused at least one binary (see $OUTDIR/nav_$r.log)"
+  log "$r fused global_planning_map alive (planner reads this one)"
 done
 if [ "$COMMS" = "1" ]; then
   # grep -q inside a function so wait_for can retry the whole pipeline.
@@ -968,7 +1009,7 @@ log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field sit
 # of the ROI to 2D cell coverage — a different number against the same
 # done_unknown_fraction threshold, changing when every run ends and invalidating
 # any comparison with runs recorded before this change.
-log "planning_map = /<r>/scovox_node/global_planning_map (${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=scovox"
+log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=scovox"
 
 # --- 6a. run manifest -------------------------------------------------------
 # Everything that distinguishes this run from another one, written INTO the run
@@ -1015,6 +1056,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "comms=$COMMS"
   echo "seed=$SEED"
   echo "tx_power_dbm=$TX_POWER"
+  echo "tree_attenuation_db=$TREE_ATTEN"
   # The arm's label for the outage gate, recorded because it is a claim about
   # what this run was FOR, not something recoverable from tx_power_dbm alone.
   echo "expect_outage=$EXPECT_OUTAGE"
@@ -1154,7 +1196,7 @@ for r in $ROBOTS; do
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
       -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
       -p use_planning_map:=true \
-      -p planning_map_topic:=/$r/scovox_node/global_planning_map \
+      -p planning_map_topic:=/$r/dscovox_node/global_planning_map \
       -p done_coverage_source:=scovox \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
