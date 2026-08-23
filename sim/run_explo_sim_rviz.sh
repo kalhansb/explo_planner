@@ -622,8 +622,52 @@ sim_clock() {
   rm -f "$f"
 }
 stack_procs() {
-  ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
-    | grep -v grep | grep -v claude | grep -v run_explo_sim_rviz
+  # Matching machine-wide by command pattern is correct for ONE cell and a
+  # cross-kill for two: this list feeds teardown()'s `kill -KILL`, so without
+  # scoping, cell A's teardown SIGKILLs cell B's gazebo and planner mid-run.
+  # That surfaces as a random mid-run death in an unrelated cell -- the most
+  # expensive kind of bug to chase. When IGN_PARTITION is set we keep only
+  # processes whose OWN environment carries the same value, read from
+  # /proc/<pid>/environ rather than the command line: the partition is
+  # inherited by gazebo and the ros_gz bridge and never appears in argv.
+  # Unset (the sequential default) falls through to the original behaviour
+  # byte for byte, so this cannot regress a normal single-cell run.
+  local matched
+  matched=$(ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
+    | grep -v grep | grep -v claude | grep -v run_explo_sim_rviz)
+  [ -z "${IGN_PARTITION:-}" ] && { printf '%s\n' "$matched"; return 0; }
+  printf '%s\n' "$matched" | while read -r p rest; do
+    [ -n "$p" ] || continue
+    # -x so IGN_PARTITION=p1 cannot match IGN_PARTITION=p10; -F so a partition
+    # name is never interpreted as a regex. A pid that exits mid-scan yields a
+    # read error, swallowed here, and is omitted -- correct, it needs no kill.
+    if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
+       | grep -qxF "IGN_PARTITION=${IGN_PARTITION}"; then
+      printf '%s %s\n' "$p" "$rest"
+    fi
+  done
+}
+count_own() {
+  # How many processes matching $1 belong to THIS cell? Same ownership test as
+  # stack_procs, for the bring-up guards rather than for teardown. A guard that
+  # counts machine-wide is correct for one cell and a RACE for two: with two
+  # concurrent cells there are four planner binaries, and whichever cell checks
+  # first aborts on the other cell's existence. That is not hypothetical -- it
+  # was observed directly, a cell dying "expected exactly 2, found 4" eight
+  # seconds after an otherwise healthy start, while the other survived purely
+  # because it happened to check after the first had been torn down.
+  # IGN_PARTITION unset falls through to the machine-wide count, so sequential
+  # runs keep exactly today's behaviour.
+  local pat=$1 n=0 p
+  for p in $(ps -eo pid=,cmd= | grep "$pat" | awk '{print $1}'); do
+    if [ -z "${IGN_PARTITION:-}" ]; then
+      n=$((n+1))
+    elif tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
+         | grep -qxF "IGN_PARTITION=${IGN_PARTITION}"; then
+      n=$((n+1))
+    fi
+  done
+  printf '%s\n' "$n"
 }
 TORN=0
 teardown() {
@@ -1027,6 +1071,11 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "host=$(hostname)"
   echo "outdir=$OUTDIR"
   echo "ros_domain_id=${ROS_DOMAIN_ID:-unset}"
+  # Both isolation keys, because a parallel campaign is only trustworthy if each
+  # cell can be shown after the fact to have been isolated. "unset" here means
+  # the cell ran unscoped, which is correct sequentially and a defect in a
+  # parallel batch -- so the manifest must be able to say which it was.
+  echo "ign_partition=${IGN_PARTITION:-unset}"
   echo
   echo "# --- arm / independent variables ---"
   # Per-robot JSONL event stream: the run's primary record. The manifest names
@@ -1235,8 +1284,10 @@ sleep 8
 # this pipeline, so ps lists the grep too. A literal pattern matches the grep's
 # OWN cmdline and every count comes back one too high. Bracketing one character
 # makes the pattern text differ from the text it matches.
-NPLAN=$(ps -eo cmd= | grep -c "[l]ib/explo_planner/explo_planner_node")
-[ "$NPLAN" = 2 ] || die "expected exactly 2 explo_planner_node, found $NPLAN"
+# count_own, not a machine-wide `grep -c`: see its definition. The [l] bracket
+# stays load-bearing there for the same reason it was here.
+NPLAN=$(count_own "[l]ib/explo_planner/explo_planner_node")
+[ "$NPLAN" = 2 ] || die "expected exactly 2 explo_planner_node (own cell), found $NPLAN"
 log "planners up (exactly 2 explo_planner_node)"
 
 # --- 6b. comms gates (COMMS=1) ----------------------------------------------
