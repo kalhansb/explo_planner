@@ -41,7 +41,12 @@ EXTRA_ENV=""
 # Coverage-termination threshold, passed through so every cell in a campaign
 # shares one value. It defines the primary endpoint, so a campaign that mixed
 # two of them would be comparing different experiments.
-DONE_UNKNOWN="${DONE_UNKNOWN:-0.55}"
+DONE_UNKNOWN="${DONE_UNKNOWN:-0.64}"
+# WHICH completion rule, passed through for the same reason as the threshold:
+# "latch" and "streak" define different endpoints, so a campaign that mixed them
+# would be comparing different experiments under one column name. See the long
+# note in run_explo_sim_rviz.sh for why "latch" is the default.
+DONE_CRITERION="${DONE_CRITERION:-latch}"
 # The world. It sets BOTH the link budget (stems in the Fresnel corridor) and
 # the coverage floor, so it is not a free knob: a campaign that changes it is a
 # different experiment and needs its own DONE_UNKNOWN. Passed explicitly rather
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
     --expect-outage) EXPECT_OUT="$2"; shift 2;;
     --comms)    COMMS_ON="$2"; shift 2;;
     --done-unknown) DONE_UNKNOWN="$2"; shift 2;;
+    --done-criterion) DONE_CRITERION="$2"; shift 2;;
     --env)      EXTRA_ENV="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -143,7 +149,8 @@ for cell in "${CELL_LIST[@]}"; do
   env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$arm" EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
-      DONE_UNKNOWN="$DONE_UNKNOWN" SCENARIO="$SCENARIO" \
+      DONE_UNKNOWN="$DONE_UNKNOWN" DONE_CRITERION="$DONE_CRITERION" \
+      SCENARIO="$SCENARIO" \
       $EXTRA_ENV \
       "$HERE/run_explo_sim_rviz.sh" > "$ROOT/$name.console.log" 2>&1
   rc=$?

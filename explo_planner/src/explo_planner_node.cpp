@@ -249,6 +249,20 @@ private:
   /// DEFERRED by the reconnect confirmation gate and no transition happened —
   /// the caller must then leave the node somewhere that re-runs this check.
   bool finishOrRendezvous(const char* reason);
+  /// The `exploration_complete` event — THIS robot declaring its own
+  /// exploration exhausted, emitted at the instant of the declaration and
+  /// before anything is decided about what happens next. Factored out of
+  /// finishOrRendezvous so the latch criterion, which skips the rendezvous
+  /// decision entirely, still records the same event at the same instant.
+  void recordExplorationComplete(const char* reason);
+  /// The ending itself: keep beaconing if DONE-idle, then transition. Shared by
+  /// both criteria so there is exactly one place a run can end.
+  bool finishNow(const char* reason);
+  /// Latched, state-blind completion test (done_criterion == "latch"). Takes an
+  /// already-measured ROI unknown fraction — every caller has just computed one
+  /// and a second ROI walk is the most expensive thing in the tick. Returns
+  /// true on the call that latched, false on every other call.
+  bool maybeLatchCoverageDone(double unk, const char* source);
   /// The manoeuvre dispatch itself (mode -> pursuit / meeting point / anchor /
   /// hold), factored out of finishOrRendezvous so the mid-run trigger in
   /// doPlan can arm the same manoeuvres without the DONE fallthrough. Always
@@ -463,6 +477,15 @@ private:
   double failed_goal_ttl_sec_;
   double done_unknown_fraction_;
   int    done_min_consecutive_steps_;
+  // Which rule decides that THIS robot has finished exploring:
+  //  - "latch" (default): the first tick on which the ROI unknown fraction
+  //    reaches done_unknown_fraction, in ANY state and regardless of who is in
+  //    comms range. Latched: it never un-finishes. No streak, no rendezvous.
+  //  - "streak": the legacy rule — done_min_consecutive_steps consecutive PLAN
+  //    ticks below threshold, then finishOrRendezvous, which may spend a
+  //    reconnect manoeuvre before DONE. Kept so banked campaigns remain
+  //    reproducible; see the param load for why the default changed.
+  std::string done_criterion_{"latch"};
   // Where the coverage-termination unknown fraction is measured:
   //  - "planning_map": 2D unknown cells in the latched planning_map (legacy).
   //    Returns -1 (check INACTIVE) when no planning_map is published.
@@ -986,8 +1009,19 @@ private:
   Eigen::Vector3f exploit_flood_pos_ = Eigen::Vector3f::Zero();
   size_t exploit_flood_reached_ = 0;
 
-  // Coverage termination streak.
+  // Coverage termination streak (done_criterion == "streak" only).
   int coverage_done_streak_ = 0;
+
+  // Coverage termination latch (done_criterion == "latch"). One-way: set on the
+  // first qualifying sample and never cleared, so a map that wobbles back above
+  // threshold — or a merge that re-frontiers the ROI — cannot un-finish a robot
+  // that has already reported finished. The two stamps are recorded because the
+  // latch instant is the endpoint this criterion defines, and it is NOT the same
+  // as the run's t_sim end (which is set by the SLOWER robot, plus teardown
+  // grace); an analysis needs both to separate the two.
+  bool   coverage_latched_        = false;
+  double coverage_latch_t_sim_    = -1.0;
+  double coverage_latch_unknown_  = -1.0;
 
   // Rendezvous anchor: the robot pose the last time it heard a teammate. That
   // pose sits inside the comms bubble, so it is the cheapest point to return to
@@ -1501,6 +1535,29 @@ ExploPlannerNode::ExploPlannerNode()
       dp("done_unknown_fraction", 0.05);
   done_min_consecutive_steps_ =
       dp("done_min_consecutive_steps", 3);
+  // WHICH RULE DECIDES FINISHED. The default is "latch" and the paragraph above
+  // describes "streak", which is now opt-in. The change is deliberate and the
+  // reason is measurable: the streak test runs only at the top of doPlan, so a
+  // robot inside a reconnect manoeuvre cannot declare itself finished however
+  // saturated its map is. Measured on the tr1 campaign, that blind spot plus
+  // re-earning the streak from zero after the manoeuvre put ~60 s of pure
+  // detection latency on the hybrid arm and 0 s on the off arm — an endpoint
+  // that moves with the treatment is not an endpoint, it is part of the
+  // treatment. "latch" measures the same quantity in both arms:
+  //   * the robot's OWN fused-map ROI unknown fraction (nothing team-wide),
+  //   * tested on every metrics tick in EVERY state, manoeuvres included,
+  //   * on first touch — no confirmation streak,
+  //   * with no rendezvous gate: being in comms is not required to be finished.
+  // The run then ends when BOTH robots have latched independently, which the
+  // harness already implements by waiting for every planner's state to read
+  // DONE. Set "streak" to reproduce a pre-2026-08-24 campaign.
+  done_criterion_ = dp("done_criterion", std::string("latch"));
+  if (done_criterion_ != "latch" && done_criterion_ != "streak") {
+    RCLCPP_WARN(get_logger(),
+        "Unknown done_criterion '%s' — falling back to 'latch'.",
+        done_criterion_.c_str());
+    done_criterion_ = "latch";
+  }
   // Measurement source: "planning_map" (legacy 2D; INACTIVE when none is
   // published), "scovox" (2.5D column coverage of the fused 3D map — works
   // without a planning_map), or "auto" (planning_map if present, else
@@ -2102,6 +2159,10 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("done_min_consecutive_steps",
                           done_min_consecutive_steps_);
     exp_log_->addParamStr("done_coverage_source", done_coverage_source_);
+    // Which rule ended the run. Recorded because it is not recoverable from any
+    // other field, and a campaign that mixes the two criteria is comparing two
+    // different endpoints under one column name.
+    exp_log_->addParamStr("done_criterion", done_criterion_);
     exp_log_->addParamStr("done_action", done_action_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
@@ -2806,7 +2867,22 @@ void ExploPlannerNode::tick() {
       // queue drains. When the queue empties the exploit sub-loop reverts to
       // EXPLORE -> PLAN, whose coverage check immediately lands back in DONE
       // (streak already at threshold) unless the map regressed.
+      //
+      // The latch criterion overrides that: "finished" is a one-way property of
+      // this robot, and leaving DONE would contradict it — the run-completion
+      // rule (every planner reads DONE) is evaluated on the state column, so a
+      // latched robot that flicks back out to EXPLOIT_PLAN would re-open a run
+      // it already ended. Targets are not part of this experiment's completion
+      // question; if a configuration ever needs both, it wants done_criterion=
+      // streak, where DONE is genuinely revocable.
       if (done_action_ == "idle") {
+        if (coverage_latched_) {
+          RCLCPP_INFO_ONCE(get_logger(),
+              "Exploration finished [latch] at t_sim=%.1f; idling and "
+              "beaconing. This robot does not leave DONE.",
+              coverage_latch_t_sim_);
+          break;
+        }
         if (exploitation_enabled_ && target_queue_.hasPending()) {
           target_queue_.activate();
           phase_ = Phase::EXPLOIT;
@@ -3005,7 +3081,28 @@ void ExploPlannerNode::doPlan() {
   // can short-circuit out of PLAN entirely once the ROI is fully known.
   // Requires N consecutive low-unknown ticks to avoid premature DONE
   // from a momentary measurement gap.
-  if (done_unknown_fraction_ > 0.0) {
+  //
+  // Under done_criterion == "latch" this site is NOT the deciding one — the
+  // metrics tick is, because it runs in every state — but the test is repeated
+  // here anyway so the criterion does not silently depend on the sampler being
+  // enabled (metrics_period_sec <= 0 disables that timer entirely), and so a
+  // robot that saturates between two sampler ticks finishes on the PLAN tick
+  // rather than waiting out the sampler period. maybeLatchCoverageDone is
+  // idempotent, so evaluating it from both hooks latches exactly once.
+  if (done_criterion_ == "latch") {
+    if (done_unknown_fraction_ > 0.0) {
+      const char* cov_src = "";
+      const double unk = coverageUnknownFraction(&cov_src);
+      if (maybeLatchCoverageDone(unk, cov_src)) return;
+      if (unk < 0.0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+            "Coverage termination (done_unknown_fraction=%.3f) INACTIVE: "
+            "source '%s' cannot measure the ROI unknown fraction (no "
+            "planning_map / degenerate ROI); stopping only at max_steps=%d.",
+            done_unknown_fraction_, cov_src, max_steps_);
+      }
+    }
+  } else if (done_unknown_fraction_ > 0.0) {
     const char* cov_src = "";
     double unk = coverageUnknownFraction(&cov_src);
     if (unk >= 0.0 && unk < done_unknown_fraction_) {
@@ -3769,13 +3866,9 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // reconnect_mode_ manoeuvre; otherwise finish. When the whole team is
 // already present the map is already merged, so exhaustion here means the team
 // is genuinely done — everyone reaches this together and lands in DONE.
-bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
-  // livePeerCount, not the raw table size: exploit claims are retained past
-  // expiry by the grace window (vantage-contest lenience), and a graced claim
-  // must not count a 10-s-silent teammate as "present" for the barrier.
+void ExploPlannerNode::recordExplorationComplete(const char* reason) {
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-
   // exploration_complete — THIS ROBOT declaring its own exploration exhausted,
   // recorded here and not at any of the endings below. That is the point: what
   // happens next is the independent variable (finish / return / chase / hold),
@@ -3802,6 +3895,63 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
     e.occurrence        = ++exp_complete_count_;
     exp_log_->logExplorationComplete(expCtx(), e);
   }
+}
+
+bool ExploPlannerNode::finishNow(const char* reason) {
+  // A DONE-idle robot must keep announcing itself: teammates that finish
+  // LATER count peers via claim TTLs, and a silent finisher ages out of every
+  // table within seconds — its teammate would then run the whole reconnect
+  // manoeuvre against a robot that is parked in range, and wait at the
+  // barrier forever. done_action=shutdown robots genuinely disappear; that
+  // combination gets a startup warning (see the param load).
+  if (done_action_ == "idle") {
+    publishPresenceIntent();
+  }
+  transitionTo(State::DONE, reason);
+  return true;
+}
+
+// The latched, state-blind criterion. Everything this does NOT do is the point:
+// no streak to accumulate, no peer count consulted, no state excluded, and no
+// path back out. It answers one question — has this robot's own map of the ROI
+// reached the threshold yet — and the answer is monotone in time.
+bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
+  if (done_criterion_ != "latch") return false;
+  if (coverage_latched_) return false;           // first touch only
+  if (done_unknown_fraction_ <= 0.0) return false;
+  // unk < 0 is "cannot measure", NOT "fully explored". Guarding on >= 0 is what
+  // keeps a degenerate ROI or an unpublished planning_map from reading as an
+  // instant finish on the first tick of the run.
+  if (!(unk >= 0.0 && unk <= done_unknown_fraction_)) return false;
+
+  coverage_latched_       = true;
+  coverage_latch_t_sim_   = this->now().seconds();
+  coverage_latch_unknown_ = unk;
+  RCLCPP_INFO(get_logger(),
+      "Exploration complete [latch]: ROI unknown fraction %.3f <= %.3f "
+      "(source=%s) in state %s at t_sim=%.1f — %d steps, %.2f m traveled. "
+      "Latched; this robot does not un-finish.",
+      unk, done_unknown_fraction_, source, stateName(state_),
+      coverage_latch_t_sim_, step_, cumulative_distance_);
+
+  // Order matters. Record the declaration against the state we were actually in
+  // (transitionTo would otherwise have already moved us), then stop the
+  // platform, then end. The abandon is what the streak path never needed: it
+  // finished from PLAN, where the robot is stationary and nav2 holds no goal.
+  // This one can fire mid-drive, and nav2 does not know the run is over — an
+  // uncancelled goal keeps driving a "finished" robot around.
+  recordExplorationComplete("coverage-latched");
+  abandonNavGoal("coverage-latched");
+  return finishNow("coverage-latched");
+}
+
+bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
+  // livePeerCount, not the raw table size: exploit claims are retained past
+  // expiry by the grace window (vantage-contest lenience), and a graced claim
+  // must not count a 10-s-silent teammate as "present" for the barrier.
+  const int active =
+      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  recordExplorationComplete(reason);
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
     // Confirmation gate. `active` above is one read of a claim table that may
@@ -3838,17 +3988,7 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
         "(%d/%d peers) -> DONE.",
         reason, active, rendezvous_expected_peers_);
   }
-  // A DONE-idle robot must keep announcing itself: teammates that finish
-  // LATER count peers via claim TTLs, and a silent finisher ages out of every
-  // table within seconds — its teammate would then run the whole reconnect
-  // manoeuvre against a robot that is parked in range, and wait at the
-  // barrier forever. done_action=shutdown robots genuinely disappear; that
-  // combination gets a startup warning (see the param load).
-  if (done_action_ == "idle") {
-    publishPresenceIntent();
-  }
-  transitionTo(State::DONE, reason);
-  return true;
+  return finishNow(reason);
 }
 
 // Mode dispatch (mesh radios). Pursuit and hybrid try the chase first;
@@ -5364,6 +5504,27 @@ void ExploPlannerNode::metricsTick() {
                   : mt_now + eff_dur;
   if (next <= mt_now) next = mt_now + eff_dur;
   metrics_next_ = next;
+
+  // THE DECIDING HOOK for done_criterion == "latch". This callback is the only
+  // thing in the node that measures the ROI unknown fraction in EVERY state —
+  // it re-ingests the fused map at the top precisely so the number stays live
+  // during a reconnect manoeuvre — which is exactly the property the criterion
+  // needs and exactly what the old top-of-doPlan test lacked. last_unknown_-
+  // fraction_ was cached by the fillCommonMetrics call above, so the row that
+  // reports the qualifying fraction and the tick that acts on it are the same
+  // tick and cannot disagree. (The cached double, not m.unknown_fraction: that
+  // field is a float and the comparison is against a threshold given in
+  // decimal.)
+  //
+  // LAST in the function, not first, for two reasons: the qualifying sample is
+  // data and must reach the CSV whatever the latch then does with it, and the
+  // row/rate accounting above must count that final row or the realised
+  // sampling rate reported in run_end is short by one.
+  //
+  // Safe to transition from here — this timer shares the node's default
+  // (mutually-exclusive) callback group with tick(), so no state-machine
+  // callback can be halfway through when this runs.
+  maybeLatchCoverageDone(last_unknown_fraction_, last_coverage_source_);
 }
 
 // ==================================================================

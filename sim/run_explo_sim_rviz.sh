@@ -531,15 +531,41 @@ VOXEL_RES="$(flt "${VOXEL_RES:-0.20}")"
 # half of a +-50 ROI and then cycles there indefinitely.
 #
 # So this follows plan §2.1's own prescription — measure the floor, set the
-# criterion above it — rather than chasing a threshold that cannot be hit. With
-# 0.55 the criterion lands in the fast early phase, where map sharing is what
-# separates the arms, and the runs terminate naturally instead of every arm
-# censoring at T and reporting the same non-answer.
+# criterion above it — rather than chasing a threshold that cannot be hit. The
+# criterion lands in the fast early phase, where map sharing is what separates
+# the arms, and the runs terminate naturally instead of every arm censoring at T
+# and reporting the same non-answer. The default was 0.55 through the sw/pb
+# campaigns; it is 0.64 from tr1 onward, which is the value tr1's 40 banked
+# cells were actually run at and the value the current criterion is defined at.
 #
 # It MUST be identical across arms: it is the definition of the primary
 # endpoint, so a run at a different value is not comparable to one at this one.
 # Recorded in the manifest for exactly that reason.
-DONE_UNKNOWN="$(flt "${DONE_UNKNOWN:-0.55}")"
+DONE_UNKNOWN="$(flt "${DONE_UNKNOWN:-0.64}")"
+# WHICH RULE decides a robot has finished. "latch" (default): each robot is
+# finished the first tick its OWN dscovox-fused ROI unknown fraction reaches
+# DONE_UNKNOWN — any state, no confirmation streak, no rendezvous gate, and it
+# never un-finishes. The run then ends when BOTH robots have latched, which is
+# the STOP_ON_DONE rule below unchanged (it already waits for every planner's
+# state column to read DONE).
+#
+# Why the default moved off "streak": the old rule was only tested at the top of
+# doPlan, so a robot inside a reconnect manoeuvre could not declare itself
+# finished however saturated its map was. On tr1 that put ~60 s of detection
+# latency on the hybrid arm and 0 s on off — the endpoint moved with the
+# treatment, which makes it part of the treatment rather than a measure of it.
+# "latch" measures the same thing in both arms. Robots still BEHAVE differently
+# between arms; the chase simply no longer decides when the clock stops.
+#
+# Like DONE_UNKNOWN this is the definition of the primary endpoint, so it MUST
+# be identical across arms and runs at a different value are not comparable.
+# Recorded in the manifest for that reason.
+DONE_CRITERION="${DONE_CRITERION:-latch}"
+case "$DONE_CRITERION" in
+  latch|streak) ;;
+  *) echo "DONE_CRITERION must be 'latch' or 'streak', got '$DONE_CRITERION'" >&2
+     exit 2 ;;
+esac
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, NOT the default 0. This box runs other ROS work (the scovox
 # replay harnesses) on domain 0, and a second /clock publisher appearing there
@@ -1130,6 +1156,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "visited_goal_ttl_sec=$VISITED_TTL"
   echo "voxel_resolution_m=$VOXEL_RES"
   echo "done_unknown_fraction=$DONE_UNKNOWN"
+  echo "done_criterion=$DONE_CRITERION"
   echo "done_coverage_source=scovox"
   echo "prox_hold_m=$PROX_HOLD_M"
   echo "prox_resume_m=$PROX_RESUME_M"
@@ -1252,6 +1279,7 @@ for r in $ROBOTS; do
       -p utility_cost_exponent:=$UTIL_GAMMA \
       -p map_resolution:=$VOXEL_RES \
       -p done_unknown_fraction:=$DONE_UNKNOWN \
+      -p done_criterion:=$DONE_CRITERION \
       -p frontier_z_lo_offset_m:=$FRONTIER_Z_LO_OFF \
       -p frontier_z_hi_offset_m:=$FRONTIER_Z_HI_OFF \
       -p visited_goal_radius_m:=$VISITED_RADIUS \
@@ -1387,9 +1415,29 @@ planner_state() {
     END { print last }
   ' "$OUTDIR/planner_$1.csv" 2>/dev/null
 }
+# Poll cadence, in WALL seconds. Deliberately TWO numbers, not one.
+#
+# The loop's cheap work -- process liveness, and the planner's own `state`
+# column via an awk over a local CSV -- costs effectively nothing, so it runs
+# often. That is what tightens the two end-of-run boundaries: the instant every
+# robot reaches DONE, and the instant the grace window expires. Both were
+# previously detected up to one poll late, and the poll was 15 s, so a run could
+# be held open ~15 wall-s at each boundary for nothing.
+#
+# The expensive work is sim_clock, which spawns `ros2 topic echo /clock --once`
+# and costs ~0.3 s of CPU per call (measured, idle machine). Polling THAT every
+# POLL_S would be a ~16 % continuous duty cycle per cell, and with concurrent
+# shards it would contend with the single render thread that gates sim time --
+# trading one bottleneck for another. So the clock keeps its own slower budget
+# and is only forced to POLL_S resolution when the answer is about to change:
+# on the all-DONE edge, and inside the grace window, which is exactly where the
+# resolution is the thing being bought.
+POLL_S="${POLL_S:-2}"
+CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
 LAST_SA=-1; LAST_SB=-1; STALL=0
+LAST_CLOCK_WALL=0
 while true; do
-  sleep 15
+  sleep "$POLL_S"
   for entry in "${PIDS[@]}"; do
     name=${entry%%:*}; pid=${entry##*:}
     # RViz closed by the user is a normal way to end a watch session.
@@ -1398,6 +1446,27 @@ while true; do
     fi
     alive "$pid" || die "$name (pid $pid) died mid-run — see $OUTDIR/$name.log"
   done
+  # Cheap probe, hoisted ABOVE the clock read. This is the whole point of the
+  # fast poll: it answers "is the run over?" without paying for a ros2 spawn.
+  # Kept at 0 when STOP_ON_DONE is off so the clock budget below falls through
+  # to the slow cadence, i.e. byte-for-byte the old behaviour.
+  all_done=0
+  if [ "$STOP_ON_DONE" = "1" ]; then
+    all_done=1
+    for r in $ROBOTS; do
+      [ "$(planner_state "$r")" = "DONE" ] || { all_done=0; break; }
+    done
+  fi
+  # $SECONDS is a bash builtin, so this costs no fork. Read the clock on the
+  # slow budget, EXCEPT on the all-DONE edge or with a grace window already
+  # open -- there the next few seconds decide when the run ends.
+  NOW_WALL=$SECONDS
+  if [ "$all_done" = 1 ] || [ "$DONE_SINCE" != -1 ] \
+     || [ $((NOW_WALL - LAST_CLOCK_WALL)) -ge "$CLOCK_EVERY_S" ]; then
+    LAST_CLOCK_WALL=$NOW_WALL
+  else
+    continue
+  fi
   T=$(sim_clock)
   [ -n "$T" ] || { log "WARN /clock read failed, retrying"; continue; }
   if [ $((T - LAST_HB)) -ge 60 ]; then
@@ -1434,10 +1503,8 @@ while true; do
     LAST_SA=$SA; LAST_SB=$SB
   fi
   if [ "$STOP_ON_DONE" = "1" ]; then
-    all_done=1
-    for r in $ROBOTS; do
-      [ "$(planner_state "$r")" = "DONE" ] || { all_done=0; break; }
-    done
+    # all_done was computed above, before the clock read, so that a fast poll
+    # can detect the edge without a ros2 spawn.
     if [ "$all_done" = 1 ]; then
       # Re-armed on any robot leaving DONE, so a target release or a manoeuvre
       # that pulls one back out restarts the grace rather than banking it.
