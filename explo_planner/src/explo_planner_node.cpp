@@ -2568,7 +2568,8 @@ ExploPlannerNode::ExploPlannerNode()
             if (!link_index_usable_ || link_self_idx_ != idx) {
               RCLCPP_INFO(get_logger(),
                   "Link gate: armed as robot index %d of [%s, %s]; the mid-run "
-                  "trigger now fires on radio link-down, not record age.",
+                  "trigger still fires on record age, but a fire is vetoed "
+                  "while the radio is up.",
                   idx, names[0].c_str(), names[1].c_str());
             }
             link_self_idx_     = idx;
@@ -2614,8 +2615,9 @@ ExploPlannerNode::ExploPlannerNode()
         });
     RCLCPP_INFO(get_logger(),
         "Link gate: subscribed to '%s' (KeepLast(1)) with index from '%s', "
-        "stale after %.1fs. Mid-run reconnect fires on link-down duration; "
-        "peer_record_age_sec is still logged unchanged.",
+        "stale after %.1fs. The mid-run trigger clock is unchanged "
+        "(peer_record_age_sec); the link state only vetoes a fire aimed at a "
+        "peer that is already reachable.",
         comms_link_states_topic_.c_str(),
         comms_link_robot_index_topic_.c_str(), comms_link_stale_sec_);
   }
