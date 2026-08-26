@@ -746,13 +746,17 @@ private:
   // measured from here rather than from a stored up->down edge, because
   // Float64MultiArray carries no header: if the executor stalls in a long PLAN
   // tick, a backlog delivered afterwards is all stamped at receipt, which would
-  // compress the history and read the down-duration as ~0. That is also why the
-  // subscription below is KeepLast(1) and not deep — with only the newest
-  // sample the current state is always true. The residual error is honest and
-  // one-sided: a stall that hides an up->down edge makes the down-duration read
-  // too LONG by at most the stall, so the trigger can fire on a genuine outage
-  // younger than the gate. It can never fire on a link that is up, which is the
-  // 16-21 % this change exists to remove.
+  // compress the history and read the down-duration as ~0.
+  //
+  // That is also why the subscription below is KeepLast(1) and not deep, and
+  // why it is safe: the VETO reads link_connected_, which comes from the newest
+  // sample and is therefore never staler than linkGateReady's freshness bound.
+  // Down-duration is used only to debounce that veto, so the residual error is
+  // confined and one-sided — a stall that hides an up->down edge makes the
+  // duration read too LONG by at most the stall, which can at worst lift the
+  // debounce a few seconds early on a link that is genuinely down. It can never
+  // fire on a link that is up, which is the 16-21 % this change exists to
+  // remove.
   rclcpp::Time link_up_last_seen_;
   // --- Info-gated mid-run trigger (voxels, not seconds) ---
   // 0 (the default) keeps the fixed silence clock above, bit-identical legacy
@@ -1249,11 +1253,16 @@ private:
   double dispatch_est_unshared_ = -1.0;
   // How long the RADIO had been down when the mid-run trigger fired, stashed on
   // the same discipline. -1 = the link gate was not in play (feature off, no
-  // usable robot index, stale samples, or a terminal dispatch), in which case
-  // the fire was decided on peer_record_age_sec exactly as before. Logged
-  // alongside rather than instead of the record age: the whole point of §30.11
-  // is that the two clocks disagree, so collapsing them into one column would
-  // destroy the measurement that motivated the change.
+  // usable robot index, stale samples, or a terminal dispatch). It is a
+  // DIAGNOSTIC, never the trigger clock: the fire is decided on
+  // peer_record_age_sec in every case, and the gate only vetoes. On a gated
+  // dispatch it therefore always reads >= reconnect_confirm_sec.
+  //
+  // Logged alongside rather than instead of the record age: the whole point of
+  // §30.11 is that the two clocks disagree, so collapsing them into one column
+  // would destroy the measurement that motivated the change. It is also the
+  // positive control — a gated run whose two columns agree everywhere is a run
+  // in which the gate did nothing.
   double dispatch_link_down_sec_ = -1.0;
   // True when the link gate has a fresh, decodable sample for our own pair and
   // may therefore override the record-age clock. Logs (throttled) when a topic
@@ -3382,56 +3391,67 @@ void ExploPlannerNode::doPlan() {
       // midrunGateSec walks the peer table, and a fully-connected gated run
       // would otherwise pay that walk on every PLAN tick of the whole run.
       if (!teamComplete(live, rendezvous_expected_peers_) && cooldown_ok) {
-        // WHICH CLOCK THE GATE COMPARES AGAINST (§30.11, §30.24). missing_for
-        // is record age: it ages whenever the peer is not SENDING, which
-        // includes a teammate sitting in a long PLAN tick two metres away. When
-        // the link gate is armed the radio answers instead, and the two
-        // possible answers are different in kind:
-        //   link UP   -> there is nothing to reconnect to. Do not fire at all,
-        //                however old the record is. This is the 16-21 % of
-        //                fires that were pure loss.
-        //   link DOWN -> compare the gate against how long the RADIO has been
-        //                down, not how long the mailbox has been quiet.
-        // -1 is a sentinel for "stand down this tick" and is checked before any
-        // gate maths runs, because midrunGateSec walks the peer table and a
-        // quiet-but-connected teammate would otherwise buy that walk on every
-        // PLAN tick for the rest of the run.
-        double link_down_for = missing_for;   // legacy clock unless gated
-        bool   link_gated    = false;
+        // THE LINK GATE IS A VETO, NOT A CLOCK (§30.11, §30.24, §30.26).
+        //
+        // missing_for is record age: it ages whenever the peer is not SENDING,
+        // which includes a teammate sitting in a long PLAN tick two metres
+        // away. That is the defect — but the repair is only to refuse the
+        // fires that cannot possibly help, NOT to re-time the trigger.
+        //
+        // Timing on link-down duration instead was tried and rejected against
+        // the banked data. The two quantities are not variations of each
+        // other: record age accumulates ACROSS outages (the beacon is
+        // conditional, so silence spans up-periods), while continuous outage
+        // resets at every flicker. On tl1's 30 hybrid cells only 1 of 286
+        // outages ever reached the campaign's 240 s gate, so timing on it
+        // would have dropped 17 of 19 mid-run fires — switching mid-run
+        // pursuit off rather than correcting it, under a threshold that was
+        // never tuned for that quantity. The veto drops 4 of 19: exactly the
+        // fires that went out to a peer already on the radio.
+        //
+        // What the veto CANNOT fix, by design: the other half of §30.24's
+        // "bought nothing" 42 % fired into a genuine outage that ended within
+        // the ~14.6 s it takes to start moving. Suppressing those needs a
+        // prediction of when the link returns, which is peer state the robot
+        // has no deployable way to know. Left in deliberately.
+        bool   link_veto     = false;   // stand down this tick
+        double link_down_for = -1.0;    // diagnostic; -1 = gate not in play
         if (linkGateReady(trig_now)) {
-          link_gated = true;
-          if (link_connected_) {
+          link_down_for = link_connected_
+                              ? 0.0
+                              : (trig_now - link_up_last_seen_).seconds();
+          // Debounced on the SAME constant the release path uses, so a
+          // one-sample flicker cannot launch a manoeuvre. Also makes
+          // link_down_sec on any dispatch unambiguous: >= confirm when the
+          // gate decided, -1 when it was not in play.
+          if (link_down_for < reconnect_confirm_sec_) {
+            link_veto = true;
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                 "Reconnect (mid-run): standing down — peer record silent "
-                "%.0fs but the radio link is UP, so a chase would be spent on "
+                "%.0fs but the radio link is %s, so a chase would be spent on "
                 "a peer that is already reachable.",
-                missing_for);
-            link_down_for = -1.0;
-          } else {
-            link_down_for = (trig_now - link_up_last_seen_).seconds();
+                missing_for,
+                link_connected_ ? "UP" : "only just down");
           }
         }
-        if (link_down_for >= 0.0) {
+        if (!link_veto) {
           double est_unshared = -1.0;
-          // Fed missing_for ON PURPOSE, not link_down_for: the unshared-map
-          // backlog accrues from the last time the pair actually exchanged
-          // anything, which is last CONTACT. A peer that was connected but
-          // quiet was still not sending deltas, so dating the backlog from
-          // link-down would under-count it.
+          // Gate maths runs only past the veto: midrunGateSec walks the peer
+          // table, and a quiet-but-connected teammate would otherwise buy that
+          // walk on every PLAN tick for the rest of the run.
           const double gate_sec = midrunGateSec(missing_for, &est_unshared);
-          if (link_down_for >= gate_sec) {
+          if (missing_for >= gate_sec) {
             ++midrun_attempts_;
             reconnect_terminal_ = false;
             hold_escalated_ = false;
             dispatch_gate_sec_      = gate_sec;
             dispatch_est_unshared_  = est_unshared;
-            dispatch_link_down_sec_ = link_gated ? link_down_for : -1.0;
+            dispatch_link_down_sec_ = link_down_for;
             RCLCPP_INFO(get_logger(),
-                "Reconnect (mid-run): %s %.0fs >= gate %.0fs "
-                "(record age %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
+                "Reconnect (mid-run): peer silent %.0fs >= gate %.0fs "
+                "(radio down %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
                 "interrupting exploration for the reconnect manoeuvre.",
-                link_gated ? "radio link down" : "peer silent",
-                link_down_for, gate_sec, missing_for, est_unshared,
+                missing_for, gate_sec, link_down_for, est_unshared,
                 midrun_attempts_, reconnect_midrun_max_attempts_);
             if (dispatchReconnect("peer-lost")) return;
           }
