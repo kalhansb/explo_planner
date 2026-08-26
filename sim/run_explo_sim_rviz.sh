@@ -329,6 +329,38 @@ TREE_ATTEN="$(flt "${TREE_ATTEN:-11.98}")"
 # severity is TX_POWER's job alone, and the two are set independently so that a
 # control run whose link DID drop is still reported rather than excused.
 EXPECT_OUTAGE="${EXPECT_OUTAGE:-1}"
+# --- Link-state gate for the mid-run reconnect trigger (§30.11, §30.24) ------
+# The trigger used to fire on peer RECORD AGE, which ages whenever a teammate is
+# not sending -- link up or down. Measured against the emulator's own trace it
+# ran +49.1 s ahead of real link-down and 41-42 % of all mid-run fires bought
+# nothing, 16-21 % of them firing while the radio was UP. LINK_GATE=1 points the
+# planner at the emulator's connected bit instead.
+#
+# OFF BY DEFAULT, and that is deliberate: every campaign banked so far
+# (pb3g2, tr1, tl1, tl2, td1) ran on the record-age clock, and a default flip
+# would silently make the next run incomparable with all of them. Turn it on per
+# campaign, and record that you did -- the manifest line below is the record.
+#
+# Only meaningful with COMMS=1: with no emulator there is no link topic, the
+# planner finds no samples, and it would spend the run warning about a gate it
+# cannot use. So the topics resolve to "" unless the radio is actually in
+# circuit, which also keeps a COMMS=0 smoke test quiet.
+#
+# Set identically for EVERY arm. The arms must differ in RECONNECT_MODE alone;
+# `off` cannot reach the gated code at all (it needs rendezvous_enabled, which
+# is false there), so passing it the same parameters costs nothing and removes
+# a whole class of "did the arms differ in something else too" question.
+LINK_GATE="${LINK_GATE:-0}"
+if [ "$LINK_GATE" = "1" ] && [ "$COMMS" = "1" ]; then
+  LINK_GATE_TOPIC="${LINK_GATE_TOPIC:-/hmr_comms_sim/link_states}"
+  LINK_GATE_INDEX="${LINK_GATE_INDEX:-/hmr_comms_sim/robot_index}"
+else
+  LINK_GATE_TOPIC=""
+  LINK_GATE_INDEX=""
+fi
+# Newest link sample older than this and the planner stands down to the legacy
+# clock rather than acting on a stale belief. The emulator publishes at 5 Hz.
+LINK_GATE_STALE="$(flt "${LINK_GATE_STALE:-3.0}")"
 # Reliable-relay backlog cap, in bytes. The emulator's shipped default is 64 MiB
 # and on overflow it drops the OLDEST queued map delta and never retransmits, so
 # the receiver's merged map loses those voxels for the rest of the run. That
@@ -1118,6 +1150,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_min_share_voxels=$RECONNECT_MIN_SHARE_VOX"
   echo "reconnect_midrun_min_silence_sec=$MIDRUN_MIN_SILENCE"
   echo "reconnect_midrun_max_silence_sec=$MIDRUN_MAX_SILENCE"
+  # Which CLOCK the mid-run trigger fired on. This is a behavioural switch, not
+  # a tuning knob: a link_gate=1 run and a link_gate=0 run are different
+  # experiments and their fire times are not comparable. Recorded per run so no
+  # future readout has to infer it from a git hash — two of the hashes on the
+  # last campaign were '-dirty' and could not have answered this.
+  echo "link_gate=$LINK_GATE"
+  echo "link_gate_topic=${LINK_GATE_TOPIC:-none}"
+  echo "link_gate_index_topic=${LINK_GATE_INDEX:-none}"
+  echo "link_gate_stale_sec=$LINK_GATE_STALE"
   echo "reconnect_release_confirm_sec=$RECONNECT_RELEASE_CONFIRM"
   echo "reconnect_arrive_tol_m=$RECONNECT_ARRIVE_TOL"
   echo "reconnect_nav_max_sec=$RECONNECT_NAV_MAX"
@@ -1235,6 +1276,16 @@ for r in $ROBOTS; do
     EXTRA=( -p coord_intent_pub_topic:=exploration/intents
             -p coord_intent_sub_topics:="[\"rx/$peer/exploration/intents\"]" )
     log "$r intents: pub /$r/exploration/intents  sub /$r/rx/$peer/exploration/intents"
+  fi
+  # Link-state gate. Appended to the same array rather than passed as bare -p
+  # flags because the "off" value is the empty string, and `-p name:=` with
+  # nothing after it is not a parameter assignment ros2 will accept — an unset
+  # gate has to mean "pass no parameter at all", not "pass an empty one".
+  if [ -n "$LINK_GATE_TOPIC" ]; then
+    EXTRA+=( -p comms_link_states_topic:="$LINK_GATE_TOPIC"
+             -p comms_link_robot_index_topic:="$LINK_GATE_INDEX"
+             -p comms_link_stale_sec:="$LINK_GATE_STALE" )
+    log "$r link gate: $LINK_GATE_TOPIC (index $LINK_GATE_INDEX, stale ${LINK_GATE_STALE}s)"
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \

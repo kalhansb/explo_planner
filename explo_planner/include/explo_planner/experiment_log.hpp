@@ -201,6 +201,16 @@ struct ReconnectDispatchEvent {
   /// (median), so it is an upper bound on what a merge will deliver.
   double gate_sec = -1.0;
   double est_unshared_vox = -1.0;
+  /// How long the RADIO had been down when a mid-run trigger fired, from the
+  /// comms emulator's own connected bit; -1 = the link gate was not in play
+  /// (feature off, undecodable robot index, stale samples, or a terminal
+  /// dispatch), so the fire was decided on peer_record_age_sec exactly as in
+  /// every campaign before this one. Logged BESIDE peer_record_age_sec rather
+  /// than replacing it: §30.11 is the finding that the two clocks disagree by a
+  /// median of 49 s, and collapsing them into one column would destroy the
+  /// measurement that motivated the change. A gated run in which the two
+  /// columns agree everywhere is evidence the gate is not doing anything.
+  double link_down_sec = -1.0;
 };
 
 /// `reconnect_end` payload.

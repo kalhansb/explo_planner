@@ -51,6 +51,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
@@ -693,6 +694,66 @@ private:
   // after this many failures the policy has had its chance and the robot
   // reverts to terminal-only behaviour (logged, so the analysis can see it).
   int    reconnect_midrun_max_attempts_ = 6;
+  // --- Link-state gating for the mid-run trigger (see §30.11 and §30.24) ---
+  // THE DEFECT THIS FIXES. Everything above measures silence with a RECORD-AGE
+  // clock: team_last_complete_time_ advances only while peer intents arrive,
+  // and the intent beacon is conditional twice over (it needs an active intent
+  // and a state outside PLAN), so a healthy in-range teammate stuck in a long
+  // PLAN loop is indistinguishable from one behind a hill. Measured against the
+  // emulator's own link trace the record clock ran a median +49.1 s ahead of
+  // real link-down, and 41-42 % of all mid-run fires bought nothing — 16-21 %
+  // of them fired while the radio was UP. A chase is real distance debited from
+  // exploration, so those are pure loss.
+  //
+  // WHAT IS AND IS NOT LEGITIMATE TO READ. The emulator publishes one row per
+  // robot pair with [i, j, distance_m, trees_on_link, path_loss_db, snr_db,
+  // ber, bandwidth_mbps, connected]. Only two of those may be touched here:
+  // `connected` for pairs involving THIS robot, and `path_loss_db` solely as
+  // the startup mask (a row the emulator has not computed yet reads
+  // path_loss_db <= 0 with every physical field zeroed, and counting it as a
+  // real disconnection manufactures a reconnection event at t=0 — same rule as
+  // link_logger.py). `connected` is the stand-in for what a real mesh radio
+  // genuinely exposes: a per-neighbour link indication kept alive by MAC-level
+  // keepalives that are unconditional and fast, which is exactly what the
+  // app-layer beacon is not. Reading distance_m, trees_on_link, path_loss_db
+  // as a signal, snr_db, or any pair not involving self would be peer position
+  // through the back door, and using link data to PREDICT reconnection or to
+  // steer the chase would be oracle-driven. None of that is done below.
+  // The topic is a global side channel and reaches a robot the emulator
+  // considers disconnected; that discipline is by convention here, not
+  // enforced by the transport.
+  //
+  // "" (the default) leaves the feature OFF and the trigger bit-identical to
+  // the campaigns already banked. Nothing about the `off` arm can reach this:
+  // the whole mid-run block requires rendezvous_enabled_, which is false there.
+  std::string comms_link_states_topic_;
+  std::string comms_link_robot_index_topic_;
+  // Newest sample older than this and the gate stands down to the legacy clock
+  // rather than acting on a stale belief. The emulator publishes at 5 Hz, so
+  // 3 s is 15 missed samples: a real gap, not jitter.
+  double comms_link_stale_sec_ = 3.0;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr
+      link_states_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr link_index_sub_;
+  int  link_self_idx_      = -1;     ///< own row index in the emulator's table
+  bool link_index_usable_  = false;  ///< a 2-robot index naming us has arrived
+  bool link_index_warned_  = false;  ///< N != 2 complaint is emitted once
+  bool link_connected_     = false;  ///< newest own-pair connected bit
+  bool link_have_sample_   = false;
+  bool link_clock_anchored_ = false;
+  rclcpp::Time link_last_sample_time_;  ///< receipt of the newest usable sample
+  // Receipt time at which the link was last OBSERVED up. Down-duration is
+  // measured from here rather than from a stored up->down edge, because
+  // Float64MultiArray carries no header: if the executor stalls in a long PLAN
+  // tick, a backlog delivered afterwards is all stamped at receipt, which would
+  // compress the history and read the down-duration as ~0. That is also why the
+  // subscription below is KeepLast(1) and not deep — with only the newest
+  // sample the current state is always true. The residual error is honest and
+  // one-sided: a stall that hides an up->down edge makes the down-duration read
+  // too LONG by at most the stall, so the trigger can fire on a genuine outage
+  // younger than the gate. It can never fire on a link that is up, which is the
+  // 16-21 % this change exists to remove.
+  rclcpp::Time link_up_last_seen_;
   // --- Info-gated mid-run trigger (voxels, not seconds) ---
   // 0 (the default) keeps the fixed silence clock above, bit-identical legacy
   // behaviour. Positive: the trigger time becomes "when the pair's estimated
@@ -1186,6 +1247,19 @@ private:
   // dispatch, which also has gate_sec = the fixed silence clock).
   double dispatch_gate_sec_     = -1.0;
   double dispatch_est_unshared_ = -1.0;
+  // How long the RADIO had been down when the mid-run trigger fired, stashed on
+  // the same discipline. -1 = the link gate was not in play (feature off, no
+  // usable robot index, stale samples, or a terminal dispatch), in which case
+  // the fire was decided on peer_record_age_sec exactly as before. Logged
+  // alongside rather than instead of the record age: the whole point of §30.11
+  // is that the two clocks disagree, so collapsing them into one column would
+  // destroy the measurement that motivated the change.
+  double dispatch_link_down_sec_ = -1.0;
+  // True when the link gate has a fresh, decodable sample for our own pair and
+  // may therefore override the record-age clock. Logs (throttled) when a topic
+  // is configured but unusable, so a typo degrades loudly rather than silently
+  // reverting to the behaviour this change exists to replace.
+  bool linkGateReady(const rclcpp::Time& now);
 
   // --- ROS interfaces ---
   tf2_ros::Buffer tf_buffer_;
@@ -1856,6 +1930,25 @@ ExploPlannerNode::ExploPlannerNode()
   reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
+  // Link-state gate (see the member comments). "" = off, bit-identical legacy
+  // record-age clock, no subscription created at all.
+  comms_link_states_topic_ =
+      dp("comms_link_states_topic", std::string(""));
+  comms_link_robot_index_topic_ =
+      dp("comms_link_robot_index_topic", std::string(""));
+  comms_link_stale_sec_ = dp("comms_link_stale_sec", 3.0);
+  if (!comms_link_states_topic_.empty() &&
+      comms_link_robot_index_topic_.empty()) {
+    // The index is what turns a pair row into "my pair". Without it every
+    // sample is undecodable and the gate would stand down on every tick while
+    // looking configured — the failure mode this project keeps rediscovering.
+    RCLCPP_WARN(get_logger(),
+        "comms_link_states_topic is set to '%s' but "
+        "comms_link_robot_index_topic is empty: link rows cannot be matched to "
+        "this robot, so the mid-run trigger will keep using the record-age "
+        "clock. Set both or neither.",
+        comms_link_states_topic_.c_str());
+  }
   // Info gate (see the member comments). 0 = off, bit-identical legacy clock.
   reconnect_min_share_voxels_      = dp("reconnect_min_share_voxels", 0.0);
   reconnect_midrun_min_silence_sec_ =
@@ -2397,6 +2490,125 @@ ExploPlannerNode::ExploPlannerNode()
         (coord_intent_sub_topics_.size() == 1 &&
          coord_intent_sub_topics_[0] == coord_intent_pub_topic_)
             ? " (shared bus: no external process can gate this stream)" : "");
+  }
+
+  // --- Link-state gate wiring (§30.11). Only two fields of the emulator's
+  // table are ever read here — see the member comments for why the rest would
+  // be an oracle. Nothing is created when the topic is unset, so a legacy run
+  // does not even subscribe.
+  if (!comms_link_states_topic_.empty()) {
+    if (!comms_link_robot_index_topic_.empty()) {
+      link_index_sub_ = create_subscription<std_msgs::msg::String>(
+          comms_link_robot_index_topic_,
+          // Must match the emulator's transient_local publisher or the latched
+          // index never arrives and every link sample stays undecodable.
+          rclcpp::QoS(1).transient_local(),
+          [this](const std_msgs::msg::String::SharedPtr msg) {
+            // Minimal scan of {"robots":["a","b"],...}. A JSON dependency for
+            // one flat array of strings is not worth the build cost, and the
+            // emitter is a fixed ostringstream in the emulator, not arbitrary
+            // JSON: PublishRobotIndex writes exactly this shape.
+            const std::string& s = msg->data;
+            const auto key = s.find("\"robots\"");
+            if (key == std::string::npos) return;
+            const auto open  = s.find('[', key);
+            if (open == std::string::npos) return;
+            const auto close = s.find(']', open);
+            if (close == std::string::npos) return;
+            std::vector<std::string> names;
+            size_t p = open;
+            while (true) {
+              const auto q1 = s.find('"', p);
+              if (q1 == std::string::npos || q1 > close) break;
+              const auto q2 = s.find('"', q1 + 1);
+              if (q2 == std::string::npos || q2 > close) break;
+              names.push_back(s.substr(q1 + 1, q2 - q1 - 1));
+              p = q2 + 1;
+            }
+            // Deliberately restricted to two robots. With three or more,
+            // "connected to at least one peer" and "the team is complete" stop
+            // being the same statement, and the mid-run trigger is written
+            // against the latter. Guessing a meaning here would be a silent
+            // wrong answer in the heterogeneous campaign that is already
+            // planned, so refuse loudly and keep the legacy clock instead.
+            if (names.size() != 2) {
+              if (!link_index_warned_) {
+                link_index_warned_ = true;
+                RCLCPP_WARN(get_logger(),
+                    "Link gate: robot index lists %zu robots; the gate is only "
+                    "defined for a pair, so the mid-run trigger keeps the "
+                    "record-age clock for this run.",
+                    names.size());
+              }
+              link_index_usable_ = false;
+              return;
+            }
+            const auto it = std::find(names.begin(), names.end(), robot_name_);
+            if (it == names.end()) {
+              if (!link_index_warned_) {
+                link_index_warned_ = true;
+                RCLCPP_WARN(get_logger(),
+                    "Link gate: robot index does not name '%s' (it lists '%s', "
+                    "'%s'); keeping the record-age clock.",
+                    robot_name_.c_str(), names[0].c_str(), names[1].c_str());
+              }
+              link_index_usable_ = false;
+              return;
+            }
+            const int idx = static_cast<int>(it - names.begin());
+            if (!link_index_usable_ || link_self_idx_ != idx) {
+              RCLCPP_INFO(get_logger(),
+                  "Link gate: armed as robot index %d of [%s, %s]; the mid-run "
+                  "trigger now fires on radio link-down, not record age.",
+                  idx, names[0].c_str(), names[1].c_str());
+            }
+            link_self_idx_     = idx;
+            link_index_usable_ = true;
+          });
+    }
+    link_states_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
+        comms_link_states_topic_,
+        // KeepLast(1) ON PURPOSE — see link_up_last_seen_. These messages carry
+        // no header, so a backlog delivered after an executor stall would be
+        // stamped at receipt and read as a link that just came back.
+        rclcpp::QoS(rclcpp::KeepLast(1)),
+        [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+          if (!link_index_usable_) return;
+          constexpr size_t kCols = 9;   // emulator's kLinkStateCols
+          const auto& d = msg->data;
+          bool found = false, connected = false;
+          for (size_t k = 0; k + kCols <= d.size(); k += kCols) {
+            const int i = static_cast<int>(d[k]);
+            const int j = static_cast<int>(d[k + 1]);
+            if (i != link_self_idx_ && j != link_self_idx_) continue;
+            // Startup mask, same discriminator as link_logger.py: the path-loss
+            // floor is ~49 dB at one metre and only grows, so <= 0 is a row the
+            // emulator never computed. Treating it as a disconnection would
+            // manufacture a reconnection the instant poses arrive.
+            if (d[k + 4] <= 0.0) continue;
+            found = true;
+            if (d[k + 8] != 0.0) connected = true;   // `connected` column
+          }
+          if (!found) return;
+          const auto now = this->now();
+          link_have_sample_      = true;
+          link_last_sample_time_ = now;
+          link_connected_        = connected;
+          // Anchor on the first usable sample whatever its state: with no
+          // observed "up" to measure from, the earliest defensible claim is
+          // "down since we started watching", which under-states the outage and
+          // therefore delays rather than invents a fire.
+          if (connected || !link_clock_anchored_) {
+            link_up_last_seen_    = now;
+            link_clock_anchored_  = true;
+          }
+        });
+    RCLCPP_INFO(get_logger(),
+        "Link gate: subscribed to '%s' (KeepLast(1)) with index from '%s', "
+        "stale after %.1fs. Mid-run reconnect fires on link-down duration; "
+        "peer_record_age_sec is still logged unchanged.",
+        comms_link_states_topic_.c_str(),
+        comms_link_robot_index_topic_.c_str(), comms_link_stale_sec_);
   }
 
   // --- Proximity-stop wiring: peer localiser poses + the nav2 cancel client.
@@ -3170,21 +3382,59 @@ void ExploPlannerNode::doPlan() {
       // midrunGateSec walks the peer table, and a fully-connected gated run
       // would otherwise pay that walk on every PLAN tick of the whole run.
       if (!teamComplete(live, rendezvous_expected_peers_) && cooldown_ok) {
-        double est_unshared = -1.0;
-        const double gate_sec = midrunGateSec(missing_for, &est_unshared);
-        if (missing_for >= gate_sec) {
-          ++midrun_attempts_;
-          reconnect_terminal_ = false;
-          hold_escalated_ = false;
-          dispatch_gate_sec_     = gate_sec;
-          dispatch_est_unshared_ = est_unshared;
-          RCLCPP_INFO(get_logger(),
-              "Reconnect (mid-run): peer silent %.0fs >= gate %.0fs "
-              "(est unshared %.0f vox, attempt %d/%d) -> interrupting "
-              "exploration for the reconnect manoeuvre.",
-              missing_for, gate_sec, est_unshared, midrun_attempts_,
-              reconnect_midrun_max_attempts_);
-          if (dispatchReconnect("peer-lost")) return;
+        // WHICH CLOCK THE GATE COMPARES AGAINST (§30.11, §30.24). missing_for
+        // is record age: it ages whenever the peer is not SENDING, which
+        // includes a teammate sitting in a long PLAN tick two metres away. When
+        // the link gate is armed the radio answers instead, and the two
+        // possible answers are different in kind:
+        //   link UP   -> there is nothing to reconnect to. Do not fire at all,
+        //                however old the record is. This is the 16-21 % of
+        //                fires that were pure loss.
+        //   link DOWN -> compare the gate against how long the RADIO has been
+        //                down, not how long the mailbox has been quiet.
+        // -1 is a sentinel for "stand down this tick" and is checked before any
+        // gate maths runs, because midrunGateSec walks the peer table and a
+        // quiet-but-connected teammate would otherwise buy that walk on every
+        // PLAN tick for the rest of the run.
+        double link_down_for = missing_for;   // legacy clock unless gated
+        bool   link_gated    = false;
+        if (linkGateReady(trig_now)) {
+          link_gated = true;
+          if (link_connected_) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+                "Reconnect (mid-run): standing down — peer record silent "
+                "%.0fs but the radio link is UP, so a chase would be spent on "
+                "a peer that is already reachable.",
+                missing_for);
+            link_down_for = -1.0;
+          } else {
+            link_down_for = (trig_now - link_up_last_seen_).seconds();
+          }
+        }
+        if (link_down_for >= 0.0) {
+          double est_unshared = -1.0;
+          // Fed missing_for ON PURPOSE, not link_down_for: the unshared-map
+          // backlog accrues from the last time the pair actually exchanged
+          // anything, which is last CONTACT. A peer that was connected but
+          // quiet was still not sending deltas, so dating the backlog from
+          // link-down would under-count it.
+          const double gate_sec = midrunGateSec(missing_for, &est_unshared);
+          if (link_down_for >= gate_sec) {
+            ++midrun_attempts_;
+            reconnect_terminal_ = false;
+            hold_escalated_ = false;
+            dispatch_gate_sec_      = gate_sec;
+            dispatch_est_unshared_  = est_unshared;
+            dispatch_link_down_sec_ = link_gated ? link_down_for : -1.0;
+            RCLCPP_INFO(get_logger(),
+                "Reconnect (mid-run): %s %.0fs >= gate %.0fs "
+                "(record age %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
+                "interrupting exploration for the reconnect manoeuvre.",
+                link_gated ? "radio link down" : "peer silent",
+                link_down_for, gate_sec, missing_for, est_unshared,
+                midrun_attempts_, reconnect_midrun_max_attempts_);
+            if (dispatchReconnect("peer-lost")) return;
+          }
         }
       }
     } else if (midrun_attempts_ == reconnect_midrun_max_attempts_) {
@@ -4061,6 +4311,32 @@ void ExploPlannerNode::stampMapInfo() {
       static_cast<uint64_t>(std::max(0.0, latest_map_voxels_));
   current_intent_msg_.map_growth_rate =
       static_cast<float>(map_growth_rate_);
+}
+
+bool ExploPlannerNode::linkGateReady(const rclcpp::Time& now) {
+  if (comms_link_states_topic_.empty()) return false;   // feature off
+  if (!link_index_usable_ || !link_have_sample_ || !link_clock_anchored_) {
+    // Configured but not delivering. Say so, throttled: silently reverting to
+    // the record-age clock is exactly the "check that stopped checking" shape —
+    // the run would log as though the gate were in force while behaving like
+    // the binary this change replaces.
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 60000,
+        "Link gate configured on '%s' but not usable yet (index %s, samples "
+        "%s): the mid-run trigger is running on the record-age clock.",
+        comms_link_states_topic_.c_str(),
+        link_index_usable_ ? "ok" : "missing",
+        link_have_sample_ ? "ok" : "none");
+    return false;
+  }
+  const double age = (now - link_last_sample_time_).seconds();
+  if (age > comms_link_stale_sec_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 60000,
+        "Link gate: newest link sample is %.1fs old (> %.1fs); standing down to "
+        "the record-age clock rather than acting on a stale belief.",
+        age, comms_link_stale_sec_);
+    return false;
+  }
+  return true;
 }
 
 double ExploPlannerNode::midrunGateSec(double missing_for,
@@ -5702,6 +5978,12 @@ void ExploPlannerNode::logReconnectDispatch(const char* action,
   if (!reconnect_terminal_) {
     e.gate_sec         = dispatch_gate_sec_;
     e.est_unshared_vox = dispatch_est_unshared_;
+    // Same lifetime and the same reason: a hold or resume_exploring leaf of
+    // this manoeuvre re-reports the link-down duration the trigger fired on.
+    // Terminal dispatches leave it -1 — the link gate only governs the mid-run
+    // trigger, and pretending otherwise would put a number in the column for
+    // decisions it never touched.
+    e.link_down_sec    = dispatch_link_down_sec_;
   }
   exp_log_->logReconnectDispatch(expCtx(), e);
 }

@@ -426,6 +426,10 @@ void ExperimentLog::logReconnectDispatch(const ExperimentContext& ctx,
   integer("attempt", e.attempt);
   num("gate_sec", e.gate_sec);
   num("est_unshared_vox", e.est_unshared_vox);
+  // Additive key: the event stream is JSON-lines and sim/event_log.py parses it
+  // with json.loads, so older readers ignore it and newer readers can tell a
+  // link-gated fire from a record-age one without consulting the manifest.
+  num("link_down_sec", e.link_down_sec);
   teamCounts(e.peers_live, e.expected_peers);
   end();
 }
