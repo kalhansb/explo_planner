@@ -2569,7 +2569,8 @@ ExploPlannerNode::ExploPlannerNode()
               RCLCPP_INFO(get_logger(),
                   "Link gate: armed as robot index %d of [%s, %s]; the mid-run "
                   "trigger still fires on record age, but a fire is vetoed "
-                  "while the radio is up.",
+                  "while the radio is up — at BOTH the trigger and the "
+                  "exhausted-chase escalation.",
                   idx, names[0].c_str(), names[1].c_str());
             }
             link_self_idx_     = idx;
@@ -3409,7 +3410,10 @@ void ExploPlannerNode::doPlan() {
         // would have dropped 17 of 19 mid-run fires — switching mid-run
         // pursuit off rather than correcting it, under a threshold that was
         // never tuned for that quantity. The veto drops 4 of 19: exactly the
-        // fires that went out to a peer already on the radio.
+        // fires that went out to a peer already on the radio. Those 4 do not
+        // all arrive here — 3 came through this trigger and 1 through the
+        // exhausted-chase escalation in pursuitFallback, which is why the veto
+        // is applied at both sites and why gating only this one left a leak.
         //
         // What the veto CANNOT fix, by design: the other half of §30.24's
         // "bought nothing" 42 % fired into a genuine outage that ended within
@@ -5120,6 +5124,45 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
   // whatever was declined when it was ARMED is no longer the explanation for
   // what happens next.
   reconnect_decline_reason_.clear();
+  // THE SECOND DISPATCH SITE, and the reason the veto at the mid-run trigger
+  // was not enough on its own. gt1's first 11 cells put the trigger-site leak
+  // at 0 fires with the radio up (against 3 in the ungated tl1 arm), and left
+  // exactly one leak standing — here. Measured over both arms, escalation from
+  // an exhausted chase fired with the radio UP 2 times out of 2, and during a
+  // genuine outage 0 times out of 2. That lopsidedness is not bad luck, it is
+  // the mechanism: the trail runs out BECAUSE the peer moved on, and a peer
+  // that moved on has usually come back into contact. So the site that most
+  // reliably needs the veto was the one running without it.
+  //
+  // It is also the more expensive of the two actions. The trigger site arms a
+  // chase along a trail; this one commits to a meeting point (HYBRID) or parks
+  // at a barrier (PURSUIT), so a mistake here costs travel to a fixed location
+  // plus the wait once the robot arrives.
+  //
+  // Same freshness bound and same debounce as the trigger-site veto, on
+  // purpose: two different notions of "the radio is up" in one node would make
+  // any future disagreement between the sites unattributable.
+  const rclcpp::Time fb_now = this->now();
+  if (linkGateReady(fb_now)) {
+    const double link_down_for =
+        link_connected_ ? 0.0 : (fb_now - link_up_last_seen_).seconds();
+    if (link_down_for < reconnect_confirm_sec_) {
+      RCLCPP_INFO(get_logger(),
+          "Pursuit fallback (%s): standing down — the radio link to '%s' is "
+          "%s, so escalating would commit travel toward a peer that is already "
+          "reachable. Resuming exploration instead.",
+          why, pursue_peer_id_.c_str(),
+          link_connected_ ? "UP" : "only just down");
+      // resumeExploring, not a bare transition: it stamps the mid-run cooldown
+      // and sets reconnect_terminal_, without which every following PLAN tick
+      // would see the same stale record age and re-dispatch until the attempt
+      // budget burned out. The trigger-site veto would then stand down on each
+      // of those, so the run would look quiet in the logs while having spent
+      // its attempts.
+      resumeExploring(why);
+      return;
+    }
+  }
   if (reconnect_mode_ == ReconnectMode::HYBRID) {
     // pursue_rec_ is the pair the chase was armed from (snapshotted in
     // startPursuit): the midpoint must come from the SAME contact event the
