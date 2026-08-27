@@ -164,7 +164,20 @@ for cell in "${CELL_LIST[@]}"; do
   # CSVs with the retry's.
   [ -d "$out" ] && { log "clearing partial $name"; rm -rf "$out"; }
 
-  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek)"
+  # Disk guard. A lean-record cell is ~340 MB and a 90-cell matrix is ~31 GB on
+  # a box that is already 91% full, so this campaign can plausibly fill the
+  # disk overnight. Out of space does not fail cleanly: the bag writer, the
+  # event log and the manifest all fail independently and produce cells that
+  # look complete and are silently truncated. Stopping with a whole cell's
+  # margin left is much cheaper than finding that out afterwards.
+  free_mb=$(df -Pm "$ROOT" | awk 'NR==2 {print $4}')
+  if [ "${free_mb:-0}" -lt "${MIN_FREE_MB:-8192}" ]; then
+    log "ABORT: only ${free_mb} MB free under $ROOT (need ${MIN_FREE_MB:-8192})"
+    log "       stopping before $name rather than writing a truncated cell."
+    break
+  fi
+
+  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek free=${free_mb}MB)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
