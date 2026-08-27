@@ -1088,6 +1088,34 @@ private:
   double coverage_latch_t_sim_    = -1.0;
   double coverage_latch_unknown_  = -1.0;
 
+  // --- Post-latch coast (done_seek_enabled) ---
+  // A latch that lands MID-MANOEUVRE currently cancels the chase: the robot
+  // brakes, discards its frozen contact pair, and the partner keeps waiting at
+  // a barrier for a robot that is no longer coming. That is not an edge case —
+  // it is the modal way a manoeuvre ends, 56 of 88 reconnect_end events across
+  // the banked campaigns and 58-76% within every hybrid arm.
+  //
+  // Coasting keeps the nav2 goal the robot ALREADY had, so it finishes the
+  // drive toward its partner and delivers its map. Crucially it costs nothing
+  // in the metric: state_ reads DONE from the same tick, so the harness's
+  // completion rule (every planner reads DONE) never sees the difference, and
+  // this robot's own clock stopped at the latch regardless.
+  //
+  // OFF by default, and deliberately a RUNTIME switch rather than a build:
+  // every banked campaign ran without it, and the A/B for it has to sit inside
+  // ONE run_campaign.sh invocation or the arm is confounded with the session.
+  bool   done_seek_enabled_       = false;
+  double done_seek_max_sec_       = 600.0;
+  // Live coast state. done_seek_coasting_ is the ONLY thing that distinguishes
+  // a DONE robot that is still rolling from one that is parked, so every exit
+  // path must clear it — an uncleared flag would shrink the presence claim for
+  // the rest of the run (see publishPresenceIntent).
+  bool   done_seek_coasting_      = false;
+  double done_seek_start_sim_     = -1.0;
+  double done_seek_dist_at_start_ = 0.0;
+  double done_seek_last_dist_     = 0.0;
+  double done_seek_last_move_sim_ = -1.0;
+
   // Rendezvous anchor: the robot pose the last time it heard a teammate. That
   // pose sits inside the comms bubble, so it is the cheapest point to return to
   // for reconnection. Recorded on every peer intent (see the intent callback);
@@ -1939,6 +1967,27 @@ ExploPlannerNode::ExploPlannerNode()
   reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
+  // Post-latch coast (see the member comments). OFF by default so this binary
+  // reproduces every banked campaign bit-for-bit on the control side.
+  done_seek_enabled_ = dp("done_seek_enabled", false);
+  done_seek_max_sec_ = dp("done_seek_max_sec", 600.0);
+  // Unconditional, both directions, once per run. This is the anchor for the
+  // liveness check: a one-sided "no coast in the control arm" assertion passes
+  // trivially on a build where the feature is dead everywhere, which is exactly
+  // how guards here have gone quiet before while still printing PASS. Every run
+  // states which side it is on, so treated-with-no-line and control-with-a-line
+  // are both detectable from the console log alone.
+  RCLCPP_INFO(get_logger(),
+      "DONE-SEEK %s (done_seek_enabled=%s, done_seek_max_sec=%.0f).",
+      done_seek_enabled_ ? "ENABLED" : "DISABLED",
+      done_seek_enabled_ ? "true" : "false", done_seek_max_sec_);
+  if (done_seek_enabled_ && done_seek_max_sec_ <= 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "done_seek_enabled=true with done_seek_max_sec=%.1f: the coast has no "
+        "upper bound but the no-progress exit still applies. An unreachable "
+        "goal will drive this robot until it stops making headway.",
+        done_seek_max_sec_);
+  }
   // Link-state gate (see the member comments). "" = off, bit-identical legacy
   // record-age clock, no subscription created at all.
   comms_link_states_topic_ =
@@ -2265,6 +2314,10 @@ ExploPlannerNode::ExploPlannerNode()
     // other field, and a campaign that mixes the two criteria is comparing two
     // different endpoints under one column name.
     exp_log_->addParamStr("done_criterion", done_criterion_);
+    // Stamped unconditionally so the arm is recoverable from the run's own
+    // params rather than from a campaign script that may have moved on.
+    exp_log_->addParamBool("done_seek_enabled", done_seek_enabled_);
+    exp_log_->addParamNum("done_seek_max_sec", done_seek_max_sec_);
     exp_log_->addParamStr("done_action", done_action_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
@@ -3101,6 +3154,39 @@ void ExploPlannerNode::tick() {
       // streak, where DONE is genuinely revocable.
       if (done_action_ == "idle") {
         if (coverage_latched_) {
+          // Coast watchdog. Nothing else in this branch touches nav2, so if
+          // done_seek let a goal stand this is the ONLY bound on it — without
+          // it an unreachable goal drives a "finished" robot until teardown.
+          // Two exits, and both brake, so a coast can never leave the platform
+          // rolling: the robot stops making progress (nav2 arrived, or gave up
+          // and is no longer commanding), or the cap expires.
+          if (done_seek_coasting_) {
+            const double tnow  = this->now().seconds();
+            const double coast = tnow - done_seek_start_sim_;
+            if (cumulative_distance_ > done_seek_last_dist_ + 0.25) {
+              done_seek_last_dist_     = cumulative_distance_;
+              done_seek_last_move_sim_ = tnow;
+            }
+            const double still = tnow - done_seek_last_move_sim_;
+            if (still >= 30.0) {
+              done_seek_coasting_ = false;
+              RCLCPP_INFO(get_logger(),
+                  "DONE-SEEK coast END [arrived]: stopped moving %.0f s ago "
+                  "after %.1f s and %.2f m. Parking here.",
+                  still, coast,
+                  cumulative_distance_ - done_seek_dist_at_start_);
+            } else if (done_seek_max_sec_ > 0.0 &&
+                       coast >= done_seek_max_sec_) {
+              done_seek_coasting_ = false;
+              RCLCPP_WARN(get_logger(),
+                  "DONE-SEEK coast END [timeout]: %.1f s reached the %.0f s cap "
+                  "while still moving (%.2f m travelled) — braking. The goal "
+                  "was probably unreachable.",
+                  coast, done_seek_max_sec_,
+                  cumulative_distance_ - done_seek_dist_at_start_);
+              abandonNavGoal("done-seek-timeout");
+            }
+          }
           RCLCPP_INFO_ONCE(get_logger(),
               "Exploration finished [latch] at t_sim=%.1f; idling and "
               "beaconing. This robot does not leave DONE.",
@@ -4217,7 +4303,33 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // This one can fire mid-drive, and nav2 does not know the run is over — an
   // uncancelled goal keeps driving a "finished" robot around.
   recordExplorationComplete("coverage-latched");
-  abandonNavGoal("coverage-latched");
+  // The abandon above this line was correct for a robot that latches while
+  // exploring: nav2 does not know the run is over and an uncancelled goal would
+  // drive a finished robot around at random. It is exactly WRONG for a robot
+  // that latches while chasing its partner, because there the uncancelled goal
+  // is aimed at the one place we want it to go. Coasting is therefore gated on
+  // reconnect_active_ — the manoeuvre clock — and not on the state name, so it
+  // covers RETURN_NAV, RETURN_SYNC, PURSUE and a PROXIMITY_HOLD taken inside
+  // one, which is the same set transitionTo uses to decide the manoeuvre ended.
+  //
+  // Read this next to transitionTo: it runs a few lines later via finishNow,
+  // sees DONE is outside that set, and closes the manoeuvre out (reconnect_end,
+  // reconnect_active_ = false). So the flag must be sampled HERE; by the time
+  // the DONE branch ticks it is already gone.
+  if (done_seek_enabled_ && reconnect_active_) {
+    done_seek_coasting_      = true;
+    done_seek_start_sim_     = this->now().seconds();
+    done_seek_dist_at_start_ = cumulative_distance_;
+    done_seek_last_dist_     = cumulative_distance_;
+    done_seek_last_move_sim_ = done_seek_start_sim_;
+    RCLCPP_INFO(get_logger(),
+        "DONE-SEEK coast START: latched in state %s with a reconnect manoeuvre "
+        "live — keeping the nav goal instead of braking, cap %.0f s. This robot "
+        "reads DONE from here on, so the run clock is unaffected.",
+        stateName(state_), done_seek_max_sec_);
+  } else {
+    abandonNavGoal("coverage-latched");
+  }
   return finishNow("coverage-latched");
 }
 
@@ -5286,10 +5398,25 @@ void ExploPlannerNode::publishPresenceIntent() {
   current_goal_.yaw = latest_yaw_;
 
   if (intent_pub_ && coord_) {
+    // The disc above is harmless for a PARKED robot: it sits wherever that
+    // robot finished, typically far from the partner and out of radio range.
+    // A COASTING robot drags it toward the partner and stops beside it — which
+    // hands a 10 m frontier veto to the one robot still holding the run clock,
+    // and being stationary it usually wins the proximity tie-break for
+    // candidates near itself. That is a route by which this feature could make
+    // runs SLOWER, so shrink the disc for the duration of the coast.
+    //
+    // A token 0.5 m rather than 0.0: the receiver treats 0.0 as "unset" and
+    // substitutes its own match radius (coord_claim_radius_m auto-resolves to
+    // fov_max_range = 10 m), so zero would restore the very disc being removed.
+    // The beacon itself must keep going out — teamComplete counts presence, and
+    // a silent finisher ages out of every peer's table within seconds.
+    const double claim_r =
+        done_seek_coasting_ ? 0.5 : coord_claim_radius_m_;
     current_intent_msg_ = coord_->buildIntent(
         current_goal_, latest_pos_, this->now(),
         static_cast<float>(coord_claim_ttl_sec_),
-        static_cast<float>(coord_claim_radius_m_),
+        static_cast<float>(claim_r),
         /*planner_type_id (eig)=*/0u, map_frame_);
     publishIntent();
     have_active_intent_ = true;

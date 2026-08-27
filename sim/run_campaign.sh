@@ -73,6 +73,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$ROOT" ] || { echo "FATAL: --root is required" >&2; exit 2; }
+# EXTRA_ENV is expanded AFTER the per-cell assignments below, so a DONE_SEEK in
+# it would win over the arm-name suffix and flip every cell to the same side
+# while the OUTDIR names still claimed an A/B. That failure is invisible in the
+# campaign index and only recoverable from the manifests, so refuse it here.
+case " $EXTRA_ENV " in
+  *" DONE_SEEK="*|*"DONE_SEEK="*)
+    echo "FATAL: set the post-latch coast with the arm suffix (e.g. hybrid_seek)," >&2
+    echo "       not with --env DONE_SEEK=... -- --env applies to EVERY cell and" >&2
+    echo "       would silently collapse the A/B into one arm." >&2
+    exit 2;;
+esac
 
 # Build the cell list. --cells wins; otherwise cross --arms with --seeds.
 if [ -z "$CELLS" ]; then
@@ -112,6 +123,20 @@ for cell in "${CELL_LIST[@]}"; do
   name="${TAG}_${arm}_seed${seed}"
   out="$ROOT/$name"
 
+  # Arm-name suffix "_seek" = same RECONNECT_MODE, post-latch coast on.
+  #
+  # --env sets ONE environment for every cell, so it cannot express a
+  # within-campaign A/B; without this the treated and control arms would need
+  # two run_campaign.sh calls, and 30.27 measured that a session boundary moves
+  # the geomean ~1.08x -- the same size as the effect under test. Encoding the
+  # switch in the arm token keeps both sides inside one invocation, interleaved
+  # by the seed-major loop above, and keeps them in separate OUTDIRs with
+  # distinct names so no analysis script has to know about the feature.
+  cell_mode="$arm"; cell_seek="0"
+  case "$arm" in
+    *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
+  esac
+
   # "Complete" means reached an end reason AND passed its run-time gates. A run
   # that dropped relay traffic reaches all_done exactly like a good one, so
   # resuming on run_end_reason alone would skip every invalid cell forever and
@@ -139,7 +164,7 @@ for cell in "${CELL_LIST[@]}"; do
   # CSVs with the retry's.
   [ -d "$out" ] && { log "clearing partial $name"; rm -rf "$out"; }
 
-  log "START $name"
+  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
@@ -147,7 +172,8 @@ for cell in "${CELL_LIST[@]}"; do
   [ "$COMMS_ON" = "0" ] && cell_expect=0
 
   env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
-      RECONNECT_MODE="$arm" EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
+      RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
+      EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
       DONE_UNKNOWN="$DONE_UNKNOWN" DONE_CRITERION="$DONE_CRITERION" \
       SCENARIO="$SCENARIO" \

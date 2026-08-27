@@ -218,6 +218,21 @@ MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-240}")"
 # Barrier give-up for mid-run attempts (terminal barriers keep RDV_MAX_WAIT).
 MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
 MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
+# --- Post-latch coast (2026-08-27) -----------------------------------------
+# 56 of 88 banked reconnect_end events are a robot that crossed the coverage
+# latch mid-chase: it brakes, drops the contact, and the partner keeps waiting
+# at a barrier for someone who is no longer coming. DONE_SEEK=1 keeps the nav
+# goal the robot already had so it finishes that drive and delivers its map.
+#
+# It is metric-neutral by construction -- state_ reads DONE from the same tick,
+# so the all_done check below is untouched -- which is exactly why it has to be
+# a RUNTIME switch: treated and control cells must sit inside ONE run_campaign
+# invocation or the arm is confounded with the session (30.27, ~1.08x floor).
+# Default 0 so an un-set campaign reproduces every banked run.
+DONE_SEEK="${DONE_SEEK:-0}"
+if [ "$DONE_SEEK" = "1" ]; then DONE_SEEK_ARG="true"; else DONE_SEEK_ARG="false"; fi
+# Cap on a single coast. 0 disables the cap (the no-progress exit still holds).
+DONE_SEEK_MAX="$(flt "${DONE_SEEK_MAX:-600}")"
 # --- Information gate on the mid-run trigger (2026-08-19) -------------------
 # Replaces the fixed MIDRUN_SILENCE clock with "reconnect once the pair has
 # gathered RECONNECT_MIN_SHARE_VOX of map the other side has not seen", by
@@ -1097,6 +1112,7 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # consulted.
 RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
 if [ "$RECONNECT_MODE" = "off" ]; then RDV_ENABLED="false"; MODE_ARG="hybrid"; fi
+log "done_seek_enabled=$DONE_SEEK_ARG done_seek_max_sec=$DONE_SEEK_MAX (DONE_SEEK=$DONE_SEEK)"
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
 log "proximity_hold/resume_dist_m=$PROX_HOLD_M/$PROX_RESUME_M m (yaml field defaults 5.0/6.0 overridden for sim)"
 EXPLOIT_ARG="true"; [ "$EXPLOIT" = "0" ] && EXPLOIT_ARG="false"
@@ -1147,6 +1163,11 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_midrun_silence_sec=$MIDRUN_SILENCE"
   echo "reconnect_midrun_max_wait_sec=$MIDRUN_MAX_WAIT"
   echo "reconnect_midrun_max_attempts=$MIDRUN_MAX_ATTEMPTS"
+  # Stamped for every cell, both sides. The arm has to be recoverable from the
+  # cell itself -- a campaign script can be edited after the fact, a manifest
+  # written at launch cannot.
+  echo "done_seek_enabled=$DONE_SEEK_ARG"
+  echo "done_seek_max_sec=$DONE_SEEK_MAX"
   echo "reconnect_min_share_voxels=$RECONNECT_MIN_SHARE_VOX"
   echo "reconnect_midrun_min_silence_sec=$MIDRUN_MIN_SILENCE"
   echo "reconnect_midrun_max_silence_sec=$MIDRUN_MAX_SILENCE"
@@ -1305,6 +1326,8 @@ for r in $ROBOTS; do
       -p reconnect_midrun_silence_sec:=$MIDRUN_SILENCE \
       -p reconnect_midrun_max_wait_sec:=$MIDRUN_MAX_WAIT \
       -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \
+      -p done_seek_enabled:=$DONE_SEEK_ARG \
+      -p done_seek_max_sec:=$DONE_SEEK_MAX \
       -p reconnect_min_share_voxels:=$RECONNECT_MIN_SHARE_VOX \
       -p reconnect_midrun_min_silence_sec:=$MIDRUN_MIN_SILENCE \
       -p reconnect_midrun_max_silence_sec:=$MIDRUN_MAX_SILENCE \
