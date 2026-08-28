@@ -172,19 +172,28 @@ def load_run(run_dir):
     # robot was censored; the metric column is blank either way, which is the
     # honest rendering of "this run has no completion time".
     t_done_team = t_explore = t_mission = None
+    # WHY the exclusion reason is kept rather than dropped: a blank metric
+    # column is the honest rendering of "censored", but it is a DISHONEST
+    # rendering of "the event log would not parse". Those are different facts
+    # and a bare `except: pass` made them identical -- a whole campaign's logs
+    # could fail to load and every column would just quietly read blank, which
+    # looks like censoring and would be reported as censoring.
+    event_log_note = None
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import event_log
         s = event_log.summarise_run(run_dir)
-        if "excluded" not in s:
+        if "excluded" in s:
+            event_log_note = s["excluded"]
+        else:
             t_done_team = s["t_team"]
             # Mission-return endpoints (None on banked, pre-v2 logs). On those
             # runs `makespan` below includes the homing leg plus harness grace,
             # so these are the numbers a mission-return analysis should quote.
             t_explore = s.get("t_explore")
             t_mission = s.get("t_mission")
-    except Exception:
-        pass
+    except Exception as e:
+        event_log_note = f"{type(e).__name__}: {e}"
 
     return {
         "name": os.path.basename(run_dir),
@@ -195,6 +204,9 @@ def load_run(run_dir):
         "t_done_team": t_done_team,
         "t_explore": t_explore,
         "t_mission": t_mission,
+        # None when the event log was read successfully. Non-None means the
+        # three t_* fields above are blank for a reason that is NOT censoring.
+        "event_log_note": event_log_note,
     }
 
 
@@ -538,6 +550,24 @@ def main():
             verdict.append((label, ma, mb, note))
 
     print()
+    # Printed BEFORE the censoring block on purpose. The t_done_team column is
+    # documented as "blank = censored", and that documentation is only true for
+    # runs whose event log actually loaded. Any run listed here has a blank for
+    # a different reason, and reading it as censoring would overstate exactly
+    # the quantity this file exists to compare.
+    for label in (args.label_a, args.label_b):
+        notes = [(r["name"], r["event_log_note"]) for r in groups[label]
+                 if r.get("event_log_note")]
+        if notes:
+            print(f"EVENT LOG UNREAD in {label} ({len(notes)}/"
+                  f"{len(groups[label])}): t_done_team / t_explore / t_mission "
+                  f"are blank for these runs because the log could not be "
+                  f"read. That is a different fact from censoring, and the "
+                  f"column header's 'blank = censored' does not apply to them. "
+                  f"A run can be both — the CENSORED block below is computed "
+                  f"from the CSV crossing and is unaffected by this.")
+            for name, note in notes:
+                print(f"  {name}: {note}")
     for label in (args.label_a, args.label_b):
         cens = [r["name"] for r in groups[label]
                 if vals.get((label, r["name"])) and vals[(label, r["name"])]["censored"]]

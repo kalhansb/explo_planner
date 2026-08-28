@@ -348,8 +348,13 @@ private:
   /// evaluated, selected by the caller to match `kind`: window movement for
   /// "frozen", closing distance for "approach". It is not interchangeable with
   /// `metric`, which is an instantaneous remaining distance sampled at the fire
-  /// instant — on the banked g6pilot fires the two differ by 4x to 162x, and
-  /// once in sign. The matching threshold is re-derived inside from `kind`.
+  /// instant — on the 2 banked g6pilot fires that log both, the two differ by
+  /// 4.1x and ~123x, and once in sign (the robot was receding). The other 5
+  /// banked fires log no delta at all, which is why this parameter exists; see
+  /// logHomeWatchdog in experiment_log.hpp for the full accounting, and note
+  /// that the "4x to 162x over 7 fires" this comment used to claim was wrong in
+  /// both the range and the n. The matching threshold is re-derived inside
+  /// from `kind`.
   void homeWatchdogFire(const char* kind, float metric, float dist_home,
                         float test_delta);
   bool engageRetrace();
@@ -5971,8 +5976,15 @@ void ExploPlannerNode::resumeRetrace(const char* why) {
     // reader grouping by mode counted escape-ends as retrace events. The
     // resumed mode is still recorded, in next_mode, where it does not collide.
     // No tested pair: an escape-end is not a detector fire, so it has no
-    // inequality to record. The sentinels keep that distinction visible in the
-    // row rather than borrowing a neighbouring detector's numbers.
+    // inequality to record. The two kNoTestDelta arguments are NOT sentinels
+    // and nothing downstream reads them as such — logHomeWatchdog omits
+    // test_delta_m and test_threshold_m from escape-end rows entirely, gated on
+    // `kind`, precisely because every numeric sentinel collides with a real
+    // reading (0.0 is the canonical frozen fire, negatives are a receding
+    // approach fire). ABSENCE is what carries the meaning. These are inert
+    // placeholders for arguments that will not be written; an earlier version
+    // of this comment credited them with the distinction that the omission
+    // actually makes.
     exp_log_->logHomeWatchdog(expCtx(), "escape-end", "escape",
                               why, (latest_pos_ - home_pos_).head<2>().norm(),
                               escape_metric,
@@ -6037,6 +6049,19 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
   const char* mode = homeModeName(home_mode_);
   const char* response = "resend";
   const bool is_frozen = std::strcmp(kind, "frozen") == 0;
+  // `kind` is a two-valued enum spelled as a string, and everything below
+  // treats "not frozen" as "approach". That is true today because there is
+  // exactly one call site and it passes a ternary over the two literals — but
+  // a third kind added later would inherit approach's window AND threshold
+  // silently, and the row would then log a test_threshold_m the detector never
+  // compared against. That is worse than not logging one: the whole point of
+  // the field is that the fired inequality is re-derivable from the row.
+  if (!is_frozen && std::strcmp(kind, "approach") != 0) {
+    RCLCPP_ERROR(get_logger(),
+        "home watchdog fired with unknown kind '%s' — logging it against the "
+        "approach window/threshold, which is almost certainly wrong. The "
+        "test_threshold_m on this row must not be trusted.", kind);
+  }
   const double window = is_frozen ? progress_window_sec_
                                   : return_approach_window_sec_;
   // Selected by `kind` for the same reason `window` is: one event type carries

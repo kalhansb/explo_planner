@@ -1400,7 +1400,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     echo "done_action_in_params=$(grep -o 'done_action:[[:space:]]*"[^"]*"' \
       "$planner_params" 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')"
   else
+    # BOTH keys, not just the hash. Dropping done_action_in_params here made a
+    # missing params file the one case where the field vanishes from the
+    # manifest entirely — and any consumer that greps for the key gets no line,
+    # which is indistinguishable from an OLD manifest written before the key
+    # existed. The failure it is meant to expose (barrier silently off because
+    # the params did not install) is exactly this failure, so the key has to be
+    # present and say so.
     echo "sha256_shared_params=missing"
+    echo "done_action_in_params=missing"
   fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
@@ -1627,13 +1635,25 @@ LAST_HB=0
 #
 # The first version of this comment said 840 s, having simply omitted PURSUE.
 # That figure was already falsified by the bank: the longest banked manoeuvre
-# is 840.2 s and the longest interval with NEITHER robot stepping is 921.6
-# sim-s, both in hybrid cells. 1800 would have cleared the observed maximum but
-# left only 1.15x over the configured ceiling.
+# is 840.2 s, and the longest interval with NEITHER robot stepping is 1024.8
+# sim-s whole-run, both in hybrid cells.
+#
+# 1024.8 is NOT the figure this gate has to clear, though, and an earlier
+# version of this comment quoted 921.6, which reproduces neither number. The
+# gate below is disarmed once either robot is DONE (`[ "${DONE_A:-0}" = 0 ]`),
+# so what bounds a FALSE ABORT is the longest freeze inside the armed window,
+# which is 420.0 sim-s. The whole-run maximum is the larger number and the
+# irrelevant one: most of it accrues after a robot has declared, when the gate
+# is already asleep and cannot fire. 1800 would have cleared even the
+# whole-run maximum, but left only 1.15x over the configured ceiling.
 #
 # Why the margin has to be generous in this direction specifically: only the
-# hybrid arm dispatches manoeuvres (422 in hybrid, 0 across 157 banked off
-# cells), so a false abort is drawn from ONE arm of a 30x2 comparison, on the
+# hybrid arm manoeuvres at all. Across the banked hybrid cells the mid-run
+# reconnect logic fires 422 times — 302 actual dispatches, 113 vetoed by the
+# link gate, 7 give-ups — against 0 across 157 banked off cells. (The single
+# "422 dispatches" this comment used to claim was the sum of all three, and
+# only the 302 are dispatches.) So a false abort is drawn from ONE arm of a
+# 30x2 comparison, on the
 # primary endpoint. A late abort merely wastes wall time. The base rate of a
 # real hang is 0 in 500 banked cells, so the expected cost of the extra 600 s
 # is ~zero and it buys 1.5x over the configured ceiling. Still inside
@@ -1807,9 +1827,12 @@ while true; do
       #
       # The first of those is emitted from recordExplorationComplete, which is
       # the single funnel BOTH endings route through (see the comment there).
-      # That matters: through generation 8 the step-budget ending printed
+      # That matters: through generation 7 the step-budget ending printed
       # neither prefix, so the gate stayed armed across the whole homing leg
-      # and killed cells at exactly mission_return_max_sec.
+      # and killed cells at exactly mission_return_max_sec. Generation 8 is the
+      # one that FIXED it, by routing both endings through the single funnel —
+      # saying "through generation 8" would credit the fix to the generations
+      # that still had the bug.
       #
       # The empty-vs-zero handling below is the OTHER silent disarm, and it is
       # subtle in both directions. `grep -c` on an existing file with no match
@@ -1848,8 +1871,10 @@ while true; do
       # HANG_HB) rather than off this corpus, which cannot bound it.
       #
       # Nor did it bound the HOMING leg, for a fourth reason: all 24 banked
-      # cells ended by LATCH, which prints a matching prefix and disarms this
-      # gate before homing starts. That bound is structural instead — the
+      # ROBOT-RUNS — 12 cells, two robots each, not 24 cells — ended by LATCH,
+      # which prints a matching prefix and disarms this gate before homing
+      # starts. Half the corpus this line used to claim. That bound is
+      # structural instead, which is why halving it changes nothing — the
       # funnel line is printed on every ending, before startReturnHome.
       if [ "$STALL" -ge "$HANG_HB" ] && [ "${DONE_A:-0}" = 0 ] && [ "${DONE_B:-0}" = 0 ]; then
         die "HUNG: neither planner advanced a step in $((STALL * 60)) sim-s \
@@ -1879,7 +1904,26 @@ while true; do
       DONE_SINCE=-1
     fi
   fi
-  [ "$DURATION_S" != "0" ] && [ "$T" -ge $((T0 + DURATION_S)) ] && { RUN_END_REASON="censored_at_T"; break; }
+  # The horizon. A run that reaches it while the DONE drain grace is still
+  # counting down did NOT get cut off unfinished: every planner had already
+  # declared, at DONE_SINCE, which is inside the horizon by construction. Only
+  # the ${DONE_GRACE_S}s drain hold spilled past it. Calling that "censored_at_T"
+  # labels a completed run as an incomplete one, and it does so ASYMMETRICALLY —
+  # the slower arm finishes nearer the horizon, so it collects more of these —
+  # which turns a labelling bug into an apparent arm effect.
+  #
+  # The primary endpoint reader is immune (event_log.py decides censoring from
+  # the planner's own events, never from this string), so this is a fix to the
+  # manifest and to everything that reads it, not to the headline result.
+  if [ "$DURATION_S" != "0" ] && [ "$T" -ge $((T0 + DURATION_S)) ]; then
+    if [ "$DONE_SINCE" != -1 ]; then
+      RUN_END_REASON="all_done"
+      log "horizon reached at t_sim=+$((T - T0))s, but every planner was already DONE at t_sim=$((DONE_SINCE - T0)) s — the drain grace, not the run, overran"
+    else
+      RUN_END_REASON="censored_at_T"
+    fi
+    break
+  fi
 done
 # Which exit fired is data, not logging: "every robot finished by t" and
 # "still unfinished when the horizon cut it off" are different observations and

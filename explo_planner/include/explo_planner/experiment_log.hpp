@@ -563,13 +563,27 @@ class ExperimentLog {
   /// instant, and neither is the tested quantity — that is test_delta_m, added
   /// in generation 8. Through generation 7 the fire rows carried no tested
   /// value at all, and metric_m was documented as "the metric over
-  /// window_sec", which reads exactly as if it were one. It is not: on the 7
-  /// banked g6pilot fires metric_m stood 4x to 162x above the delta that
-  /// actually fired the detector, and in one case the robot was RECEDING
-  /// (-0.03 m) while the row read 3.69. A reader scoring the detector on the
-  /// old contract would have called every fire spurious. The two are kept
-  /// side by side rather than collapsed because "how far is left" and "how far
-  /// it moved" are different questions and the diagnosis needs both.
+  /// window_sec", which reads exactly as if it were one. It is not.
+  ///
+  /// The banked evidence, stated exactly: g6pilot has 7 approach fires, and
+  /// only 2 of them log the tested delta at all — it survives solely in the
+  /// planner's "metric moved X m in 40 s" text, which the other 5 (all
+  /// retrace-mode fires) do not print. On those 2, metric_m stood 4.1x and
+  /// ~123x above the delta, and on the second the robot was RECEDING (-0.03 m)
+  /// while the row read 3.69. The ~123x is only bounded, not measured: the
+  /// delta is printed to 2 dp and is near zero, so the true ratio lies
+  /// somewhere in 105x-148x.
+  ///
+  /// An earlier version of this comment said "4x to 162x" across all 7 fires.
+  /// Both halves were wrong — 162x reproduces from nothing, and 5 of the 7
+  /// carry no delta to compare against. Which is itself the argument for
+  /// test_delta_m: the quantity was unrecoverable from the log for most fires,
+  /// so even the case FOR logging it had to be made on two data points.
+  ///
+  /// A reader scoring the detector on the old contract would have called every
+  /// fire spurious. The two are kept side by side rather than collapsed
+  /// because "how far is left" and "how far it moved" are different questions
+  /// and the diagnosis needs both.
   void logHomeWatchdog(const ExperimentContext& ctx, const char* kind,
                        const char* mode, const char* response,
                        double dist_home_m, double metric_m, double window_sec,

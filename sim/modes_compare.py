@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rank the reconnection modes on TEAM EXPLORATION COMPLETION TIME.
 
-    modes_compare.py /tmp/hmr_campaign/p7modes_* [--threshold 0.55]
+    modes_compare.py /tmp/hmr_campaign/p7modes_* [--threshold 0.64]
 
 PRIMARY ENDPOINT: t_team, the sim time at which BOTH robots' copies of the merged
 map have fallen to `--threshold` unknown. Not the first robot -- the team is not
@@ -26,8 +26,12 @@ exploration, and t_lead was identical in expectation across arms by
 construction.
 
 Generation 8 adds a MID-RUN trigger (explo_planner_node.cpp, the link-gated
-dispatch) that fires DURING exploration; the bank already records 422 mid-run
-dispatches. That breaks the argument above in both directions: the treatment
+dispatch) that fires DURING exploration. The bank already records 302 mid-run
+dispatches across the hybrid cells -- not the 422 an earlier version of this
+line claimed, which was the sum of three different things: 302 dispatches, 113
+firings vetoed by the link gate, and 7 give-ups. Only the 302 are manoeuvres
+the robot actually performed, and only those can move a completion time.
+That breaks the argument above in both directions: the treatment
 can now move t_lead, and the "it can act inside `lag` and nowhere else" claim
 this module prints at runtime is simply false for such a campaign. This tool is
 not the pre-registered reader for generation 8 -- event_log.py is -- and its
@@ -341,19 +345,28 @@ def declared_of(run_dir):
     one for the other would change every number this file has ever printed
     without saying so, and a disagreement is a finding about the run rather than
     a defect in either measure.
+
+    Returns the summary, or a dict carrying only `excluded` (a reason string)
+    when there is no summary to return. It never returns None, and that is the
+    point: the previous version collapsed "import failed", "the event log will
+    not parse", "there is no event log" and "the planner declared nothing" all
+    into None, and the caller could not tell a cross-check that AGREED from one
+    that never ran. A silent None here makes the COMPLETION CROSS-CHECK block
+    print nothing, which reads as "checked, no disagreement" -- the exact
+    failure mode where a guard keeps printing PASS after it stopped checking.
     """
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import event_log
-    except ImportError:
-        return None
+    except ImportError as e:
+        return dict(excluded=f"event_log unimportable: {e}")
     try:
-        s = event_log.summarise_run(run_dir)
-    except Exception:
-        return None
-    if "excluded" in s:
-        return None
-    return s
+        # summarise_run already reports its own exclusions this way (missing
+        # logs, truncation, schema refusal), so pass that through unchanged
+        # rather than flattening it.
+        return event_log.summarise_run(run_dir)
+    except Exception as e:
+        return dict(excluded=f"{type(e).__name__}: {e}")
 
 
 def midrun_count(run_dir):
@@ -425,6 +438,11 @@ def measure(run_dir, thresh):
     # taken from here too: it is the only place the control arm is distinguished
     # from hybrid, since a control run carries reconnect_mode "hybrid".
     dec = declared_of(run_dir)
+    # Separate "the cross-check ran and found nothing" from "the cross-check
+    # could not run". Both used to look like None downstream.
+    decl_excluded = dec.get("excluded")
+    if decl_excluded:
+        dec = None
     t_team_decl = dec["t_team"] if dec else None
     decl_delta = (t_team_decl - t_team
                   if (t_team_decl is not None and t_team is not None) else None)
@@ -444,6 +462,7 @@ def measure(run_dir, thresh):
         t_team=t_team, t_lead=t_lead, censored=censored, lag=lag,
         t_team_decl=t_team_decl, decl_delta=decl_delta,
         decl_censor_split=decl_censor_split,
+        decl_excluded=decl_excluded,
         arm_stamped=(dec.get("arm") if dec else None),
         lag_dist=lag_dist, map_end=gap_end, map_peak=peak,
         # Read at t_team, not at end-of-run. End-of-run includes the DONE grace
@@ -810,6 +829,27 @@ def main():
              if r.get("decl_delta") is not None and abs(r["decl_delta"]) >= 5.0]
     mislabel = [(a, r) for a in sorted(arms) for r in arms[a]
                 if r.get("arm_stamped") and r["arm_stamped"] != a]
+    # Cells the cross-check could not run on at all. Reported even when nothing
+    # else fired, because "no disagreements" over zero comparisons is not a
+    # clean bill of health and must not be allowed to read as one.
+    unchecked = [(a, r) for a in sorted(arms) for r in arms[a]
+                 if r.get("decl_excluded")]
+    if unchecked:
+        n_tot = sum(len(arms[a]) for a in arms)
+        print(f"\nCOMPLETION CROSS-CHECK NOT RUN on {len(unchecked)} of "
+              f"{n_tot} cells — the checks below cover the rest only:")
+        by_reason = {}
+        for a, r in unchecked:
+            # Group by the reason's shape, not its text: the schema refusal
+            # names a different file path every time and would otherwise print
+            # one line per cell.
+            key = re.sub(r"/\S+", " <path>", str(r["decl_excluded"]))
+            key = re.sub(r"\bseed\d+\b", "seed<N>", key)
+            by_reason.setdefault(key, []).append(f"{a}/seed{r['seed']}")
+        for key, cells in sorted(by_reason.items()):
+            shown = ", ".join(cells[:6]) + (" …" if len(cells) > 6 else "")
+            print(f"    {len(cells)}x {key}")
+            print(f"        {shown}")
     if split or drift or mislabel:
         print("\nCOMPLETION CROSS-CHECK — this table's t_team is the CSV "
               "crossing of unknown_fraction;")

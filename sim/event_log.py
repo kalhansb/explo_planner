@@ -66,6 +66,7 @@ Two grouping rules that are easy to get wrong and silent when you do:
 import glob
 import json
 import os
+import re
 # Top-level, not in the __main__ block where the argv import lives: the schema
 # warning in summarise_robot() writes to sys.stderr, and that function runs when
 # this module is IMPORTED by another script — a path on which __main__ never
@@ -73,9 +74,37 @@ import os
 # NameError instead of warning.
 import sys
 
+# The lowest event-log schema this reader accepts, as a MODULE-level constant so
+# the CLI can lower it deliberately (--min-schema) without editing source.
+#
+# The default must track the current generation rather than being permissive:
+# the whole point is that scoring a generation-8 campaign should not quietly
+# read a generation-6 cell that happens to sit in the same directory. Lowering
+# it is legitimate for historical work; doing so silently is not, which is why
+# it is a flag and not a default.
+MIN_SCHEMA = 3
+
 
 class EventLogError(Exception):
     pass
+
+
+def arm_from_dirname(run_dir):
+    """Arm token from a cell directory name: g8r1_hybrid_seed101 -> "hybrid".
+
+    A fallback for cells that cannot be PARSED at all. The normal arm comes from
+    the run_start params, which requires a readable run_start — precisely what
+    an excluded cell may not have. Without this fallback every excluded cell
+    files under "?" in arm_summary, and the summary becomes unable to say
+    whether exclusions are balanced across arms. That is the one question its
+    own closing NOTE exists to answer, so losing it on the exclusion path
+    defeats the check exactly when it matters.
+
+    Same shape as modes_compare.RE_CELL: greedy up to the final _seed<N>, so
+    multi-token arms ("hybrid_seek") survive intact.
+    """
+    m = re.search(r"_(.+)_seed\d+$", os.path.basename(run_dir.rstrip("/")))
+    return m.group(1) if m else None
 
 
 def run_arm(params):
@@ -147,17 +176,34 @@ def summarise_robot(path):
     # experiment_log.hpp aspirational rather than true, and left the argument
     # for voiding the generation-7 cells resting on a check that did not exist.
     #
-    # Below MIN is a hard refusal, because the v2->v3 break is the dangerous
-    # shape: `metrics_rows` was RENAMED to `metrics_timer_rows`, so a lenient
-    # read of a v2 file does not raise, it reports every run as having written
-    # zero metrics rows. Silence is the failure mode, so this has to be loud.
+    # Below MIN is a refusal. State the reason accurately, because the first
+    # version of this message did not:
+    #
+    #   - It said the refused files are "the generation-7 cells". They are not.
+    #     v1 spans 25 campaign tags and v2 spans 6 (g5smoke, g6pilot, mr0pilot,
+    #     mr0smoke, mr1, mr1smoke) — many generations, and NOT the void g7 cells,
+    #     which were moved out of the campaign root entirely.
+    #   - It said reading a v2 file anyway "yields plausible wrong numbers"
+    #     because of the `metrics_rows` -> `metrics_timer_rows` rename. That is
+    #     the dangerous shape in general, but it is not a hazard for THIS
+    #     reader: grep says no function here touches either that field or the
+    #     removed `last_contact_age_sec`. The rename is checked where it is
+    #     actually read — gate_g8.py check 19.
+    #
+    # So the honest justification is generation hygiene, not a parse hazard: a
+    # generation-8 summary must not silently absorb pre-generation-8 cells,
+    # because pooling across binary generations is the standing error this
+    # project keeps making. That is a real reason to refuse BY DEFAULT, and a
+    # bad reason to refuse ABSOLUTELY — hence --min-schema, which makes reading
+    # the historical bank a deliberate, visible act rather than an impossible
+    # one. Before this flag existed the guard refused 1004 of 1006 banked
+    # robot-runs with no way to override, which is not a guard, it is an outage.
     #
     # ABOVE max is deliberately NOT a refusal. A future generation is more
     # likely to add fields than to move them, and a check that hard-fails
     # forward gets deleted the first time it is wrong — which is how a guard
     # stops guarding. Warn, keep going, and let the field-level reads fail if
     # they actually break.
-    MIN_SCHEMA = 3
     ver = start.get("schema_version")
     if ver is None:
         raise EventLogError(
@@ -165,12 +211,16 @@ def summarise_robot(path):
             f"and its field names cannot be trusted to mean what this script "
             f"assumes")
     if ver < MIN_SCHEMA:
+        # Do NOT phrase this as "generation {MIN_SCHEMA}". The schema version
+        # and the binary generation are different counters that happen to both
+        # be small integers -- schema 3 belongs to generation 8 -- and naming
+        # the wrong one in the error is how a reader ends up believing the void
+        # generation-7 cells are the ones being refused. Say "schema".
         raise EventLogError(
-            f"{path}: schema_version {ver} < {MIN_SCHEMA}. Field-incompatible "
-            f"with this reader: v2 wrote `metrics_rows` where v3 writes "
-            f"`metrics_timer_rows`, and v2 carried `last_contact_age_sec`, "
-            f"since removed. Reading it anyway yields plausible wrong numbers, "
-            f"not an error. These are the generation-7 cells; they are void.")
+            f"{path}: schema_version {ver} < {MIN_SCHEMA}. Refused by default "
+            f"so a schema-{MIN_SCHEMA} summary cannot silently pool cells from "
+            f"an older binary generation. Pass --min-schema {ver} to read it "
+            f"deliberately.")
     if ver > MIN_SCHEMA:
         print(f"warning: {path}: schema_version {ver} is newer than this "
               f"reader's {MIN_SCHEMA}; unknown fields ignored", file=sys.stderr)
@@ -255,13 +305,22 @@ def summarise_run(run_dir, expect_robots=2):
     that failed to produce data is not a run that finished quickly.
     """
     logs = robot_logs(run_dir)
+    # `arm` on the exclusion paths comes from the DIRECTORY NAME, because those
+    # are exactly the paths on which the params are unreadable. arm_summary can
+    # otherwise only recover an arm via per_robot, so an unparseable cell files
+    # under "?" -- and an exclusion of unknown arm cannot answer the one
+    # question the exclusion count exists to answer, namely whether the two arms
+    # lost the same number of cells. A directory-name arm is weaker evidence
+    # than a params arm and is not used for anything but this bookkeeping.
+    dir_arm = arm_from_dirname(run_dir)
     if len(logs) != expect_robots:
         return dict(excluded=f"{len(logs)} event log(s), expected {expect_robots}",
-                    run=os.path.basename(run_dir.rstrip("/")))
+                    run=os.path.basename(run_dir.rstrip("/")), arm=dir_arm)
     try:
         per = {r: summarise_robot(p) for r, p in logs.items()}
     except EventLogError as e:
-        return dict(excluded=str(e), run=os.path.basename(run_dir.rstrip("/")))
+        return dict(excluded=str(e), run=os.path.basename(run_dir.rstrip("/")),
+                    arm=dir_arm)
 
     unhealthy = [r for r, s in per.items() if not s["complete"]]
     if unhealthy:
@@ -361,10 +420,27 @@ def arm_summary(rows):
 
 def main(argv):
     import argparse
+    global MIN_SCHEMA
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("run_dirs", nargs="+")
     ap.add_argument("--json", action="store_true", help="machine-readable")
+    ap.add_argument("--min-schema", type=int, default=MIN_SCHEMA,
+                    help=f"lowest event-log schema_version to read (default "
+                         f"{MIN_SCHEMA}, what the current binary writes). Lower "
+                         f"it to read banked cells from older binaries. Doing "
+                         f"so pools across binary generations, which is only "
+                         f"valid if you are looking at one generation at a "
+                         f"time; it is a flag so that choice is visible in the "
+                         f"command line that produced the numbers.")
     a = ap.parse_args(argv)
+    if a.min_schema != MIN_SCHEMA:
+        # Announce it on stderr as well as accepting it. The flag's whole value
+        # is that lowering the bar leaves a trace, and a trace that lives only
+        # in a shell history someone has to go and find is not much of one.
+        print(f"warning: reading schema >= {a.min_schema} instead of the "
+              f"default {MIN_SCHEMA}; results may pool binary generations",
+              file=sys.stderr)
+        MIN_SCHEMA = a.min_schema
 
     rows = [summarise_run(d) for d in a.run_dirs]
     if a.json:
@@ -375,7 +451,11 @@ def main(argv):
           f"{'t_missn':>9s} {'resume':>7s} {'rtf':>5s}  note")
     for r in rows:
         if "excluded" in r:
-            print(f"{r.get('run','?'):34s} {'':11s} {'EXCLUDED':>9s} "
+            # Print the arm on this row too. A blank here is what made an
+            # excluded cell look arm-less on inspection even after the record
+            # itself carried the arm.
+            print(f"{r.get('run','?'):34s} {str(r.get('arm')):11s} "
+                  f"{'EXCLUDED':>9s} "
                   f"{'':>9s} {'':>9s} {'':>7s} {'':>5s}  {r['excluded']}")
             continue
         tt = "CENSORED" if r["t_team"] is None else f"{r['t_team']:9.1f}"
