@@ -36,12 +36,57 @@ ROBOTS = ["atlas", "bestla"]
 # the gate's job is to prove the cells came from the binary the pre-registration
 # names, and a gate that reads the identity from whatever happens to be built
 # would pass for any binary at all.
+#
+# Two of them CANNOT be literals here, for a reason that is structural and not
+# a matter of taste. The manifest's git_explo_planner is `git rev-parse HEAD`
+# at run time, and the JSONL's git_rev is baked into the binary at CMake
+# configure time — so both name the commit the campaign was built from. This
+# file is IN that commit. A file cannot contain its own commit hash, and the
+# binary's sha256 has the same problem, since the rev string is compiled into
+# it: filling either literal changes the tree, which changes the commit, which
+# changes both values again. There is no fixed point.
+#
+# So they are declared OUT OF BAND, in a file written once at campaign launch
+# and living outside git:
+#
+#     $GATE_ROOT/<TAG>.identity.txt      (key=value, one per line)
+#
+# That preserves the property that matters — the gate is told what to expect by
+# something it does not compute — while being physically possible. The
+# pre-registration records the same two values, and the identity file being
+# outside git is not a weakness here: it is written BEFORE the first cell runs
+# and any later edit is visible in its mtime against the campaign's own cells.
+#
+# Env overrides exist for the calibration harness, which must point the real
+# logic at synthetic cells of known identity.
 # ---------------------------------------------------------------------------
+def _declared_identity():
+    """The two build-dependent identity fields, from env or the identity file."""
+    out = {}
+    path = os.environ.get("GATE_IDENTITY",
+                          os.path.join(ROOT, f"{TAG}.identity.txt"))
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    # Env wins, so the calibration can override a real identity file if one
+    # happens to exist in its synthetic root.
+    for k in ("git_explo_planner", "sha256_explo_planner_node"):
+        if os.environ.get(f"GATE_EXPECT_{k}"):
+            out[k] = os.environ[f"GATE_EXPECT_{k}"]
+    return out
+
+
+_decl = _declared_identity()
 EXPECT = {
-    "git_explo_planner": "FILL_ME",
+    "git_explo_planner": _decl.get("git_explo_planner", "FILL_ME"),
     "git_simple_nav_3d": "c9f83a7",
     "git_scovox": "078d3f7",
-    "sha256_explo_planner_node": "FILL_ME",
+    "sha256_explo_planner_node": _decl.get("sha256_explo_planner_node",
+                                           "FILL_ME"),
 }
 
 DONE_UNKNOWN_FRACTION = 0.640
@@ -141,9 +186,13 @@ def recovery_pairing(path):
 
 
 if "FILL_ME" in EXPECT.values():
-    print("REFUSING TO RUN: the generation-8 identity is not filled in.\n"
+    missing = sorted(k for k, v in EXPECT.items() if v == "FILL_ME")
+    print("REFUSING TO RUN: the generation-8 identity is not declared.\n"
           "  A gate that does not know which binary it is gating cannot fail\n"
-          "  check 3, and would pass a campaign built from anything.")
+          "  check 3, and would pass a campaign built from anything.\n"
+          f"  Undeclared: {', '.join(missing)}\n"
+          f"  Write them to {os.path.join(ROOT, TAG + '.identity.txt')} as\n"
+          "  key=value lines, or set GATE_EXPECT_<key> in the environment.")
     sys.exit(2)
 
 cells = sorted(

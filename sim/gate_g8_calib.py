@@ -112,16 +112,17 @@ def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
 
 
 def run_gate(root, tag):
-    """Run the real gate with only its identity filled in."""
-    src = open(GATE).read()
-    src = src.replace('"git_explo_planner": "FILL_ME"',
-                      f'"git_explo_planner": "{REV}"')
-    src = src.replace('"sha256_explo_planner_node": "FILL_ME"',
-                      f'"sha256_explo_planner_node": "{SHA}"')
-    tmp = os.path.join(root, "_gate_under_test.py")
-    open(tmp, "w").write(src)
-    env = dict(os.environ, GATE_ROOT=root)
-    p = subprocess.run([sys.executable, tmp, tag], capture_output=True,
+    """Run the real gate, declaring the synthetic campaign's identity.
+
+    This used to rewrite the gate's source to patch the two FILL_ME literals,
+    which meant the calibration validated a COPY of the gate rather than the
+    gate. Now that the identity is declared out of band it can be injected, so
+    what runs here is byte-for-byte the file that will score the campaign.
+    """
+    env = dict(os.environ, GATE_ROOT=root,
+               GATE_EXPECT_git_explo_planner=REV,
+               GATE_EXPECT_sha256_explo_planner_node=SHA)
+    p = subprocess.run([sys.executable, GATE, tag], capture_output=True,
                        text=True, env=env)
     return p.returncode, p.stdout + p.stderr
 
@@ -275,6 +276,34 @@ try:
     if not ok:
         fails += 1
         print(out[-1500:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== the identity FILE path, which is what the campaign actually uses ===")
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    ev = {r: base_events() for r in ROBOTS}
+    build(root, "cal", ev)
+    # No GATE_EXPECT_* env at all: the gate must find the identity in
+    # <ROOT>/<TAG>.identity.txt. Calibrated separately from the env path
+    # because the env path is the calibration harness's own shortcut, and a
+    # file-reading branch that only ever runs in production is a branch nobody
+    # has tested.
+    open(os.path.join(root, "cal.identity.txt"), "w").write(
+        f"# declared at launch\ngit_explo_planner={REV}\n"
+        f"sha256_explo_planner_node={SHA}\n")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("GATE_EXPECT_")}
+    env["GATE_ROOT"] = root
+    p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
+                       text=True, env=env)
+    out = p.stdout + p.stderr
+    ok = "REFUSING TO RUN" not in out and "check 3" not in out
+    print(f"  {'PASS' if ok else 'FAIL'}  identity read from "
+          f"<TAG>.identity.txt (rc={p.returncode})")
+    if not ok:
+        fails += 1
+        print("    " + "\n    ".join(out.splitlines()[:12]))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
