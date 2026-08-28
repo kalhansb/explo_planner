@@ -462,12 +462,13 @@ ROI_HALF="$(flt "${ROI_HALF:-50.0}")"
 # world-fixed envelope over the fused grid and the planner reads that instead,
 # putting reachability in the same domain as the candidates it filters.
 #
-# Still NOT /<r>/dscovox_node/planning_map (no "global_"). simple_nav_3d's nav
-# global planner has been subscribed to that name, transient_local, with no
-# publisher, for the whole campaign history — it has never planned. Publishing
-# there would silently start it as a second, uncontrolled behavioural change in
-# the same build. Whether to wake it is a separate decision for a later
-# generation; one behavioural change at a time.
+# Still NOT /<r>/dscovox_node/planning_map (no "global_"). That name means
+# scovox_node's 20 m rolling crop, which the LOCAL nav planner consumes.
+# simple_nav_3d's nav global planner used to subscribe to it — transient_local,
+# with no publisher — and so never planned for the whole campaign history; in
+# generation 5 it was repointed at this same global_planning_map instead of
+# that name being made real. Both planners now read this topic; neither reads
+# the other's.
 PLAN_MAP_SIZE="$(flt "${PLAN_MAP_SIZE:-$(awk "BEGIN{print 3*$ROI_HALF}")}")"
 PLAN_MAP_RES="$(flt "${PLAN_MAP_RES:-0.40}")"
 # Dijkstra flood radius for the candidate reachability filter. MUST be set here,
@@ -586,6 +587,66 @@ CAND_N_YAW="${CAND_N_YAW:-}"
 # genuinely re-frontiered later in the run can still be revisited.
 VISITED_RADIUS="$(flt "${VISITED_RADIUS:-6.0}")"
 VISITED_TTL="$(flt "${VISITED_TTL:-180.0}")"
+# Failed-goal blacklist (generation 5). The mismatch that made this a defect:
+# the TTL was 60 s while ONE nav attempt is budgeted up to nav_max_timeout_sec
+# = 180 s, so a blacklisted trap reliably expired while the robot was still
+# burning a single budget somewhere else and was then free to be re-picked.
+# mr1_hybrid_seed18 atlas did exactly that: eight 180 s failures at the same
+# two sites, 1441 s of the run spent on ground it had already proved
+# unreachable, ending 0.021 above the 0.64 coverage threshold -- i.e. censored
+# by this alone. 240 = 180 + 60 keeps a site suppressed across a full failure
+# elsewhere; the planner WARNs at startup if this drops below that sum.
+# RETIRE_AFTER holds a site for the rest of the run once it has failed that
+# many times, because TTL expiry alone cannot close a permanent terrain trap.
+# Both are released immediately by actually reaching the site.
+FAILED_TTL="$(flt "${FAILED_TTL:-240.0}")"
+FAILED_RETIRE="${FAILED_RETIRE:-3}"
+# The disc the TTL above applies over. Passed and recorded because "suppressed"
+# is a claim about an AREA, not a point: at 2.0 m one entry covers a goal and
+# its neighbours, and at 0.2 m the planner would re-pick a cell 30 cm from the
+# trap and call it a new goal. A manifest that names the TTL but not the radius
+# describes half of the mechanism.
+FAILED_RADIUS="$(flt "${FAILED_RADIUS:-2.0}")"
+# The nav budget the TTL above is sized against, and the no-progress abort that
+# ends a leg early. All four are recorded for one reason: generation 5's
+# censoring vocabulary is written in these units. A cell ending in `timeout`
+# means a leg hit NAV_MAX_TIMEOUT, `no-progress` means it moved less than
+# PROGRESS_MIN_DIST in PROGRESS_WINDOW, and neither label can be read at all
+# without the numbers that produced it. They were fixed in the YAML through four
+# binary generations and invisible in every cell, so a reader comparing a gen-4
+# cell to a gen-5 one had no way to tell whether the budget had moved under them.
+NAV_MIN_TIMEOUT="$(flt "${NAV_MIN_TIMEOUT:-30.0}")"
+NAV_MAX_TIMEOUT="$(flt "${NAV_MAX_TIMEOUT:-180.0}")"
+PROGRESS_WINDOW="$(flt "${PROGRESS_WINDOW:-15.0}")"
+PROGRESS_MIN_DIST="$(flt "${PROGRESS_MIN_DIST:-0.2}")"
+# Refuse the exact defect generation 5 exists to fix, rather than warning about
+# it. The planner has its own startup check on this inequality, but it is a
+# WARN: it scrolls past in a log nobody reads until the campaign is over, which
+# is precisely what happened for the whole of mr1. Here it costs a cell nothing
+# to stop.
+#
+# The threshold is the planner's (+30), NOT the 240 = 180 + 60 the default
+# picks. Two numbers for two jobs: +30 is the floor below which the TTL is
+# certainly broken, and the extra 30 s in the default is deliberate slack on
+# top. A guard set at the default would reject working configurations, and one
+# set below +30 would pass the broken ones.
+awk -v ttl="$FAILED_TTL" -v navmax="$NAV_MAX_TIMEOUT" 'BEGIN {
+  if (ttl < navmax + 30.0) exit 1
+}' || {
+  echo "FATAL: failed_goal_ttl_sec=$FAILED_TTL is below nav_max_timeout_sec" >&2
+  echo "       ($NAV_MAX_TIMEOUT) + 30. A blacklisted trap would expire while" >&2
+  echo "       the robot is still burning ONE nav budget elsewhere, and be free" >&2
+  echo "       to be re-picked the moment it returns -- the mr1_hybrid_seed18" >&2
+  echo "       failure. Raise FAILED_TTL or lower NAV_MAX_TIMEOUT." >&2
+  exit 2
+}
+# Homing approach watchdog (generation 5). See §32.10: the original homing
+# watchdog measured GROSS metres travelled, which a robot orbiting a local
+# minimum satisfies forever. These bound the approach test that replaces it.
+RETURN_APPROACH_WINDOW="$(flt "${RETURN_APPROACH_WINDOW:-40.0}")"
+RETURN_APPROACH_MIN="$(flt "${RETURN_APPROACH_MIN:-1.0}")"
+RETURN_ESCAPE_MAX="${RETURN_ESCAPE_MAX:-3}"
+RETURN_ESCAPE_LEG="$(flt "${RETURN_ESCAPE_LEG:-30.0}")"
 # scovox voxel edge length. The launch default is 0.10, which does not survive a
 # run long enough to reach coverage termination: free space is carved along the
 # whole ray to max_range 20 m, so the fused map grew to 12.7M voxels by t=550 s
@@ -1254,6 +1315,22 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "frontier_z_hi_offset_m=$FRONTIER_Z_HI_OFF"
   echo "visited_goal_radius_m=$VISITED_RADIUS"
   echo "visited_goal_ttl_sec=$VISITED_TTL"
+  # The failed-goal pair was NOT in this manifest before generation 5, which is
+  # precisely how a 60 s TTL against a 180 s nav budget survived a whole
+  # campaign without anyone being able to see it in a cell's own record.
+  echo "failed_goal_ttl_sec=$FAILED_TTL"
+  echo "failed_goal_retire_after=$FAILED_RETIRE"
+  echo "failed_goal_radius_m=$FAILED_RADIUS"
+  # The nav budget and the no-progress abort. The run's end_reason vocabulary is
+  # denominated in these, so a cell that omits them cannot be read on its own.
+  echo "nav_min_timeout_sec=$NAV_MIN_TIMEOUT"
+  echo "nav_max_timeout_sec=$NAV_MAX_TIMEOUT"
+  echo "progress_window_sec=$PROGRESS_WINDOW"
+  echo "progress_min_distance_m=$PROGRESS_MIN_DIST"
+  echo "return_approach_window_sec=$RETURN_APPROACH_WINDOW"
+  echo "return_approach_min_m=$RETURN_APPROACH_MIN"
+  echo "return_escape_max_attempts=$RETURN_ESCAPE_MAX"
+  echo "return_escape_leg_sec=$RETURN_ESCAPE_LEG"
   echo "voxel_resolution_m=$VOXEL_RES"
   echo "done_unknown_fraction=$DONE_UNKNOWN"
   echo "done_criterion=$DONE_CRITERION"
@@ -1399,6 +1476,17 @@ for r in $ROBOTS; do
       -p frontier_z_hi_offset_m:=$FRONTIER_Z_HI_OFF \
       -p visited_goal_radius_m:=$VISITED_RADIUS \
       -p visited_goal_ttl_sec:=$VISITED_TTL \
+      -p failed_goal_ttl_sec:=$FAILED_TTL \
+      -p failed_goal_retire_after:=$FAILED_RETIRE \
+      -p failed_goal_radius_m:=$FAILED_RADIUS \
+      -p nav_min_timeout_sec:=$NAV_MIN_TIMEOUT \
+      -p nav_max_timeout_sec:=$NAV_MAX_TIMEOUT \
+      -p progress_window_sec:=$PROGRESS_WINDOW \
+      -p progress_min_distance_m:=$PROGRESS_MIN_DIST \
+      -p return_approach_window_sec:=$RETURN_APPROACH_WINDOW \
+      -p return_approach_min_m:=$RETURN_APPROACH_MIN \
+      -p return_escape_max_attempts:=$RETURN_ESCAPE_MAX \
+      -p return_escape_leg_sec:=$RETURN_ESCAPE_LEG \
       ${FOV_ARGS[@]+"${FOV_ARGS[@]}"} \
       ${EXTRA[@]+"${EXTRA[@]}"} \
       -p output_csv:="$OUTDIR/planner_$r.csv"

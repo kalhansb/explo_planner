@@ -17,16 +17,37 @@
 # it will be interrupted, and re-running the whole thing to recover the tail
 # would be worse than the interruption.
 #
-# Usage:
-#   ./run_campaign.sh --root DIR --cells "off:1,off:2,pursuit:1" [--duration 3600]
-#                     [--tx 22.0] [--record 2] [--tag phase3]
-#   ./run_campaign.sh --root DIR --arms "off,rendezvous,pursuit,hybrid" \
-#                     --seeds "1,2,3" ...          # cross product
+# Usage (--root, --duration and --scenario are REQUIRED; see their declarations
+# for why the last two lost their defaults):
+#   ./run_campaign.sh --root DIR --duration 3000 \
+#                     --scenario flatforest_dense_2robot_lidar.yaml \
+#                     --cells "off:1,off:2,pursuit:1" \
+#                     [--tx 30.0] [--record 0] [--tag phase3]
+#   ./run_campaign.sh --root DIR --duration 3000 --scenario ... \
+#                     --arms "off,hybrid" --seeds "1,2,3"   # cross product
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROOT=""; CELLS=""; ARMS=""; SEEDS=""; TAG="run"
-DURATION="${DURATION_S:-3600}"; TX="30.0"; REC="2"; EXPECT_OUT="1"
+# DURATION has NO default. It is the censoring horizon, so it defines the
+# primary endpoint every bit as much as DONE_UNKNOWN does: a cell that ran to
+# 3600 s and one that ran to 3000 s do not have comparable completion times or
+# comparable censoring rates, and nothing downstream can tell them apart from
+# the numbers alone. The old default was 3600 while every campaign since
+# 2026-08-27 has passed 3000, so the default's only reachable effect was to
+# silently relabel a campaign that forgot the flag. Required is better than
+# right: there is no value here that is correct for an unknown experiment.
+DURATION=""
+# Transmit power. Fixed hardware, identical on both robots, never an
+# experimental variable (see the --comms note below) — so unlike DURATION this
+# one genuinely has a correct default and keeps it.
+TX="30.0"
+# Bag recording off by default. A lean-record cell is ~340 MB, a 60-cell matrix
+# is ~20 GB, and the analyses this project actually runs read the event JSONL
+# and the planner CSV, never the bags. The old default of 2 meant forgetting
+# --record spent a fifth of the disk on data nothing reads.
+REC="0"
+EXPECT_OUT="1"
 # --comms 0 runs the IDEAL-COMMS CONTROL: run_explo_sim_rviz.sh leaves both
 # robots on their direct topics, one broadcast domain, emulator never launched.
 # That is the honest way to express "assume comms never fails" -- the earlier
@@ -52,7 +73,13 @@ DONE_CRITERION="${DONE_CRITERION:-latch}"
 # different experiment and needs its own DONE_UNKNOWN. Passed explicitly rather
 # than inherited from the environment so a stale exported SCENARIO cannot
 # silently relabel a campaign.
-SCENARIO="${SCENARIO:-flatforest_2robot_lidar.yaml}"
+#
+# No default, for the reason the paragraph above gives: the last default named
+# a world no campaign has used since the dense forest became the standard, so a
+# forgotten --scenario produced a sparser map, a different link budget and a
+# different coverage floor under the campaign's own tag. Nothing in the cell
+# would have said so except this key in the manifest.
+SCENARIO=""
 # Mission return (see run_explo_sim_rviz.sh). An explicit first-class flag, NOT
 # an --env passenger, because it applies to EVERY cell identically in BOTH arms
 # — it is part of the mission definition, not an arm. Default 1: from 2026-08-27
@@ -81,6 +108,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$ROOT" ] || { echo "FATAL: --root is required" >&2; exit 2; }
+# The two experiment-defining knobs that used to carry defaults. See their
+# declarations for why a default is worse than nothing here.
+[ -n "$DURATION" ] || {
+  echo "FATAL: --duration is required (it is the censoring horizon, so it" >&2
+  echo "       defines the endpoint; campaigns since 2026-08-27 use 3000)" >&2
+  exit 2; }
+[ -n "$SCENARIO" ] || {
+  echo "FATAL: --scenario is required (it sets both the link budget and the" >&2
+  echo "       coverage floor; the current standard is" >&2
+  echo "       flatforest_dense_2robot_lidar.yaml)" >&2
+  exit 2; }
+case "$DURATION" in
+  ''|*[!0-9]*)
+    echo "FATAL: --duration must be whole seconds (got '$DURATION')" >&2
+    exit 2;;
+esac
 # EXTRA_ENV is expanded AFTER the per-cell assignments below, so a DONE_SEEK in
 # it would win over the arm-name suffix and flip every cell to the same side
 # while the OUTDIR names still claimed an A/B. That failure is invisible in the
@@ -171,11 +214,40 @@ for cell in "${CELL_LIST[@]}"; do
     # directory name. That is an operator error to stop on, not to paper over
     # with a silent REDO that would overwrite banked data.
     want_mr="false"; [ "$MISSION_RETURN_FLAG" = "1" ] && want_mr="true"
-    have_mr=$(sed -n 's/^mission_return_enabled=//p' "$out/run_manifest.txt" 2>/dev/null | head -1)
-    if [ "${have_mr:-missing}" != "$want_mr" ]; then
-      log "ABORT: $name is complete but its manifest says mission_return_enabled=${have_mr:-<absent>},"
-      log "       while this campaign runs --mission-return $MISSION_RETURN_FLAG. Same name, different"
-      log "       experiment — refusing to skip OR overwrite. Use a fresh --root/--tag."
+    # Every key here changes what the run's endpoints MEAN, so a completed cell
+    # that disagrees on any of them is not "already complete" — it is a
+    # different experiment sharing a directory name. Checking only
+    # mission_return covered one of five: a resume that changed --scenario or
+    # --duration silently kept the old cells and pooled two horizons under one
+    # tag, which is the same defect the mission_return guard was written for.
+    # An absent key counts as a mismatch (`<absent>`): a manifest predating the
+    # key cannot be shown to agree, and "cannot be shown to agree" is exactly
+    # what this guard is for.
+    for kv in \
+      "mission_return_enabled=$want_mr" \
+      "scenario=$SCENARIO" \
+      "duration_s=$DURATION" \
+      "done_criterion=$DONE_CRITERION"
+    do
+      k="${kv%%=*}"; want="${kv#*=}"
+      have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+      if [ "${have:-<absent>}" != "$want" ]; then
+        log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
+        log "       while this campaign runs $k=$want. Same name, different"
+        log "       experiment — refusing to skip OR overwrite. Use a fresh --root/--tag."
+        exit 2
+      fi
+    done
+    # done_unknown_fraction compared numerically, not as a string: the run
+    # script normalises floats (0.64 stays 0.64 but 1 becomes 1.0), so a string
+    # compare would abort a resume over a formatting difference and teach the
+    # operator to distrust the guard.
+    have_du=$(sed -n 's/^done_unknown_fraction=//p' "$out/run_manifest.txt" 2>/dev/null | head -1)
+    if ! awk -v a="${have_du:-}" -v b="$DONE_UNKNOWN" \
+         'BEGIN { exit !(a != "" && a + 0 == b + 0) }'; then
+      log "ABORT: $name is complete but its manifest says done_unknown_fraction=${have_du:-<absent>},"
+      log "       while this campaign runs $DONE_UNKNOWN. That is the primary endpoint —"
+      log "       refusing to skip OR overwrite. Use a fresh --root/--tag."
       exit 2
     fi
     if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then

@@ -74,6 +74,7 @@
 #include "explo_planner/plan_map_query.hpp"
 #include "explo_planner/planner_util.hpp"
 #include "explo_planner/failed_goal_blacklist.hpp"
+#include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
 #include "explo_planner/vantage_planner.hpp"
@@ -304,6 +305,28 @@ private:
   bool startReturnHome(const char* reason);
   void doReturnHome();
   bool finishMissionReturn(const char* result, const char* end_reason);
+  // Homing watchdog helpers (generation 5, see the HomeMode member block).
+  // homeApproachMetric is the distance the watchdog holds accountable:
+  // straight-line to home in DIRECT, remaining-trail length in RETRACE (so
+  // that following a curved trail is not scored as failing to approach).
+  // homeWatchdogFire owns the whole graduated response — resend, retrace,
+  // escape, park — and is the ONLY place a homing watchdog decision is made.
+  // engageRetrace/pickEscapeTarget/resumeRetrace are its state transitions;
+  // republishHomeGoal is the shared brake-then-deferred-publish primitive
+  // (the nav cancel action is a no-op here, so the brake goal at the current
+  // pose is what actually stops the platform — see abandonNavGoal).
+  // HomeMode is declared here rather than beside its state members because
+  // these signatures need it.
+  enum class HomeMode { DIRECT, RETRACE, ESCAPE };
+  float homeApproachMetric() const;
+  static const char* homeModeName(HomeMode m);
+  void homeWatchdogFire(const char* kind, float metric, float dist_home,
+                        float approach_delta);
+  bool engageRetrace();
+  bool pickEscapeTarget();
+  void startEscapeLeg();
+  void resumeRetrace(const char* why);
+  void republishHomeGoal(const char* why);
   // Mesh-reconnection pursuit (see the PURSUE state). startPursuit arms the
   // chase along the missing peer's last-contact trail (returns false when the
   // record is too stale to be worth chasing — pursuitBudgetSec() == 0);
@@ -502,6 +525,7 @@ private:
   double pose_max_age_sec_ = 5.0;
   double failed_goal_radius_m_;
   double failed_goal_ttl_sec_;
+  int    failed_goal_retire_after_{0};
   double done_unknown_fraction_;
   int    done_min_consecutive_steps_;
   // Which rule decides that THIS robot has finished exploring:
@@ -1188,8 +1212,46 @@ private:
   // traversed once — recorded from home capture until homing starts. The
   // second no-progress retry follows it back crumb by crumb.
   std::vector<Eigen::Vector3f> home_trail_;
-  bool return_home_retrace_ = false;
   int  home_trail_idx_      = -1;
+
+  // ---- Approach-based homing watchdog (binary generation 5) ----
+  // The original no-progress watchdog measures GROSS metres travelled, so a
+  // robot orbiting a local minimum at 0.05 m/s satisfies it forever while
+  // netting zero approach: mr1_hybrid_seed11 atlas hit the 600 s cap 48.75 m
+  // from home after 30.35 m of travel with ZERO watchdog fires. This second,
+  // independent watchdog measures the distance that actually matters —
+  // remaining distance home — and the two are reported separately
+  // (kind=approach vs kind=frozen) so each failure mode stays attributable.
+  //
+  // Mode also replaces the old return_home_retrace_ flag: with an escape leg
+  // in the ladder there are three publishable targets, and two booleans for
+  // three states is how they drift apart.
+  HomeMode home_mode_ = HomeMode::DIRECT;
+  rclcpp::Time approach_check_time_{0, 0, RCL_ROS_TIME};
+  float  approach_check_metric_ = 0.f;
+  int    home_escapes_used_     = 0;
+  int    escape_last_crumb_     = -1;  // anti-repeat: never twice in a row
+  int    escape_fallback_n_     = 0;   // rotates the behind-robot fallback
+  rclcpp::Time escape_leg_start_{0, 0, RCL_ROS_TIME};
+  Eigen::Vector3f escape_target_ = Eigen::Vector3f::Zero();
+  double return_approach_window_sec_ = 40.0;
+  double return_approach_min_m_      = 1.0;
+  int    return_escape_max_attempts_ = 3;
+  double return_escape_leg_sec_      = 30.0;
+  // Geometry constants, all tied to the 2 m breadcrumb spacing: an escape
+  // target is a crumb 0.75x-3x the spacing away, arrival is one spacing, and
+  // the approach check is suppressed inside 3 m because there the 1.0 m
+  // threshold is a large fraction of what is left (the frozen detector and
+  // the nav budget still cover that band).
+  static constexpr float kEscapeBandMinM      = 1.5f;
+  static constexpr float kEscapeBandMaxM      = 6.0f;
+  static constexpr float kEscapeArriveM       = 1.5f;
+  static constexpr float kEscapeFallbackM     = 2.5f;
+  static constexpr float kApproachSuppressM   = 3.0f;
+  // Raised by trackDistance's teleport guard, consumed by doReturnHome: an
+  // approach delta measured across a relocalization discontinuity is a
+  // measurement artefact, not a stall.
+  bool pose_jump_seen_ = false;
 
   // Rendezvous anchor: the robot pose the last time it heard a teammate. That
   // pose sits inside the comms bubble, so it is the cheapest point to return to
@@ -1680,10 +1742,53 @@ ExploPlannerNode::ExploPlannerNode()
   // `failed_goal_radius_m` of a non-expired entry. Prevents the planner
   // from re-picking the same unreachable goal forever when the robot is
   // physically stuck (same pose -> same scores -> same pick loop).
+  //
+  // The TTL must outlast one full worst-case attempt SOMEWHERE ELSE plus the
+  // travel and replanning around it. It did not: the 60 s default was sized to
+  // an old 60 s budget cap, and when nav_max_timeout_sec went to 180 s in the
+  // campaign yaml the TTL was not raised with it. The consequence, measured in
+  // mr1_hybrid_seed18: each of two terrain traps expired from the blacklist
+  // while the robot was busy burning a 180 s budget at the other one. Observed
+  // fail -> re-pick gaps for the same trap were 210, 203, 224 and 225 s — all
+  // longer than 60 and all shorter than 240. Eight full budgets, 1441 s, two
+  // sites, and the cell ended 0.021 of unknown-fraction short of done.
   failed_goal_radius_m_ =
       dp("failed_goal_radius_m", 2.0);
   failed_goal_ttl_sec_ =
-      dp("failed_goal_ttl_sec", 60.0);
+      dp("failed_goal_ttl_sec", 240.0);
+  // Retirement: after this many failures at one site (clustered at
+  // failed_goal_radius_m), the site is suppressed for the rest of the run
+  // rather than expiring. 0 disables it and restores pure TTL behaviour.
+  //
+  // TTL alone cannot handle a PERMANENT trap, only a transient one — any
+  // finite TTL eventually lets a fixed piece of bad terrain back into the
+  // argmax, and the site's information shadow guarantees it wins again,
+  // because the ground behind the trap stays unobserved precisely because the
+  // robot never gets there. Retirement bounds the waste at
+  // retire_after x nav_max_timeout_sec per site per run.
+  //
+  // Retiring is not the same as giving up: arriving inside the radius clears
+  // the record (clearNear below), and the amnesty path in the selection loop
+  // re-offers retired sites when they are the only candidates left.
+  //
+  // k=3 from the mr1 evidence: across 72 robot-logs and 49 distinct failure
+  // sites, reattempts at [budget] sites succeeded 0/7, and exactly 1 of 49
+  // sites was later reached within the 2 m radius — a no-progress site that
+  // recovered on its FIRST reattempt, which k=3 would not have blocked.
+  failed_goal_retire_after_ = dp("failed_goal_retire_after", 3);
+  failed_goals_.setRetireAfter(failed_goal_retire_after_);
+  // Make the drift that caused seed18 impossible to repeat silently. The two
+  // numbers are coupled — a blacklist entry has to outlive one attempt
+  // elsewhere — and nothing enforced that coupling, so raising one of them in
+  // the campaign yaml quietly disarmed the other.
+  if (failed_goal_ttl_sec_ < nav_max_timeout_sec_ + 30.0) {
+    RCLCPP_WARN(get_logger(),
+        "failed_goal_ttl_sec=%.0f is below nav_max_timeout_sec=%.0f + 30: a "
+        "blacklisted site can expire while the robot is still burning one full "
+        "nav budget somewhere else, which re-opens the trap it was meant to "
+        "close. Use >= %.0f.",
+        failed_goal_ttl_sec_, nav_max_timeout_sec_, nav_max_timeout_sec_ + 30.0);
+  }
   // Visited-goal suppression. A goal the robot REACHED is parked for
   // visited_goal_ttl_sec, and EXPLORE candidates within visited_goal_radius_m
   // of a live entry are skipped. 0 (default) = off, shipped behaviour.
@@ -2069,6 +2174,18 @@ ExploPlannerNode::ExploPlannerNode()
   mission_return_enabled_ = dp("mission_return_enabled", false);
   mission_home_tol_m_     = dp("mission_home_tol_m", 1.0);
   mission_return_max_sec_ = dp("mission_return_max_sec", 600.0);
+  // Approach watchdog (generation 5). 1.0 m per 40 s = 0.025 m/s net, which is
+  // ~9x below the slowest ARRIVED homing in the 71-homing population (mean
+  // approach 0.220 m/s, median 0.388) and infinitely above seed11's -0.0001
+  // m/s, so the separation is not marginal in either direction. The 40 s
+  // window is long enough for a legitimate circumnavigation (worst arrived
+  // detour ratio 1.47) and short enough that two fires still leave 5/6 of the
+  // 600 s cap. Escapes are capped so the whole ladder is bounded well inside
+  // the cap: 40 + 40 + 3 x (30 escape + 40 window) = 290 s worst case.
+  return_approach_window_sec_ = dp("return_approach_window_sec", 40.0);
+  return_approach_min_m_      = dp("return_approach_min_m", 1.0);
+  return_escape_max_attempts_ = dp("return_escape_max_attempts", 3);
+  return_escape_leg_sec_      = dp("return_escape_leg_sec", 30.0);
   // Same unconditional both-directions announce contract as DONE-SEEK above:
   // every run states which side it is on, so a treated cell with no line and a
   // control cell with one are both detectable from the console log alone.
@@ -2418,6 +2535,23 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamBool("mission_return_enabled", mission_return_enabled_);
     exp_log_->addParamNum("mission_home_tol_m", mission_home_tol_m_);
     exp_log_->addParamNum("mission_return_max_sec", mission_return_max_sec_);
+    // Homing watchdog + failed-goal blacklist. Stamped because these are
+    // exactly the knobs whose value the analysis has to know and cannot infer:
+    // the mr1 campaign ran with failed_goal_ttl_sec at 60 while the manifest
+    // recorded only the visited_goal_* pair, which is how a 60-vs-180 s
+    // mismatch between the blacklist TTL and the nav timeout stayed invisible
+    // for a whole generation.
+    exp_log_->addParamNum("return_approach_window_sec",
+                          return_approach_window_sec_);
+    exp_log_->addParamNum("return_approach_min_m", return_approach_min_m_);
+    exp_log_->addParamNum("return_escape_max_attempts",
+                          return_escape_max_attempts_);
+    exp_log_->addParamNum("return_escape_leg_sec", return_escape_leg_sec_);
+    exp_log_->addParamNum("failed_goal_ttl_sec", failed_goal_ttl_sec_);
+    exp_log_->addParamNum("failed_goal_radius_m", failed_goal_radius_m_);
+    exp_log_->addParamNum("failed_goal_retire_after", failed_goal_retire_after_);
+    exp_log_->addParamNum("progress_window_sec", progress_window_sec_);
+    exp_log_->addParamNum("progress_min_distance_m", progress_min_distance_m_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
     exp_log_->addParamBool("terrain_relative_z", terrain_relative_z_);
@@ -3890,6 +4024,14 @@ void ExploPlannerNode::doPlan() {
   int rejected_too_close = 0;
   bool found = false;
   size_t selected_idx = 0;
+  // Candidates whose ONLY disqualification was the failed-goal blacklist.
+  // Retirement makes suppression permanent within a run, so there has to be a
+  // path back: if every candidate is suppressed, the planner must re-attempt
+  // the least-recently-failed one rather than sit in the "all candidates
+  // rejected, retrying next tick" spin, which is already starvation. Amnesty
+  // makes retirement mean "last resort", not "abandoned while frontiers
+  // remain", which bounds the worst case at exactly today's behaviour.
+  std::vector<size_t> suppressed_only;
   for (size_t idx : order) {
     const auto& vp = candidates[idx];
     // 0. Skip candidates at the robot's feet — these are "already reached"
@@ -3938,6 +4080,7 @@ void ExploPlannerNode::doPlan() {
     }
     if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
       ++rejected_blacklist;
+      suppressed_only.push_back(idx);
       continue;
     }
     // 4. MinPos peer-claim check (only when coordination is enabled).
@@ -3960,6 +4103,59 @@ void ExploPlannerNode::doPlan() {
     selected_idx = idx;
     found = true;
     break;
+  }
+  if (!found && !suppressed_only.empty()) {
+    // Retired last, then least-recently-failed (see amnestyOrderBefore for why
+    // the retired partition has to be there). stable_sort so equal keys keep
+    // the score order they inherited from `order`.
+    std::stable_sort(
+        suppressed_only.begin(), suppressed_only.end(),
+        [&](size_t a, size_t b) {
+          return amnestyOrderBefore(failed_goals_, candidates[a].position,
+                                    candidates[b].position,
+                                    failed_goal_radius_m_);
+        });
+    for (size_t idx : suppressed_only) {
+      const auto& vp = candidates[idx];
+      // Re-run the peer-claim check. In the loop above the blacklist rejection
+      // `continue`s BEFORE MinPos is consulted, so a suppressed candidate has
+      // never been tested against peer claims. Skipping it here would let the
+      // safety valve hand this robot a goal its partner has already claimed —
+      // turning a coordination experiment into a duplicated-effort one at
+      // exactly the moment the planner is least able to notice.
+      if (coord_ && coord_->enabled()) {
+        const auto* peer = coord_->claimMatching(
+            vp.position, static_cast<float>(coord_claim_radius_m_),
+            &plan_start);
+        if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
+                                              *peer, robot_name_)) {
+          continue;  // not counted again; it was already counted as blk
+        }
+      }
+      const double last_fail = failed_goals_.lastFailTimeNear(
+          vp.position, failed_goal_radius_m_);
+      const double age = std::isfinite(last_fail)
+                             ? plan_start.seconds() - last_fail
+                             : -1.0;
+      const bool amnesty_retired =
+          failed_goals_.isRetiredNear(vp.position, failed_goal_radius_m_);
+      current_goal_ = vp;
+      selected_idx = idx;
+      found = true;
+      RCLCPP_WARN(get_logger(),
+          "Step %d: all %zu candidates suppressed by the failed-goal "
+          "blacklist; AMNESTY re-attempt of the %s goal "
+          "(%.2f, %.2f), last failed %.1fs ago.",
+          step_, candidates.size(),
+          amnesty_retired ? "least-recently-failed RETIRED"
+                          : "least-recently-failed",
+          vp.position.x(), vp.position.y(), age);
+      if (exp_log_) {
+        exp_log_->logGoalAmnesty(expCtx(), vp.position.x(), vp.position.y(),
+                                 age, amnesty_retired);
+      }
+      break;
+    }
   }
   if (!found) {
     RCLCPP_WARN(get_logger(),
@@ -4255,6 +4451,16 @@ void ExploPlannerNode::doNavigate() {
       // is what breaks the cycle; recording only where it failed (below) never
       // could, because these goals are reached successfully every time.
       visited_goals_.add(current_goal_.position, this->now().seconds());
+      // Arriving inside a failed site's radius is proof the ground is
+      // reachable, which outranks any amount of failure history — including a
+      // retirement, which otherwise lasts the whole run. This is the main
+      // re-entry path that keeps retirement from being permanent by accident.
+      if (const std::size_t cleared = failed_goals_.clearNear(
+              current_goal_.position, failed_goal_radius_m_)) {
+        RCLCPP_INFO(get_logger(),
+            "Goal reached inside a failed-goal site; %zu record(s) cleared.",
+            cleared);
+      }
       RCLCPP_INFO(get_logger(),
           "Goal reached: dist=%.2f yaw_err=%.1f deg", dist,
           yaw_err * 180.0f / static_cast<float>(M_PI));
@@ -4316,13 +4522,28 @@ void ExploPlannerNode::doNavigate() {
 // and transition out of NAVIGATE. Centralised so both timeout paths
 // (budget exceeded / no progress) share the same logging + bookkeeping.
 void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
-  failed_goals_.add(current_goal_.position, this->now().seconds());
+  const double fail_time = this->now().seconds();
+  const int k = failed_goals_.add(current_goal_.position, fail_time,
+                                  failed_goal_radius_m_);
+  const bool retired =
+      failed_goals_.isRetiredNear(current_goal_.position, failed_goal_radius_m_);
+  char status[48];
+  if (retired) {
+    std::snprintf(status, sizeof(status), "RETIRED for run");
+  } else {
+    std::snprintf(status, sizeof(status), "ttl=%.0fs", failed_goal_ttl_sec_);
+  }
   RCLCPP_WARN(get_logger(),
       "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f). "
-      "Blacklisted; %zu active failed-goal entries.",
+      "Blacklisted [k=%d, %s]; %zu active failed-goal sites.",
       step_, reason, elapsed,
       current_goal_.position.x(), current_goal_.position.y(),
-      failed_goals_.size());
+      k, status, failed_goals_.size());
+  if (exp_log_) {
+    exp_log_->logNavGoalFailed(expCtx(), current_goal_.position.x(),
+                               current_goal_.position.y(), reason, elapsed, k,
+                               retired);
+  }
   have_active_intent_ = false;  // release the claim on failure
   // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
   // know that — the goal is still accepted and still driving (invariant: see
@@ -5089,8 +5310,14 @@ bool ExploPlannerNode::startReturnHome(const char* reason) {
   return_home_goal_sent_     = false;
   return_home_retries_       = 0;
   return_home_dist_at_start_ = cumulative_distance_;
-  return_home_retrace_       = false;
+  home_mode_                 = HomeMode::DIRECT;
   home_trail_idx_            = -1;
+  home_escapes_used_         = 0;
+  escape_last_crumb_         = -1;
+  escape_fallback_n_         = 0;
+  pose_jump_seen_            = false;
+  approach_check_time_       = this->now();
+  approach_check_metric_     = (latest_pos_ - home_pos_).head<2>().norm();
   // 0.3 s (3 ticks) covers the cancel-all round trip from this call site AND
   // from transitionTo below, whichever fires it.
   home_pub_not_before_ = this->now() + rclcpp::Duration::from_seconds(0.3);
@@ -5099,6 +5326,16 @@ bool ExploPlannerNode::startReturnHome(const char* reason) {
       "cap %.0f s.",
       home_pos_.x(), home_pos_.y(), reason,
       mission_home_tol_m_, mission_return_max_sec_);
+  // Same-binary control for an absence claim: "zero watchdog fires" only means
+  // "correctly did not fire" if the watchdog is provably armed in that run.
+  // Emitted for EVERY homing, so a log with a homing and no ARMED line is a
+  // detectable defect rather than a silent one.
+  RCLCPP_INFO(get_logger(),
+      "MISSION-RETURN WATCHDOG ARMED: approach %.1f m / %.0f s (suppressed "
+      "inside %.1f m), frozen %.2f m / %.0f s, escapes 0/%d.",
+      return_approach_min_m_, return_approach_window_sec_, kApproachSuppressM,
+      progress_min_distance_m_, progress_window_sec_,
+      return_escape_max_attempts_);
   // No goal publish here — see the declaration comment. The caller's
   // abandonNavGoal cancel-all is still in flight, so a goal sent now can be
   // swallowed by it; the first doReturnHome tick publishes instead.
@@ -5116,14 +5353,29 @@ void ExploPlannerNode::doReturnHome() {
     // Reached at entry and again after each no-progress retry.
     if (this->now() < home_pub_not_before_) return;
     current_goal_ = CandidateViewpoint{};
-    if (return_home_retrace_ && home_trail_idx_ > 0) {
-      const Eigen::Vector3f& wp = home_trail_[home_trail_idx_];
-      current_goal_.position = wp;
-      current_goal_.yaw = std::atan2(wp.y() - latest_pos_.y(),
-                                     wp.x() - latest_pos_.x());
+    // Three publishable targets, one per mode. RETRACE with the index at or
+    // below 0 means the trail is spent, which is the home goal again.
+    const bool retracing = home_mode_ == HomeMode::RETRACE &&
+                           home_trail_idx_ > 0 &&
+                           home_trail_idx_ < static_cast<int>(home_trail_.size());
+    const char* what = "home goal";
+    if (home_mode_ == HomeMode::ESCAPE) {
+      current_goal_.position = escape_target_;
+      what = "escape goal";
+    } else if (retracing) {
+      current_goal_.position = home_trail_[home_trail_idx_];
+      what = "retrace waypoint";
     } else {
       current_goal_.position = home_pos_;
+    }
+    if (!retracing && home_mode_ != HomeMode::ESCAPE) {
+      // Target IS home: keep the recorded home yaw, as the final approach has
+      // always done.
       current_goal_.yaw = home_yaw_;
+    } else {
+      current_goal_.yaw =
+          std::atan2(current_goal_.position.y() - latest_pos_.y(),
+                     current_goal_.position.x() - latest_pos_.x());
     }
     publishGoal(current_goal_);
     if (intent_pub_ && coord_) {
@@ -5140,17 +5392,17 @@ void ExploPlannerNode::doReturnHome() {
     const float dy = current_goal_.position.y() - latest_pos_.y();
     const float dist = std::sqrt(dx * dx + dy * dy);
     // Budget distance is the straight line to the goal — except in retrace
-    // mode, where the goal is only the nearest crumb: there it must cover
-    // the whole remaining trail down to home, or the budget would fire
-    // moments after the switch.
-    double budget_dist = dist;
-    if (return_home_retrace_ && home_trail_idx_ > 0) {
-      for (int i = home_trail_idx_; i > 0; --i) {
-        budget_dist +=
-            (home_trail_[i] - home_trail_[i - 1]).head<2>().norm();
-      }
-      budget_dist += (home_trail_.front() - home_pos_).head<2>().norm();
-    }
+    // mode, where the goal is only the nearest crumb: there it must cover the
+    // whole remaining trail down to home, or the budget would fire moments
+    // after the switch. Deliberately the SAME function the approach watchdog
+    // scores with: one of them says how far there is to go and the other says
+    // how long that may take, so if the two definitions drift apart the ladder
+    // either fires on a robot making fine progress or stops firing at all.
+    const double budget_dist =
+        retracing ? home_trail::remainingTrailDistance(home_trail_,
+                                                       home_trail_idx_,
+                                                       latest_pos_)
+                  : dist;
     const double elapsed = (this->now() - state_enter_time_).seconds();
     // Distance-true budget, same model as the manoeuvre legs (see
     // startReturnTo). Measured from NOW (elapsed added) because a retry
@@ -5158,18 +5410,47 @@ void ExploPlannerNode::doReturnHome() {
     // distance alone would fall below the already-elapsed time and fire on
     // the next tick. No min() against the mission cap — the cap check below
     // runs first every tick, so it bounds the leg regardless.
-    nav_budget_sec_ = elapsed + std::max(
+    double leg_budget = std::max(
         nav_min_timeout_sec_,
         budget_dist * nav_safety_factor_ /
             std::max(nav_speed_est_mps_, 1e-3));
+    if (home_mode_ == HomeMode::ESCAPE) {
+      // An escape leg must expire as an escape, not as a dead mission.
+      //
+      // The two deadlines race. The leg cap (return_escape_leg_sec) ends the
+      // leg with resumeRetrace and the run continues; the nav budget ends the
+      // WHOLE return with finishMissionReturn("budget", "home-gave-up"), which
+      // censors the cell. The budget check runs first in the tick, so whichever
+      // deadline is earlier decides which of those two very different outcomes
+      // a cell gets — and the escape target is always short enough that the
+      // distance term loses to nav_min_timeout_sec, leaving the budget at a
+      // flat 30.0 s against a leg cap of a flat 30.0 s. The only thing that has
+      // been keeping the leg cap in front is the 0.3 s publish deferral: three
+      // ticks, held by a coincidence between two independently-tunable params
+      // that nothing in the code relates or checks.
+      //
+      // So state the relationship instead of inheriting it. The leg cap is the
+      // authority on how long an escape may take; the budget's job here is only
+      // to catch a leg whose termination logic never runs at all, so it sits a
+      // clear margin behind and is not derived from distance.
+      constexpr double kEscapeBudgetMarginSec = 10.0;
+      leg_budget = return_escape_leg_sec_ + kEscapeBudgetMarginSec;
+    }
+    nav_budget_sec_ = elapsed + leg_budget;
+    // BOTH watchdog windows restart at every publish. The approach baseline in
+    // particular must be re-taken here: a fire brakes the robot, and measuring
+    // the next window from a metric sampled before the brake would charge the
+    // new leg for the old leg's stall.
     progress_check_time_ = this->now();
     progress_check_dist_ = cumulative_distance_;
+    approach_check_time_ = this->now();
+    approach_check_metric_ = homeApproachMetric();
+    pose_jump_seen_ = false;
     return_home_goal_sent_ = true;
     RCLCPP_INFO(get_logger(),
         "MISSION-RETURN: %s published (dist=%.2f m, budget %.0f s%s).",
-        return_home_retrace_ ? "retrace waypoint" : "home goal",
-        dist, nav_budget_sec_,
-        return_home_retries_ > 0 ? ", retry" : "");
+        what, dist, nav_budget_sec_,
+        return_home_retries_ > 0 || home_escapes_used_ > 0 ? ", retry" : "");
     return;
   }
 
@@ -5206,8 +5487,9 @@ void ExploPlannerNode::doReturnHome() {
   // index toward home past any crumbs already inside that circle and aim at
   // the next one. Plain goal replacement — no cancel, so nothing to race.
   // The arrival check above still measures against home itself, and the
-  // watchdog below keeps running on cumulative distance as usual.
-  if (return_home_retrace_ && home_trail_idx_ > 0) {
+  // watchdogs below keep running as usual. An advance shrinks the approach
+  // metric (triangle inequality), so it can never manufacture a stall.
+  if (home_mode_ == HomeMode::RETRACE && home_trail_idx_ > 0) {
     if ((latest_pos_ - home_trail_[home_trail_idx_]).head<2>().norm() <
         3.0f) {
       while (home_trail_idx_ > 0 &&
@@ -5228,53 +5510,325 @@ void ExploPlannerNode::doReturnHome() {
       publishGoal(current_goal_);
     }
   }
-  const double window_elapsed = (now - progress_check_time_).seconds();
-  if (window_elapsed > progress_window_sec_) {
-    const float delta = cumulative_distance_ - progress_check_dist_;
-    if (delta < progress_min_distance_m_) {
-      if (return_home_retries_ < 2) {
-        ++return_home_retries_;
-        if (return_home_retries_ >= 2 && home_trail_.size() > 1) {
-          // Second stall: the direct goal has failed two full windows.
-          // Switch to retracing the outbound trail from the crumb nearest
-          // the robot — every metre of it was traversed once already, so a
-          // local-minimum trap on unexplored geometry cannot block it.
-          return_home_retrace_ = true;
-          home_trail_idx_ = 0;
-          float best = std::numeric_limits<float>::max();
-          for (int i = 0; i < static_cast<int>(home_trail_.size()); ++i) {
-            const float d =
-                (home_trail_[i] - latest_pos_).head<2>().norm();
-            if (d < best) { best = d; home_trail_idx_ = i; }
-          }
-          RCLCPP_WARN(get_logger(),
-              "MISSION-RETURN: no progress toward home (%.2f m away) — "
-              "retry %d/2: retracing outbound trail from crumb %d/%zu "
-              "(%.2f m away).",
-              dist, return_home_retries_, home_trail_idx_,
-              home_trail_.size(), best);
-        } else {
-          RCLCPP_WARN(get_logger(),
-              "MISSION-RETURN: no progress toward home (%.2f m away) — "
-              "retry %d/2: cancelling and resending the goal.",
-              dist, return_home_retries_);
-        }
-        abandonNavGoal("home-no-progress-retry");
-        return_home_goal_sent_ = false;  // wall-clock-gated re-publish
-        home_pub_not_before_ =
-            this->now() + rclcpp::Duration::from_seconds(0.3);
-        return;
-      }
-      RCLCPP_WARN(get_logger(),
-          "MISSION-RETURN: still no progress after %d retries (%.2f m from "
-          "home) — parking here.", return_home_retries_, dist);
-      finishMissionReturn("no-progress", "home-gave-up");
-      return;
-    }
+  // ---- Two independent watchdogs ----
+  // FROZEN: gross metres travelled, the historical test, measurement UNCHANGED
+  // (15 s / 0.2 m, shared with the NAVIGATE paths). It answers "is the
+  // platform physically moving at all?".
+  // APPROACH: remaining distance home. It answers the question the frozen test
+  // structurally cannot — "is any of that movement getting the robot home?" —
+  // and is the whole point of this generation: seed11 orbited at 0.05 m/s for
+  // the full 600 s cap, passing the frozen test in every window, netting
+  // -0.08 m of approach.
+  // They are evaluated together, both windows are advanced whichever fires,
+  // and `kind` in the log distinguishes them, so each defect stays attributable
+  // to exactly one detector.
+  const float metric = homeApproachMetric();
+  bool frozen = false;
+  bool no_approach = false;
+  float approach_delta = 0.f;
+
+  const double move_window = (now - progress_check_time_).seconds();
+  if (move_window > progress_window_sec_) {
+    frozen = (cumulative_distance_ - progress_check_dist_) <
+             progress_min_distance_m_;
     progress_check_time_ = now;
     progress_check_dist_ = cumulative_distance_;
   }
+
+  const double appr_window = (now - approach_check_time_).seconds();
+  // Suppressed in ESCAPE (an escape leg moves AWAY from home on purpose) and
+  // inside kApproachSuppressM (3.0 m) of the target, where the 1.0 m the
+  // detector demands per window is a large fraction of what remains and the
+  // frozen detector plus the nav budget still cover the robot.
+  if (home_mode_ != HomeMode::ESCAPE && metric > kApproachSuppressM &&
+      appr_window > return_approach_window_sec_) {
+    approach_delta = approach_check_metric_ - metric;
+    no_approach = approach_delta < static_cast<float>(return_approach_min_m_);
+    approach_check_time_ = now;
+    approach_check_metric_ = metric;
+  }
+  // A relocalization jump makes the approach delta a measurement artefact, not
+  // a stall. Re-baseline and forfeit this window rather than fire on it. The
+  // frozen detector is already jump-proof: trackDistance refuses to add the
+  // jump to cumulative_distance_.
+  if (pose_jump_seen_) {
+    pose_jump_seen_ = false;
+    approach_check_time_ = now;
+    approach_check_metric_ = metric;
+    no_approach = false;
+  }
+
+  if (frozen || no_approach) {
+    // Frozen wins the label when both fire: "not moving" is the more specific
+    // diagnosis and picks the response that assumes the platform is stuck.
+    homeWatchdogFire(frozen ? "frozen" : "approach", metric, dist,
+                     approach_delta);
+    return;
+  }
+
+  // Escape-leg termination. Arrival at the escape target, or the leg cap.
+  // Either way the answer is the same: go back to retracing — see resumeRetrace
+  // for why an escape never resumes DIRECT.
+  if (home_mode_ == HomeMode::ESCAPE) {
+    const float d = (latest_pos_ - escape_target_).head<2>().norm();
+    const double leg = (now - escape_leg_start_).seconds();
+    if (d < kEscapeArriveM || leg > return_escape_leg_sec_) {
+      resumeRetrace(d < kEscapeArriveM ? "escape-arrived" : "escape-leg-cap");
+      return;
+    }
+  }
   republishGoal(current_goal_);
+}
+
+const char* ExploPlannerNode::homeModeName(HomeMode m) {
+  switch (m) {
+    case HomeMode::DIRECT:  return "direct";
+    case HomeMode::RETRACE: return "retrace";
+    case HomeMode::ESCAPE:  return "escape";
+  }
+  return "?";
+}
+
+/// Distance the approach watchdog holds the robot accountable for.
+/// DIRECT: straight line to home. RETRACE: remaining trail length — the same
+/// model the nav budget uses — so that following a curved trail away from the
+/// straight line is not scored as failing to approach.
+float ExploPlannerNode::homeApproachMetric() const {
+  // The index check stays here rather than leaning on remainingTrailDistance's
+  // 0.0 return: a spent trail means "the goal is home again", which is a
+  // straight line, not a zero distance.
+  if (home_mode_ != HomeMode::RETRACE || home_trail_idx_ <= 0 ||
+      home_trail_idx_ >= static_cast<int>(home_trail_.size())) {
+    return (latest_pos_ - home_pos_).head<2>().norm();
+  }
+  return home_trail::remainingTrailDistance(home_trail_, home_trail_idx_,
+                                            latest_pos_);
+}
+
+/// Switch to retracing the outbound trail from the crumb nearest the robot.
+/// Every metre of that trail was driven once already this run, so a local
+/// minimum on unexplored geometry cannot block it. False if there is no usable
+/// trail (a homing that began within 2 m of home).
+bool ExploPlannerNode::engageRetrace() {
+  // size() <= 1 is "no trail at all", which is a genuine false: there is
+  // nothing to retrace. A single usable crumb is not — that is a retrace of one
+  // segment. nearestCrumbFromOne never returns 0 (crumb 0 IS home; see its
+  // comment for what selecting it does to the ladder).
+  if (home_trail_.size() <= 1) return false;
+  home_trail_idx_ = home_trail::nearestCrumbFromOne(home_trail_, latest_pos_);
+  home_mode_ = HomeMode::RETRACE;
+  return true;
+}
+
+/// Choose where an escape leg drives. Preference order:
+///  1. A breadcrumb 1.5-6.0 m away (0.75x-3x the crumb spacing) — ground this
+///     robot physically drove over earlier in the run, which is the strongest
+///     reachability prior available. Nearest wins; ties break toward the HIGHER
+///     index, i.e. the most recently visited crumb, which is behind the robot.
+///  2. A pose 2.5 m behind the robot, rotated by 0/+60/-60 deg on successive
+///     attempts so a repeat never aims at the same blocked spot.
+/// Behind is the point: it forces a ~180 deg rotate-in-place (the controller
+/// zeroes linear and rotates whenever heading error exceeds 45 deg, and angular
+/// is never clearance-scaled), after which the front arc faces ground with
+/// known clearance. Both candidate freeze mechanisms — slow-down-band creep and
+/// heading oscillation — are FRONT-ARC phenomena.
+bool ExploPlannerNode::pickEscapeTarget() {
+  // escape_last_crumb_ is the anti-repeat: never escape twice onto the same
+  // crumb. Search starts at 1 because crumb 0 is home — see pickBandCrumb for
+  // why aiming an escape there is worse than not escaping at all.
+  const int best_i = home_trail::pickBandCrumb(home_trail_, latest_pos_,
+                                               kEscapeBandMinM, kEscapeBandMaxM,
+                                               escape_last_crumb_);
+  if (best_i >= 0) {
+    escape_last_crumb_ = best_i;
+    escape_target_ = home_trail_[best_i];
+    return true;
+  }
+  static constexpr float kFallbackOffsetRad[3] = {0.f, 1.047f, -1.047f};
+  const float off = kFallbackOffsetRad[escape_fallback_n_ % 3];
+  ++escape_fallback_n_;
+  const float th = latest_yaw_ + static_cast<float>(M_PI) + off;
+  escape_target_ = latest_pos_ + Eigen::Vector3f(kEscapeFallbackM * std::cos(th),
+                                                 kEscapeFallbackM * std::sin(th),
+                                                 0.f);
+  escape_last_crumb_ = -1;
+  return false;  // used the fallback, not a crumb
+}
+
+void ExploPlannerNode::startEscapeLeg() {
+  const bool on_crumb = pickEscapeTarget();
+  ++home_escapes_used_;
+  home_mode_ = HomeMode::ESCAPE;
+  escape_leg_start_ = this->now();
+  // No frozen-window re-baseline here on purpose: republishHomeGoal clears
+  // return_home_goal_sent_, so the publish block runs ~0.3 s from now and
+  // resets progress_check_time_/_dist_ itself. Resetting here as well would be
+  // dead code overwritten within three ticks — the leg is already judged from
+  // its own publish, not from the remains of the window that fired.
+  RCLCPP_WARN(get_logger(),
+      "MISSION-RETURN: escape %d/%d — driving %.2f m to %s (%.2f, %.2f) to "
+      "break the stall, then resuming the retrace.",
+      home_escapes_used_, return_escape_max_attempts_,
+      (escape_target_ - latest_pos_).head<2>().norm(),
+      on_crumb ? "breadcrumb" : "a pose behind the robot",
+      escape_target_.x(), escape_target_.y());
+}
+
+/// End an escape leg and go back to retracing. NEVER back to DIRECT: needing an
+/// escape at all is evidence the direct goal is the thing that trapped the
+/// robot. Falls back to the direct goal only when there is no usable trail.
+void ExploPlannerNode::resumeRetrace(const char* why) {
+  const bool ok = engageRetrace();
+  if (!ok) home_mode_ = HomeMode::DIRECT;
+  RCLCPP_WARN(get_logger(),
+      "MISSION-RETURN: escape leg ended [%s] after %.1f s — %s.", why,
+      (this->now() - escape_leg_start_).seconds(),
+      ok ? "resuming the retrace from the nearest crumb"
+         : "no usable trail, resuming the direct home goal");
+  if (exp_log_) {
+    // mode is the mode this event is ABOUT — always "escape" here, because
+    // resumeRetrace is only ever reached from an escape leg. It used to log
+    // homeModeName(home_mode_), which by this point is the mode just resumed
+    // INTO, i.e. the opposite convention to every detector-fire row, so a
+    // reader grouping by mode counted escape-ends as retrace events. The
+    // resumed mode is still recorded, in next_mode, where it does not collide.
+    exp_log_->logHomeWatchdog(expCtx(), "escape-end", "escape",
+                              why, (latest_pos_ - home_pos_).head<2>().norm(),
+                              homeApproachMetric(),
+                              (this->now() - escape_leg_start_).seconds(),
+                              home_escapes_used_, homeModeName(home_mode_));
+  }
+  republishHomeGoal("home-escape-end");
+}
+
+/// Brake at the current pose, then let the next tick publish the mode's goal.
+/// The nav cancel action is a no-op here (simple_nav_3d does not serve it), so
+/// the brake goal at the robot's own pose is what actually stops the platform —
+/// and it also clears the navigator's active goal, which is what makes a
+/// positional repeat acceptable again afterwards.
+void ExploPlannerNode::republishHomeGoal(const char* why) {
+  abandonNavGoal(why);
+  return_home_goal_sent_ = false;  // wall-clock-gated re-publish
+  home_pub_not_before_ = this->now() + rclcpp::Duration::from_seconds(0.3);
+}
+
+/// The single decision point for a homing watchdog fire. Graduated, and never
+/// instantly fatal on a first fire: a false positive costs a resend, or at
+/// worst a demotion to the retrace, which is slower but convergent. Only an
+/// exhausted escape budget parks the robot.
+///   approach in DIRECT, fire 1 -> resend the home goal
+///   approach in DIRECT, fire 2 -> engage the retrace
+///   approach in RETRACE       -> escape leg
+///   frozen, any mode          -> escape leg (a stuck platform will not be
+///                                unstuck by resending the goal it is already
+///                                failing to follow — seed16's resend at
+///                                +106 s changed nothing)
+///   frozen during an escape   -> abort the leg, back to the retrace
+///   escape budget exhausted   -> park, with the unchanged result vocabulary
+/// Termination: DIRECT gives at most 2 fires before it becomes RETRACE, every
+/// RETRACE fire spends one of a bounded number of escapes, and an escape leg
+/// can only end in RETRACE.
+///
+/// WHAT ACTUALLY BOUNDS A WEDGED ROBOT — read this before quoting the 600 s
+/// cap. mission_return_max_sec is the outer bound only for a robot that keeps
+/// MOVING without arriving (the seed11 orbit case: it passes every frozen test
+/// and rides the cap to 600 s). A robot that cannot move at all is parked far
+/// sooner, by this ladder rather than by the cap, because `frozen` alone walks
+/// the whole thing:
+///     15 s  frozen in DIRECT              -> escape 1   (want_escape is true
+///                                            for frozen in ANY mode)
+///     30 s  frozen during that escape     -> abort to RETRACE (no escape spent)
+///     45 s  frozen in RETRACE             -> escape 2
+///     60 s  abort;  75 s escape 3;  90 s abort
+///    105 s  frozen in RETRACE, budget spent -> park, "no-progress"
+/// i.e. (2 * return_escape_max_attempts + 1) * progress_window_sec = 105 s at
+/// the campaign's 3 escapes and 15 s window. That is the intended outcome —
+/// a robot that has not moved 0.2 m in any of seven consecutive windows is not
+/// going to, and censoring it at 105 s is both honest and cheaper than 600 s of
+/// sim. It is written down here because the recorded mission-end time of a
+/// censored cell differs by ~8 minutes depending on which bound fired, and
+/// exposure to this ladder is not arm-symmetric (see the nav-failure counts),
+/// so any analysis must treat 105 s and 600 s parks as the same event class and
+/// must not read the difference as a treatment effect.
+void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
+                                        float dist_home, float approach_delta) {
+  const char* mode = homeModeName(home_mode_);
+  const char* response = "resend";
+  const double window = std::strcmp(kind, "frozen") == 0
+                            ? progress_window_sec_
+                            : return_approach_window_sec_;
+
+  if (home_mode_ == HomeMode::ESCAPE) {
+    // Only `frozen` can reach here — approach is suppressed during an escape.
+    RCLCPP_WARN(get_logger(),
+        "MISSION-RETURN: %s during the escape leg (%.2f m from home) — "
+        "aborting the leg.", kind, dist_home);
+    resumeRetrace("escape-frozen");
+    return;  // resumeRetrace emits its own event and republishes
+  }
+
+  const bool want_escape =
+      std::strcmp(kind, "frozen") == 0 || home_mode_ == HomeMode::RETRACE;
+
+  if (want_escape) {
+    if (home_escapes_used_ >= return_escape_max_attempts_) {
+      RCLCPP_WARN(get_logger(),
+          "MISSION-RETURN: %s watchdog fired in %s mode with all %d escapes "
+          "spent (%.2f m from home, metric %.2f m) — parking here.",
+          kind, mode, return_escape_max_attempts_, dist_home, metric);
+      if (exp_log_) {
+        exp_log_->logHomeWatchdog(expCtx(), kind, mode, "park", dist_home,
+                                  metric, window, home_escapes_used_);
+      }
+      finishMissionReturn("no-progress", "home-gave-up");
+      return;
+    }
+    RCLCPP_WARN(get_logger(),
+        "MISSION-RETURN: %s watchdog fired in %s mode — %.2f m from home, "
+        "metric %.2f m over a %.0f s window.",
+        kind, mode, dist_home, metric, window);
+    startEscapeLeg();
+    response = "escape";
+  } else {
+    ++return_home_retries_;
+    RCLCPP_WARN(get_logger(),
+        "MISSION-RETURN: no approach toward home (%.2f m away, metric moved "
+        "%.2f m in %.0f s, need %.1f m) — retry %d/2: %s.",
+        dist_home, approach_delta, window,
+        return_approach_min_m_, return_home_retries_,
+        return_home_retries_ >= 2 ? "retracing the outbound trail"
+                                  : "braking and re-sending the home goal");
+    if (return_home_retries_ >= 2) {
+      if (engageRetrace()) {
+        response = "retrace";
+        RCLCPP_WARN(get_logger(),
+            "MISSION-RETURN: retracing from crumb %d/%zu (%.2f m away).",
+            home_trail_idx_, home_trail_.size(),
+            (home_trail_[home_trail_idx_] - latest_pos_).head<2>().norm());
+      } else {
+        // No trail to retrace (homing began within one crumb spacing of home).
+        // Escape instead of resending a goal that has already failed twice.
+        if (home_escapes_used_ >= return_escape_max_attempts_) {
+          if (exp_log_) {
+            exp_log_->logHomeWatchdog(expCtx(), kind, mode, "park", dist_home,
+                                      metric, window, home_escapes_used_);
+          }
+          RCLCPP_WARN(get_logger(),
+              "MISSION-RETURN: no trail to retrace and all %d escapes spent — "
+              "parking here.", return_escape_max_attempts_);
+          finishMissionReturn("no-progress", "home-gave-up");
+          return;
+        }
+        startEscapeLeg();
+        response = "escape";
+      }
+    }
+  }
+  if (exp_log_) {
+    exp_log_->logHomeWatchdog(expCtx(), kind, mode, response, dist_home, metric,
+                              window, home_escapes_used_);
+  }
+  republishHomeGoal("home-watchdog");
 }
 
 bool ExploPlannerNode::finishMissionReturn(const char* result,
@@ -5968,8 +6522,9 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
   prox_nav_elapsed_sec_ = (this->now() - state_enter_time_).seconds();
   ++prox_hold_count_;
   RCLCPP_WARN(get_logger(),
-      "Proximity hold #%d: yielding to '%s' at %.2f m (< %.2f m). Cancelling "
-      "the nav goal; resuming beyond %.2f m or when the peer parks.",
+      "Proximity hold #%d: yielding to '%s' at %.2f m (< %.2f m). Publishing a "
+      "brake goal at the current pose; resuming beyond %.2f m or when the peer "
+      "parks.",
       prox_hold_count_, d.peer_id.c_str(), d.dist_m,
       prox_guard_->config().hold_dist_m, prox_guard_->config().resume_dist_m);
 
@@ -6054,6 +6609,7 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
 // after the first pose, so latest_pos_ is live; do not call this from a state
 // entered before the first pose, where it would command the frame origin.
 void ExploPlannerNode::abandonNavGoal(const char* why) {
+  bool cancel_sent = false;
   if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
     // The reason is copied into the callback, not captured as a pointer: the
     // response lands ticks later and one caller forwards failGoal's `reason`
@@ -6069,11 +6625,19 @@ void ExploPlannerNode::abandonNavGoal(const char* why) {
                 tag.c_str(), resp ? static_cast<int>(resp->return_code) : -1);
           }
         });
+    cancel_sent = true;
+    RCLCPP_INFO(get_logger(), "Nav cancel request sent to '%s'.",
+                proximity_nav_cancel_action_.c_str());
   } else {
-    RCLCPP_WARN(get_logger(),
+    // WARN_ONCE, not WARN. On the sim stack this branch is taken on every
+    // single abandon — 281 identical lines across the mr1 campaign — and a
+    // warning that fires every time is a warning nobody reads. Once per run is
+    // enough to establish the fact; the per-abandon truth now lives in the
+    // INFO line below, which no longer claims a cancel happened.
+    RCLCPP_WARN_ONCE(get_logger(),
         "Nav abandon [%s]: cancel client for '%s' unavailable (proximity stop "
         "disabled, or the action server is not up) — the brake goal is the "
-        "only stop command.",
+        "only stop command. Further occurrences suppressed.",
         why, proximity_nav_cancel_action_.c_str());
   }
   // Brake in place. current_goal_ is deliberately left alone: callers still
@@ -6084,8 +6648,15 @@ void ExploPlannerNode::abandonNavGoal(const char* why) {
   brake.yaw = latest_yaw_;
   publishGoal(brake);
 
+  // Say what was actually done. The old wording — "cancelled + braking in
+  // place" — was printed unconditionally, including on the 281 campaign
+  // abandons where no cancel was sent at all because simple_nav_3d serves no
+  // action server. Reading those logs, every abandon looked like a commanded
+  // stop; the robot was in fact still driving to the old goal until the brake
+  // pose overrode it. That false line cost a diagnosis once already.
   RCLCPP_INFO(get_logger(),
-      "Abandoning nav goal [%s]: cancelled + braking in place.", why);
+      "Abandoning nav goal [%s]: brake goal published at current pose%s.", why,
+      cancel_sent ? " (cancel also requested)" : "");
 }
 
 void ExploPlannerNode::doProximityHold() {
@@ -6149,6 +6720,19 @@ void ExploPlannerNode::doProximityHold() {
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
   progress_check_time_ = now;
   progress_check_dist_ = cumulative_distance_;
+  // The homing approach watchdog gets the same treatment as the frozen one
+  // directly above, and for the same reason: held time is not lack of
+  // progress. doReturnHome does not run while state_ is PROXIMITY_HOLD, so
+  // without this the 40 s approach window free-runs on the clock while the
+  // robot is deliberately braked, and the first tick after release compares a
+  // window of (real drive + hold) against a threshold calibrated on driving
+  // alone. That fires on release by construction whenever a hold of 34 s or
+  // more lands early in a window — and with proximity_hold_dist_m at 5.0 m
+  // against homes 3 m apart, both robots homing at once is exactly when it
+  // happens. Charging a commanded yield-to-teammate as a homing stall would
+  // put a systematic penalty on the coordination behaviour under study.
+  approach_check_time_   = now;
+  approach_check_metric_ = homeApproachMetric();
   // A hold taken on the RETURN_HOME entry tick interrupted nothing: the home
   // goal is deferred to the first doReturnHome tick (see startReturnHome) and
   // current_goal_ still holds the pre-latch drive — republishing THAT would
@@ -7816,8 +8400,22 @@ void ExploPlannerNode::updatePoseFromTF() {
   // robot while it retraces. First crumb is home itself. 2 m spacing keeps a
   // 3000 s run under ~700 points. Recorded whenever the flag is on: the leg
   // that will need it cannot know that in advance.
-  if (mission_return_enabled_ && have_home_ &&
-      state_ != State::RETURN_HOME && state_ != State::DONE &&
+  //
+  // PROXIMITY_HOLD has to count as homing when the hold interrupted a homing
+  // leg. It is a distinct state, so testing state_ alone let the trail keep
+  // growing through a hold taken mid-return: a crumb would land at the HIGHEST
+  // index at a mid-homing position, engageRetrace would pick it as nearest,
+  // and the advance loop would then walk outward to trail[N-1] — tens of
+  // metres AWAY from home — while homeApproachMetric folded the whole homing
+  // leg back into the metric the watchdog scores. A hold taken while still
+  // exploring is the opposite case and must keep recording, so this asks what
+  // the hold interrupted rather than blanket-excluding the state.
+  const bool homing_now =
+      state_ == State::RETURN_HOME || state_ == State::DONE ||
+      (state_ == State::PROXIMITY_HOLD &&
+       (prox_resume_state_ == State::RETURN_HOME ||
+        prox_resume_state_ == State::DONE));
+  if (mission_return_enabled_ && have_home_ && !homing_now &&
       (home_trail_.empty() ||
        (latest_pos_ - home_trail_.back()).head<2>().norm() >= 2.0f)) {
     home_trail_.push_back(latest_pos_);
@@ -7837,6 +8435,10 @@ void ExploPlannerNode::trackDistance() {
     // no-progress watchdog. prev_pos_ is still advanced so the next tick
     // measures from the corrected pose. 0 disables the guard.
     if (max_pose_jump_m_ > 0.0f && step > max_pose_jump_m_) {
+      // Latched for doReturnHome: the approach watchdog measures a DELTA in
+      // distance-to-home, and a teleport moves that delta by metres in one
+      // tick in either direction. The homing tick clears the flag.
+      pose_jump_seen_ = true;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
           "Pose jump of %.2f m in one tick exceeds max_pose_jump_m=%.2f — "
           "treating as a localization discontinuity, not travel.",

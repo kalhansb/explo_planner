@@ -495,6 +495,57 @@ void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
   end();
 }
 
+void ExperimentLog::logNavGoalFailed(const ExperimentContext& ctx, double x,
+                                     double y, const char* reason,
+                                     double elapsed_sec, int k, bool retired) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("nav_goal_failed", ctx);
+  num("x", x);
+  num("y", y);
+  text("reason", reason);
+  num("elapsed_sec", elapsed_sec);
+  integer("k", k);
+  boolean("retired", retired);
+  end();
+}
+
+void ExperimentLog::logGoalAmnesty(const ExperimentContext& ctx, double x,
+                                   double y, double last_fail_age_sec,
+                                   bool retired) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("goal_amnesty", ctx);
+  num("x", x);
+  num("y", y);
+  num("last_fail_age_sec", last_fail_age_sec);
+  // Whether the amnesty landed on a RETIRED site. These are two different
+  // events for analysis: retired=false is the valve doing its job on a merely
+  // hot goal, retired=true means nothing but confirmed traps were left, which
+  // is a starvation signature and not a routine retry.
+  boolean("retired", retired);
+  end();
+}
+
+void ExperimentLog::logHomeWatchdog(const ExperimentContext& ctx,
+                                    const char* kind, const char* mode,
+                                    const char* response, double dist_home_m,
+                                    double metric_m, double window_sec,
+                                    int escapes_used, const char* next_mode) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("home_watchdog", ctx);
+  text("kind", kind);
+  text("mode", mode);
+  text("response", response);
+  num("dist_home_m", dist_home_m);
+  // Meaning depends on `kind` — see the contract in the header. For a detector
+  // fire this is the remaining-distance metric over `window_sec`; for
+  // escape-end it is that same metric sampled at the moment the leg ended.
+  num("metric_m", metric_m);
+  num("window_sec", window_sec);
+  integer("escapes_used", escapes_used);
+  if (next_mode) text("next_mode", next_mode);
+  end();
+}
+
 void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
                               const RunEndEvent& e) {
   if (!open_ || !started_ || run_end_written_) return;

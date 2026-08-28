@@ -185,6 +185,14 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
   target_link_libraries(test_failed_goal_blacklist explo_planner_lib)
+  # Point the test at the SOURCE config, not the installed copy: the claim it
+  # guards is about the value that gets committed and shipped, and the install
+  # tree can be stale or absent when the tests run.
+  target_compile_definitions(test_failed_goal_blacklist PRIVATE
+    SHARED_PARAMS_YAML="${CMAKE_CURRENT_SOURCE_DIR}/config/shared_params.yaml")
+
+  ament_add_gtest(test_home_trail test/test_home_trail.cpp)
+  target_link_libraries(test_home_trail explo_planner_lib)
 
   ament_add_gtest(test_planner_util test/test_planner_util.cpp)
   target_link_libraries(test_planner_util explo_planner_lib)

@@ -245,7 +245,31 @@
     # area that genuinely re-frontiers late in a run can be revisited.
     visited_goal_radius_m: 0.0
     visited_goal_ttl_sec: 120.0
-    failed_goal_ttl_sec: 60.0
+    # 240 = nav_max_timeout_sec (180) + 60. A TTL BELOW one full nav budget is
+    # self-defeating: the entry expires while the robot is still spending a
+    # single 180 s attempt somewhere else, so the trap it was meant to close is
+    # open again the moment that attempt ends. At 60 s that is exactly what
+    # happened — mr1_hybrid_seed18 re-picked the same two unreachable sites
+    # eight times for 1441 s and was censored 0.021 above the coverage
+    # threshold. The planner WARNs at startup if this is set below 210.
+    failed_goal_ttl_sec: 240.0
+    # Permanent retirement after this many failures at one site (0 = off). TTL
+    # expiry alone cannot close a PERMANENT terrain trap; retirement can, and
+    # arriving at the site still clears it, so a genuinely reachable place is
+    # never locked out by bad luck.
+    failed_goal_retire_after: 3
+
+    # Homing approach watchdog (see doc §32.10). The original homing watchdog
+    # measured gross metres travelled, so a robot orbiting a local minimum at
+    # 0.05 m/s passed it in every window while netting zero approach. This one
+    # measures remaining distance home: 1.0 m per 40 s = 0.025 m/s, ~9x below
+    # the slowest homing that actually arrived. Response is graduated —
+    # resend, then retrace, then a short escape leg to once-driven ground —
+    # so a false fire costs time, never a park.
+    return_approach_window_sec: 40.0
+    return_approach_min_m: 1.0
+    return_escape_max_attempts: 3
+    return_escape_leg_sec: 30.0
 
     # Coverage-based termination. Once the unknown fraction in the ROI drops
     # below done_unknown_fraction for done_min_consecutive_steps PLAN cycles

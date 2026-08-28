@@ -397,6 +397,52 @@ class ExperimentLog {
                               const ExplorationCompleteEvent& e);
   void logMissionComplete(const ExperimentContext& ctx,
                           const MissionCompleteEvent& e);
+  /// A navigation attempt gave up. `k` is the site's cumulative failure count
+  /// after this one (sites cluster at failed_goal_radius_m), `retired` says the
+  /// site is now suppressed for the rest of the run rather than on a TTL.
+  /// Emitted so "how much time went into unreachable ground, and where" is a
+  /// query over the event log rather than a regex over ROS log lines.
+  void logNavGoalFailed(const ExperimentContext& ctx, double x, double y,
+                        const char* reason, double elapsed_sec, int k,
+                        bool retired);
+  /// The failed-goal blacklist suppressed EVERY candidate and the planner
+  /// re-attempted one anyway — non-retired first, least-recently-failed within
+  /// that. Expected to be absent in a healthy run; each occurrence is a
+  /// measurement of how close suppression came to starving the planner, and
+  /// `retired` says whether only confirmed traps were left to pick from.
+  void logGoalAmnesty(const ExperimentContext& ctx, double x, double y,
+                      double last_fail_age_sec, bool retired);
+  /// A mission-return homing event. ONE event type covers two different things,
+  /// so the vocabulary below is a contract the analysis depends on — do not
+  /// widen it without updating the readers.
+  ///
+  ///   kind = "approach" | "frozen"   a detector fired.
+  ///     mode        the homing mode it fired IN (direct|retrace|escape),
+  ///                 captured before any transition this fire causes.
+  ///     response    what was done: resend | retrace | escape | park.
+  ///                 (An "approach" fire never reaches mode=escape: that
+  ///                 detector is suppressed during an escape leg.)
+  ///     window_sec  the detector's window — progress_window_sec for frozen,
+  ///                 return_approach_window_sec for approach.
+  ///     next_mode   absent.
+  ///
+  ///   kind = "escape-end"            an escape leg finished. NOT a detector
+  ///                                  fire; do not pool these with the rows
+  ///                                  above when counting watchdog fires.
+  ///     mode        always "escape" — the mode the event is about, same
+  ///                 convention as a detector fire.
+  ///     response    why the leg ended: escape-arrived | escape-leg-cap |
+  ///                 escape-frozen.
+  ///     window_sec  the leg's DURATION in seconds, not a detector window.
+  ///     next_mode   the mode homing resumed in: retrace, or direct when there
+  ///                 was no usable trail.
+  ///
+  /// escapes_used is the running count against return_escape_max_attempts and
+  /// is post-increment on the row that starts a leg (response="escape").
+  void logHomeWatchdog(const ExperimentContext& ctx, const char* kind,
+                       const char* mode, const char* response,
+                       double dist_home_m, double metric_m, double window_sec,
+                       int escapes_used, const char* next_mode = nullptr);
   /// Emits `run_end` (once — later calls are ignored) with the logger's own
   /// health and accounting appended. Safe to call from a destructor: it never
   /// throws and never touches ROS beyond the already-constructed logger.
