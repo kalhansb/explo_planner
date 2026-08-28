@@ -4668,6 +4668,31 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   coverage_latched_       = true;
   coverage_latch_t_sim_   = this->now().seconds();
   coverage_latch_unknown_ = unk;
+  // Publish the DECIDING sample into the cache that the event log reads.
+  //
+  // This is load-bearing on the primary endpoint's own record. There are two
+  // hooks into this function and they arrive with differently-sourced values:
+  // the metrics tick passes last_unknown_fraction_ itself (already refreshed on
+  // that tick, so cache and decision agree by construction), but the doPlan hook
+  // measures fresh and does NOT touch the cache. recordExplorationComplete then
+  // stamps the event from the cache — so a latch that fired from doPlan wrote
+  // the PREVIOUS metrics sample into the exploration_complete event, up to one
+  // metrics period stale and, since the fraction is falling, systematically
+  // HIGHER than the number that was tested. g6pilot_off_seed104/atlas latched on
+  // 0.638 and recorded 0.660, i.e. an endpoint event that reads as if it fired
+  // above its own 0.640 criterion. The decision was right in every case; only
+  // the record was wrong, which is worse than harmless because the record is
+  // what any analysis reads.
+  //
+  // Assigning here rather than at either call site is deliberate: it makes the
+  // property hold for any future hook without that hook having to know about it.
+  // Safe for the other consumer (logRunEnd, which documents the value as "at
+  // most one metrics period old") — this only ever makes it fresher, and
+  // fillCommonMetrics overwrites it on the next row regardless. `source` is a
+  // string literal from coverageUnknownFraction, the same lifetime class the
+  // cache already holds.
+  last_unknown_fraction_ = unk;
+  last_coverage_source_  = source;
   RCLCPP_INFO(get_logger(),
       "Exploration complete [latch]: ROI unknown fraction %.3f <= %.3f "
       "(source=%s) in state %s at t_sim=%.1f — %d steps, %.2f m traveled. "
