@@ -497,15 +497,30 @@ void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
 
 void ExperimentLog::logNavGoalFailed(const ExperimentContext& ctx, double x,
                                      double y, const char* reason,
-                                     double elapsed_sec, int k, bool retired) {
+                                     double elapsed_sec, int k, bool retired,
+                                     double budget_sec, bool pose_stale) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("nav_goal_failed", ctx);
   num("x", x);
   num("y", y);
   text("reason", reason);
   num("elapsed_sec", elapsed_sec);
+  num("budget_sec", budget_sec);
   integer("k", k);
   boolean("retired", retired);
+  // True means the no-progress / budget verdict was reached while TF was
+  // stale. Such a row is evidence about the pose feed, not about the terrain,
+  // and must not be pooled with ordinary nav failures.
+  boolean("pose_stale", pose_stale);
+  end();
+}
+
+void ExperimentLog::logPoseHealth(const ExperimentContext& ctx, bool lost,
+                                  double age_sec) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("pose_health", ctx);
+  boolean("lost", lost);
+  num("age_sec", age_sec);
   end();
 }
 

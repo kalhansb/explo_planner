@@ -1639,6 +1639,28 @@ POLL_S="${POLL_S:-2}"
 CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
 LAST_SA=-1; LAST_SB=-1; STALL=0
 LAST_CLOCK_WALL=0
+# Wall-clock deadman on the sim clock itself.
+#
+# Every other end condition in this loop -- the duration cap, the step-stall
+# hang gate, the all-DONE grace -- is keyed on sim time, and the only wall-clock
+# test is process liveness. A deadlocked Gazebo passes all of them: the
+# processes stay alive, sim_clock keeps returning the same non-empty number, so
+# the duration cap is never reached, and the 60-sim-second heartbeat that drives
+# the hang gate never ticks either. The loop then polls silently forever. In a
+# sequential campaign that does not cost one cell, it costs the night: the
+# driver is still inside cell 7 at breakfast and cells 8..60 never started.
+#
+# Deliberately generous. Sim time can legitimately stall for tens of seconds
+# during a heavy lidar frame or a costmap rebuild, and killing a healthy slow
+# cell is a worse failure than the one being prevented.
+CLOCK_DEADMAN_S="${CLOCK_DEADMAN_S:-420}"
+LAST_T_SEEN=-1
+LAST_T_WALL=$SECONDS
+# A /clock read that returns nothing `continue`s, so it must not be able to spin
+# unbounded either: an rmw failure would otherwise look exactly like the frozen
+# clock above, minus the log line.
+CLOCK_FAIL=0
+CLOCK_FAIL_MAX="${CLOCK_FAIL_MAX:-60}"
 while true; do
   sleep "$POLL_S"
   for entry in "${PIDS[@]}"; do
@@ -1671,7 +1693,21 @@ while true; do
     continue
   fi
   T=$(sim_clock)
-  [ -n "$T" ] || { log "WARN /clock read failed, retrying"; continue; }
+  if [ -z "$T" ]; then
+    CLOCK_FAIL=$((CLOCK_FAIL + 1))
+    log "WARN /clock read failed ($CLOCK_FAIL/$CLOCK_FAIL_MAX), retrying"
+    [ "$CLOCK_FAIL" -lt "$CLOCK_FAIL_MAX" ] \
+      || die "/clock unreadable for $CLOCK_FAIL consecutive reads — giving up on this cell"
+    continue
+  fi
+  CLOCK_FAIL=0
+  # Deadman: sim time itself must advance. See CLOCK_DEADMAN_S above.
+  if [ "$T" != "$LAST_T_SEEN" ]; then
+    LAST_T_SEEN=$T
+    LAST_T_WALL=$NOW_WALL
+  elif [ $((NOW_WALL - LAST_T_WALL)) -ge "$CLOCK_DEADMAN_S" ]; then
+    die "sim clock frozen at t_sim=$T for $((NOW_WALL - LAST_T_WALL))s wall — declaring this cell hung"
+  fi
   if [ $((T - LAST_HB)) -ge 60 ]; then
     LAST_HB=$T
     SA=$(grep -c "selected goal" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)

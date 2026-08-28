@@ -1079,6 +1079,13 @@ private:
   bool     held_vantage_valid_     = false;
   int   step_  = 0;
   bool  have_pose_ = false;
+  // Edge state for the pose_health event: true between a reported loss and its
+  // recovery. Separate from have_pose_ so the pre-first-transform ticks, which
+  // also have have_pose_ == false, do not read as a recovery.
+  bool  pose_loss_reported_ = false;
+  // Unbroken run of doPlan ticks that rejected every candidate. Carried in the
+  // throttled starvation WARN, which without it cannot show duration.
+  int   consecutive_all_rejected_ = 0;
   bool  have_map_  = false;
   bool  have_plan_map_ = false;
   Eigen::Vector3f latest_pos_ = Eigen::Vector3f::Zero();
@@ -4158,13 +4165,32 @@ void ExploPlannerNode::doPlan() {
     }
   }
   if (!found) {
-    RCLCPP_WARN(get_logger(),
+    // Throttled, and carrying its own consecutive count because the throttle
+    // alone would destroy the quantity that matters. doPlan runs at 10 Hz and
+    // this branch re-enters PLAN, so sustained candidate starvation — the exact
+    // silent hang the harness gate exists for — emitted ~600 identical lines a
+    // minute and buried every other line in the planner log. Throttling without
+    // the counter would swap that for the opposite error: an hour of starvation
+    // and a run that never picked another goal would look like a dozen isolated
+    // retries. The count is what separates "one unlucky tick" from "this robot
+    // has not been able to plan since t=900".
+    ++consecutive_all_rejected_;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "Step %d: all %zu candidates rejected (close=%d map=%d unreach=%d "
-        "blk=%d minpos=%d). Retrying next tick.",
+        "blk=%d minpos=%d). Retrying next tick; %d consecutive rejected ticks.",
         step_, candidates.size(), rejected_too_close,
         rejected_map, rejected_unreachable,
-        rejected_blacklist, rejected_minpos);
+        rejected_blacklist, rejected_minpos, consecutive_all_rejected_);
     return;  // stay in PLAN, retry next tick
+  }
+  // Reset only on a tick that actually selected a goal, so the counter measures
+  // an unbroken starvation run rather than resetting on any code path that
+  // happens to reach here.
+  if (consecutive_all_rejected_ > 0) {
+    RCLCPP_INFO(get_logger(),
+        "Step %d: planning recovered after %d consecutive all-rejected ticks.",
+        step_, consecutive_all_rejected_);
+    consecutive_all_rejected_ = 0;
   }
 
   // Drain utility / coord diagnostics into pending_* fields for the
@@ -4533,16 +4559,25 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
   } else {
     std::snprintf(status, sizeof(status), "ttl=%.0fs", failed_goal_ttl_sec_);
   }
+  // The budget this attempt was measured against is logged with the failure,
+  // not left at DEBUG where the campaign never captures it. Without it the
+  // pair (elapsed, budget) can only be reconstructed by re-deriving the budget
+  // from goal distance and the speed estimate, and a "budget" failure at 31 s
+  // is a different animal from one at 179 s: the first says the estimator was
+  // wrong about a short hop, the second that the robot genuinely could not get
+  // there. `pose_stale` marks an attempt whose progress metric was measured
+  // against a pose that stopped updating — see the pose-health event.
   RCLCPP_WARN(get_logger(),
-      "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f). "
-      "Blacklisted [k=%d, %s]; %zu active failed-goal sites.",
-      step_, reason, elapsed,
+      "Step %d: navigation failed [%s] after %.1fs of %.1fs budget at goal "
+      "(%.2f, %.2f)%s. Blacklisted [k=%d, %s]; %zu active failed-goal sites.",
+      step_, reason, elapsed, nav_budget_sec_,
       current_goal_.position.x(), current_goal_.position.y(),
+      have_pose_ ? "" : " [POSE STALE]",
       k, status, failed_goals_.size());
   if (exp_log_) {
     exp_log_->logNavGoalFailed(expCtx(), current_goal_.position.x(),
                                current_goal_.position.y(), reason, elapsed, k,
-                               retired);
+                               retired, nav_budget_sec_, !have_pose_);
   }
   have_active_intent_ = false;  // release the claim on failure
   // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
@@ -8372,9 +8407,25 @@ void ExploPlannerNode::updatePoseFromTF() {
           "TF %s -> %s is %.1f s old (pose_max_age_sec=%.1f) — treating the "
           "pose as lost until the transform updates.",
           map_frame_.c_str(), base_frame_.c_str(), age, pose_max_age_sec_);
+      // Edge-triggered into the event log. The WARN above is throttled and
+      // lives only in the ROS log; analysis reads the JSONL, where a dead pose
+      // feed was previously indistinguishable from a robot that had stopped
+      // moving — the same no-progress failures, the same watchdog ladder, the
+      // same park, with nothing recording that the measurements were blind.
+      if (have_pose_ && exp_log_) {
+        exp_log_->logPoseHealth(expCtx(), /*lost=*/true, age);
+        pose_loss_reported_ = true;
+      }
       have_pose_ = false;
       return;
     }
+  }
+  // Recovery is gated on a REPORTED loss, not on !have_pose_, which is also
+  // false for every tick before the first transform ever arrives — that would
+  // stamp a "pose recovered" event on the healthy start of every single run.
+  if (pose_loss_reported_ && exp_log_) {
+    exp_log_->logPoseHealth(expCtx(), /*lost=*/false, 0.0);
+    pose_loss_reported_ = false;
   }
   latest_pos_ = Eigen::Vector3f(
       static_cast<float>(tf.transform.translation.x),

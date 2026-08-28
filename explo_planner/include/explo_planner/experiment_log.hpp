@@ -402,9 +402,22 @@ class ExperimentLog {
   /// site is now suppressed for the rest of the run rather than on a TTL.
   /// Emitted so "how much time went into unreachable ground, and where" is a
   /// query over the event log rather than a regex over ROS log lines.
+  /// `budget_sec` is the timeout this attempt was measured against, carried
+  /// because `elapsed_sec` alone cannot distinguish an under-estimated budget
+  /// from ground the robot truly could not cross. `pose_stale` is true when TF
+  /// had gone stale at the moment of failure, which makes the no-progress
+  /// verdict a statement about the pose feed rather than about the robot.
   void logNavGoalFailed(const ExperimentContext& ctx, double x, double y,
                         const char* reason, double elapsed_sec, int k,
-                        bool retired);
+                        bool retired, double budget_sec, bool pose_stale);
+  /// The TF pose went stale (`lost=true`) or came back (`lost=false`).
+  /// Exists because every downstream symptom of a dead pose feed — frozen
+  /// progress metric, no-progress goal failures, the homing watchdog ladder
+  /// walking to a park — is recorded in this log as a *physical* stall, and
+  /// nothing in the JSONL distinguished "the robot stopped moving" from "the
+  /// robot stopped being observed". `age_sec` is the transform's age at the
+  /// moment of the transition (0 on recovery).
+  void logPoseHealth(const ExperimentContext& ctx, bool lost, double age_sec);
   /// The failed-goal blacklist suppressed EVERY candidate and the planner
   /// re-attempted one anyway — non-retired first, least-recently-failed within
   /// that. Expected to be absent in a healthy run; each occurrence is a
