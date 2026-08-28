@@ -108,8 +108,18 @@ enum class State {
   // Coordinated proximity stop (multi-robot). A DRIVING robot that has lost
   // right-of-way to a nearby moving teammate cancels its nav goal and parks
   // here until the peer clears off or parks, then resumes the same goal.
-  // Entered only from NAVIGATE / RETURN_NAV / PURSUE; see checkProximityHold().
-  PROXIMITY_HOLD
+  // Entered only from NAVIGATE / RETURN_NAV / PURSUE / RETURN_HOME; see
+  // checkProximityHold().
+  PROXIMITY_HOLD,
+  // Mission return (arm-invariant platform behaviour, mission_return_enabled).
+  // At ANY terminal exploration ending — coverage latch, step budget, or a
+  // barrier give-up — the robot drives back to its recorded start pose, so
+  // every run ends with the team regrouped at spawn regardless of arm. The
+  // exploration endpoint (exploration_complete) is stamped BEFORE entry;
+  // run_end after this leg resolves is the mission endpoint. Resolves into
+  // DONE on arrival, give-up, or the mission_return_max_sec cap — it can not
+  // loop back into exploration or a reconnect manoeuvre.
+  RETURN_HOME
 };
 
 // Stable, machine-readable state names. These are wire/CSV values consumed by
@@ -132,6 +142,7 @@ inline const char* stateName(State s) {
     case State::RETURN_SYNC:    return "RETURN_SYNC";
     case State::PURSUE:         return "PURSUE";
     case State::PROXIMITY_HOLD: return "PROXIMITY_HOLD";
+    case State::RETURN_HOME:    return "RETURN_HOME";
   }
   return "UNKNOWN";
 }
@@ -278,6 +289,21 @@ private:
                      const char* reason);
   void doReturnNav();
   void doReturnSync();
+  // Mission return (RETURN_HOME). startReturnHome enters the state WITHOUT
+  // publishing a goal — abandonNavGoal's cancel-all is fire-and-forget, so a
+  // goal sent in the same tick can be swallowed by the still-in-flight cancel.
+  // doReturnHome publishes once home_pub_not_before_ passes (a wall-clock
+  // gate: tick-count deferral proved to be no deferral under backlogged
+  // timers — see the member comment) and arms the nav budget; later ticks
+  // run arrival / cap / budget / waypoint-advance / no-progress checks and
+  // resolve into DONE via finishMissionReturn (mission_complete event, then
+  // finishNow). The second no-progress retry switches to retracing the
+  // robot's own outbound breadcrumb trail (home_trail_). startReturnHome
+  // returns true so terminal-ending call sites can
+  // `return startReturnHome(...)` like finishNow.
+  bool startReturnHome(const char* reason);
+  void doReturnHome();
+  bool finishMissionReturn(const char* result, const char* end_reason);
   // Mesh-reconnection pursuit (see the PURSUE state). startPursuit arms the
   // chase along the missing peer's last-contact trail (returns false when the
   // record is too stale to be worth chasing — pursuitBudgetSec() == 0);
@@ -1115,6 +1141,55 @@ private:
   double done_seek_dist_at_start_ = 0.0;
   double done_seek_last_dist_     = 0.0;
   double done_seek_last_move_sim_ = -1.0;
+
+  // --- Mission return (mission_return_enabled) ---
+  // Arm-invariant platform behaviour: at ANY terminal exploration ending the
+  // robot drives back to its recorded start pose, so both arms end in the same
+  // connected configuration (spawns are 3 m apart) and "mission end" is a
+  // well-defined endpoint in the off arm too. When enabled it pre-empts BOTH
+  // legacy endings — the park-in-place AND the done_seek coast (the branch in
+  // maybeLatchCoverageDone runs before the coast gate, so done_seek_coasting_
+  // is unreachable under mission return).
+  //
+  // have_home_ is a separate ONE-SHOT latch, deliberately not have_pose_:
+  // have_pose_ is a revertible TF-health flag that can drop and come back,
+  // and re-recording "home" mid-run would send the robot to wherever TF last
+  // hiccuped. home is captured exactly once, at the first successful pose.
+  //
+  // mission_home_tol_m is its own knob because the two homes are only 3 m
+  // apart — reconnect_arrive_tol_m (4.0) would accept the PARTNER's home.
+  bool   mission_return_enabled_  = false;
+  double mission_home_tol_m_      = 1.0;
+  double mission_return_max_sec_  = 600.0;
+  bool   have_home_               = false;
+  Eigen::Vector3f home_pos_       = Eigen::Vector3f::Zero();
+  float  home_yaw_                = 0.f;
+  // Live homing-leg state. return_home_goal_sent_ defers the goal publish
+  // past the cancel-all; the rest feed the mission_complete event and the
+  // run_end summary.
+  bool   return_home_goal_sent_   = false;
+  int    return_home_retries_     = 0;
+  double return_home_dist_at_start_ = 0.0;
+  std::string return_home_reason_;
+  std::string mission_home_result_;      // empty until resolved
+  double mission_home_sim_sec_    = -1.0;
+  // Publish gate for the deferral above. "Next tick" alone is NOT a gap: a
+  // backlogged executor fires queued tick callbacks back-to-back, and
+  // mr0pilot's logs show the "deferred" publish landing 0.2-0.4 ms after
+  // abandonNavGoal — with the async cancel-all still in flight and able to
+  // swallow the fresh goal. A wall-clock gate cannot be defeated by timer
+  // catch-up. ROS time: compared against this->now() (sim time in runs).
+  rclcpp::Time home_pub_not_before_{0, 0, RCL_ROS_TIME};
+  // Breadcrumb trail for the retrace fallback. The nav global planner never
+  // plans (66/66 robot-logs, §28 of the experiment doc), so a long direct
+  // home goal is greedy local navigation and can trap in a local minimum
+  // (mr0pilot_hybrid_seed4 bestla: parked 31 m out). The trail is the
+  // robot's own outbound positions at >=2 m spacing — ground it has already
+  // traversed once — recorded from home capture until homing starts. The
+  // second no-progress retry follows it back crumb by crumb.
+  std::vector<Eigen::Vector3f> home_trail_;
+  bool return_home_retrace_ = false;
+  int  home_trail_idx_      = -1;
 
   // Rendezvous anchor: the robot pose the last time it heard a teammate. That
   // pose sits inside the comms bubble, so it is the cheapest point to return to
@@ -1988,6 +2063,27 @@ ExploPlannerNode::ExploPlannerNode()
         "goal will drive this robot until it stops making headway.",
         done_seek_max_sec_);
   }
+  // Mission return (see the member comments). OFF by default for the same
+  // reason as the coast: this binary must reproduce banked behaviour exactly
+  // unless the campaign explicitly opts in.
+  mission_return_enabled_ = dp("mission_return_enabled", false);
+  mission_home_tol_m_     = dp("mission_home_tol_m", 1.0);
+  mission_return_max_sec_ = dp("mission_return_max_sec", 600.0);
+  // Same unconditional both-directions announce contract as DONE-SEEK above:
+  // every run states which side it is on, so a treated cell with no line and a
+  // control cell with one are both detectable from the console log alone.
+  RCLCPP_INFO(get_logger(),
+      "MISSION-RETURN %s (mission_return_enabled=%s, mission_home_tol_m=%.1f, "
+      "mission_return_max_sec=%.0f).",
+      mission_return_enabled_ ? "ENABLED" : "DISABLED",
+      mission_return_enabled_ ? "true" : "false",
+      mission_home_tol_m_, mission_return_max_sec_);
+  if (mission_return_enabled_ && done_seek_enabled_) {
+    RCLCPP_WARN(get_logger(),
+        "mission_return_enabled=true makes the done_seek coast unreachable: "
+        "the mission-return branch pre-empts the coast gate at every terminal "
+        "ending. done_seek_enabled=true is harmless but inert.");
+  }
   // Link-state gate (see the member comments). "" = off, bit-identical legacy
   // record-age clock, no subscription created at all.
   comms_link_states_topic_ =
@@ -2319,6 +2415,9 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamBool("done_seek_enabled", done_seek_enabled_);
     exp_log_->addParamNum("done_seek_max_sec", done_seek_max_sec_);
     exp_log_->addParamStr("done_action", done_action_);
+    exp_log_->addParamBool("mission_return_enabled", mission_return_enabled_);
+    exp_log_->addParamNum("mission_home_tol_m", mission_home_tol_m_);
+    exp_log_->addParamNum("mission_return_max_sec", mission_return_max_sec_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
     exp_log_->addParamBool("terrain_relative_z", terrain_relative_z_);
@@ -3048,8 +3147,12 @@ void ExploPlannerNode::tick() {
   // driving states would otherwise do this tick. The stationary states are
   // deliberately exempt — a dwelling/integrating/planning robot is already
   // still, and the moving peer's costmap treats it as an ordinary obstacle.
+  // RETURN_HOME is in the driving set for the strongest version of the reason:
+  // under mission return BOTH robots converge on start poses ~3 m apart, so the
+  // final approach is the one leg of the run where a crossing is guaranteed
+  // rather than incidental.
   if ((state_ == State::NAVIGATE || state_ == State::RETURN_NAV ||
-       state_ == State::PURSUE) &&
+       state_ == State::PURSUE || state_ == State::RETURN_HOME) &&
       checkProximityHold()) {
     return;
   }
@@ -3132,6 +3235,10 @@ void ExploPlannerNode::tick() {
 
     case State::PROXIMITY_HOLD:
       doProximityHold();
+      break;
+
+    case State::RETURN_HOME:
+      doReturnHome();
       break;
 
     case State::DONE:
@@ -3248,11 +3355,16 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
       // Classified mechanically from the two facts that decide it, with the
       // raw fields alongside so an analysis can re-classify: the team being
       // complete AT THIS INSTANT is what "reconnected" means (every release
-      // path in the manoeuvre states tests exactly that), and landing in DONE
-      // instead of PLAN is what "gave up" means.
+      // path in the manoeuvre states tests exactly that), and landing in a
+      // state where exploration is over — DONE, or RETURN_HOME under mission
+      // return — instead of PLAN is what "gave up" means. RETURN_HOME must be
+      // in that set or every latch-ended manoeuvre in a mission-return run
+      // re-buckets from gave_up to abandoned and the outcome mix stops being
+      // comparable across campaigns.
       e.outcome = teamComplete(live, rendezvous_expected_peers_)
                       ? "reconnected"
-                      : (s == State::DONE ? "gave_up" : "abandoned");
+                      : ((s == State::DONE || s == State::RETURN_HOME)
+                             ? "gave_up" : "abandoned");
       e.to_state       = stateName(s);
       e.reason         = reason;
       e.duration_sec   = manoeuvre_sec;
@@ -4303,6 +4415,22 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // This one can fire mid-drive, and nav2 does not know the run is over — an
   // uncancelled goal keeps driving a "finished" robot around.
   recordExplorationComplete("coverage-latched");
+  // Mission return pre-empts BOTH legacy endings below (park, and the
+  // done_seek coast): the homing traverse is itself the go-reconnect
+  // behaviour the coast approximated, so the coast is superseded rather than
+  // stacked in front of it — running it first would charge a treatment-only
+  // detour to the mission clock. The exploration endpoint is untouched: it
+  // was stamped one line up, before anything about the ending is decided.
+  if (mission_return_enabled_ && have_home_) {
+    abandonNavGoal("coverage-latched");
+    return startReturnHome("coverage-latched");
+  }
+  if (mission_return_enabled_) {
+    RCLCPP_ERROR(get_logger(),
+        "mission_return_enabled with no recorded home pose — the first TF "
+        "pose never arrived, which cannot happen after exploration started. "
+        "Falling back to the park-in-place ending.");
+  }
   // The abandon above this line was correct for a robot that latches while
   // exploring: nav2 does not know the run is over and an uncancelled goal would
   // drive a finished robot around at random. It is exactly WRONG for a robot
@@ -4340,6 +4468,19 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
   recordExplorationComplete(reason);
+  // Mission return replaces the TERMINAL manoeuvre outright (mid-run
+  // manoeuvres, dispatched from doPlan, are untouched — they ARE the
+  // treatment). Both robots' start poses are within comms range of each
+  // other, so driving home is a reconnection manoeuvre with a guaranteed
+  // fixed point; running a chase or barrier first would just add a detour in
+  // front of the same regroup. This also covers the step-budget ending: a
+  // robot that never latched still goes home, so no arm can strand a robot
+  // wherever its budget ran out (the exploration metric filters on the
+  // exploration_complete reason, not on this routing).
+  if (mission_return_enabled_ && have_home_) {
+    abandonNavGoal(reason);
+    return startReturnHome(reason);
+  }
   if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
     // Confirmation gate. `active` above is one read of a claim table that may
@@ -4910,6 +5051,16 @@ void ExploPlannerNode::doReturnSync() {
         "Rendezvous: waited %.0fs for team (%d/%d present); "
         "max_wait=%.0fs reached -> giving up and finishing.",
         waited, active, rendezvous_expected_peers_, wait_cap);
+    // Under mission return this site should be unreachable — terminal
+    // manoeuvres are never dispatched (finishOrRendezvous routes home
+    // instead) — but if a config drift ever re-opens the path, a give-up
+    // must not strand the robot at a dead barrier: reroute it home, which is
+    // what every other ending does. Defensive, and loud in the event stream
+    // (reason survives into reconnect_end and mission_complete).
+    if (mission_return_enabled_ && have_home_) {
+      startReturnHome("barrier-gave-up");
+      return;
+    }
     // Same presence rule as finishOrRendezvous's DONE branch: a given-up
     // idle robot is still parked and countable — its late-arriving pursuer
     // must be able to release its own barrier on contact.
@@ -4926,6 +5077,238 @@ void ExploPlannerNode::doReturnSync() {
       "Rendezvous: waiting for team at the barrier (%d/%d present)%s.",
       active, rendezvous_expected_peers_,
       rendezvous_max_wait_sec_ > 0.0 ? "" : " (no timeout)");
+}
+
+// ==================================================================
+// Mission return (RETURN_HOME)
+// ==================================================================
+
+bool ExploPlannerNode::startReturnHome(const char* reason) {
+  standDownExploitation();
+  return_home_reason_        = reason;
+  return_home_goal_sent_     = false;
+  return_home_retries_       = 0;
+  return_home_dist_at_start_ = cumulative_distance_;
+  return_home_retrace_       = false;
+  home_trail_idx_            = -1;
+  // 0.3 s (3 ticks) covers the cancel-all round trip from this call site AND
+  // from transitionTo below, whichever fires it.
+  home_pub_not_before_ = this->now() + rclcpp::Duration::from_seconds(0.3);
+  RCLCPP_INFO(get_logger(),
+      "MISSION-RETURN: heading home to (%.2f, %.2f) [%s] — tol %.1f m, "
+      "cap %.0f s.",
+      home_pos_.x(), home_pos_.y(), reason,
+      mission_home_tol_m_, mission_return_max_sec_);
+  // No goal publish here — see the declaration comment. The caller's
+  // abandonNavGoal cancel-all is still in flight, so a goal sent now can be
+  // swallowed by it; the first doReturnHome tick publishes instead.
+  // transitionTo also closes any live reconnect manoeuvre (RETURN_HOME is
+  // outside the manoeuvre set), emitting reconnect_end with this reason.
+  transitionTo(State::RETURN_HOME, reason);
+  return true;
+}
+
+void ExploPlannerNode::doReturnHome() {
+  if (!return_home_goal_sent_) {
+    // Deferred (re-)publish, wall-clock gated: waiting "one tick" is not a
+    // gap when the executor is backlogged (mr0pilot logs: 0.2-0.4 ms), so
+    // the gate holds this branch until the cancel-all is safely behind us.
+    // Reached at entry and again after each no-progress retry.
+    if (this->now() < home_pub_not_before_) return;
+    current_goal_ = CandidateViewpoint{};
+    if (return_home_retrace_ && home_trail_idx_ > 0) {
+      const Eigen::Vector3f& wp = home_trail_[home_trail_idx_];
+      current_goal_.position = wp;
+      current_goal_.yaw = std::atan2(wp.y() - latest_pos_.y(),
+                                     wp.x() - latest_pos_.x());
+    } else {
+      current_goal_.position = home_pos_;
+      current_goal_.yaw = home_yaw_;
+    }
+    publishGoal(current_goal_);
+    if (intent_pub_ && coord_) {
+      // 0.5 m claim, the same figure the coast used: home is a fixed point,
+      // not a contested frontier, and 0.0 reads as "unset" to receivers.
+      current_intent_msg_ = coord_->buildIntent(
+          current_goal_, latest_pos_, this->now(),
+          static_cast<float>(coord_claim_ttl_sec_),
+          0.5f, /*planner_type_id (eig)=*/0u, map_frame_);
+      publishIntent();
+      have_active_intent_ = true;
+    }
+    const float dx = current_goal_.position.x() - latest_pos_.x();
+    const float dy = current_goal_.position.y() - latest_pos_.y();
+    const float dist = std::sqrt(dx * dx + dy * dy);
+    // Budget distance is the straight line to the goal — except in retrace
+    // mode, where the goal is only the nearest crumb: there it must cover
+    // the whole remaining trail down to home, or the budget would fire
+    // moments after the switch.
+    double budget_dist = dist;
+    if (return_home_retrace_ && home_trail_idx_ > 0) {
+      for (int i = home_trail_idx_; i > 0; --i) {
+        budget_dist +=
+            (home_trail_[i] - home_trail_[i - 1]).head<2>().norm();
+      }
+      budget_dist += (home_trail_.front() - home_pos_).head<2>().norm();
+    }
+    const double elapsed = (this->now() - state_enter_time_).seconds();
+    // Distance-true budget, same model as the manoeuvre legs (see
+    // startReturnTo). Measured from NOW (elapsed added) because a retry
+    // re-arms this mid-leg: a budget recomputed from the shrinking remaining
+    // distance alone would fall below the already-elapsed time and fire on
+    // the next tick. No min() against the mission cap — the cap check below
+    // runs first every tick, so it bounds the leg regardless.
+    nav_budget_sec_ = elapsed + std::max(
+        nav_min_timeout_sec_,
+        budget_dist * nav_safety_factor_ /
+            std::max(nav_speed_est_mps_, 1e-3));
+    progress_check_time_ = this->now();
+    progress_check_dist_ = cumulative_distance_;
+    return_home_goal_sent_ = true;
+    RCLCPP_INFO(get_logger(),
+        "MISSION-RETURN: %s published (dist=%.2f m, budget %.0f s%s).",
+        return_home_retrace_ ? "retrace waypoint" : "home goal",
+        dist, nav_budget_sec_,
+        return_home_retries_ > 0 ? ", retry" : "");
+    return;
+  }
+
+  const float dx = latest_pos_.x() - home_pos_.x();
+  const float dy = latest_pos_.y() - home_pos_.y();
+  const float dist = std::sqrt(dx * dx + dy * dy);
+  // mission_home_tol_m, NOT reconnect_arrive_tol_m: the two homes are only
+  // 3 m apart, so the 4 m manoeuvre tolerance would accept the partner's.
+  if (dist < static_cast<float>(mission_home_tol_m_)) {
+    finishMissionReturn("arrived", "mission-home");
+    return;
+  }
+
+  const auto now = this->now();
+  const double elapsed = (now - state_enter_time_).seconds();
+  // Overall cap first: it is the field guarantee that a mission-return run
+  // still ends. The robot parks where it is; the analysis reads the result
+  // from mission_complete, not from where the robot stopped.
+  if (mission_return_max_sec_ > 0.0 && elapsed >= mission_return_max_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "MISSION-RETURN: %.0f s cap reached %.2f m short of home — parking "
+        "here.", mission_return_max_sec_, dist);
+    finishMissionReturn("timeout", "home-timeout");
+    return;
+  }
+  if (elapsed > nav_budget_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "MISSION-RETURN: home unreachable within budget (%.1f s, "
+        "dist=%.2f m) — parking here.", elapsed, dist);
+    finishMissionReturn("budget", "home-gave-up");
+    return;
+  }
+  // Retrace waypoint advance: within 3 m of the current crumb, walk the
+  // index toward home past any crumbs already inside that circle and aim at
+  // the next one. Plain goal replacement — no cancel, so nothing to race.
+  // The arrival check above still measures against home itself, and the
+  // watchdog below keeps running on cumulative distance as usual.
+  if (return_home_retrace_ && home_trail_idx_ > 0) {
+    if ((latest_pos_ - home_trail_[home_trail_idx_]).head<2>().norm() <
+        3.0f) {
+      while (home_trail_idx_ > 0 &&
+             (latest_pos_ - home_trail_[home_trail_idx_]).head<2>().norm() <
+                 3.0f) {
+        --home_trail_idx_;
+      }
+      if (home_trail_idx_ > 0) {
+        const Eigen::Vector3f& wp = home_trail_[home_trail_idx_];
+        current_goal_.position = wp;
+        current_goal_.yaw = std::atan2(wp.y() - latest_pos_.y(),
+                                       wp.x() - latest_pos_.x());
+      } else {
+        // Trail exhausted — final exact approach on home itself.
+        current_goal_.position = home_pos_;
+        current_goal_.yaw = home_yaw_;
+      }
+      publishGoal(current_goal_);
+    }
+  }
+  const double window_elapsed = (now - progress_check_time_).seconds();
+  if (window_elapsed > progress_window_sec_) {
+    const float delta = cumulative_distance_ - progress_check_dist_;
+    if (delta < progress_min_distance_m_) {
+      if (return_home_retries_ < 2) {
+        ++return_home_retries_;
+        if (return_home_retries_ >= 2 && home_trail_.size() > 1) {
+          // Second stall: the direct goal has failed two full windows.
+          // Switch to retracing the outbound trail from the crumb nearest
+          // the robot — every metre of it was traversed once already, so a
+          // local-minimum trap on unexplored geometry cannot block it.
+          return_home_retrace_ = true;
+          home_trail_idx_ = 0;
+          float best = std::numeric_limits<float>::max();
+          for (int i = 0; i < static_cast<int>(home_trail_.size()); ++i) {
+            const float d =
+                (home_trail_[i] - latest_pos_).head<2>().norm();
+            if (d < best) { best = d; home_trail_idx_ = i; }
+          }
+          RCLCPP_WARN(get_logger(),
+              "MISSION-RETURN: no progress toward home (%.2f m away) — "
+              "retry %d/2: retracing outbound trail from crumb %d/%zu "
+              "(%.2f m away).",
+              dist, return_home_retries_, home_trail_idx_,
+              home_trail_.size(), best);
+        } else {
+          RCLCPP_WARN(get_logger(),
+              "MISSION-RETURN: no progress toward home (%.2f m away) — "
+              "retry %d/2: cancelling and resending the goal.",
+              dist, return_home_retries_);
+        }
+        abandonNavGoal("home-no-progress-retry");
+        return_home_goal_sent_ = false;  // wall-clock-gated re-publish
+        home_pub_not_before_ =
+            this->now() + rclcpp::Duration::from_seconds(0.3);
+        return;
+      }
+      RCLCPP_WARN(get_logger(),
+          "MISSION-RETURN: still no progress after %d retries (%.2f m from "
+          "home) — parking here.", return_home_retries_, dist);
+      finishMissionReturn("no-progress", "home-gave-up");
+      return;
+    }
+    progress_check_time_ = now;
+    progress_check_dist_ = cumulative_distance_;
+  }
+  republishGoal(current_goal_);
+}
+
+bool ExploPlannerNode::finishMissionReturn(const char* result,
+                                           const char* end_reason) {
+  const auto now = this->now();
+  const float dx = latest_pos_.x() - home_pos_.x();
+  const float dy = latest_pos_.y() - home_pos_.y();
+  const float dist = std::sqrt(dx * dx + dy * dy);
+  const double homing_sec = (now - state_enter_time_).seconds();
+  const double homing_m   = cumulative_distance_ - return_home_dist_at_start_;
+  mission_home_result_  = result;
+  mission_home_sim_sec_ = now.seconds();
+  if (exp_log_) {
+    MissionCompleteEvent e;
+    e.result              = result;
+    e.reason              = return_home_reason_.c_str();
+    e.home_x              = home_pos_.x();
+    e.home_y              = home_pos_.y();
+    e.final_x             = latest_pos_.x();
+    e.final_y             = latest_pos_.y();
+    e.dist_to_home_m      = dist;
+    e.homing_duration_sec = homing_sec;
+    e.homing_distance_m   = homing_m;
+    e.latched             = coverage_latched_;
+    exp_log_->logMissionComplete(expCtx(), e);
+  }
+  RCLCPP_INFO(get_logger(),
+      "MISSION-RETURN %s [%s]: %.2f m from home after %.1f s / %.2f m of "
+      "homing.", result, end_reason, dist, homing_sec, homing_m);
+  // Stop the platform before parking: on the give-up paths nav2 still holds
+  // the unreachable goal, and an arrival-by-tolerance lands before nav2
+  // finishes driving to the exact pose (same rationale as doReturnNav).
+  abandonNavGoal(end_reason);
+  return finishNow(end_reason);
 }
 
 // ==================================================================
@@ -5459,7 +5842,7 @@ void ExploPlannerNode::heartbeatTick() {
        state_ == State::EXPLOIT_PLAN || state_ == State::EXPLOIT_DWELL ||
        state_ == State::RETURN_NAV || state_ == State::RETURN_SYNC ||
        state_ == State::PURSUE || state_ == State::PROXIMITY_HOLD ||
-       state_ == State::DONE);
+       state_ == State::RETURN_HOME || state_ == State::DONE);
   const auto hb_now = this->now();
   // Second, independent suppression cause: EXECUTOR STARVATION. The block below
   // keys entirely off state_, so it can only see a beacon that was never
@@ -5525,7 +5908,7 @@ void ExploPlannerNode::heartbeatTick() {
       state_ != State::EXPLOIT_PLAN && state_ != State::EXPLOIT_DWELL &&
       state_ != State::RETURN_NAV && state_ != State::RETURN_SYNC &&
       state_ != State::PURSUE && state_ != State::PROXIMITY_HOLD &&
-      state_ != State::DONE) {
+      state_ != State::RETURN_HOME && state_ != State::DONE) {
     return;
   }
   if (!intent_pub_) return;
@@ -5766,6 +6149,11 @@ void ExploPlannerNode::doProximityHold() {
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
   progress_check_time_ = now;
   progress_check_dist_ = cumulative_distance_;
+  // A hold taken on the RETURN_HOME entry tick interrupted nothing: the home
+  // goal is deferred to the first doReturnHome tick (see startReturnHome) and
+  // current_goal_ still holds the pre-latch drive — republishing THAT would
+  // send a finished robot back toward its old frontier for a tick.
+  if (state_ == State::RETURN_HOME && !return_home_goal_sent_) return;
   publishGoal(current_goal_);
 }
 
@@ -6207,6 +6595,18 @@ void ExploPlannerNode::logRunEnd(const char* reason) {
           ? (metrics_last_row_sim_sec_ - metrics_first_row_sim_sec_) /
                 static_cast<double>(metrics_rows_written_ - 1)
           : -1.0;
+  // Final geometry + mission-return summary (schema 2). latest_pos_ rather
+  // than a fresh TF lookup, same teardown rationale as the coverage fields
+  // above; mission_home_result_ stays "" (-> null) when the homing leg never
+  // resolved — including a censored run killed mid-homing, which a reader
+  // must be able to tell apart from an arrival.
+  e.have_home = have_home_;
+  e.home_x    = home_pos_.x();
+  e.home_y    = home_pos_.y();
+  e.final_x   = latest_pos_.x();
+  e.final_y   = latest_pos_.y();
+  e.mission_home_result  = mission_home_result_;
+  e.mission_home_sim_sec = mission_home_sim_sec_;
   exp_log_->logRunEnd(expCtx(), e);
 }
 
@@ -7398,6 +7798,30 @@ void ExploPlannerNode::updatePoseFromTF() {
       static_cast<float>(tf.transform.translation.z));
   latest_yaw_ = static_cast<float>(tf2::getYaw(tf.transform.rotation));
   have_pose_ = true;
+  // Mission-return home capture: exactly once, at the FIRST successful fresh
+  // pose. Deliberately its own latch and not have_pose_ — that flag drops and
+  // returns with TF health, and re-recording here would move "home" to
+  // wherever TF last recovered. The coords are logged so the verify script can
+  // check them against the scenario's declared spawns.
+  if (!have_home_) {
+    have_home_ = true;
+    home_pos_  = latest_pos_;
+    home_yaw_  = latest_yaw_;
+    RCLCPP_INFO(get_logger(),
+        "MISSION-RETURN home recorded: (%.2f, %.2f, %.2f) yaw %.2f.",
+        home_pos_.x(), home_pos_.y(), home_pos_.z(), home_yaw_);
+  }
+  // Breadcrumb trail (retrace fallback, see doReturnHome). Outbound only —
+  // recording stops once homing starts, so the trail cannot grow toward the
+  // robot while it retraces. First crumb is home itself. 2 m spacing keeps a
+  // 3000 s run under ~700 points. Recorded whenever the flag is on: the leg
+  // that will need it cannot know that in advance.
+  if (mission_return_enabled_ && have_home_ &&
+      state_ != State::RETURN_HOME && state_ != State::DONE &&
+      (home_trail_.empty() ||
+       (latest_pos_ - home_trail_.back()).head<2>().norm() >= 2.0f)) {
+    home_trail_.push_back(latest_pos_);
+  }
 }
 
 void ExploPlannerNode::trackDistance() {

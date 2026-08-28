@@ -229,10 +229,41 @@ MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
 # a RUNTIME switch: treated and control cells must sit inside ONE run_campaign
 # invocation or the arm is confounded with the session (30.27, ~1.08x floor).
 # Default 0 so an un-set campaign reproduces every banked run.
+#
+# SUPERSEDED under MISSION_RETURN=1: the mission-return branch in the planner
+# pre-empts the coast gate at every terminal ending, so the coast is
+# unreachable there (the homing traverse is itself the go-reconnect behaviour
+# the coast approximated). DONE_SEEK matters only in MISSION_RETURN=0 runs.
 DONE_SEEK="${DONE_SEEK:-0}"
 if [ "$DONE_SEEK" = "1" ]; then DONE_SEEK_ARG="true"; else DONE_SEEK_ARG="false"; fi
 # Cap on a single coast. 0 disables the cap (the no-progress exit still holds).
 DONE_SEEK_MAX="$(flt "${DONE_SEEK_MAX:-600}")"
+# --- Mission return (2026-08-27) --------------------------------------------
+# MISSION_RETURN=1 adds an arm-invariant requirement to the mission itself: at
+# ANY terminal exploration ending (coverage latch, step budget, barrier
+# give-up) the robot drives back to its recorded start pose. Both arms then
+# end in the same connected configuration (spawns are 3 m apart), which is
+# what makes "mission end time" a well-defined primary endpoint in the off
+# arm too — the run still ends when every planner reads DONE, so the all_done
+# check below is untouched, but DONE now means "home (or bounded give-up)",
+# not "parked wherever exploration ended".
+#
+# NOT metric-neutral for exploration finish: a robot that finishes first now
+# drives home through the world and can deliver its map to the still-exploring
+# partner en route, in BOTH arms — that is part of the shared mission
+# definition, so exploration finish under MISSION_RETURN=1 is a NEW endpoint,
+# never poolable with banked numbers. Default 0 so an un-set invocation
+# reproduces every banked run bit-for-bit.
+MISSION_RETURN="${MISSION_RETURN:-0}"
+if [ "$MISSION_RETURN" = "1" ]; then MISSION_RETURN_ARG="true"; else MISSION_RETURN_ARG="false"; fi
+# Arrival tolerance. Its own knob (not RECONNECT_ARRIVE_TOL=4.0) because the
+# two homes are only 3 m apart — the manoeuvre tolerance would accept the
+# partner's home as an arrival.
+MISSION_HOME_TOL="$(flt "${MISSION_HOME_TOL:-1.0}")"
+# Overall cap on the homing leg. The field guarantee that a mission-return run
+# still ends: on expiry the robot parks where it is and the run ends with
+# mission_complete result=timeout. 0 disables the cap.
+MISSION_RETURN_MAX="$(flt "${MISSION_RETURN_MAX:-600}")"
 # --- Information gate on the mid-run trigger (2026-08-19) -------------------
 # Replaces the fixed MIDRUN_SILENCE clock with "reconnect once the pair has
 # gathered RECONNECT_MIN_SHARE_VOX of map the other side has not seen", by
@@ -1113,6 +1144,7 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
 if [ "$RECONNECT_MODE" = "off" ]; then RDV_ENABLED="false"; MODE_ARG="hybrid"; fi
 log "done_seek_enabled=$DONE_SEEK_ARG done_seek_max_sec=$DONE_SEEK_MAX (DONE_SEEK=$DONE_SEEK)"
+log "mission_return_enabled=$MISSION_RETURN_ARG home_tol=${MISSION_HOME_TOL}m max=${MISSION_RETURN_MAX}s (MISSION_RETURN=$MISSION_RETURN)"
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
 log "proximity_hold/resume_dist_m=$PROX_HOLD_M/$PROX_RESUME_M m (yaml field defaults 5.0/6.0 overridden for sim)"
 EXPLOIT_ARG="true"; [ "$EXPLOIT" = "0" ] && EXPLOIT_ARG="false"
@@ -1168,6 +1200,12 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # written at launch cannot.
   echo "done_seek_enabled=$DONE_SEEK_ARG"
   echo "done_seek_max_sec=$DONE_SEEK_MAX"
+  # Mission return changes what a run's endpoints MEAN (see the MISSION_RETURN
+  # block above): a resume must never mix cells across this switch, and an
+  # analysis must refuse to pool them.
+  echo "mission_return_enabled=$MISSION_RETURN_ARG"
+  echo "mission_home_tol_m=$MISSION_HOME_TOL"
+  echo "mission_return_max_sec=$MISSION_RETURN_MAX"
   echo "reconnect_min_share_voxels=$RECONNECT_MIN_SHARE_VOX"
   echo "reconnect_midrun_min_silence_sec=$MIDRUN_MIN_SILENCE"
   echo "reconnect_midrun_max_silence_sec=$MIDRUN_MAX_SILENCE"
@@ -1328,6 +1366,9 @@ for r in $ROBOTS; do
       -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \
       -p done_seek_enabled:=$DONE_SEEK_ARG \
       -p done_seek_max_sec:=$DONE_SEEK_MAX \
+      -p mission_return_enabled:=$MISSION_RETURN_ARG \
+      -p mission_home_tol_m:=$MISSION_HOME_TOL \
+      -p mission_return_max_sec:=$MISSION_RETURN_MAX \
       -p reconnect_min_share_voxels:=$RECONNECT_MIN_SHARE_VOX \
       -p reconnect_midrun_min_silence_sec:=$MIDRUN_MIN_SILENCE \
       -p reconnect_midrun_max_silence_sec:=$MIDRUN_MAX_SILENCE \

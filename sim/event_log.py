@@ -31,6 +31,22 @@ states it directly rather than having it inferred from the shape of a CSV:
                         substituting the horizon for it turns a run that did not
                         finish into the fastest-looking run in its arm.
 
+Mission return (schema v2, mission_return_enabled runs) adds a second pair of
+endpoints on top -- ADDS, because the fields above keep their banked meaning
+and banked and mission-return numbers are never pooled anyway:
+
+  explore_latched_sim_sec  the last exploration_complete whose reason is
+                        "coverage-latched". THE pre-registered secondary
+                        endpoint (exploration finish). A step-budget or
+                        barrier-gave-up declaration ends the run but is not a
+                        finish, so it does not populate this field.
+  t_mission             THE pre-registered primary endpoint (mission end).
+                        max over robots of the mission_complete stamp,
+                        REQUIRING result=="arrived" on every robot. A robot
+                        that timed out or gave up homing has an ended run but
+                        an unfinished mission: withheld, never imputed, same
+                        as censoring above -- and visible in mission_results.
+
 Sim time throughout. The wall clock is in the file too but the real-time factor
 drifts 0.89 -> 0.76 within a single run, so wall seconds are not comparable
 even against themselves.
@@ -130,6 +146,28 @@ def summarise_robot(path):
                 f"{path}: run_end says explore_done_sim_sec={stated} but the "
                 f"last exploration_complete is at {done}")
 
+    # Exploration FINISH (pre-registered secondary endpoint): only a
+    # coverage-latched declaration is a finish. Under mission return a
+    # step-budget robot still declares (and still goes home), so filtering on
+    # the reason here -- not on what happened next -- is what keeps the
+    # endpoint arm-invariant.
+    latched = [e for e in completes if e.get("reason") == "coverage-latched"]
+    latched_t = latched[-1]["t_sim_sec"] if latched else None
+
+    # Mission end (pre-registered primary endpoint, schema v2). Emitted at most
+    # once; cross-checked against run_end the same way as exploration above.
+    missions = [e for e in evs if e["event"] == "mission_complete"]
+    if len(missions) > 1:
+        raise EventLogError(f"{path}: {len(missions)} mission_complete events")
+    mission = missions[0] if missions else None
+    if end is not None and end.get("mission_home_result"):
+        if mission is None or mission.get("result") != end["mission_home_result"]:
+            raise EventLogError(
+                f"{path}: run_end says mission_home_result="
+                f"{end['mission_home_result']!r} but the mission_complete "
+                f"event says {mission.get('result') if mission else None!r}")
+    mission_ret = start.get("params", {}).get("mission_return_enabled")
+
     # Truncation is detectable from the file's own contents: run_end reports how
     # many events it wrote, and seq is contiguous from 0.
     written = end.get("events_written") if end else None
@@ -142,6 +180,15 @@ def summarise_robot(path):
         explore_done_sim_sec=done,
         explore_done_first_sim_sec=(completes[0]["t_sim_sec"]
                                     if completes else None),
+        explore_latched_sim_sec=latched_t,
+        mission_return_enabled=mission_ret,
+        mission_result=mission.get("result") if mission else None,
+        mission_sim_sec=mission.get("t_sim_sec") if mission else None,
+        mission_reason=mission.get("reason") if mission else None,
+        homing_duration_sec=(mission.get("homing_duration_sec")
+                             if mission else None),
+        homing_distance_m=(mission.get("homing_distance_m")
+                           if mission else None),
         # Non-zero only where a robot resumed after a manoeuvre and exhausted
         # again -- i.e. only in the reconnecting arms.
         resume_delta_sec=((completes[-1]["t_sim_sec"] - completes[0]["t_sim_sec"])
@@ -184,6 +231,16 @@ def summarise_run(run_dir, expect_robots=2):
     censored = any(d is None for d in dones)
     finished = [d for d in dones if d is not None]
     any_p = next(iter(per.values()))["params"]
+
+    # Pre-registered endpoints (mission-return campaigns). Same withholding
+    # rule as t_team: if ANY robot lacks the endpoint the team has no value,
+    # and the per-robot results stay visible so the censoring is countable.
+    latches = [s["explore_latched_sim_sec"] for s in per.values()]
+    t_explore = max(latches) if all(t is not None for t in latches) else None
+    arrived = all(s["mission_result"] == "arrived" for s in per.values())
+    t_mission = (max(s["mission_sim_sec"] for s in per.values())
+                 if arrived else None)
+
     return dict(
         run=os.path.basename(run_dir.rstrip("/")),
         arm=run_arm(any_p),
@@ -196,6 +253,11 @@ def summarise_run(run_dir, expect_robots=2):
         t_lead=min(finished) if finished else None,
         censored=censored,
         censored_robots=[r for r, s in per.items() if s["censored"]],
+        # Mission-return endpoints. None on banked (pre-v2) logs, and None on a
+        # v2 run any robot of which never latched / never arrived -- withheld.
+        t_explore=t_explore,
+        t_mission=t_mission,
+        mission_results={r: s["mission_result"] for r, s in per.items()},
         resume_delta_total_sec=sum(s["resume_delta_sec"] or 0.0
                                    for s in per.values()),
         rtf_mean=(sum(s["rtf_mean"] or 0.0 for s in per.values())
@@ -223,18 +285,36 @@ def arm_summary(rows):
                 if arm:
                     break
         rec = by_arm.setdefault(arm or "?", dict(
-            arm=arm or "?", n=0, finished=0, censored=0, excluded=0, times=[]))
+            arm=arm or "?", n=0, finished=0, censored=0, excluded=0, times=[],
+            mission_done=0, mission_censored=0, times_mission=[],
+            times_explore=[]))
         rec["n"] += 1
         if "excluded" in r:
             rec["excluded"] += 1
-        elif r["t_team"] is None:
+            continue
+        if r["t_team"] is None:
             rec["censored"] += 1
         else:
             rec["finished"] += 1
             rec["times"].append(r["t_team"])
+        # Mission endpoints ride alongside, counted with the same honesty rule:
+        # a mission mean is only reportable next to its own censoring count.
+        if r.get("t_mission") is not None:
+            rec["mission_done"] += 1
+            rec["times_mission"].append(r["t_mission"])
+        else:
+            rec["mission_censored"] += 1
+        if r.get("t_explore") is not None:
+            rec["times_explore"].append(r["t_explore"])
     for rec in by_arm.values():
         rec["mean_t_team"] = (sum(rec["times"]) / len(rec["times"])
                               if rec["times"] else None)
+        rec["mean_t_mission"] = (sum(rec["times_mission"])
+                                 / len(rec["times_mission"])
+                                 if rec["times_mission"] else None)
+        rec["mean_t_explore"] = (sum(rec["times_explore"])
+                                 / len(rec["times_explore"])
+                                 if rec["times_explore"] else None)
     return [by_arm[k] for k in sorted(by_arm)]
 
 
@@ -250,31 +330,41 @@ def main(argv):
         print(json.dumps(dict(runs=rows, by_arm=arm_summary(rows)),
                          indent=1, default=str))
         return 0
-    print(f"{'run':34s} {'arm':11s} {'t_team':>9s} {'t_lead':>9s} "
-          f"{'resume':>7s} {'rtf':>5s}  note")
+    print(f"{'run':34s} {'arm':11s} {'t_team':>9s} {'t_expl':>9s} "
+          f"{'t_missn':>9s} {'resume':>7s} {'rtf':>5s}  note")
     for r in rows:
         if "excluded" in r:
             print(f"{r.get('run','?'):34s} {'':11s} {'EXCLUDED':>9s} "
-                  f"{'':>9s} {'':>7s} {'':>5s}  {r['excluded']}")
+                  f"{'':>9s} {'':>9s} {'':>7s} {'':>5s}  {r['excluded']}")
             continue
         tt = "CENSORED" if r["t_team"] is None else f"{r['t_team']:9.1f}"
-        # t_lead is None when EVERY robot is censored -- the case this whole
-        # reader exists to keep out of the means, so it must not crash the
-        # report that shows it.
-        tl = "-" if r["t_lead"] is None else f"{r['t_lead']:9.1f}"
+        te = "-" if r.get("t_explore") is None else f"{r['t_explore']:9.1f}"
+        tm = "-" if r.get("t_mission") is None else f"{r['t_mission']:9.1f}"
         note = ("censored: " + ",".join(r["censored_robots"])) if r["censored"] else ""
+        # On a mission-return run a "-" in t_missn deserves its reason.
+        if r.get("t_mission") is None and any(r.get("mission_results", {}).values()):
+            bad = [f"{rob}:{res or 'none'}"
+                   for rob, res in r["mission_results"].items()
+                   if res != "arrived"]
+            note = (note + " " if note else "") + "mission " + ",".join(bad)
         print(f"{r['run']:34s} {str(r['arm']):11s} {tt:>9s} "
-              f"{tl:>9s} {r['resume_delta_total_sec']:7.1f} "
+              f"{te:>9s} {tm:>9s} {r['resume_delta_total_sec']:7.1f} "
               f"{r['rtf_mean']:5.3f}  {note}")
 
     summ = arm_summary(rows)
     print()
     print(f"{'arm':11s} {'n':>3s} {'done':>5s} {'cens':>5s} {'excl':>5s} "
-          f"{'mean t_team':>12s}")
+          f"{'mean t_team':>12s} {'mean t_expl':>12s} "
+          f"{'mean t_missn':>12s} {'m.cens':>6s}")
     for s in summ:
         mt = "-" if s["mean_t_team"] is None else f"{s['mean_t_team']:12.1f}"
+        me = ("-" if s["mean_t_explore"] is None
+              else f"{s['mean_t_explore']:12.1f}")
+        mm = ("-" if s["mean_t_mission"] is None
+              else f"{s['mean_t_mission']:12.1f}")
         print(f"{s['arm']:11s} {s['n']:3d} {s['finished']:5d} "
-              f"{s['censored']:5d} {s['excluded']:5d} {mt:>12s}")
+              f"{s['censored']:5d} {s['excluded']:5d} {mt:>12s} "
+              f"{me:>12s} {mm:>12s} {s['mission_censored']:6d}")
     lost = [s for s in summ if s["censored"] or s["excluded"]]
     if lost:
         print()

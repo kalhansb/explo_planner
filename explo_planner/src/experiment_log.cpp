@@ -476,6 +476,25 @@ void ExperimentLog::logExplorationComplete(
   end();
 }
 
+void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
+                                       const MissionCompleteEvent& e) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("mission_complete", ctx);
+  text("result", e.result);
+  text("reason", e.reason);
+  num("mission_home_sim_sec", ctx.sim_time_sec);
+  num("mission_home_rel_sec", ctx.sim_time_sec - t0_sec_);
+  num("home_x", e.home_x);
+  num("home_y", e.home_y);
+  num("final_x", e.final_x);
+  num("final_y", e.final_y);
+  num("dist_to_home_m", e.dist_to_home_m);
+  num("homing_duration_sec", e.homing_duration_sec);
+  num("homing_distance_m", e.homing_distance_m);
+  boolean("latched", e.latched);
+  end();
+}
+
 void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
                               const RunEndEvent& e) {
   if (!open_ || !started_ || run_end_written_) return;
@@ -531,6 +550,26 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
   num("metrics_effective_period_sec", e.metrics_effective_period_sec);
   integer("metrics_rows", e.metrics_rows);
   integer("metrics_backoffs", e.metrics_backoffs);
+  // Final geometry + mission-return summary (schema 2, see RunEndEvent).
+  // home is null-per-field rather than omitted so a reader indexing by key
+  // sees the same shape in every file of a campaign.
+  boolean("have_home", e.have_home);
+  if (e.have_home) {
+    num("home_x", e.home_x);
+    num("home_y", e.home_y);
+  } else {
+    key("home_x"); line_ += "null";
+    key("home_y"); line_ += "null";
+  }
+  num("final_x", e.final_x);
+  num("final_y", e.final_y);
+  if (!e.mission_home_result.empty()) {
+    text("mission_home_result", e.mission_home_result);
+    num("mission_home_sim_sec", e.mission_home_sim_sec);
+  } else {
+    key("mission_home_result"); line_ += "null";
+    key("mission_home_sim_sec"); line_ += "null";
+  }
   integer("milestones_reached", milestonesReached());
   integer("milestones_total", static_cast<long long>(milestones_.size()));
   // Self-accounting. A file whose last line is a run_end with

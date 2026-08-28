@@ -211,6 +211,9 @@ def state_at(rows, t):
     return s or "UNKNOWN"
 
 
+# Reconnect manoeuvres ONLY. RETURN_HOME (mission return) is deliberately NOT
+# here: it runs in BOTH arms as part of the mission definition, so counting it
+# would book arm-invariant homing as treatment activity.
 MANOEUVRE = {"RETURN_NAV", "RETURN_SYNC", "PURSUE"}
 
 
@@ -236,11 +239,19 @@ def count_firings_from_logs(run_dir):
 
 
 def classify_contact(states):
-    """Merge attribution (§5.3). One class per contact, per the plan's list."""
+    """Merge attribution (§5.3). One class per contact, per the plan's list.
+
+    mission_return: contact while a robot drives home (RETURN_HOME) and no
+    reconnect manoeuvre is live. Its own class, not "deliberate" -- the homing
+    leg runs in both arms, so folding it into the manoeuvre class would credit
+    the treatment with contacts the control gets for free.
+    """
     if any(s in MANOEUVRE for s in states):
         return "deliberate"
     if any(s == "PROXIMITY_HOLD" for s in states):
         return "proximity"
+    if any(s == "RETURN_HOME" for s in states):
+        return "mission_return"
     if all(s == "DONE" for s in states):
         return "opportunistic_terminal"
     return "opportunistic"

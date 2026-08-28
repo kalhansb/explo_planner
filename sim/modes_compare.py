@@ -110,7 +110,11 @@ import sys
 
 # The planner's actual manoeuvre states. Verified against the CSVs, not guessed:
 # the full state vocabulary is {WAIT_FOR_MAP, NAVIGATE, PLAN, INTEGRATE,
-# LOG_STEP, DONE, PURSUE, RETURN_NAV, RETURN_SYNC}.
+# LOG_STEP, DONE, PURSUE, RETURN_NAV, RETURN_SYNC, PROXIMITY_HOLD, and — since
+# mission return, 2026-08-27 — RETURN_HOME}. RETURN_HOME is deliberately NOT in
+# the set below: it is the arm-invariant drive home, present in the control arm
+# too, and its rows carry reconnect_elapsed_sec = -1 (transitionTo closes any
+# live manoeuvre on entering it), so neither clause of `cur` may claim it.
 #
 # This replaces a regex `recon|pursu|rendez`, which was wrong in the worst
 # possible direction. It matched PURSUE but NOT RETURN_NAV or RETURN_SYNC -- the

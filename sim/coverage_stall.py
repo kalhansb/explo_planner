@@ -43,14 +43,38 @@ BANDS = [(0.90, 0.85), (0.85, 0.80), (0.80, 0.75), (0.75, 0.70), (0.70, 0.65),
 
 
 def run_end(cell):
+    """End of the COVERAGE clock, not necessarily of the run.
+
+    On a mission-return cell (manifest mission_return_enabled=true) the run
+    ends when the robots get back home, so run_end_t_sim includes a homing leg
+    during which unknown_fraction is flat by construction. Using it here would
+    book that leg as a terminal "stall" and inflate every stall%% denominator.
+    For those cells the clock ends at the last exploration_complete instead.
+    """
+    end = mission = None
     try:
         with open(os.path.join(cell, "run_manifest.txt"), errors="ignore") as fh:
             for ln in fh:
                 if ln.startswith("run_end_t_sim="):
-                    return float(ln.strip().split("=", 1)[1])
+                    end = float(ln.strip().split("=", 1)[1])
+                elif ln.startswith("mission_return_enabled="):
+                    mission = ln.strip().split("=", 1)[1] == "true"
     except (OSError, ValueError):
         pass
-    return None
+    if not mission:
+        return end
+    done = None
+    for p in glob.glob(os.path.join(cell, "*.events.jsonl")):
+        with open(p, errors="ignore") as fh:
+            for ln in fh:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if e.get("event") == "exploration_complete":
+                    t = float(e["t_sim_sec"])
+                    done = t if done is None else max(done, t)
+    return done if done is not None else end
 
 
 def trace(cell):

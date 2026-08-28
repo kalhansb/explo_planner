@@ -97,6 +97,11 @@ def exhaustion_time(run_dir):
     when both are, and the §2.3 window is about the state the manoeuvre would
     have armed in. Returns None when a planner never got there (a censored run
     cannot date its own exhaustion).
+
+    RETURN_HOME counts as "got there": under mission return the latch routes
+    into the homing leg instead of DONE, so first-DONE would date exhaustion
+    at ARRIVAL, hundreds of seconds late. Exhaustion is the first entry into
+    either terminal routing.
     """
     times = []
     for name in os.listdir(run_dir):
@@ -106,7 +111,7 @@ def exhaustion_time(run_dir):
         try:
             with open(os.path.join(run_dir, name)) as f:
                 for row in csv.DictReader(f):
-                    if row.get("state") == "DONE":
+                    if row.get("state") in ("DONE", "RETURN_HOME"):
                         first_done = float(row["sim_time_sec"])
                         break
         except (OSError, KeyError, ValueError):

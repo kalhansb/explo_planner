@@ -80,6 +80,9 @@ import os
 import re
 import statistics as st
 
+# Reconnect manoeuvres only. RETURN_HOME (mission return, 2026-08-27) is NOT
+# one: it runs in both arms, and transitionTo closes any live manoeuvre on
+# entry, so its rows carry reconnect_elapsed_sec = -1 and belong to no episode.
 MANOEUVRE_STATES = {"PURSUE", "RETURN_NAV", "RETURN_SYNC"}
 
 # Decision lines. Each marks one firing; the kind is fixed by which line hit.

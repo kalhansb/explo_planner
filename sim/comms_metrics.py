@@ -171,13 +171,18 @@ def load_run(run_dir):
     # inferred. None both when the log is absent (runs predating it) and when a
     # robot was censored; the metric column is blank either way, which is the
     # honest rendering of "this run has no completion time".
-    t_done_team = None
+    t_done_team = t_explore = t_mission = None
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import event_log
         s = event_log.summarise_run(run_dir)
         if "excluded" not in s:
             t_done_team = s["t_team"]
+            # Mission-return endpoints (None on banked, pre-v2 logs). On those
+            # runs `makespan` below includes the homing leg plus harness grace,
+            # so these are the numbers a mission-return analysis should quote.
+            t_explore = s.get("t_explore")
+            t_mission = s.get("t_mission")
     except Exception:
         pass
 
@@ -188,6 +193,8 @@ def load_run(run_dir):
         "end_reason": reason,
         "makespan": end_t,
         "t_done_team": t_done_team,
+        "t_explore": t_explore,
+        "t_mission": t_mission,
     }
 
 

@@ -7,7 +7,7 @@ time-to-criterion, the plan's stated outcome. What it can move is how much of
 the teammate's map you end up holding once your own frontier is gone.
 
   saturation  unknown_fraction at the first post-exploration state
-              (PURSUE / RETURN_NAV / RETURN_SYNC / DONE)
+              (PURSUE / RETURN_NAV / RETURN_SYNC / RETURN_HOME / DONE)
   final       lowest unknown_fraction the robot reaches
   gain        saturation - final, i.e. map acquired after exploring stopped
 
@@ -19,7 +19,11 @@ import glob
 import os
 import sys
 
-POST = {"PURSUE", "RETURN_NAV", "RETURN_SYNC", "DONE"}
+# RETURN_HOME (mission return) is a post-exploration state in BOTH arms: under
+# mission_return_enabled the latch routes straight into it, so without it here
+# `sat` would be read hundreds of seconds late, at the first DONE row after the
+# homing leg -- after any en-route merges -- and the headline gain collapses.
+POST = {"PURSUE", "RETURN_NAV", "RETURN_SYNC", "RETURN_HOME", "DONE"}
 
 
 def robot_scores(csv_path):

@@ -62,6 +62,7 @@ import argparse
 import bisect
 import csv
 import glob
+import json
 import os
 import sys
 
@@ -91,6 +92,28 @@ def at(s, times, t):
 def gap_pct(x, y):
     hi = max(x, y)
     return abs(x - y) / hi * 100.0 if hi > 0 else 0.0
+
+
+def latch_time(outdir):
+    """Last exploration_complete over both robots, or None (pre-v2 logs).
+
+    On a mission-return run the CSVs run on through the homing leg, so the
+    end-of-run gap is measured AFTER the regroup -- a near-zero there is the
+    mission return doing its job, and it says nothing about how far apart the
+    maps were when exploring stopped. That instant is reported separately.
+    """
+    t = None
+    for p in glob.glob(os.path.join(outdir, "*.events.jsonl")):
+        with open(p, errors="replace") as fh:
+            for ln in fh:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if e.get("event") == "exploration_complete":
+                    s = float(e["t_sim_sec"])
+                    t = s if t is None else max(t, s)
+    return t
 
 
 def main():
@@ -139,8 +162,18 @@ def main():
         t += args.step
 
     drained = "drained" if end <= peak * 0.5 else "still open"
+    # The at-latch reading only exists where the event log does; "-" otherwise.
+    t_latch = latch_time(args.outdir)
+    at_latch = ""
+    if t_latch is not None and t_latch <= t_end:
+        la, lb = at(a, ta, t_latch), at(b, tb, t_latch)
+        if la is not None and lb is not None:
+            at_latch = (f", at-latch {gap_pct(la, lb):.2f}% at t={t_latch:.0f}s"
+                        f" (gap when exploring stopped; `end` is after any"
+                        f" mission-return regroup)")
     print(f"PASS\t{args.name}\t{names[0]}={va:.0f} {names[1]}={vb:.0f} at t={t_end:.0f}s: "
-          f"end {end:.2f}%, peak {peak:.2f}% at t={t_peak:.0f}s ({drained}) — "
+          f"end {end:.2f}%, peak {peak:.2f}% at t={t_peak:.0f}s ({drained})"
+          f"{at_latch} — "
           f"REPORT ONLY, not a validity gate: this tracks undrained backlog at "
           f"the stop instant, which scales with outage severity")
     return 0

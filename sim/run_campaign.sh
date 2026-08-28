@@ -53,6 +53,13 @@ DONE_CRITERION="${DONE_CRITERION:-latch}"
 # than inherited from the environment so a stale exported SCENARIO cannot
 # silently relabel a campaign.
 SCENARIO="${SCENARIO:-flatforest_2robot_lidar.yaml}"
+# Mission return (see run_explo_sim_rviz.sh). An explicit first-class flag, NOT
+# an --env passenger, because it applies to EVERY cell identically in BOTH arms
+# — it is part of the mission definition, not an arm. Default 1: from 2026-08-27
+# campaigns measure mission end time as the primary endpoint, and their
+# exploration-finish numbers are a NEW endpoint never pooled with banked runs.
+# Pass --mission-return 0 only to reproduce the legacy park-in-place design.
+MISSION_RETURN_FLAG="1"
 while [ $# -gt 0 ]; do
   case "$1" in
     --root)     ROOT="$2"; shift 2;;
@@ -68,6 +75,7 @@ while [ $# -gt 0 ]; do
     --comms)    COMMS_ON="$2"; shift 2;;
     --done-unknown) DONE_UNKNOWN="$2"; shift 2;;
     --done-criterion) DONE_CRITERION="$2"; shift 2;;
+    --mission-return) MISSION_RETURN_FLAG="$2"; shift 2;;
     --env)      EXTRA_ENV="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -83,6 +91,20 @@ case " $EXTRA_ENV " in
     echo "       not with --env DONE_SEEK=... -- --env applies to EVERY cell and" >&2
     echo "       would silently collapse the A/B into one arm." >&2
     exit 2;;
+esac
+# Same shape of failure, different mechanism: MISSION_RETURN in --env would
+# win over the explicit flag below, so the campaign index and the operator's
+# intent could disagree while every OUTDIR name looked right.
+case " $EXTRA_ENV " in
+  *"MISSION_RETURN="*)
+    echo "FATAL: set mission return with --mission-return 0|1, not --env" >&2
+    echo "       MISSION_RETURN=... -- the flag is recorded per cell and guarded" >&2
+    echo "       on resume; an --env passenger is neither." >&2
+    exit 2;;
+esac
+case "$MISSION_RETURN_FLAG" in
+  0|1) ;;
+  *) echo "FATAL: --mission-return must be 0 or 1 (got '$MISSION_RETURN_FLAG')" >&2; exit 2;;
 esac
 
 # Build the cell list. --cells wins; otherwise cross --arms with --seeds.
@@ -142,6 +164,20 @@ for cell in "${CELL_LIST[@]}"; do
   # resuming on run_end_reason alone would skip every invalid cell forever and
   # quietly hand the analysis a matrix of corrupted maps.
   if [ -f "$out/run_manifest.txt" ] && grep -q '^run_end_reason=' "$out/run_manifest.txt" 2>/dev/null; then
+    # A cell may only satisfy a resume if it ran the same MISSION DEFINITION.
+    # mission_return changes what both endpoints mean, so a completed cell from
+    # the other side of that switch (or from before it existed — no line at
+    # all) is not "already complete", it is a different experiment sharing the
+    # directory name. That is an operator error to stop on, not to paper over
+    # with a silent REDO that would overwrite banked data.
+    want_mr="false"; [ "$MISSION_RETURN_FLAG" = "1" ] && want_mr="true"
+    have_mr=$(sed -n 's/^mission_return_enabled=//p' "$out/run_manifest.txt" 2>/dev/null | head -1)
+    if [ "${have_mr:-missing}" != "$want_mr" ]; then
+      log "ABORT: $name is complete but its manifest says mission_return_enabled=${have_mr:-<absent>},"
+      log "       while this campaign runs --mission-return $MISSION_RETURN_FLAG. Same name, different"
+      log "       experiment — refusing to skip OR overwrite. Use a fresh --root/--tag."
+      exit 2
+    fi
     if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then
       # Keep the evidence. A gate can fail *because the link never dropped*, so
       # re-rolling preferentially discards mild-outage realisations; deleting the
@@ -177,7 +213,7 @@ for cell in "${CELL_LIST[@]}"; do
     break
   fi
 
-  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek free=${free_mb}MB)"
+  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
@@ -186,6 +222,7 @@ for cell in "${CELL_LIST[@]}"; do
 
   env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
+      MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \
       DONE_UNKNOWN="$DONE_UNKNOWN" DONE_CRITERION="$DONE_CRITERION" \

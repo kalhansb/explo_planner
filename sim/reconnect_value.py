@@ -191,6 +191,8 @@ def analyse(d):
     rec = {"cell": cell, "arm": mf.get("reconnect_mode_requested", "?"),
            "seed": mf.get("seed", "?"),
            "budget": (mf.get("pursuit_budget_max_sec") or "?").replace(".0", ""),
+           # On mission-return cells this is the MISSION end (homing included),
+           # not the exploration finish -- see event_log.py for the split pair.
            "t_complete": mf.get("run_end_t_sim"),
            "end_reason": mf.get("run_end_reason"),
            "gates": mf.get("run_gates_verdict"),

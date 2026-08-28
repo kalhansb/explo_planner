@@ -217,6 +217,9 @@ struct ReconnectDispatchEvent {
 struct ReconnectEndEvent {
   /// reconnected | gave_up | abandoned — classified by the node from the team
   /// state and the destination state at the moment the manoeuvre clock stops.
+  /// "Gave up" destinations are the states where exploration is over: DONE,
+  /// and RETURN_HOME under mission return (a latch that ends a manoeuvre must
+  /// bucket the same way whether the robot then parks or drives home).
   const char* outcome = "abandoned";
   const char* to_state = "UNKNOWN";       ///< state the manoeuvre resolved into
   const char* reason = "";                ///< transition reason string
@@ -238,6 +241,29 @@ struct ExplorationCompleteEvent {
   int    peers_live = 0;
   int    expected_peers = 0;
   int    occurrence = 1;                  ///< 1 = the first declaration of the run
+};
+
+/// `mission_complete` payload — the moment the mission-return homing leg
+/// resolves, however it resolves. Emitted at most once per run (the homing leg
+/// is entered only from a terminal exploration ending and only resolves into
+/// DONE), and only in runs with mission_return_enabled — its absence in a
+/// mission-return run whose exploration completed is a defect signal. The
+/// mission endpoint (primary metric) is this event's stamp for
+/// result=="arrived"; every other result is a flagged, bounded failure that
+/// still ends the run.
+struct MissionCompleteEvent {
+  /// arrived | timeout | budget | no-progress — how the homing leg resolved.
+  const char* result = "";
+  /// The reason the robot went home, i.e. the terminal exploration ending
+  /// that dispatched it ("coverage-latched" / "step-budget" / ...). NOT the
+  /// resolution — that is `result`.
+  const char* reason = "";
+  double home_x = 0.0, home_y = 0.0;      ///< the recorded start pose driven to
+  double final_x = 0.0, final_y = 0.0;    ///< where the robot actually stopped
+  double dist_to_home_m = -1.0;           ///< XY distance between the two rows above
+  double homing_duration_sec = -1.0;      ///< SIM seconds spent in RETURN_HOME
+  double homing_distance_m = -1.0;        ///< metres travelled while homing
+  bool   latched = false;                 ///< had the coverage latch fired (vs step budget)
 };
 
 /// `run_end` payload. The logger appends its own health/accounting fields, the
@@ -263,6 +289,20 @@ struct RunEndEvent {
   double metrics_effective_period_sec = -1.0; ///< the sampler's own current belief
   int    metrics_rows = 0;                    ///< periodic rows actually written
   int    metrics_backoffs = 0;                ///< times it stretched its period
+  // --- Mission return / final geometry (schema 2) ---------------------
+  // Where the run actually ENDED, in every run — not only mission-return
+  // ones. The step trajectory samples at a period, so the true final pose is
+  // otherwise unrecorded; with these, "did the robot end where it started"
+  // is answerable from run_end alone, and in a mission-return run the pair
+  // (home, final) is the audit of the homing leg without replaying events.
+  bool   have_home = false;                   ///< a home pose was ever recorded
+  double home_x = 0.0, home_y = 0.0;          ///< recorded start pose (junk if !have_home)
+  double final_x = 0.0, final_y = 0.0;        ///< last known pose at run end
+  /// "" (never resolved / feature off) | arrived | timeout | budget |
+  /// no-progress — restates mission_complete so single-line readers need not
+  /// scan the event stream. The logger writes "" as null.
+  std::string mission_home_result;
+  double mission_home_sim_sec = -1.0;         ///< sim stamp of the resolution, -1 = none
 };
 
 // ==================================================================
@@ -273,7 +313,9 @@ class ExperimentLog {
  public:
   /// Schema version stamped into `run_start`. Bump on ANY change to field
   /// names or meanings so an analysis script can refuse a file it predates.
-  static constexpr int kSchemaVersion = 1;
+  /// v2: mission_complete event; run_end gains have_home/home_x/home_y/
+  /// final_x/final_y/mission_home_result/mission_home_sim_sec.
+  static constexpr int kSchemaVersion = 2;
 
   /// Decimal places used for every number written. Fixed, not significant
   /// digits: 6 decimals is microseconds on a sim timestamp and micrometres on a
@@ -353,6 +395,8 @@ class ExperimentLog {
                        const ReconnectEndEvent& e);
   void logExplorationComplete(const ExperimentContext& ctx,
                               const ExplorationCompleteEvent& e);
+  void logMissionComplete(const ExperimentContext& ctx,
+                          const MissionCompleteEvent& e);
   /// Emits `run_end` (once — later calls are ignored) with the logger's own
   /// health and accounting appended. Safe to call from a destructor: it never
   /// throws and never touches ROS beyond the already-constructed logger.
