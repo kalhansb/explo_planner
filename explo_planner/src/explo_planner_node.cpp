@@ -276,6 +276,30 @@ private:
   /// and a second ROI walk is the most expensive thing in the tick. Returns
   /// true on the call that latched, false on every other call.
   bool maybeLatchCoverageDone(double unk, const char* source);
+  /// Publish the sample a completion decision was actually taken on into the
+  /// cache that recordExplorationComplete stamps its event from.
+  ///
+  /// Exists because the obvious place to do this — inside the latch — is the
+  /// wrong place. Generation 7 fixed the mis-stamp there, but the fix sat after
+  /// `if (done_criterion_ != "latch") return false;`, so the streak criterion
+  /// kept the identical defect: it decides on a fresh local `unk` and reaches
+  /// recordExplorationComplete through finishOrRendezvous, which stamps the
+  /// PREVIOUS metrics sample. Every termination path must therefore call this
+  /// with the number it decided on, and no path may depend on which criterion
+  /// is configured. The invariant is: the event's unknown_fraction is the
+  /// quantity the decision tested, never a neighbouring sample of it.
+  ///
+  /// Three of the four completion paths call this explicitly. The fourth —
+  /// doLogStep's step-budget ending, the DOMINANT termination in dense terrain
+  /// — satisfies the invariant WITHOUT a call, and deliberately so: doLogStep
+  /// opens with fillCommonMetrics, which writes the cache from the same tick's
+  /// measurement before step_ is incremented and the budget tested, so the
+  /// stamped fraction is already same-tick fresh. Adding a call there would buy
+  /// a second full ROI walk and zero accuracy. Stated here because the
+  /// invariant is what matters and "every path calls this" is not the same
+  /// claim — a future reader who checks the call sites instead of the ordering
+  /// will find one missing and be tempted to "fix" it.
+  void noteCoverageDecisionSample(double unk, const char* source);
   /// The manoeuvre dispatch itself (mode -> pursuit / meeting point / anchor /
   /// hold), factored out of finishOrRendezvous so the mid-run trigger in
   /// doPlan can arm the same manoeuvres without the DONE fallthrough. Always
@@ -320,8 +344,14 @@ private:
   enum class HomeMode { DIRECT, RETRACE, ESCAPE };
   float homeApproachMetric() const;
   static const char* homeModeName(HomeMode m);
+  /// `test_delta` is the LEFT-HAND SIDE of the inequality the firing detector
+  /// evaluated, selected by the caller to match `kind`: window movement for
+  /// "frozen", closing distance for "approach". It is not interchangeable with
+  /// `metric`, which is an instantaneous remaining distance sampled at the fire
+  /// instant — on the banked g6pilot fires the two differ by 4x to 162x, and
+  /// once in sign. The matching threshold is re-derived inside from `kind`.
   void homeWatchdogFire(const char* kind, float metric, float dist_home,
-                        float approach_delta);
+                        float test_delta);
   bool engageRetrace();
   bool pickEscapeTarget();
   void startEscapeLeg();
@@ -425,7 +455,13 @@ private:
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
 
   // NAVIGATE helpers
-  void failGoal(const char* reason, double elapsed);
+  /// Park the current goal in the failed-goal blacklist and leave NAVIGATE.
+  /// `elapsed` is time since NAVIGATE entry (context on every row); the
+  /// comparison that actually fired is passed separately as
+  /// (test_name, test_value, test_threshold) because the three callers do not
+  /// test the same quantity — see logNavGoalFailed's contract.
+  void failGoal(const char* reason, double elapsed, const char* test_name,
+                double test_value, double test_threshold);
   void heartbeatTick();
 
   // Coordinated proximity stop. checkProximityHold runs each tick while a nav
@@ -1255,6 +1291,17 @@ private:
   static constexpr float kEscapeArriveM       = 1.5f;
   static constexpr float kEscapeFallbackM     = 2.5f;
   static constexpr float kApproachSuppressM   = 3.0f;
+  // Placeholder passed on home_watchdog rows that record no detector
+  // inequality (kind="escape-end", a leg termination rather than a fire).
+  //
+  // It is NOT a sentinel and must never be read as one: the writer omits both
+  // test fields entirely on those rows, keyed on `kind`, so absence — not a
+  // magic value — is what marks "no inequality here". A numeric sentinel
+  // cannot work for this field in either direction: 0.0 is the canonical
+  // frozen fire (a robot that moved exactly nothing) and negatives are the
+  // canonical receding approach fire (-0.03 m in g6pilot_hybrid_seed103), so
+  // every candidate value is also a real measurement.
+  static constexpr double kNoTestDelta        = 0.0;
   // Raised by trackDistance's teleport guard, consumed by doReturnHome: an
   // approach delta measured across a relocalization discontinuity is a
   // measurement artefact, not a stall.
@@ -1436,6 +1483,11 @@ private:
   // positive control — a gated run whose two columns agree everywhere is a run
   // in which the gate did nothing.
   double dispatch_link_down_sec_ = -1.0;
+  /// The mid-run trigger's own left-hand side, held for the whole manoeuvre like
+  /// the other dispatch_* diagnostics so every leaf re-reports the decision it
+  /// was armed from. See ReconnectDispatch::team_incomplete_sec for why this is
+  /// not peer_record_age_sec.
+  double dispatch_team_incomplete_sec_ = -1.0;
   // True when the link gate has a fresh, decodable sample for our own pair and
   // may therefore override the record-age clock. Logs (throttled) when a topic
   // is configured but unusable, so a typo degrades loudly rather than silently
@@ -2559,6 +2611,18 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("failed_goal_retire_after", failed_goal_retire_after_);
     exp_log_->addParamNum("progress_window_sec", progress_window_sec_);
     exp_log_->addParamNum("progress_min_distance_m", progress_min_distance_m_);
+    // The thresholds every nav_goal_failed row is tested against. Previously
+    // absent from the echo entirely, which meant the number that decided 30 of
+    // 31 failures in the g6pilot campaign (goal_rotate_timeout_sec = 15 s)
+    // appeared NOWHERE in the machine-readable output and was recoverable only
+    // by reading the YAML by hand. nav_budget_sec is per-goal — computed from
+    // goal distance by navBudgetSec — so it cannot be echoed as a constant;
+    // echoing its four inputs makes it reconstructible instead.
+    exp_log_->addParamNum("goal_rotate_timeout_sec", goal_rotate_timeout_sec_);
+    exp_log_->addParamNum("nav_speed_estimate_mps", nav_speed_est_mps_);
+    exp_log_->addParamNum("nav_safety_factor", nav_safety_factor_);
+    exp_log_->addParamNum("nav_min_timeout_sec", nav_min_timeout_sec_);
+    exp_log_->addParamNum("nav_max_timeout_sec", nav_max_timeout_sec_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
     exp_log_->addParamBool("terrain_relative_z", terrain_relative_z_);
@@ -3497,26 +3561,39 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
                           s == State::PURSUE || s == State::PROXIMITY_HOLD);
   if (reconnect_active_ && !manoeuvre) {
     const double manoeuvre_sec = (this->now() - reconnect_start_time_).seconds();
+    const int live =
+        coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+    // Classified mechanically from the two facts that decide it, with the
+    // raw fields alongside so an analysis can re-classify: the team being
+    // complete AT THIS INSTANT is what "reconnected" means (every release
+    // path in the manoeuvre states tests exactly that), and landing in a
+    // state where exploration is over — DONE, or RETURN_HOME under mission
+    // return — instead of PLAN is what "gave up" means. RETURN_HOME must be
+    // in that set or every latch-ended manoeuvre in a mission-return run
+    // re-buckets from gave_up to abandoned and the outcome mix stops being
+    // comparable across campaigns.
+    //
+    // Hoisted above the log line, and above the `if (exp_log_)`, so the line
+    // and the event carry ONE expression's answer. Computing it twice is how
+    // a log and its event drift apart, which is the whole defect class this
+    // generation is closing.
+    const char* outcome = teamComplete(live, rendezvous_expected_peers_)
+                    ? "reconnected"
+                    : ((s == State::DONE || s == State::RETURN_HOME)
+                           ? "gave_up" : "abandoned");
+    // The outcome is IN the line because it was not, through generation 7, and
+    // the plaintext log therefore could not say how any manoeuvre resolved.
+    // The destination state is not a proxy for it: under mission return every
+    // manoeuvre ends "-> RETURN_HOME" whether it reconnected or gave up, so a
+    // log-based classifier had nothing to key on and silently labelled all 5
+    // banked firings "open_at_horizon" — never ended — beside a duration it had
+    // just parsed from this very line. 0/5 correct against the jsonl.
     RCLCPP_INFO(get_logger(),
-        "Reconnect manoeuvre ended after %.1f s sim (-> %s).",
-        manoeuvre_sec, stateName(s));
+        "Reconnect manoeuvre ended after %.1f s sim: %s (-> %s).",
+        manoeuvre_sec, outcome, stateName(s));
     if (exp_log_) {
-      const int live =
-          coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
       ReconnectEndEvent e;
-      // Classified mechanically from the two facts that decide it, with the
-      // raw fields alongside so an analysis can re-classify: the team being
-      // complete AT THIS INSTANT is what "reconnected" means (every release
-      // path in the manoeuvre states tests exactly that), and landing in a
-      // state where exploration is over — DONE, or RETURN_HOME under mission
-      // return — instead of PLAN is what "gave up" means. RETURN_HOME must be
-      // in that set or every latch-ended manoeuvre in a mission-return run
-      // re-buckets from gave_up to abandoned and the outcome mix stops being
-      // comparable across campaigns.
-      e.outcome = teamComplete(live, rendezvous_expected_peers_)
-                      ? "reconnected"
-                      : ((s == State::DONE || s == State::RETURN_HOME)
-                             ? "gave_up" : "abandoned");
+      e.outcome        = outcome;
       e.to_state       = stateName(s);
       e.reason         = reason;
       e.duration_sec   = manoeuvre_sec;
@@ -3618,6 +3695,26 @@ void ExploPlannerNode::doPlan() {
   // drain. In shutdown mode LOG_STEP routes to DONE before PLAN ever runs
   // with a spent budget, so legacy behaviour is untouched.
   if (step_ >= max_steps_) {
+    // Measure fresh rather than letting the event inherit the last sampler
+    // tick. The budget, not coverage, is what ended this run, so the fraction
+    // is descriptive here rather than the tested quantity — but it is still
+    // read as "how much was left when it stopped", and a stale answer to that
+    // is a wrong answer.
+    //
+    // Cost is one extra ROI walk per PLAN tick spent at a spent budget, NOT
+    // "once per run" as this said through generation 7. finishOrRendezvous's
+    // return value is discarded here, so a DEFERRED decision (rendezvous
+    // confirmation window) leaves the node in PLAN and re-walks on the next
+    // tick until the window resolves. It is bounded by reconnect_confirm_sec
+    // (3.0 s) and stamps nothing twice — recordExplorationComplete is keyed on
+    // step_, which cannot advance during a deferral. Unreachable in the g8r1
+    // configuration regardless: finishOrRendezvous returns at the
+    // mission_return_enabled_ && have_home_ branch, above the deferral gate,
+    // and startReturnHome always returns true. Documented because the walk is
+    // a grid traversal and "once per run" is what a reader would budget for.
+    const char* budget_src = "";
+    noteCoverageDecisionSample(coverageUnknownFraction(&budget_src),
+                               budget_src);
     finishOrRendezvous("step-budget");
     return;
   }
@@ -3690,6 +3787,10 @@ void ExploPlannerNode::doPlan() {
             "Exploration complete: ROI saturated "
             "(unknown=%.3f, %d steps, %.2f m traveled).",
             unk, step_, cumulative_distance_);
+        // Record the fraction this decision was taken on, not the last sampler
+        // tick's. Same defect the latch path had; it is only absent from the
+        // pilot data because done_criterion=latch was configured throughout.
+        noteCoverageDecisionSample(unk, cov_src);
         // With rendezvous on and a teammate still out of comms, return to the
         // anchor and wait for the team instead of finishing (see below).
         finishOrRendezvous("coverage-saturated");
@@ -3746,10 +3847,20 @@ void ExploPlannerNode::doPlan() {
       if (!teamComplete(live, rendezvous_expected_peers_) && cooldown_ok) {
         // THE LINK GATE IS A VETO, NOT A CLOCK (§30.11, §30.24, §30.26).
         //
-        // missing_for is record age: it ages whenever the peer is not SENDING,
-        // which includes a teammate sitting in a long PLAN tick two metres
-        // away. That is the defect — but the repair is only to refuse the
-        // fires that cannot possibly help, NOT to re-time the trigger.
+        // missing_for is the TEAM-PRESENCE clock, not the peer's record age:
+        // team_last_complete_time_ is stamped on the 1 Hz heartbeat while
+        // livePeerCount() reads the team complete, and a peer stays live until
+        // its claim expires coord_claim_ttl_sec (5 s) after its last beacon. So
+        // missing_for ~= peer_record_age_sec - TTL, measured at 3.74-5.01 s
+        // below it across all 6 banked dispatches, and a nominal 240 s gate
+        // fires at a record age of ~245 s. It is logged as its own column
+        // (team_incomplete_sec) so the fired inequality is recoverable offline.
+        //
+        // It shares the defect record age has, which is what the veto below is
+        // for: it ages whenever the peer is not SENDING, which includes a
+        // teammate sitting in a long PLAN tick two metres away. The repair is
+        // only to refuse the fires that cannot possibly help, NOT to re-time the
+        // trigger.
         //
         // Timing on link-down duration instead was tried and rejected against
         // the banked data. The two quantities are not variations of each
@@ -3783,7 +3894,7 @@ void ExploPlannerNode::doPlan() {
           if (link_down_for < reconnect_confirm_sec_) {
             link_veto = true;
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
-                "Reconnect (mid-run): standing down — peer record silent "
+                "Reconnect (mid-run): standing down — team incomplete "
                 "%.0fs but the radio link is %s, so a chase would be spent on "
                 "a peer that is already reachable.",
                 missing_for,
@@ -3803,8 +3914,16 @@ void ExploPlannerNode::doPlan() {
             dispatch_gate_sec_      = gate_sec;
             dispatch_est_unshared_  = est_unshared;
             dispatch_link_down_sec_ = link_down_for;
+            dispatch_team_incomplete_sec_ = missing_for;
+            // "team incomplete", not "peer silent": missing_for measures the
+            // team-presence clock, which lags the peer's record age by
+            // coord_claim_ttl_sec. Through generation 7 this line said "peer
+            // silent", and read against the JSONL's peer_record_age_sec the two
+            // disagreed by 3.74-5.01 s with no way to tell which was the tested
+            // one. Naming it here and logging it beside gate_sec makes the
+            // inequality the code evaluated readable off the line itself.
             RCLCPP_INFO(get_logger(),
-                "Reconnect (mid-run): peer silent %.0fs >= gate %.0fs "
+                "Reconnect (mid-run): team incomplete %.0fs >= gate %.0fs "
                 "(radio down %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
                 "interrupting exploration for the reconnect manoeuvre.",
                 missing_for, gate_sec, link_down_for, est_unshared,
@@ -4517,8 +4636,10 @@ void ExploPlannerNode::doNavigate() {
       rotate_deadline_armed_ = true;
       rotate_start_time_ = now;
     }
-    if ((now - rotate_start_time_).seconds() > goal_rotate_timeout_sec_) {
-      failGoal("budget-rotate", (now - state_enter_time_).seconds());
+    const double rotate_elapsed = (now - rotate_start_time_).seconds();
+    if (rotate_elapsed > goal_rotate_timeout_sec_) {
+      failGoal("budget-rotate", (now - state_enter_time_).seconds(),
+               "rotate_elapsed_sec", rotate_elapsed, goal_rotate_timeout_sec_);
       return;
     }
     // Keep re-publishing so the navigator keeps servicing the yaw — the old
@@ -4535,7 +4656,7 @@ void ExploPlannerNode::doNavigate() {
 
   // 1) Distance-budgeted hard timeout.
   if (elapsed > nav_budget_sec_) {
-    failGoal("budget", elapsed);
+    failGoal("budget", elapsed, "nav_elapsed_sec", elapsed, nav_budget_sec_);
     return;
   }
 
@@ -4544,7 +4665,13 @@ void ExploPlannerNode::doNavigate() {
   if (window_elapsed > progress_window_sec_) {
     float delta = cumulative_distance_ - progress_check_dist_;
     if (delta < progress_min_distance_m_) {
-      failGoal("no-progress", elapsed);
+      // The test here is a DISTANCE, not a time: metres travelled inside the
+      // progress window against progress_min_distance_m. test_name carries the
+      // units so no consumer has to infer them from `reason` and then get them
+      // wrong.
+      failGoal("no-progress", elapsed, "window_progress_m",
+               static_cast<double>(delta),
+               static_cast<double>(progress_min_distance_m_));
       return;
     }
     progress_check_time_ = now;
@@ -4558,7 +4685,9 @@ void ExploPlannerNode::doNavigate() {
 // Park the current goal in the failed-goal blacklist with a tagged reason
 // and transition out of NAVIGATE. Centralised so both timeout paths
 // (budget exceeded / no progress) share the same logging + bookkeeping.
-void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
+void ExploPlannerNode::failGoal(const char* reason, double elapsed,
+                                const char* test_name, double test_value,
+                                double test_threshold) {
   const double fail_time = this->now().seconds();
   const int k = failed_goals_.add(current_goal_.position, fail_time,
                                   failed_goal_radius_m_);
@@ -4570,25 +4699,30 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
   } else {
     std::snprintf(status, sizeof(status), "ttl=%.0fs", failed_goal_ttl_sec_);
   }
-  // The budget this attempt was measured against is logged with the failure,
-  // not left at DEBUG where the campaign never captures it. Without it the
-  // pair (elapsed, budget) can only be reconstructed by re-deriving the budget
-  // from goal distance and the speed estimate, and a "budget" failure at 31 s
-  // is a different animal from one at 179 s: the first says the estimator was
-  // wrong about a short hop, the second that the robot genuinely could not get
-  // there. `pose_stale` marks an attempt whose progress metric was measured
-  // against a pose that stopped updating — see the pose-health event.
+  // The comparison that fired is logged with the failure, not left at DEBUG
+  // where the campaign never captures it, and it is printed as the TESTED pair
+  // rather than as (elapsed, nav_budget). The old line printed the latter for
+  // all three reasons, which made every budget-rotate row read "failed at 43-58 s
+  // of a 180 s budget" — a claim about ground the robot could not cross — when
+  // the actual test was a 15 s rotation timeout. A "budget" failure at 31 s is a
+  // different animal from one at 179 s (estimator wrong about a short hop vs
+  // genuinely impassable ground), and that distinction only survives if the
+  // threshold printed is the one that was consulted. `pose_stale` marks an
+  // attempt whose progress metric was measured against a pose that stopped
+  // updating — see the pose-health event.
   RCLCPP_WARN(get_logger(),
-      "Step %d: navigation failed [%s] after %.1fs of %.1fs budget at goal "
-      "(%.2f, %.2f)%s. Blacklisted [k=%d, %s]; %zu active failed-goal sites.",
-      step_, reason, elapsed, nav_budget_sec_,
+      "Step %d: navigation failed [%s] on %s=%.1f vs %.1f (%.1fs since "
+      "NAVIGATE entry) at goal (%.2f, %.2f)%s. "
+      "Blacklisted [k=%d, %s]; %zu active failed-goal sites.",
+      step_, reason, test_name, test_value, test_threshold, elapsed,
       current_goal_.position.x(), current_goal_.position.y(),
       have_pose_ ? "" : " [POSE STALE]",
       k, status, failed_goals_.size());
   if (exp_log_) {
     exp_log_->logNavGoalFailed(expCtx(), current_goal_.position.x(),
                                current_goal_.position.y(), reason, elapsed, k,
-                               retired, nav_budget_sec_, !have_pose_);
+                               retired, nav_budget_sec_, !have_pose_,
+                               test_name, test_value, test_threshold);
   }
   have_active_intent_ = false;  // release the claim on failure
   // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
@@ -4652,6 +4786,34 @@ bool ExploPlannerNode::finishNow(const char* reason) {
   return true;
 }
 
+// The deciding sample, published into the cache the event log stamps from.
+//
+// This is load-bearing on the primary endpoint's own record. The completion
+// hooks arrive with differently-sourced values: the metrics tick passes
+// last_unknown_fraction_ itself (already refreshed on that tick, so cache and
+// decision agree by construction), but the doPlan hooks measure fresh and do
+// NOT touch the cache. recordExplorationComplete then stamps the event from the
+// cache — so a completion that fired from doPlan wrote the PREVIOUS metrics
+// sample into the exploration_complete event, up to one metrics period stale
+// and, since the fraction is falling, systematically HIGHER than the number
+// that was tested. g6pilot_off_seed104/atlas latched on 0.638 and recorded
+// 0.660, i.e. an endpoint event that reads as if it fired above its own 0.640
+// criterion. The decision was right in every case; only the record was wrong,
+// which is worse than harmless because the record is what any analysis reads.
+//
+// Safe for the other consumer (logRunEnd, which documents the value as "at most
+// one metrics period old") — this only ever makes it fresher, and
+// fillCommonMetrics overwrites it on the next row regardless. `source` is a
+// string literal from coverageUnknownFraction, the same lifetime class the
+// cache already holds. A negative `unk` means "could not measure" and must not
+// be published as if it were a coverage reading.
+void ExploPlannerNode::noteCoverageDecisionSample(double unk,
+                                                  const char* source) {
+  if (unk < 0.0) return;
+  last_unknown_fraction_ = unk;
+  if (source && *source) last_coverage_source_ = source;
+}
+
 // The latched, state-blind criterion. Everything this does NOT do is the point:
 // no streak to accumulate, no peer count consulted, no state excluded, and no
 // path back out. It answers one question — has this robot's own map of the ROI
@@ -4668,31 +4830,7 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   coverage_latched_       = true;
   coverage_latch_t_sim_   = this->now().seconds();
   coverage_latch_unknown_ = unk;
-  // Publish the DECIDING sample into the cache that the event log reads.
-  //
-  // This is load-bearing on the primary endpoint's own record. There are two
-  // hooks into this function and they arrive with differently-sourced values:
-  // the metrics tick passes last_unknown_fraction_ itself (already refreshed on
-  // that tick, so cache and decision agree by construction), but the doPlan hook
-  // measures fresh and does NOT touch the cache. recordExplorationComplete then
-  // stamps the event from the cache — so a latch that fired from doPlan wrote
-  // the PREVIOUS metrics sample into the exploration_complete event, up to one
-  // metrics period stale and, since the fraction is falling, systematically
-  // HIGHER than the number that was tested. g6pilot_off_seed104/atlas latched on
-  // 0.638 and recorded 0.660, i.e. an endpoint event that reads as if it fired
-  // above its own 0.640 criterion. The decision was right in every case; only
-  // the record was wrong, which is worse than harmless because the record is
-  // what any analysis reads.
-  //
-  // Assigning here rather than at either call site is deliberate: it makes the
-  // property hold for any future hook without that hook having to know about it.
-  // Safe for the other consumer (logRunEnd, which documents the value as "at
-  // most one metrics period old") — this only ever makes it fresher, and
-  // fillCommonMetrics overwrites it on the next row regardless. `source` is a
-  // string literal from coverageUnknownFraction, the same lifetime class the
-  // cache already holds.
-  last_unknown_fraction_ = unk;
-  last_coverage_source_  = source;
+  noteCoverageDecisionSample(unk, source);
   RCLCPP_INFO(get_logger(),
       "Exploration complete [latch]: ROI unknown fraction %.3f <= %.3f "
       "(source=%s) in state %s at t_sim=%.1f — %d steps, %.2f m traveled. "
@@ -5597,11 +5735,19 @@ void ExploPlannerNode::doReturnHome() {
   bool frozen = false;
   bool no_approach = false;
   float approach_delta = 0.f;
+  // The frozen detector's own left-hand side, captured because the next two
+  // lines destroy it: progress_check_dist_ is re-baselined immediately after
+  // the test, so by the time homeWatchdogFire runs the tested delta cannot be
+  // recomputed from any member. Through generation 7 it was never passed on at
+  // all, and a frozen fire reached the log holding only metric_m — an
+  // INSTANTANEOUS remaining distance, not the window movement that was tested.
+  // See the note on the log call for what that cost.
+  float frozen_delta = 0.f;
 
   const double move_window = (now - progress_check_time_).seconds();
   if (move_window > progress_window_sec_) {
-    frozen = (cumulative_distance_ - progress_check_dist_) <
-             progress_min_distance_m_;
+    frozen_delta = cumulative_distance_ - progress_check_dist_;
+    frozen = frozen_delta < progress_min_distance_m_;
     progress_check_time_ = now;
     progress_check_dist_ = cumulative_distance_;
   }
@@ -5632,8 +5778,14 @@ void ExploPlannerNode::doReturnHome() {
   if (frozen || no_approach) {
     // Frozen wins the label when both fire: "not moving" is the more specific
     // diagnosis and picks the response that assumes the platform is stuck.
+    //
+    // The tested delta is selected by the SAME condition that selects the
+    // label, so the logged number is always the one belonging to the detector
+    // named in `kind`. Passing approach_delta unconditionally (as generation 7
+    // did) would attribute the approach detector's value to a frozen fire on
+    // exactly the ticks where both fired.
     homeWatchdogFire(frozen ? "frozen" : "approach", metric, dist,
-                     approach_delta);
+                     frozen ? frozen_delta : approach_delta);
     return;
   }
 
@@ -5749,6 +5901,14 @@ void ExploPlannerNode::startEscapeLeg() {
 /// escape at all is evidence the direct goal is the thing that trapped the
 /// robot. Falls back to the direct goal only when there is no usable trail.
 void ExploPlannerNode::resumeRetrace(const char* why) {
+  // Snapshot the approach metric BEFORE engageRetrace() flips home_mode_.
+  // homeApproachMetric() is mode-dependent by design (straight line in
+  // DIRECT/ESCAPE, remaining trail length in RETRACE), and this event is about
+  // the escape leg that just ENDED, whose in-force metric was the straight
+  // line. Measuring after the flip reported the newly-resumed retrace's trail
+  // distance on a row labelled "escape" — the same convention error the `mode`
+  // argument below was already fixed for, left behind in the metric argument.
+  const float escape_metric = homeApproachMetric();
   const bool ok = engageRetrace();
   if (!ok) home_mode_ = HomeMode::DIRECT;
   RCLCPP_WARN(get_logger(),
@@ -5763,11 +5923,15 @@ void ExploPlannerNode::resumeRetrace(const char* why) {
     // INTO, i.e. the opposite convention to every detector-fire row, so a
     // reader grouping by mode counted escape-ends as retrace events. The
     // resumed mode is still recorded, in next_mode, where it does not collide.
+    // No tested pair: an escape-end is not a detector fire, so it has no
+    // inequality to record. The sentinels keep that distinction visible in the
+    // row rather than borrowing a neighbouring detector's numbers.
     exp_log_->logHomeWatchdog(expCtx(), "escape-end", "escape",
                               why, (latest_pos_ - home_pos_).head<2>().norm(),
-                              homeApproachMetric(),
+                              escape_metric,
                               (this->now() - escape_leg_start_).seconds(),
-                              home_escapes_used_, homeModeName(home_mode_));
+                              home_escapes_used_, kNoTestDelta, kNoTestDelta,
+                              homeModeName(home_mode_));
   }
   republishHomeGoal("home-escape-end");
 }
@@ -5822,12 +5986,20 @@ void ExploPlannerNode::republishHomeGoal(const char* why) {
 /// so any analysis must treat 105 s and 600 s parks as the same event class and
 /// must not read the difference as a treatment effect.
 void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
-                                        float dist_home, float approach_delta) {
+                                        float dist_home, float test_delta) {
   const char* mode = homeModeName(home_mode_);
   const char* response = "resend";
-  const double window = std::strcmp(kind, "frozen") == 0
-                            ? progress_window_sec_
-                            : return_approach_window_sec_;
+  const bool is_frozen = std::strcmp(kind, "frozen") == 0;
+  const double window = is_frozen ? progress_window_sec_
+                                  : return_approach_window_sec_;
+  // Selected by `kind` for the same reason `window` is: one event type carries
+  // two detectors, and the threshold that was compared against differs between
+  // them. Logged beside the delta so the fired inequality
+  // (test_delta_m < test_threshold_m) is re-derivable from the row alone,
+  // without joining to run_start params and without knowing which detector
+  // owns which param.
+  const double test_threshold = is_frozen ? progress_min_distance_m_
+                                          : return_approach_min_m_;
 
   if (home_mode_ == HomeMode::ESCAPE) {
     // Only `frozen` can reach here — approach is suppressed during an escape.
@@ -5843,21 +6015,29 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
 
   if (want_escape) {
     if (home_escapes_used_ >= return_escape_max_attempts_) {
+      // The tested delta is in this line because this is the fire that ENDS a
+      // run: "home-gave-up" is the censoring reason, and classifying a park as
+      // a genuine stall rather than a detector artefact needs the number the
+      // detector compared, not the distance still to go.
       RCLCPP_WARN(get_logger(),
           "MISSION-RETURN: %s watchdog fired in %s mode with all %d escapes "
-          "spent (%.2f m from home, metric %.2f m) — parking here.",
-          kind, mode, return_escape_max_attempts_, dist_home, metric);
+          "spent (%.2f m from home, metric %.2f m, moved %.2f m of the %.2f m "
+          "needed in %.0f s) — parking here.",
+          kind, mode, return_escape_max_attempts_, dist_home, metric,
+          test_delta, test_threshold, window);
       if (exp_log_) {
         exp_log_->logHomeWatchdog(expCtx(), kind, mode, "park", dist_home,
-                                  metric, window, home_escapes_used_);
+                                  metric, window, home_escapes_used_,
+                                  test_delta, test_threshold);
       }
       finishMissionReturn("no-progress", "home-gave-up");
       return;
     }
     RCLCPP_WARN(get_logger(),
         "MISSION-RETURN: %s watchdog fired in %s mode — %.2f m from home, "
-        "metric %.2f m over a %.0f s window.",
-        kind, mode, dist_home, metric, window);
+        "metric %.2f m, moved %.2f m of the %.2f m needed over a %.0f s "
+        "window.",
+        kind, mode, dist_home, metric, test_delta, test_threshold, window);
     startEscapeLeg();
     response = "escape";
   } else {
@@ -5865,7 +6045,7 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
     RCLCPP_WARN(get_logger(),
         "MISSION-RETURN: no approach toward home (%.2f m away, metric moved "
         "%.2f m in %.0f s, need %.1f m) — retry %d/2: %s.",
-        dist_home, approach_delta, window,
+        dist_home, test_delta, window,
         return_approach_min_m_, return_home_retries_,
         return_home_retries_ >= 2 ? "retracing the outbound trail"
                                   : "braking and re-sending the home goal");
@@ -5882,11 +6062,13 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
         if (home_escapes_used_ >= return_escape_max_attempts_) {
           if (exp_log_) {
             exp_log_->logHomeWatchdog(expCtx(), kind, mode, "park", dist_home,
-                                      metric, window, home_escapes_used_);
+                                      metric, window, home_escapes_used_,
+                                      test_delta, test_threshold);
           }
           RCLCPP_WARN(get_logger(),
-              "MISSION-RETURN: no trail to retrace and all %d escapes spent — "
-              "parking here.", return_escape_max_attempts_);
+              "MISSION-RETURN: no trail to retrace and all %d escapes spent "
+              "(moved %.2f m of the %.2f m needed in %.0f s) — parking here.",
+              return_escape_max_attempts_, test_delta, test_threshold, window);
           finishMissionReturn("no-progress", "home-gave-up");
           return;
         }
@@ -5897,7 +6079,8 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
   }
   if (exp_log_) {
     exp_log_->logHomeWatchdog(expCtx(), kind, mode, response, dist_home, metric,
-                              window, home_escapes_used_);
+                              window, home_escapes_used_, test_delta,
+                              test_threshold);
   }
   republishHomeGoal("home-watchdog");
 }
@@ -6359,6 +6542,15 @@ bool ExploPlannerNode::pursuitExploreFallback(const char* why) {
   // and the next goal is whatever PLAN picks. NB a resume_exploring dispatch
   // has no matching reconnect_end when the chase was DECLINED — there was no
   // manoeuvre clock running to stop (see resumeExploring).
+  //
+  // The refresh is the whole point on THIS leaf: refreshDispatchContext's own
+  // comment names pursuitFallback as a path that "commits once a chase has
+  // run", so without it peer_record_age_sec is stamped as of the chase TRIGGER
+  // and understates the true age by up to the entire pursuit budget
+  // (pursuit_budget_max_sec = 600 s) — always in the flattering direction, and
+  // only on the post-chase subset, which is worse than uniform noise because it
+  // biases exactly the comparison the field exists to support.
+  refreshDispatchContext();
   logReconnectDispatch("resume_exploring", nullptr, /*budget_sec=*/-1.0, why);
   resumeExploring(why);
   return true;
@@ -7099,6 +7291,21 @@ void ExploPlannerNode::expClockAnchorTick() {
 // Coordination) rides on every peer event so the two can be cross-checked.
 void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
   if (!exp_log_) return;
+  // Do not seed a belief before run_start. Under use_sim_time this->now() is 0
+  // until the first /clock message, and run_start is deliberately held for the
+  // first tick with a live clock — so an intent that arrives in that window
+  // stamps last_heard at time 0 and marks the peer live. The peer_seen event
+  // itself is dropped (logPeerSeen counts it in dropped_before_start_), but the
+  // POISONED BELIEF survives, and expPeerSweep later measures silence against
+  // time 0: g6pilot_hybrid_seed105/bestla logged peer_lost at t_sim=26.91 with
+  // silent_sec=26.91 and t_rel=0.0, a 27 s outage that never happened, and that
+  // run is also the only one of 24 missing its first_contact=true event.
+  //
+  // Returning here costs at most one heartbeat period (intents arrive at 1 Hz):
+  // the next intent creates the belief with a real stamp and logs first contact
+  // properly. Nothing else reads peer_belief_ — coordination runs off coord_
+  // and last_contact_ — so this is confined to the event log's own bookkeeping.
+  if (!exp_log_->started()) return;
   const auto now = this->now();
   auto it = peer_belief_.find(peer_id);
   if (it == peer_belief_.end()) {
@@ -7112,7 +7319,6 @@ void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
     PeerEvent e;
     e.peer = peer_id;
     e.silent_sec = 0.0;
-    e.last_contact_age_sec = -1.0;
     e.first_contact = true;
     e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
     e.expected_peers = rendezvous_expected_peers_;
@@ -7125,9 +7331,6 @@ void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
     // The outage this message ends, measured from the last one that preceded
     // it — NOT from when the sweep noticed, which lags by up to a claim TTL.
     e.silent_sec = (now - it->second.last_heard).seconds();
-    const auto rec = last_contact_.find(peer_id);
-    e.last_contact_age_sec = (rec != last_contact_.end())
-        ? (now - rec->second.stamp).seconds() : -1.0;
     e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
     e.expected_peers = rendezvous_expected_peers_;
     exp_log_->logPeerSeen(expCtx(), e);
@@ -7147,9 +7350,6 @@ void ExploPlannerNode::expPeerSweep() {
     PeerEvent e;
     e.peer = peer_id;
     e.silent_sec = silent;
-    const auto rec = last_contact_.find(peer_id);
-    e.last_contact_age_sec = (rec != last_contact_.end())
-        ? (now - rec->second.stamp).seconds() : -1.0;
     e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
     e.expected_peers = rendezvous_expected_peers_;
     exp_log_->logPeerLost(expCtx(), e);
@@ -7219,6 +7419,7 @@ void ExploPlannerNode::logReconnectDispatch(const char* action,
     // trigger, and pretending otherwise would put a number in the column for
     // decisions it never touched.
     e.link_down_sec    = dispatch_link_down_sec_;
+    e.team_incomplete_sec = dispatch_team_incomplete_sec_;
   }
   exp_log_->logReconnectDispatch(expCtx(), e);
 }
@@ -7243,7 +7444,7 @@ void ExploPlannerNode::logRunEnd(const char* reason) {
   // to be a period at all; -1 says "not measurable", never a fabricated 0.
   e.metrics_period_param_sec     = metrics_period_sec_;
   e.metrics_effective_period_sec = metrics_effective_period_;
-  e.metrics_rows                 = metrics_rows_written_;
+  e.metrics_timer_rows           = metrics_rows_written_;
   e.metrics_backoffs             = metrics_backoffs_;
   e.metrics_realised_period_sec =
       (metrics_rows_written_ >= 2)

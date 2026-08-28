@@ -46,6 +46,15 @@ struct StepMetrics {
   float  mean_path_cost        = 0.0f;
   float  selected_info_gain    = 0.0f;
   float  selected_path_cost    = 0.0f;
+  /// EXACT ALIAS of selected_score — both are assigned current_goal_.score, and
+  /// all 3432 rows of the g6pilot campaign were identical. The planner has one
+  /// scalar objective; there is no second "utility" quantity for this to hold.
+  /// It is NOT removed because the CSV is append-only and read positionally by
+  /// archive scripts (see metrics_logger.cpp), so deleting a mid-file column
+  /// would silently shift every column after it. Treat as redundant: never
+  /// decompose score against utility, and never fit one on the other — that is
+  /// a regression of a column on itself. The gate script asserts the identity
+  /// holds, so a future divergence is caught rather than assumed away.
   float  selected_utility      = 0.0f;
 
   // Multi-robot coordination diagnostics. Zero in single-robot mode.

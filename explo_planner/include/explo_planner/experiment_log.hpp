@@ -154,10 +154,23 @@ struct StepEvent {
 };
 
 /// `peer_lost` / `peer_seen` payload.
+///
+/// There is deliberately NO last_contact_age_sec here. It was removed after the
+/// g6pilot campaign showed it could not mean the same thing in both arms: the
+/// last_contact_ record it aged is written only under `rendezvous_enabled_`, so
+/// all 160 peer events in the off arm carried the "never contacted" sentinel -1
+/// including in runs with dozens of real contacts, while in the hybrid arm all
+/// 58 populated values equalled `silent_sec` to the last digit (both are stamped
+/// from the same intent receipt). So the field was a lie in one arm and a
+/// duplicate in the other — the worst combination, because a cross-arm read of
+/// "time since last contact" renders the control arm as robots that never met.
+/// Populating it in the off arm was rejected as the fix: last_contact_ feeds
+/// missingPeerRecord and hence the manoeuvre dispatch, and altering the control
+/// arm's state to improve a log field is the wrong trade in a two-arm
+/// experiment. Use `silent_sec`.
 struct PeerEvent {
   std::string peer;                       ///< teammate robot id
   double silent_sec = 0.0;                ///< how long the previous belief had held
-  double last_contact_age_sec = -1.0;     ///< age of the last-contact record, -1 = none
   int    peers_live = 0;
   int    expected_peers = 0;
   bool   first_contact = false;           ///< peer_seen only: never heard before
@@ -201,11 +214,36 @@ struct ReconnectDispatchEvent {
   /// (median), so it is an upper bound on what a merge will deliver.
   double gate_sec = -1.0;
   double est_unshared_vox = -1.0;
+  /// THE QUANTITY THE MID-RUN TRIGGER ACTUALLY TESTED: seconds since the team
+  /// last read complete, i.e. `now - team_last_complete_time_`. The firing
+  /// condition is exactly `team_incomplete_sec >= gate_sec`; -1 on terminal
+  /// dispatches, which this trigger did not decide.
+  ///
+  /// It exists because peer_record_age_sec is NOT that quantity and scoring the
+  /// gate against it silently tests a different inequality.
+  /// team_last_complete_time_ is stamped on the 1 Hz heartbeat whenever
+  /// livePeerCount() reads the team complete, and a peer counts live until its
+  /// coordination claim expires — coord_claim_ttl_sec (5.0 s) after its last
+  /// beacon. So this runs BEHIND the peer's record age by the TTL, plus up to
+  /// one heartbeat period of quantization:
+  ///
+  ///     team_incomplete_sec ~= peer_record_age_sec - coord_claim_ttl_sec
+  ///
+  /// Measured on g6pilot + g7r1: 6/6 dispatches, peer_record_age_sec minus this
+  /// quantity fell in [3.74, 5.01] s — bounded by the TTL exactly as predicted.
+  /// The practical consequence is that a nominal 240 s gate fires at a peer
+  /// record age of ~245 s, so a gate quoted from peer_record_age_sec is ~TTL too
+  /// high. Both columns are kept for the same reason link_down_sec is: the
+  /// disagreement between clocks is a measurement, and collapsing them destroys
+  /// it.
+  double team_incomplete_sec = -1.0;
   /// How long the RADIO had been down when a mid-run trigger fired, from the
   /// comms emulator's own connected bit; -1 = the link gate was not in play
   /// (feature off, undecodable robot index, stale samples, or a terminal
-  /// dispatch), so the fire was decided on peer_record_age_sec exactly as in
-  /// every campaign before this one. Logged BESIDE peer_record_age_sec rather
+  /// dispatch), so the fire was decided on the silence clock alone exactly as in
+  /// every campaign before this one. That clock is team_incomplete_sec, NOT
+  /// peer_record_age_sec — see the note there; this comment named the wrong
+  /// column through generation 7. Logged BESIDE peer_record_age_sec rather
   /// than replacing it: §30.11 is the finding that the two clocks disagree by a
   /// median of 49 s, and collapsing them into one column would destroy the
   /// measurement that motivated the change. A gated run in which the two
@@ -287,7 +325,18 @@ struct RunEndEvent {
   double metrics_period_param_sec = -1.0;     ///< configured metrics_period_sec
   double metrics_realised_period_sec = -1.0;  ///< measured mean, -1 if < 2 rows
   double metrics_effective_period_sec = -1.0; ///< the sampler's own current belief
-  int    metrics_rows = 0;                    ///< periodic rows actually written
+  /// Rows written by the PERIODIC SAMPLER ONLY. It is not the CSV's row count
+  /// and never was: end-of-step rows are written on the LOG_STEP path, which
+  /// does not touch this counter, so the file holds
+  ///
+  ///     csv_rows (excl. header) == metrics_timer_rows + steps
+  ///
+  /// verified exact in 24/24 robot-runs of g6pilot. Renamed from `metrics_rows`
+  /// in generation 8 because that name reads as "rows in the metrics file" and
+  /// invites `assert metrics_rows == wc -l`, which fails by exactly the step
+  /// count and looks like dropped rows. `steps` is on this same event, so the
+  /// identity is checkable without opening the CSV.
+  int    metrics_timer_rows = 0;
   int    metrics_backoffs = 0;                ///< times it stretched its period
   // --- Mission return / final geometry (schema 2) ---------------------
   // Where the run actually ENDED, in every run — not only mission-return
@@ -402,14 +451,33 @@ class ExperimentLog {
   /// site is now suppressed for the rest of the run rather than on a TTL.
   /// Emitted so "how much time went into unreachable ground, and where" is a
   /// query over the event log rather than a regex over ROS log lines.
-  /// `budget_sec` is the timeout this attempt was measured against, carried
-  /// because `elapsed_sec` alone cannot distinguish an under-estimated budget
-  /// from ground the robot truly could not cross. `pose_stale` is true when TF
-  /// had gone stale at the moment of failure, which makes the no-progress
-  /// verdict a statement about the pose feed rather than about the robot.
+  /// `elapsed_sec` is time since NAVIGATE entry — descriptive context on every
+  /// row, and NOT in general the quantity that failed. `budget_sec` is the
+  /// drive budget (nav_budget_sec), likewise context.
+  ///
+  /// The comparison that actually fired is carried separately, in
+  /// (`test_name`, `test_value`, `test_threshold`), because the three failure
+  /// reasons do not test the same thing and two of them do not test
+  /// `elapsed_sec` against `budget_sec` at all:
+  ///   budget-rotate -> rotate_elapsed_sec vs goal_rotate_timeout_sec
+  ///   budget        -> nav_elapsed_sec    vs nav_budget_sec
+  ///   no-progress   -> window_progress_m  vs progress_min_distance_m
+  /// This split exists because the earlier schema reported only the first pair
+  /// and 30 of 31 rows in the g6pilot campaign were budget-rotate: each read
+  /// "failed at 43-58 s of a 180 s budget", i.e. ground the robot could not
+  /// cross, when the truth was "blew a 15 s rotation timeout". The record was
+  /// wrong in the direction that fabricates the more interesting conclusion.
+  /// `test_name` names the units, so no consumer has to infer them from
+  /// `reason`.
+  ///
+  /// `pose_stale` is true when TF had gone stale at the moment of failure,
+  /// which makes the no-progress verdict a statement about the pose feed
+  /// rather than about the robot.
   void logNavGoalFailed(const ExperimentContext& ctx, double x, double y,
                         const char* reason, double elapsed_sec, int k,
-                        bool retired, double budget_sec, bool pose_stale);
+                        bool retired, double budget_sec, bool pose_stale,
+                        const char* test_name, double test_value,
+                        double test_threshold);
   /// The TF pose went stale (`lost=true`) or came back (`lost=false`).
   /// Exists because every downstream symptom of a dead pose feed — frozen
   /// progress metric, no-progress goal failures, the homing watchdog ladder
@@ -437,6 +505,12 @@ class ExperimentLog {
   ///                 detector is suppressed during an escape leg.)
   ///     window_sec  the detector's window — progress_window_sec for frozen,
   ///                 return_approach_window_sec for approach.
+  ///     test_delta_m / test_threshold_m
+  ///                 THE FIRED INEQUALITY: the detector fired because
+  ///                 test_delta_m < test_threshold_m. delta is window movement
+  ///                 for frozen and closing distance for approach; the
+  ///                 threshold is the matching param. Present on detector-fire
+  ///                 rows only.
   ///     next_mode   absent.
   ///
   ///   kind = "escape-end"            an escape leg finished. NOT a detector
@@ -452,10 +526,24 @@ class ExperimentLog {
   ///
   /// escapes_used is the running count against return_escape_max_attempts and
   /// is post-increment on the row that starts a leg (response="escape").
+  ///
+  /// dist_home_m and metric_m are BOTH instantaneous samples at the fire
+  /// instant, and neither is the tested quantity — that is test_delta_m, added
+  /// in generation 8. Through generation 7 the fire rows carried no tested
+  /// value at all, and metric_m was documented as "the metric over
+  /// window_sec", which reads exactly as if it were one. It is not: on the 7
+  /// banked g6pilot fires metric_m stood 4x to 162x above the delta that
+  /// actually fired the detector, and in one case the robot was RECEDING
+  /// (-0.03 m) while the row read 3.69. A reader scoring the detector on the
+  /// old contract would have called every fire spurious. The two are kept
+  /// side by side rather than collapsed because "how far is left" and "how far
+  /// it moved" are different questions and the diagnosis needs both.
   void logHomeWatchdog(const ExperimentContext& ctx, const char* kind,
                        const char* mode, const char* response,
                        double dist_home_m, double metric_m, double window_sec,
-                       int escapes_used, const char* next_mode = nullptr);
+                       int escapes_used, double test_delta_m = 0.0,
+                       double test_threshold_m = 0.0,
+                       const char* next_mode = nullptr);
   /// Emits `run_end` (once — later calls are ignored) with the logger's own
   /// health and accounting appended. Safe to call from a destructor: it never
   /// throws and never touches ROS beyond the already-constructed logger.

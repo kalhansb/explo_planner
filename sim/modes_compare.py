@@ -108,6 +108,20 @@ import re
 import statistics as st
 import sys
 
+# Cell-directory name -> (arm, seed). The arm token is `.+`, not `[A-Za-z]+`,
+# because the harness itself mandates arm names the letters-only pattern cannot
+# read: run_campaign.sh requires the post-latch coast to be carried in the arm
+# suffix (e.g. `hybrid_seek`), and those cells exist on disk (ds1_hybrid_seek_
+# seed1..4). Under the old pattern they parsed as arm="seek" — an arm nobody
+# ran — while their manifests said reconnect_mode_requested=hybrid, so they were
+# split out of "hybrid" under a fabricated label. Two arms sharing a final token
+# would have pooled silently, which is the same failure with no visible tell.
+#
+# `.+` is greedy but anchored by `_seed<digits>$` and starts from the leftmost
+# `_`, so `g8r1_hybrid_seed101` still yields ("hybrid", 101) and
+# `ds1_hybrid_seek_seed1` yields ("hybrid_seek", 1).
+RE_CELL = re.compile(r"_(.+)_seed(\d+)$")
+
 # The planner's actual manoeuvre states. Verified against the CSVs, not guessed:
 # the full state vocabulary is {WAIT_FOR_MAP, NAVIGATE, PLAN, INTEGRATE,
 # LOG_STEP, DONE, PURSUE, RETURN_NAV, RETURN_SYNC, PROXIMITY_HOLD, and — since
@@ -560,8 +574,7 @@ def ladder(run_dirs, primary, spec):
         for d in sorted(run_dirs):
             if not os.path.isdir(d):
                 continue
-            m = re.search(r"_([A-Za-z]+)_seed(\d+)$",
-                          os.path.basename(os.path.normpath(d)))
+            m = RE_CELL.search(os.path.basename(os.path.normpath(d)))
             if not m:
                 continue
             r = measure(d, th)
@@ -662,6 +675,7 @@ def main():
 
     arms = {}
     dropped = []
+    unmatched = []
     for d in sorted(args.runs):
         if not os.path.isdir(d):
             continue
@@ -669,8 +683,13 @@ def main():
         # SLASH, and basename("/a/b/") is "", so every directory silently failed
         # to match and the tool printed "no runs matched" over a complete
         # campaign. The overnight chain calls it with exactly that glob.
-        m = re.search(r"_([A-Za-z]+)_seed(\d+)$", os.path.basename(os.path.normpath(d)))
+        m = RE_CELL.search(os.path.basename(os.path.normpath(d)))
         if not m:
+            # Named, not swallowed. A bare `continue` here dropped cells BEFORE
+            # the `dropped` bookkeeping below, so a directory the regex could
+            # not read vanished from the comparison with no message at all —
+            # indistinguishable from a campaign that never ran it.
+            unmatched.append(os.path.basename(os.path.normpath(d)))
             continue
         r = measure(d, args.threshold)
         if r.get("excluded"):
@@ -678,6 +697,13 @@ def main():
             continue
         r["seed"] = int(m.group(2))
         arms.setdefault(m.group(1), []).append(r)
+    if unmatched:
+        # Printed whether or not anything else matched: a cell whose name the
+        # parser cannot read is not an exclusion, it is a cell the comparison
+        # never saw, and that must never look like an arm with fewer runs.
+        print(f"!! {len(unmatched)} directory(ies) did not parse as "
+              f"<tag>_<arm>_seed<n> and are ABSENT from every table below: "
+              + ", ".join(sorted(unmatched)))
     if not arms:
         print("no runs matched <tag>_<arm>_seed<n>")
         if dropped:

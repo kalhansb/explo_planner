@@ -194,6 +194,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_home_trail test/test_home_trail.cpp)
   target_link_libraries(test_home_trail explo_planner_lib)
 
+  ament_add_gtest(test_experiment_log test/test_experiment_log.cpp)
+  target_link_libraries(test_experiment_log explo_planner_lib)
+
   ament_add_gtest(test_planner_util test/test_planner_util.cpp)
   target_link_libraries(test_planner_util explo_planner_lib)
 

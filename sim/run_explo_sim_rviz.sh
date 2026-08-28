@@ -1728,9 +1728,35 @@ while true; do
     # state by design and its step count is supposed to stop.
     if [ "$SA" = "$LAST_SA" ] && [ "$SB" = "$LAST_SB" ]; then
       STALL=$((STALL + 1))
-      DONE_A=$(grep -c "Exploration complete\|DONE" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
-      DONE_B=$(grep -c "Exploration complete\|DONE" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
-      if [ "$STALL" -ge "$HANG_HB" ] && [ "$DONE_A" = 0 ] && [ "$DONE_B" = 0 ]; then
+      # The pattern must match ONLY genuine completion. Through generation 7 the
+      # alternate was a bare `DONE`, and every planner log's line 2 reads
+      # "DONE-SEEK DISABLED (done_seek_enabled=false, ...)" — a banner announcing
+      # a feature is OFF. All 24 g6pilot logs matched it 3 times, so DONE_A was
+      # never 0 and this gate could not fire in any run of any campaign that used
+      # it. Anchored now on the two prefixes the node actually emits on a
+      # completion path: "Exploration complete" (latch 4782 and streak 3734) and
+      # "Exploration finished" (DONE entry 3486, idle 3500, shutdown 3516).
+      #
+      # The empty-vs-zero handling below is the OTHER silent disarm, and it is
+      # subtle in both directions. `grep -c` on an existing file with no match
+      # prints "0" and EXITS 1; on a missing file it prints NOTHING and exits 2.
+      # So `|| true` alone leaves DONE_A empty for a missing log and `[ "" = 0 ]`
+      # is false — a planner that died before creating its log disarmed the gate
+      # on the very path it is most needed. But `|| echo 0` is not the fix: on
+      # the no-match-but-file-exists case grep's own "0" and the echoed "0" both
+      # land, giving "0\n0", and `[ "0 0" = 0 ]` is false too — which disarms it
+      # on the PRIMARY hung-run case. Calibrated against all three inputs.
+      DONE_PAT="Exploration complete\|Exploration finished"
+      DONE_A=$(grep -c "$DONE_PAT" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
+      DONE_B=$(grep -c "$DONE_PAT" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
+      # Calibrated before re-arming, because a gate that aborts valid cells is
+      # worse than one that never fires: the longest interval in which NEITHER
+      # robot advanced a step (which is exactly what STALL integrates) was 59.5 s
+      # across the 16 banked g6pilot + g7r1 cells, against the 600 sim-s this
+      # fires at. A full-length reconnect manoeuvre — the realistic legitimate
+      # stall, budgeted at pursuit_budget_max_sec=600 — never came close, since
+      # the two robots do not stall in lockstep.
+      if [ "$STALL" -ge "$HANG_HB" ] && [ "${DONE_A:-0}" = 0 ] && [ "${DONE_B:-0}" = 0 ]; then
         die "HUNG: neither planner advanced a step in $((STALL * 60)) sim-s \
 (steps still $SA/$SB) and neither reports DONE. Run is invalid — check \
 'rejected' counts in $OUTDIR/planner_*.log (cost_grid_radius_cap_m=$COST_CAP)."

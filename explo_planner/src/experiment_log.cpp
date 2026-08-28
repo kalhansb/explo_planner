@@ -382,7 +382,6 @@ void ExperimentLog::logPeerLost(const ExperimentContext& ctx,
   // How long the peer had been silent when the belief flipped, i.e. the age of
   // its last intent at that instant (>= the claim TTL by construction).
   num("silent_sec", e.silent_sec);
-  num("last_contact_age_sec", e.last_contact_age_sec);
   teamCounts(e.peers_live, e.expected_peers);
   end();
 }
@@ -394,7 +393,6 @@ void ExperimentLog::logPeerSeen(const ExperimentContext& ctx,
   text("peer", e.peer);
   // How long the outage lasted, measured from the last intent heard before it.
   num("silent_sec", e.silent_sec);
-  num("last_contact_age_sec", e.last_contact_age_sec);
   boolean("first_contact", e.first_contact);
   teamCounts(e.peers_live, e.expected_peers);
   end();
@@ -430,6 +428,12 @@ void ExperimentLog::logReconnectDispatch(const ExperimentContext& ctx,
   // with json.loads, so older readers ignore it and newer readers can tell a
   // link-gated fire from a record-age one without consulting the manifest.
   num("link_down_sec", e.link_down_sec);
+  // Additive for the same reason, and load-bearing: this is the left-hand side
+  // of the inequality the mid-run trigger evaluated. Without it the record holds
+  // the threshold (gate_sec) but not the quantity compared against it, so the
+  // decision cannot be re-derived from the log at all — peer_record_age_sec
+  // stands ~coord_claim_ttl_sec clear of it and tests a different inequality.
+  num("team_incomplete_sec", e.team_incomplete_sec);
   teamCounts(e.peers_live, e.expected_peers);
   end();
 }
@@ -498,7 +502,9 @@ void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
 void ExperimentLog::logNavGoalFailed(const ExperimentContext& ctx, double x,
                                      double y, const char* reason,
                                      double elapsed_sec, int k, bool retired,
-                                     double budget_sec, bool pose_stale) {
+                                     double budget_sec, bool pose_stale,
+                                     const char* test_name, double test_value,
+                                     double test_threshold) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("nav_goal_failed", ctx);
   num("x", x);
@@ -506,6 +512,14 @@ void ExperimentLog::logNavGoalFailed(const ExperimentContext& ctx, double x,
   text("reason", reason);
   num("elapsed_sec", elapsed_sec);
   num("budget_sec", budget_sec);
+  // The comparison that actually fired. Kept distinct from
+  // (elapsed_sec, budget_sec) rather than overwriting them: both pairs are
+  // wanted on a budget-rotate row — how long the whole attempt had been
+  // running AND how long the rotation had — and collapsing them is what made
+  // the old schema misreport 30 of 31 rows.
+  text("test_name", test_name);
+  num("test_value", test_value);
+  num("test_threshold", test_threshold);
   integer("k", k);
   boolean("retired", retired);
   // True means the no-progress / budget verdict was reached while TF was
@@ -544,19 +558,34 @@ void ExperimentLog::logHomeWatchdog(const ExperimentContext& ctx,
                                     const char* kind, const char* mode,
                                     const char* response, double dist_home_m,
                                     double metric_m, double window_sec,
-                                    int escapes_used, const char* next_mode) {
+                                    int escapes_used, double test_delta_m,
+                                    double test_threshold_m,
+                                    const char* next_mode) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("home_watchdog", ctx);
   text("kind", kind);
   text("mode", mode);
   text("response", response);
   num("dist_home_m", dist_home_m);
-  // Meaning depends on `kind` — see the contract in the header. For a detector
-  // fire this is the remaining-distance metric over `window_sec`; for
-  // escape-end it is that same metric sampled at the moment the leg ended.
+  // INSTANTANEOUS, at the fire instant — the remaining-distance metric as
+  // sampled on this tick, in whichever mode was in force (straight-line for
+  // direct, along-trail for retrace, which is why it can exceed dist_home_m).
+  // It is NOT movement over `window_sec`; this comment said that it was
+  // through generation 7, which made it read as the tested quantity. The
+  // tested quantity is test_delta_m below.
   num("metric_m", metric_m);
   num("window_sec", window_sec);
   integer("escapes_used", escapes_used);
+  // The fired inequality, on detector-fire rows only: the detector fired
+  // because test_delta_m < test_threshold_m. Gated on `kind` rather than on a
+  // sentinel value because every numeric sentinel collides with a real
+  // reading — 0.0 is the canonical frozen fire and negatives are a receding
+  // approach fire — so ABSENCE is what has to mean "no inequality here".
+  // escape-end rows are leg terminations and evaluate no detector.
+  if (std::strcmp(kind, "escape-end") != 0) {
+    num("test_delta_m", test_delta_m);
+    num("test_threshold_m", test_threshold_m);
+  }
   if (next_mode) text("next_mode", next_mode);
   end();
 }
@@ -614,7 +643,7 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
   num("metrics_period_param_sec", e.metrics_period_param_sec);
   num("metrics_realised_period_sec", e.metrics_realised_period_sec);
   num("metrics_effective_period_sec", e.metrics_effective_period_sec);
-  integer("metrics_rows", e.metrics_rows);
+  integer("metrics_timer_rows", e.metrics_timer_rows);
   integer("metrics_backoffs", e.metrics_backoffs);
   // Final geometry + mission-return summary (schema 2, see RunEndEvent).
   // home is null-per-field rather than omitted so a reader indexing by key

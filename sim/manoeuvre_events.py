@@ -105,8 +105,40 @@ RE_RETURN = re.compile(
 RE_HOLD = re.compile(r"Reconnect: holding for the team at the current pose")
 # Mid-run trigger context (2026-08-17). The dispatch marker precedes the
 # firing line and tags it; the resume/exhaustion lines are their own events.
+#
+# ANCHORED ON THE STABLE PREFIX ONLY, and the attempt index is pulled by a
+# separate search. The 2026-08-17 pattern spelled the whole line —
+# `peer silent (\d+)s >= \d+s \(attempt (\d+)/(\d+)\)` — and when the info gate
+# added `gate `, `radio down` and `est unshared` to the middle of that line the
+# regex stopped matching anything. It failed silently: `pending_midrun` never
+# went True, so the `midrun` column of the readout read 0 for every firing.
+# Measured on the banked logs: 6 dispatch lines present, 0 matched, i.e. every
+# mid-run fire was reported as terminal. See MIDRUN_LINE_MARKER below for the
+# guard that now makes that failure loud instead of silent.
+#
+# Both spellings are accepted. "peer silent" is the pre-generation-8 wording for
+# the same quantity (seconds since the team last read complete); it was renamed
+# because it invited reading the number as the peer's record age, which stands
+# ~coord_claim_ttl_sec clear of it. Keeping the alternation means logs from
+# either generation parse; it does not weaken the guard, which fires on any
+# wording this pattern has not been taught.
 RE_MIDRUN_DISPATCH = re.compile(
-    r"Reconnect \(mid-run\): peer silent (\d+)s >= \d+s \(attempt (\d+)/(\d+)\)")
+    r"Reconnect \(mid-run\): (?:team incomplete|peer silent) (\d+)s >= "
+    r"(?:gate )?\d+s")
+RE_MIDRUN_ATTEMPT = re.compile(r"attempt (\d+)/(\d+)\)")
+# The guard is a WHITELIST of the mid-run lines that are legitimately not
+# dispatches, not a pattern for what a dispatch looks like. Keying it on dispatch
+# syntax (an earlier attempt matched on " >= ") reproduces the original bug one
+# level up: the comparison operator is part of the wording, so a reworded line
+# escapes the detector exactly as it escapes the parser. Whitelisting inverts the
+# failure direction — a NEW kind of mid-run line raises a false alarm, which is
+# loud and cheap, instead of a silent undercount.
+MIDRUN_LINE_MARKER = "Reconnect (mid-run):"
+MIDRUN_NON_DISPATCH = (
+    "attempt budget exhausted",   # RE_MIDRUN_EXHAUSTED
+    "gave up after",              # RE_MIDRUN_RESUME
+    "standing down",              # the link-gate veto (not a firing)
+)
 RE_MIDRUN_RESUME = re.compile(
     r"Reconnect \(mid-run\): gave up after (\d+)s at the barrier")
 RE_MIDRUN_EXHAUSTED = re.compile(
@@ -123,7 +155,21 @@ RE_REJOIN = re.compile(
 RE_ARRIVED = re.compile(r"Rendezvous: reached (last-connected anchor|meeting point)")
 RE_UNREACH = re.compile(r"Rendezvous: (meeting point|last-connected anchor) unreachable")
 RE_GIVEUP = re.compile(r"max_wait=[\d.]+s reached -> giving up and finishing")
-RE_ENDED = re.compile(r"Reconnect manoeuvre ended after ([\d.]+) s sim")
+# The AUTHORITATIVE outcome, when the line carries one. Generation 8 puts the
+# planner's own classification into the ending line; the group is optional so
+# pre-gen-8 logs, which end `... s sim (-> STATE).`, still parse for duration.
+#
+# This exists because the outcome regexes above resolved NOTHING in the banked
+# logs: under mission return every manoeuvre ends "-> RETURN_HOME" whether it
+# reconnected or gave up, so none of rejoin/gave-up/arrived/unreachable was ever
+# emitted, and all 5 firings fell through to the `open_at_horizon` default —
+# "the manoeuvre never ended" — printed beside a duration parsed from this very
+# line. Measured against the jsonl: 0/5 correct, including the one genuine
+# reconnection. The destination state cannot substitute; it is the same for both
+# outcomes. Prefer this group over the walk below whenever it is present.
+RE_ENDED = re.compile(
+    r"Reconnect manoeuvre ended after ([\d.]+) s sim"
+    r"(?::\s+(reconnected|gave_up|abandoned))?")
 # The non-firing that looks like one.
 RE_FULLTEAM = re.compile(r"exploration ended \[[^\]]*\] with full team present")
 # Section 3.8: the robot's own heartbeat went quiet while it was busy. Logged on
@@ -249,9 +295,18 @@ def parse_log(path, steps=None):
                 # Context marker: the fire line that follows carries the kind;
                 # this tags it as a mid-run (vs terminal) dispatch.
                 pending_midrun = True
+                ma = RE_MIDRUN_ATTEMPT.search(line)
                 events.append({"w": w, "type": "midrun_dispatch",
                                "silent": float(m2.group(1)),
-                               "attempt": int(m2.group(2))})
+                               "attempt": int(ma.group(1)) if ma else 0})
+                continue
+            if MIDRUN_LINE_MARKER in line and not any(
+                    h in line for h in MIDRUN_NON_DISPATCH):
+                # Dispatch-shaped but unparsed: the logger's wording has moved
+                # on. Recorded rather than ignored so the caller can fail loudly
+                # instead of reporting midrun=0 for a run that fired.
+                events.append({"w": w, "type": "midrun_unparsed",
+                               "line": line.rstrip()})
                 continue
             m2 = RE_MIDRUN_RESUME.search(line)
             if m2:
@@ -325,7 +380,8 @@ def parse_log(path, steps=None):
                 continue
             m2 = RE_ENDED.search(line)
             if m2:
-                events.append({"w": w, "type": "ended", "dur": float(m2.group(1))})
+                events.append({"w": w, "type": "ended", "dur": float(m2.group(1)),
+                               "outcome": m2.group(2)})
                 continue
             m2 = RE_SUPPRESS.search(line)
             if m2:
@@ -645,12 +701,33 @@ def analyse_run(run_dir):
                     break
             if outcome == "open_at_horizon" and arrived_at is not None:
                 outcome, t_out = "arrived_waiting", arrived_at
+            stated = None
             for j in range(i + 1, len(ev)):
                 if ev[j]["type"] == "ended":
                     dur = ev[j]["dur"]
+                    stated = ev[j].get("outcome")
+                    if t_out is None:
+                        t_out = to_sim(ev[j]["w"])
                     break
                 if ev[j]["type"] == "fire":
                     break
+            # The planner's own classification wins over the walk above. The
+            # walk infers an outcome from which marker line appeared; this is
+            # the node stating it from the two facts that decided it
+            # (team-complete at the instant, and the state it landed in). Where
+            # they disagree the walk is wrong by construction — it cannot see a
+            # release that emitted no marker, which under mission return is
+            # every release.
+            if stated:
+                outcome = stated
+            elif dur is not None and outcome == "open_at_horizon":
+                # A manoeuvre that demonstrably ENDED (a duration was parsed
+                # from its ending line) cannot also be "open at the horizon".
+                # Pre-gen-8 logs carry no outcome word, so this is the honest
+                # label for them; it is a distinct string from the default so
+                # the two are never confused in a table, and so this exact
+                # contradiction can never again be printed as "never ended".
+                outcome = "ended_unclassified"
 
             lk = link_at(link, t_arm) if (link and t_arm is not None) else None
             upf = (link_up_fraction(link, t_arm)
@@ -691,8 +768,11 @@ def analyse_run(run_dir):
                    for e in R["events"] if e["type"] == "decline")
     no_fire = sum(1 for R in per_robot.values()
                   for e in R["events"] if e["type"] == "no_fire")
+    unparsed = [e["line"] for R in per_robot.values()
+                for e in R["events"] if e["type"] == "midrun_unparsed"]
     return {
         "name": name, "events": out, "declines": declines, "no_fire": no_fire,
+        "midrun_unparsed": unparsed,
         "fit": (slope, offset, n_off, resid),
         "usable": man.get("run_end_reason", "") != "",
         "gates": man.get("run_gates_verdict", ""),
@@ -742,6 +822,17 @@ def main():
 
     if skipped:
         print("interrupted (no run_end_reason), excluded: " + ", ".join(skipped))
+        print()
+
+    # Fail loudly on a parser that has fallen behind the logger. Silence here is
+    # what let RE_MIDRUN_DISPATCH match nothing for a whole generation while the
+    # `mid` column below printed a confident 0 for every firing.
+    unparsed = [ln for r in runs for ln in r.get("midrun_unparsed", [])]
+    if unparsed:
+        print(f"!! {len(unparsed)} mid-run dispatch line(s) NOT PARSED — the "
+              f"`mid` column below is UNDERCOUNTED and every affected firing "
+              f"reads as terminal. Update RE_MIDRUN_DISPATCH. First:")
+        print(f"   {unparsed[0]}")
         print()
 
     events = [e for r in runs for e in r["events"]]
