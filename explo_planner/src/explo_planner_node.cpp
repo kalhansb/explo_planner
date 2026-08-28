@@ -3271,6 +3271,17 @@ void ExploPlannerNode::tick() {
   updatePoseFromTF();
   trackDistance();
 
+  // Any tick spent outside PLAN ends an all-rejected episode. The counter must
+  // be cleared here and not only where a goal is finally selected: doPlan has
+  // several other exits (max steps reached, a queued exploit target, a failed
+  // map load, the coverage latch) and the machine can leave PLAN entirely for
+  // a reconnect manoeuvre. Resetting on selection alone would let "planning
+  // recovered after N ticks" span a whole rendezvous and bill minutes of
+  // deliberate off-PLAN behaviour to a planning stall.
+  if (state_ != State::PLAN) {
+    consecutive_all_rejected_ = 0;
+  }
+
   // A configured-but-silent peer pose topic (typo'd name, localiser down) is
   // indistinguishable from "peer far away" to the guard — keep saying so
   // until the first message lands.
