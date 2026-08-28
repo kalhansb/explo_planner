@@ -14,13 +14,24 @@ BUT READ `lag` FIRST -- IT IS THE ONLY THING THE TREATMENT CAN TOUCH.
 
     t_team = t_lead + lag
 
-The manoeuvre under test is TERMINAL. finishOrRendezvous() is the sole entry
-point to all three modes -- startPursuit is called from inside it
-(explo_planner_node.cpp:2917) -- and it has exactly three call sites, at :2191,
-:2244 and :3987, reached on "step-budget" and "coverage-saturated". Every one of
-them means THIS ROBOT HAS FINISHED EXPLORING. There is no mid-exploration
-trigger: nothing any arm does can alter the leader's own exploration, so t_lead
-is identical in expectation across arms by construction.
+THE MANOEUVRE WAS TERMINAL THROUGH GENERATION 7, AND IS NOT ANY MORE. Read the
+next two paragraphs as a statement about the campaigns this tool was written
+for, not about generation 8.
+
+Through generation 7: finishOrRendezvous() was the sole entry point to all
+three modes -- startPursuit is called from inside it -- and every one of its
+call sites meant THIS ROBOT HAS FINISHED EXPLORING. There was no
+mid-exploration trigger, so nothing any arm did could alter the leader's own
+exploration, and t_lead was identical in expectation across arms by
+construction.
+
+Generation 8 adds a MID-RUN trigger (explo_planner_node.cpp, the link-gated
+dispatch) that fires DURING exploration; the bank already records 422 mid-run
+dispatches. That breaks the argument above in both directions: the treatment
+can now move t_lead, and the "it can act inside `lag` and nowhere else" claim
+this module prints at runtime is simply false for such a campaign. This tool is
+not the pre-registered reader for generation 8 -- event_log.py is -- and its
+`lag` framing should not be quoted for one.
 
 The manoeuvre can therefore only act inside the window between the leader
 finishing and the laggard finishing, by carrying a map backlog to the laggard.
@@ -345,6 +356,29 @@ def declared_of(run_dir):
     return s
 
 
+def midrun_count(run_dir):
+    """Mid-run reconnect dispatches in this cell, both robots.
+
+    Exists so the MECHANISM WINDOW block can tell a terminal-only campaign from
+    a generation-8 one instead of asserting the former. The pattern is kept
+    identical to manoeuvre_events.RE_MIDRUN_DISPATCH -- if that one drifts, this
+    silently reads 0 and the block reverts to printing the false claim, so the
+    two are meant to be changed together.
+    """
+    import glob
+    import re as _re
+    pat = _re.compile(r"Reconnect \(mid-run\): (?:team incomplete|peer silent) "
+                      r"(\d+)s >= (?:gate )?\d+s")
+    n = 0
+    for p in glob.glob(os.path.join(run_dir, "planner_*.log")):
+        try:
+            with open(p, errors="replace") as f:
+                n += sum(1 for ln in f if pat.search(ln))
+        except OSError:
+            pass
+    return n
+
+
 def measure(run_dir, thresh):
     import glob
     end = outcome(run_dir)
@@ -424,6 +458,7 @@ def measure(run_dir, thresh):
         build=build_of(run_dir), verdict=verdict_of(run_dir),
         unk_floor=unk, fire=fa + fb, fire_s=sa + sb,
         makespan=max(a[-1][0], b[-1][0]),
+        midrun=midrun_count(run_dir),
     )
 
 
@@ -569,6 +604,7 @@ def ladder(run_dirs, primary, spec):
     ths.sort(reverse=True)
 
     rows_out = []
+    unmatched = set()
     for th in ths:
         per = {}
         for d in sorted(run_dirs):
@@ -576,6 +612,12 @@ def ladder(run_dirs, primary, spec):
                 continue
             m = RE_CELL.search(os.path.basename(os.path.normpath(d)))
             if not m:
+                # Named, not swallowed — the same fix main() already carries.
+                # A bare `continue` here dropped unreadable cells with no
+                # message, so the sensitivity ladder could disagree with the
+                # main table purely because it silently saw fewer runs, and
+                # the rank order it prints is exactly what that would corrupt.
+                unmatched.add(os.path.basename(os.path.normpath(d)))
                 continue
             r = measure(d, th)
             if r.get("excluded"):
@@ -589,6 +631,10 @@ def ladder(run_dirs, primary, spec):
         rows_out.append((th, stats))
 
     arms_all = sorted({a for _, s in rows_out for a in s})
+    if unmatched:
+        print(f"!! ladder: {len(unmatched)} directory(ies) did not parse as "
+              f"<tag>_<arm>_seed<n> and are ABSENT from the ladder below: "
+              + ", ".join(sorted(unmatched)))
     if not arms_all:
         return
     print(f"\nTHRESHOLD SENSITIVITY — median t_team, and the rank order it implies")
@@ -663,10 +709,21 @@ def ladder(run_dirs, primary, spec):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--threshold", type=float, default=0.55,
-                    help="unknown_fraction defining 'explored' (planner default 0.55)")
+    # 0.64, not the 0.55 this defaulted to through generation 7.
+    #
+    # The threshold has to match the planner's OWN done rule, because t_team is
+    # the CSV crossing of it: generation 8 latches and stops at unknown <= 0.64,
+    # so a run measured at 0.55 is asked when it crossed a level it was never
+    # driven to. It usually never crosses, the cell scores `censored`, and
+    # t_team is withheld -- a silent, near-total loss of the endpoint rather
+    # than a wrong number. The ladder brackets 0.64 on both sides for the same
+    # reason it always did: an ordering that exists only at the endpoint value
+    # is a property of the threshold, not of the arms.
+    ap.add_argument("--threshold", type=float, default=0.64,
+                    help="unknown_fraction defining 'explored' (gen-8 planner "
+                         "done rule is 0.64; pre-gen-8 campaigns used 0.55)")
     ap.add_argument("--control", default="off", help="arm to test the others against")
-    ap.add_argument("--ladder", default="0.70,0.65,0.60,0.55",
+    ap.add_argument("--ladder", default="0.70,0.67,0.64,0.61,0.58",
                     help="thresholds for the sensitivity ladder; '' disables")
     ap.add_argument("--null-runs", default="", nargs="*",
                     help="run dirs that are REPLICATES of one identical condition; "
@@ -853,12 +910,26 @@ def main():
     tts = [r["t_team"] for r in all_rs if r["t_team"] is not None]
     if lags and tts:
         frac = st.median(lags) / st.median(tts) * 100.0
+        # The claim below holds ONLY where every manoeuvre is terminal. A
+        # generation-8 campaign has a mid-run trigger that fires during
+        # exploration, so print the caveat rather than the conclusion when the
+        # cells show mid-run dispatches — otherwise this block tells the reader
+        # the treatment cannot reach ~90 % of the endpoint, which is false.
+        n_mid = sum(r.get("midrun", 0) or 0 for r in all_rs)
         print(f"\nMECHANISM WINDOW: median lag {st.median(lags):.0f} s of a median "
-              f"t_team {st.median(tts):.0f} s = {frac:.1f} % of the endpoint.\n"
-              f"    The manoeuvre is TERMINAL — it can only fire once a robot has "
-              f"finished exploring — so it can act inside `lag` and nowhere else.\n"
-              f"    The other {100 - frac:.1f} % of t_team is untreatable by "
-              f"construction and enters the comparison as pure noise. Read `lag`.")
+              f"t_team {st.median(tts):.0f} s = {frac:.1f} % of the endpoint.")
+        if n_mid:
+            print(f"    !! {n_mid} MID-RUN dispatch(es) present — the manoeuvre is "
+                  f"NOT terminal in these cells, so the `lag` window below does "
+                  f"NOT bound where the treatment can act. Do not quote this "
+                  f"block; use event_log.py, the pre-registered reader.")
+        else:
+            print(f"    The manoeuvre is TERMINAL here (0 mid-run dispatches) — it "
+                  f"can only fire once a robot has finished exploring, so it acts "
+                  f"inside `lag` and nowhere else.\n"
+                  f"    The other {100 - frac:.1f} % of t_team is untreatable by "
+                  f"construction and enters the comparison as pure noise. "
+                  f"Read `lag`.")
 
     ctl = args.control
     if ctl not in summary:

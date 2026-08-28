@@ -1384,6 +1384,24 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   else
     echo "sha256_explo_planner_node=missing"
   fi
+  # And the params file, for the same reason — it is the OTHER half of what
+  # the node actually ran, and it was invisible in the run record.
+  #
+  # The node loads it from the INSTALL tree, not from source, so a stale or
+  # hand-edited installed copy silently changes behaviour with the binary hash
+  # unmoved. done_action lives only here: it must be "idle" for the rendezvous
+  # barrier, and the node's own default is "shutdown", so a params file that
+  # failed to install turns the barrier off while every other provenance field
+  # in this manifest still matches.
+  planner_params="$WS/install/explo_planner/share/explo_planner/config/shared_params.yaml"
+  if [ -e "$planner_params" ]; then
+    echo "sha256_shared_params=$(sha256sum -b "$planner_params" 2>/dev/null \
+      | cut -c1-16)"
+    echo "done_action_in_params=$(grep -o 'done_action:[[:space:]]*"[^"]*"' \
+      "$planner_params" 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')"
+  else
+    echo "sha256_shared_params=missing"
+  fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
 # Built once, outside the loop. Empty unless the caller set something, and
@@ -1585,7 +1603,55 @@ LAST_HB=0
 # the default aborts after 10 minutes of sim time with no step on EITHER robot.
 # Sized well above a slow step: a RETURN_NAV or PURSUE manoeuvre legitimately
 # spends minutes without completing one.
-HANG_HB="${HANG_HB:-10}"
+# 40 heartbeats x 60 sim-s = 2400 sim-s, NOT the 10 (600 s) this shipped with.
+# 600 was set against an observed stall statistic and it collided exactly with a
+# CONFIGURED budget. Sized off those budgets rather than off observation,
+# because the corpus cannot bound this: it holds no manoeuvre that ran to its
+# own limit.
+#
+# THE FULL LEG, in order. dispatchReconnect starts the CHASE first under
+# hybrid, and none of these legs emits "selected goal" (that string has exactly
+# one source, doPlan), so none of them advances the counter this gate watches:
+#
+#   PURSUE       <= PURSUIT_BUDGET_MAX   600 s   (doPursue gives up at budget)
+#   RETURN_NAV   <= RECONNECT_NAV_MAX    600 s
+#   RETURN_SYNC  <= MIDRUN_MAX_WAIT      240 s
+#   pre-dispatch quiet                   ~40 s   (observed)
+#                                       ------
+#                                       ~1480 s
+#
+# plus an unbounded-in-principle correction: doProximityHold REFUNDS held time
+# to pursue_start_time_, so PURSUE's wall duration can exceed its budget by the
+# accumulated hold, up to proximity_max_hold_sec (120 s, never overridden here)
+# — call it ~1600 s worst case.
+#
+# The first version of this comment said 840 s, having simply omitted PURSUE.
+# That figure was already falsified by the bank: the longest banked manoeuvre
+# is 840.2 s and the longest interval with NEITHER robot stepping is 921.6
+# sim-s, both in hybrid cells. 1800 would have cleared the observed maximum but
+# left only 1.15x over the configured ceiling.
+#
+# Why the margin has to be generous in this direction specifically: only the
+# hybrid arm dispatches manoeuvres (422 in hybrid, 0 across 157 banked off
+# cells), so a false abort is drawn from ONE arm of a 30x2 comparison, on the
+# primary endpoint. A late abort merely wastes wall time. The base rate of a
+# real hang is 0 in 500 banked cells, so the expected cost of the extra 600 s
+# is ~zero and it buys 1.5x over the configured ceiling. Still inside
+# DURATION=3000, so the gate stays live — the check below enforces that.
+HANG_HB="${HANG_HB:-40}"
+# ...and say so out loud when it is NOT, because "well inside DURATION" is a
+# claim about two numbers that are set independently and never compared. At
+# HANG_HB=30 the gate needs 1800 sim-s of frozen steps, so any cell shorter
+# than that ships with the hang detector unable to fire even once — inert while
+# still printing its armed message, which is the same silent-non-enforcement
+# shape the threshold change above exists to fix. Warn rather than abort: a
+# short debug run with no hang gate is legitimate, a CAMPAIGN with one is not,
+# and this line is what tells the two apart in the console log.
+if [ "$DURATION_S" != "0" ] && [ "$((HANG_HB * 60))" -ge "$DURATION_S" ]; then
+  log "WARNING: hang gate is INERT — needs $((HANG_HB * 60)) sim-s of frozen" \
+      "steps but DURATION_S=$DURATION_S ends the run first. A hung planner" \
+      "will run to the censoring horizon instead of aborting early."
+fi
 # STOP_ON_DONE=1 (default) ends the run once EVERY planner is in DONE, rather
 # than burning the rest of DURATION_S on two parked robots. The experiment's
 # primary endpoint is a makespan (§5.2), so the moment the last robot finishes
@@ -1733,9 +1799,17 @@ while true; do
       # "DONE-SEEK DISABLED (done_seek_enabled=false, ...)" — a banner announcing
       # a feature is OFF. All 24 g6pilot logs matched it 3 times, so DONE_A was
       # never 0 and this gate could not fire in any run of any campaign that used
-      # it. Anchored now on the two prefixes the node actually emits on a
-      # completion path: "Exploration complete" (latch 4782 and streak 3734) and
-      # "Exploration finished" (DONE entry 3486, idle 3500, shutdown 3516).
+      # it. Anchored now on the two prefixes the node emits on a completion
+      # path: "Exploration complete" and "Exploration finished". Line numbers
+      # deliberately NOT cited — the ones that used to be here had already gone
+      # stale by five commits, and a stale pointer in a comment about a silent
+      # disarm is worse than no pointer.
+      #
+      # The first of those is emitted from recordExplorationComplete, which is
+      # the single funnel BOTH endings route through (see the comment there).
+      # That matters: through generation 8 the step-budget ending printed
+      # neither prefix, so the gate stayed armed across the whole homing leg
+      # and killed cells at exactly mission_return_max_sec.
       #
       # The empty-vs-zero handling below is the OTHER silent disarm, and it is
       # subtle in both directions. `grep -c` on an existing file with no match
@@ -1749,13 +1823,34 @@ while true; do
       DONE_PAT="Exploration complete\|Exploration finished"
       DONE_A=$(grep -c "$DONE_PAT" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
       DONE_B=$(grep -c "$DONE_PAT" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
-      # Calibrated before re-arming, because a gate that aborts valid cells is
-      # worse than one that never fires: the longest interval in which NEITHER
-      # robot advanced a step (which is exactly what STALL integrates) was 59.5 s
-      # across the 16 banked g6pilot + g7r1 cells, against the 600 sim-s this
-      # fires at. A full-length reconnect manoeuvre — the realistic legitimate
-      # stall, budgeted at pursuit_budget_max_sec=600 — never came close, since
-      # the two robots do not stall in lockstep.
+      # A gate that aborts valid cells is worse than one that never fires, and
+      # the calibration that used to justify 600 s here was WRONG in a way worth
+      # recording, because it is the reason a one-arm dropout mechanism shipped:
+      #
+      #   "the longest interval in which NEITHER robot advanced a step was
+      #    59.5 s across the 16 banked cells … a full-length reconnect
+      #    manoeuvre never came close, since the two robots do not stall in
+      #    lockstep."
+      #
+      # Three things were wrong with it. (1) 59.5 s is the max gap BETWEEN
+      # CONSECUTIVE steps, which cannot see a stall that is never followed by
+      # another step — and a manoeuvre that ends in a latch produces exactly
+      # that. Recomputed over the window this gate is actually armed in (start
+      # -> first DONE prefix), the max is 116.7 s wall / ~101 sim-s. (2) The two
+      # largest are g6pilot_hybrid_seed105 and _seed106, in BOTH of which both
+      # robots dispatched 8-18 s apart — they stall in lockstep by construction,
+      # because they cross the same silence gate on the same shared outage.
+      # (3) Every banked manoeuvre was truncated by the coverage latch at
+      # 28.5-82.9 s, so "never came close" was measured on a corpus containing
+      # no full-length manoeuvre at all.
+      #
+      # The threshold is therefore sized off the configured budgets (see
+      # HANG_HB) rather than off this corpus, which cannot bound it.
+      #
+      # Nor did it bound the HOMING leg, for a fourth reason: all 24 banked
+      # cells ended by LATCH, which prints a matching prefix and disarms this
+      # gate before homing starts. That bound is structural instead — the
+      # funnel line is printed on every ending, before startReturnHome.
       if [ "$STALL" -ge "$HANG_HB" ] && [ "${DONE_A:-0}" = 0 ] && [ "${DONE_B:-0}" = 0 ]; then
         die "HUNG: neither planner advanced a step in $((STALL * 60)) sim-s \
 (steps still $SA/$SB) and neither reports DONE. Run is invalid — check \

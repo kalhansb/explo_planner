@@ -3585,9 +3585,11 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
     // the plaintext log therefore could not say how any manoeuvre resolved.
     // The destination state is not a proxy for it: under mission return every
     // manoeuvre ends "-> RETURN_HOME" whether it reconnected or gave up, so a
-    // log-based classifier had nothing to key on and silently labelled all 5
-    // banked firings "open_at_horizon" — never ended — beside a duration it had
-    // just parsed from this very line. 0/5 correct against the jsonl.
+    // log-based classifier had nothing to key on. Across the 5 banked g6pilot
+    // firings it labelled 4 "open_at_horizon" — never ended — beside a duration
+    // it had just parsed from this very line, and the 5th "arrived_waiting" off
+    // a stray meeting-point line. 0/5 correct against the jsonl, which records
+    // one genuine reconnection among them.
     RCLCPP_INFO(get_logger(),
         "Reconnect manoeuvre ended after %.1f s sim: %s (-> %s).",
         manoeuvre_sec, outcome, stateName(s));
@@ -3712,9 +3714,17 @@ void ExploPlannerNode::doPlan() {
     // mission_return_enabled_ && have_home_ branch, above the deferral gate,
     // and startReturnHome always returns true. Documented because the walk is
     // a grid traversal and "once per run" is what a reader would budget for.
+    // Two statements, deliberately. Written as a single nested call the two
+    // arguments are only INDETERMINATELY SEQUENCED, and g++ evaluates the
+    // bare `budget_src` first at both -O0 and -O2 — so the out-parameter the
+    // inner call fills arrives at the outer call as the "" it was initialised
+    // to, noteCoverageDecisionSample's `if (source && *source)` guard rejects
+    // it, and last_coverage_source_ silently keeps the PREVIOUS decision's
+    // source. Which is this fix defeating its own purpose: recording the
+    // source this decision was actually taken on is the whole point.
     const char* budget_src = "";
-    noteCoverageDecisionSample(coverageUnknownFraction(&budget_src),
-                               budget_src);
+    const double budget_unk = coverageUnknownFraction(&budget_src);
+    noteCoverageDecisionSample(budget_unk, budget_src);
     finishOrRendezvous("step-budget");
     return;
   }
@@ -3851,10 +3861,15 @@ void ExploPlannerNode::doPlan() {
         // team_last_complete_time_ is stamped on the 1 Hz heartbeat while
         // livePeerCount() reads the team complete, and a peer stays live until
         // its claim expires coord_claim_ttl_sec (5 s) after its last beacon. So
-        // missing_for ~= peer_record_age_sec - TTL, measured at 3.74-5.01 s
-        // below it across all 6 banked dispatches, and a nominal 240 s gate
-        // fires at a record age of ~245 s. It is logged as its own column
-        // (team_incomplete_sec) so the fired inequality is recoverable offline.
+        // missing_for ~= peer_record_age_sec - TTL. Across all 6 banked
+        // dispatches it sat below the record age by 3.24-5.51 s: the point
+        // estimates are 3.74-5.01, but the only banked copy of missing_for is
+        // the %.0f-rounded plaintext number below, so every difference carries
+        // +/-0.5 s and the honest interval is the widened one. It straddles the
+        // 5 s TTL as predicted; a nominal 240 s gate fires at a record age of
+        // ~245 s. It is logged as its own column (team_incomplete_sec) so the
+        // fired inequality is recoverable offline at full precision — which no
+        // banked cell has, since that column is new in generation 8.
         //
         // It shares the defect record age has, which is what the veto below is
         // for: it ages whenever the peer is not SENDING, which includes a
@@ -3919,8 +3934,9 @@ void ExploPlannerNode::doPlan() {
             // team-presence clock, which lags the peer's record age by
             // coord_claim_ttl_sec. Through generation 7 this line said "peer
             // silent", and read against the JSONL's peer_record_age_sec the two
-            // disagreed by 3.74-5.01 s with no way to tell which was the tested
-            // one. Naming it here and logging it beside gate_sec makes the
+            // disagreed by 3.24-5.51 s (point estimates 3.74-5.01, widened by
+            // the +/-0.5 s this %.0f costs) with no way to tell which was the
+            // tested one. Naming it here and logging it beside gate_sec makes the
             // inequality the code evaluated readable off the line itself.
             RCLCPP_INFO(get_logger(),
                 "Reconnect (mid-run): team incomplete %.0fs >= gate %.0fs "
@@ -4756,8 +4772,39 @@ void ExploPlannerNode::recordExplorationComplete(const char* reason) {
   // again if a manoeuvre delivers a merged map with new frontiers in it and the
   // robot explores on and re-saturates (which is a genuine second declaration
   // and gets its own event, with occurrence > 1).
-  if (exp_log_ && exp_complete_step_ != step_) {
+  if (exp_complete_step_ != step_) {
     exp_complete_step_ = step_;
+    // Printed from the funnel, not from the endings. The harness hang gate
+    // disarms on "Exploration complete"/"Exploration finished", and through
+    // generation 8 the STEP-BUDGET ending printed neither: it emits only
+    // "Step budget reached", then hands off to startReturnHome, whose homing
+    // leg publishes goals through republishHomeGoal and so advances no step
+    // counter either. The gate integrates 10 heartbeats x 60 sim-s = 600 s of
+    // frozen steps, which is exactly mission_return_max_sec — so a robot
+    // taking its full homing budget after spending its step budget was killed
+    // as HUNG at the very moment it was behaving as designed. That is
+    // differential dropout on the primary endpoint (longest homing legs die
+    // first), and the ending it hits is the one this file calls "the dominant
+    // termination path in dense terrain".
+    //
+    // Keyed here rather than patched into the harness pattern list because
+    // this function is the single funnel every ending routes through
+    // (finishOrRendezvous and the latch path are its only callers): a token
+    // list enumerated per-ending is a list that goes stale the next time an
+    // ending is added, silently and in the disarming direction.
+    //
+    // Deliberately redundant with the latch path's own line above. A duplicate
+    // log line costs nothing; a missing one costs a cell.
+    RCLCPP_INFO(get_logger(),
+        "Exploration complete [%s]: declared at step %d, %.2f m traveled "
+        "(unknown=%.3f, source=%s, peers_live=%d).",
+        reason, step_, cumulative_distance_, last_unknown_fraction_,
+        last_coverage_source_ ? last_coverage_source_ : "?", active);
+    // Nested, not a second top-level test: the step_ key is consumed by the
+    // line above, so the event has to share this scope to keep firing on the
+    // same tick it always did. Hoisting the key past `exp_log_` only means a
+    // build with no event log now latches it too, which no caller reads.
+    if (!exp_log_) return;
     ExplorationCompleteEvent e;
     e.reason            = reason;
     e.unknown_fraction  = last_unknown_fraction_;
@@ -6006,6 +6053,34 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
     RCLCPP_WARN(get_logger(),
         "MISSION-RETURN: %s during the escape leg (%.2f m from home) — "
         "aborting the leg.", kind, dist_home);
+    // Record the FIRE before aborting the leg. Without this the only row this
+    // path produced was resumeRetrace's `escape-end`, which is a leg
+    // termination: the writer omits the tested pair on that kind, so a genuine
+    // frozen fire — with its delta and threshold both live right here — was
+    // written down carrying no inequality at all. That is the exact defect
+    // this generation exists to close, surviving on the one path where the
+    // detector fires and something else does the logging.
+    //
+    // A distinct kind, not "frozen": the row has to stay separable from a fire
+    // that provoked an escape, because this one ABORTS an escape already in
+    // progress and the two mean opposite things about the leg. It is not
+    // "escape-end", so the writer's omit-case does not swallow it.
+    //
+    // And NOT named "escape-frozen", which is what this said first: that token
+    // is already the `response` on the escape-end row that resumeRetrace emits
+    // three lines below. One abort therefore wrote the same string into two
+    // different columns of two consecutive rows, and any reader grepping the
+    // token without also keying on the column counts one abort as two.
+    //
+    // `window` is the DETECTOR's window (line 6040), not the escape leg's
+    // duration. This is a detector-fire row, so window_sec has to carry the
+    // fire convention its siblings do — the leg duration is already on the
+    // escape-end row that follows immediately, so nothing is lost.
+    if (exp_log_) {
+      exp_log_->logHomeWatchdog(expCtx(), "frozen-in-escape", mode, "abort-leg",
+                                dist_home, metric, window, home_escapes_used_,
+                                test_delta, test_threshold);
+    }
     resumeRetrace("escape-frozen");
     return;  // resumeRetrace emits its own event and republishes
   }

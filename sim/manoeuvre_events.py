@@ -159,14 +159,20 @@ RE_GIVEUP = re.compile(r"max_wait=[\d.]+s reached -> giving up and finishing")
 # planner's own classification into the ending line; the group is optional so
 # pre-gen-8 logs, which end `... s sim (-> STATE).`, still parse for duration.
 #
-# This exists because the outcome regexes above resolved NOTHING in the banked
-# logs: under mission return every manoeuvre ends "-> RETURN_HOME" whether it
-# reconnected or gave up, so none of rejoin/gave-up/arrived/unreachable was ever
-# emitted, and all 5 firings fell through to the `open_at_horizon` default —
-# "the manoeuvre never ended" — printed beside a duration parsed from this very
-# line. Measured against the jsonl: 0/5 correct, including the one genuine
-# reconnection. The destination state cannot substitute; it is the same for both
-# outcomes. Prefer this group over the walk below whenever it is present.
+# This exists because the outcome regexes above resolved almost nothing in the
+# banked logs. Under mission return every manoeuvre ends "-> RETURN_HOME"
+# whether it reconnected or gave up, so no RESOLVING marker — rejoin, gave-up,
+# unreachable — was ever emitted across the 5 banked g6pilot firings: grep finds
+# 0 of each. 4 of the 5 therefore fell through to the `open_at_horizon` default,
+# "the manoeuvre never ended", printed beside a duration parsed from this very
+# line. The 5th (hybrid_seed106, bestla) did emit one ARRIVED line — "reached
+# meeting point (dist=3.98, tol=4.0)" — and so became `arrived_waiting` at
+# line 710 instead. That is not a rescue: the jsonl records that manoeuvre as
+# gave_up, so the score against ground truth is 0/5 either way, and the arrived
+# case is strictly worse because it also carried the ARRIVAL instant as the
+# outcome time (see the t_ended note below). The destination state cannot
+# substitute; it is the same for both outcomes. Prefer this group over the walk
+# below whenever it is present.
 RE_ENDED = re.compile(
     r"Reconnect manoeuvre ended after ([\d.]+) s sim"
     r"(?::\s+(reconnected|gave_up|abandoned))?")
@@ -296,6 +302,20 @@ def parse_log(path, steps=None):
                 # this tags it as a mid-run (vs terminal) dispatch.
                 pending_midrun = True
                 ma = RE_MIDRUN_ATTEMPT.search(line)
+                # attempt=0 is a SENTINEL, not a count: the node numbers
+                # attempts from 1, so 0 can only mean the attempt clause was
+                # missing from the line. Kept distinguishable rather than
+                # defaulted to 1, because a silent 1 would read as "first
+                # attempt" and understate a retry ladder in exactly the arm
+                # that retries.
+                #
+                # A 0 is therefore AMBIGUOUS on its own and must be read
+                # alongside the `!! ... NOT PARSED` banner in main(). This
+                # script only prints that banner; it still exits 0. The
+                # campaign-level enforcement is check 20 of gate_g8.py, which
+                # is deliberately not in-tree (it is scoring, not runtime), so
+                # nothing in THIS repo will fail a run over a drifted parser.
+                # Do not read a lone 0 as proof the clause was optional.
                 events.append({"w": w, "type": "midrun_dispatch",
                                "silent": float(m2.group(1)),
                                "attempt": int(ma.group(1)) if ma else 0})
@@ -702,12 +722,14 @@ def analyse_run(run_dir):
             if outcome == "open_at_horizon" and arrived_at is not None:
                 outcome, t_out = "arrived_waiting", arrived_at
             stated = None
+            t_ended = None
             for j in range(i + 1, len(ev)):
                 if ev[j]["type"] == "ended":
                     dur = ev[j]["dur"]
                     stated = ev[j].get("outcome")
+                    t_ended = to_sim(ev[j]["w"])
                     if t_out is None:
-                        t_out = to_sim(ev[j]["w"])
+                        t_out = t_ended
                     break
                 if ev[j]["type"] == "fire":
                     break
@@ -720,6 +742,26 @@ def analyse_run(run_dir):
             # every release.
             if stated:
                 outcome = stated
+                # The timestamp has to move with the label. t_out was
+                # backfilled only `if t_out is None`, so a manoeuvre that
+                # reached the anchor and THEN ended kept the ARRIVAL instant
+                # while taking the ending's outcome word — reporting
+                # "gave_up at t=100" next to a duration measured to t=180, and
+                # sampling dist/link at an instant the stated outcome is not
+                # about. The stated outcome is a property of the ending, so it
+                # carries the ending's time; the walk's arrival time survives
+                # only where no ending line was parsed at all.
+                #
+                # Scope, deliberately wider than the arrival case that
+                # motivated it: this overrides t_out for EVERY stated outcome,
+                # including reconnected/resumed_exploring where the walk had a
+                # marker instant. Under mission return no resolving marker is
+                # ever emitted, so today that branch is unreachable and the two
+                # instants would coincide anyway. If a rejoin line is ever
+                # added, revisit — dt_to_outcome_s would then measure the whole
+                # manoeuvre rather than time-to-reconnect.
+                if t_ended is not None:
+                    t_out = t_ended
             elif dur is not None and outcome == "open_at_horizon":
                 # A manoeuvre that demonstrably ENDED (a duration was parsed
                 # from its ending line) cannot also be "open at the horizon".

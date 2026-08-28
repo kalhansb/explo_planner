@@ -66,6 +66,12 @@ Two grouping rules that are easy to get wrong and silent when you do:
 import glob
 import json
 import os
+# Top-level, not in the __main__ block where the argv import lives: the schema
+# warning in summarise_robot() writes to sys.stderr, and that function runs when
+# this module is IMPORTED by another script — a path on which __main__ never
+# executes. A block-scoped import would have made the newer-file warning raise
+# NameError instead of warning.
+import sys
 
 
 class EventLogError(Exception):
@@ -133,6 +139,41 @@ def summarise_robot(path):
     end = next((e for e in evs if e["event"] == "run_end"), None)
     if start is None:
         raise EventLogError(f"{path}: no run_start")
+
+    # The version stamp, finally read by something.
+    #
+    # It was written from the start and consumed by nothing, which made the
+    # "an analysis script can refuse a file it predates" rationale in
+    # experiment_log.hpp aspirational rather than true, and left the argument
+    # for voiding the generation-7 cells resting on a check that did not exist.
+    #
+    # Below MIN is a hard refusal, because the v2->v3 break is the dangerous
+    # shape: `metrics_rows` was RENAMED to `metrics_timer_rows`, so a lenient
+    # read of a v2 file does not raise, it reports every run as having written
+    # zero metrics rows. Silence is the failure mode, so this has to be loud.
+    #
+    # ABOVE max is deliberately NOT a refusal. A future generation is more
+    # likely to add fields than to move them, and a check that hard-fails
+    # forward gets deleted the first time it is wrong — which is how a guard
+    # stops guarding. Warn, keep going, and let the field-level reads fail if
+    # they actually break.
+    MIN_SCHEMA = 3
+    ver = start.get("schema_version")
+    if ver is None:
+        raise EventLogError(
+            f"{path}: no schema_version in run_start — predates versioning, "
+            f"and its field names cannot be trusted to mean what this script "
+            f"assumes")
+    if ver < MIN_SCHEMA:
+        raise EventLogError(
+            f"{path}: schema_version {ver} < {MIN_SCHEMA}. Field-incompatible "
+            f"with this reader: v2 wrote `metrics_rows` where v3 writes "
+            f"`metrics_timer_rows`, and v2 carried `last_contact_age_sec`, "
+            f"since removed. Reading it anyway yields plausible wrong numbers, "
+            f"not an error. These are the generation-7 cells; they are void.")
+    if ver > MIN_SCHEMA:
+        print(f"warning: {path}: schema_version {ver} is newer than this "
+              f"reader's {MIN_SCHEMA}; unknown fields ignored", file=sys.stderr)
 
     completes = [e for e in evs if e["event"] == "exploration_complete"]
     # The planner states this in run_end; recomputing it from the event list is

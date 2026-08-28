@@ -230,10 +230,15 @@ struct ReconnectDispatchEvent {
   ///     team_incomplete_sec ~= peer_record_age_sec - coord_claim_ttl_sec
   ///
   /// Measured on g6pilot + g7r1: 6/6 dispatches, peer_record_age_sec minus this
-  /// quantity fell in [3.74, 5.01] s — bounded by the TTL exactly as predicted.
-  /// The practical consequence is that a nominal 240 s gate fires at a peer
-  /// record age of ~245 s, so a gate quoted from peer_record_age_sec is ~TTL too
-  /// high. Both columns are kept for the same reason link_down_sec is: the
+  /// quantity fell in [3.24, 5.51] s, straddling the TTL as predicted. The
+  /// point estimates are [3.74, 5.01]; the interval is widened because THIS
+  /// COLUMN DID NOT EXIST in those campaigns — it is new in generation 8, and
+  /// the only banked copy of the quantity is the `%.0f`-rounded number in the
+  /// gen-7 dispatch line, worth +/-0.5 s per sample. So the relation is
+  /// corroborated, not validated at precision; g8r1 is the first data that can
+  /// test it properly. The practical consequence is that a nominal 240 s gate
+  /// fires at a peer record age of ~245 s, so a gate quoted from
+  /// peer_record_age_sec is ~TTL too high. Both columns are kept for the same reason link_down_sec is: the
   /// disagreement between clocks is a measurement, and collapsing them destroys
   /// it.
   double team_incomplete_sec = -1.0;
@@ -364,7 +369,25 @@ class ExperimentLog {
   /// names or meanings so an analysis script can refuse a file it predates.
   /// v2: mission_complete event; run_end gains have_home/home_x/home_y/
   /// final_x/final_y/mission_home_result/mission_home_sim_sec.
-  static constexpr int kSchemaVersion = 2;
+  /// v3: generation 8. Two of the changes are field-INCOMPATIBLE, not additive,
+  /// which is the whole reason this constant exists:
+  ///   - `PeerEvent::last_contact_age_sec` REMOVED (see the note at the peer
+  ///     event above). A v2-era reader that keys on it gets a KeyError, not a
+  ///     wrong number, so at least it fails loudly.
+  ///   - `RunEndEvent::metrics_rows` RENAMED to `metrics_timer_rows`. This one
+  ///     is the dangerous shape: a lenient reader with a `.get("metrics_rows",
+  ///     0)` default reads 0 forever and silently reports every run as having
+  ///     written no metrics rows.
+  /// Additive in the same generation: home_watchdog gains test_delta_m /
+  /// test_threshold_m (present only on detector fires, absent on escape-end),
+  /// and its VOCABULARY widens — a new kind `frozen-in-escape` and a new
+  /// response `abort-leg`. Vocabulary widening is a schema change even though
+  /// no field moved: a reader with an exhaustive match on kind now hits an
+  /// unhandled case, and one that counts fires by kind silently undercounts.
+  /// The gen-7 cells under /home/kalhan/hmr_campaign_void_gen7 are void for
+  /// exactly these two incompatibilities; leaving the stamp at 2 would have
+  /// made a void file and a live file indistinguishable to a script.
+  static constexpr int kSchemaVersion = 3;
 
   /// Decimal places used for every number written. Fixed, not significant
   /// digits: 6 decimals is microseconds on a sim timestamp and micrometres on a
@@ -497,14 +520,19 @@ class ExperimentLog {
   /// so the vocabulary below is a contract the analysis depends on — do not
   /// widen it without updating the readers.
   ///
-  ///   kind = "approach" | "frozen"   a detector fired.
+  ///   kind = "approach" | "frozen" | "frozen-in-escape"   a detector fired.
   ///     mode        the homing mode it fired IN (direct|retrace|escape),
   ///                 captured before any transition this fire causes.
-  ///     response    what was done: resend | retrace | escape | park.
+  ///     response    what was done: resend | retrace | escape | park, plus
+  ///                 abort-leg, which only ever appears on frozen-in-escape.
   ///                 (An "approach" fire never reaches mode=escape: that
   ///                 detector is suppressed during an escape leg.)
-  ///     window_sec  the detector's window — progress_window_sec for frozen,
-  ///                 return_approach_window_sec for approach.
+  ///     window_sec  the detector's window — progress_window_sec for frozen
+  ///                 and frozen-in-escape, return_approach_window_sec for
+  ///                 approach. Never a leg duration on these kinds; that
+  ///                 convention belongs to escape-end alone, and a
+  ///                 frozen-in-escape abort is always followed by an
+  ///                 escape-end row carrying the leg's duration.
   ///     test_delta_m / test_threshold_m
   ///                 THE FIRED INEQUALITY: the detector fired because
   ///                 test_delta_m < test_threshold_m. delta is window movement
@@ -519,7 +547,11 @@ class ExperimentLog {
   ///     mode        always "escape" — the mode the event is about, same
   ///                 convention as a detector fire.
   ///     response    why the leg ended: escape-arrived | escape-leg-cap |
-  ///                 escape-frozen.
+  ///                 escape-frozen. NOTE that escape-frozen is a `response`
+  ///                 here and nothing else: the fire that caused this ending
+  ///                 is the SEPARATE preceding row, kind=frozen-in-escape.
+  ///                 The two rows are one abort. Key on the column, not on
+  ///                 the token, or you will count it twice.
   ///     window_sec  the leg's DURATION in seconds, not a detector window.
   ///     next_mode   the mode homing resumed in: retrace, or direct when there
   ///                 was no usable trail.

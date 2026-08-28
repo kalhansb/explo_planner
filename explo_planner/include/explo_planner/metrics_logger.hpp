@@ -53,8 +53,14 @@ struct StepMetrics {
   /// archive scripts (see metrics_logger.cpp), so deleting a mid-file column
   /// would silently shift every column after it. Treat as redundant: never
   /// decompose score against utility, and never fit one on the other — that is
-  /// a regression of a column on itself. The gate script asserts the identity
-  /// holds, so a future divergence is caught rather than assumed away.
+  /// a regression of a column on itself.
+  ///
+  /// The identity is checked at CAMPAIGN-SCORING time, not build time: the
+  /// per-generation gate script (gate_g8.py check 15) re-derives it over every
+  /// CSV row before any result is read. Those scripts are deliberately not in
+  /// this tree — they pin one generation's identity and are written fresh per
+  /// campaign — so nothing here enforces the alias, and a divergence would
+  /// surface as a gate failure on the data rather than as a build failure.
   float  selected_utility      = 0.0f;
 
   // Multi-robot coordination diagnostics. Zero in single-robot mode.
