@@ -211,10 +211,45 @@ RECONNECT_CONFIRM="$(flt "${RECONNECT_CONFIRM:-3.0}")"
 # taught that an un-recorded planner param makes runs post-hoc
 # indistinguishable, which the mode comparison then has to treat as a confound.
 # Silence (s) of continuous peer absence before a robot interrupts exploration
-# to run its arm's reconnect manoeuvre. 0 = terminal-only (legacy). Must stay
-# above the measured heartbeat-suppression tail (~180 s) or the trigger fires
-# at healthy, silently-planning teammates.
-MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-240}")"
+# to run its arm's reconnect manoeuvre. 0 = terminal-only (legacy).
+#
+# 90 since generation 9; it was 240 through generation 8. The old value had to
+# clear the ~180 s heartbeat-suppression tail by pure waiting, because the
+# record-age clock alone cannot tell a silent teammate from an absent one and
+# firing at a healthy, silently-planning peer was the failure it had to avoid.
+# LINK_GATE=1 (now the default, below) makes that distinction directly from the
+# radio, so the threshold is no longer set by the suppression tail.
+#
+# Lowering it was forced by measurement, not preference: in g8r1's 23 hybrid
+# cells the 240 s clock expired in 3, so 87 % of the treated arm ran
+# behaviourally identical to the control and the campaign could not measure its
+# own treatment.
+#
+# TWO DRAFTS OF THIS NUMBER WERE WRONG BEFORE THIS ONE. The first, 120, came
+# from a circular sweep: it filtered episodes on the presence clock and then
+# scored them on the same clock, so "zero waste" merely restated the filter. The
+# second, 90, was re-scored against g8r1's banked link_states.csv with the filter
+# on the past (presence gap) and the score on the future (radio) -- but on the 20
+# hybrid cells that did NOT dispatch, which is a sample selected on the outcome
+# being swept.
+#
+# The number that stands is scored on the `off` arm, which never ran the trigger
+# at all and is therefore untreated by construction. There, at LINK_DOWN_CONFIRM
+# as it now ships (0, i.e. "not up right now"), 90 arms 18 of 23 cells, 20 % of
+# fires land in an outage that would have closed on its own anyway, and 85 %
+# beat natural recovery -- the argmin of waste across the UNWALKED grid, where
+# 120, 90 and 75 all arm the same 18 of 23.
+#
+# NEITHER FACT SURVIVES THE FORWARD WALK, so 90 is not chosen by the grid. Scored
+# at T plus the measured 14.0-18.8 s dispatch overshoot the waste argmin moves to
+# 75 at every offset and the plateau breaks; a ranking that flips that easily is
+# one 23 cells cannot resolve, and re-tuning to 75 on the same cells would repeat
+# the error. What survives is the coarse verdict (240 far too high, 60 past where
+# waste turns back up); inside 120-75 the choice is off-grid, and 90 clears the
+# p90 radio outage (52.0-111.0 s, nearest-rank) while sitting far below 240. See
+# §32.15 and the member-default comment in explo_planner_node.cpp, which carries
+# the full table and the walked numbers.
+MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-90}")"
 # Barrier give-up for mid-run attempts (terminal barriers keep RDV_MAX_WAIT).
 MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
 MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
@@ -286,12 +321,33 @@ MISSION_RETURN_MAX="$(flt "${MISSION_RETURN_MAX:-600}")"
 #   550k / 319   = ceiling -> a saturated pair drifting apart slowly is declined,
 #                           which is the gate doing its job: 200 s of silence at
 #                           that rate is only ~64k voxels, four chance merges.
-# MIDRUN_MAX_SILENCE must stay <= MIDRUN_SILENCE (240): a ceiling above it would
-# let the gated arm fire LATER than the control and confound "gated vs not"
-# with "waited longer". The planner warns at startup if it does.
+# MIDRUN_MAX_SILENCE must stay <= MIDRUN_SILENCE: a ceiling above it would let
+# the gated arm fire LATER than the control and confound "gated vs not" with
+# "waited longer". The planner warns at startup if it does.
+#
+# It TRACKS MIDRUN_SILENCE rather than carrying a copied constant. It used to be
+# a literal 90, which was correct only by coincidence: it matched generation 9's
+# clock and would have silently violated the invariant the moment either number
+# moved, in exactly the direction the warning exists to catch.
+#
+# THE FLOOR NOW BINDS OVER MOST OF THE USABLE RANGE, which the previous wording
+# denied. WHICH RATE YOU DIVIDE BY DECIDES THE ANSWER, and the previous wording
+# mixed two in one sentence: it wrote "550k/9,100 = 60 s" (cg050's early-run
+# rate, above) and then quoted a window derived from a different rate entirely.
+# The window [138k, 207k] is the ~2,300 vox/s figure the ESTIMATOR was
+# calibrated on in p14 (explo_planner_node.cpp, reconnect_min_share_voxels_):
+# 138k/2300 = 60 s = the floor, 207k/2300 = 90 s = the ceiling. Under cg050's
+# rates the same clamps give [546k, 819k] early and [174k, 261k] late. Both are
+# legitimate; they answer for different phases of a run and differ by ~4x, which
+# is precisely why the target has to be RE-DERIVED against whichever rate the
+# next campaign's world actually produces rather than copied from either. Do not
+# reuse 550k. Both clamps are inert while
+# RECONNECT_MIN_SHARE_VOX=0, which is the default and what the current campaign
+# runs -- keeping the invariant true matters for the day the gate is switched on
+# again, not for these runs.
 RECONNECT_MIN_SHARE_VOX="$(flt "${RECONNECT_MIN_SHARE_VOX:-0}")"
 MIDRUN_MIN_SILENCE="$(flt "${MIDRUN_MIN_SILENCE:-60}")"
-MIDRUN_MAX_SILENCE="$(flt "${MIDRUN_MAX_SILENCE:-240}")"
+MIDRUN_MAX_SILENCE="$(flt "${MIDRUN_MAX_SILENCE:-$MIDRUN_SILENCE}")"
 # Release flicker guard: the team must read complete this long before a
 # manoeuvre releases (and the silence clock resets). 0 = first-read (legacy).
 # MUST exceed coord_claim_ttl_sec (5.0), which the old default of 3 did not:
@@ -382,10 +438,35 @@ EXPECT_OUTAGE="${EXPECT_OUTAGE:-1}"
 # nothing, 16-21 % of them firing while the radio was UP. LINK_GATE=1 points the
 # planner at the emulator's connected bit instead.
 #
-# OFF BY DEFAULT, and that is deliberate: every campaign banked so far
-# (pb3g2, tr1, tl1, tl2, td1) ran on the record-age clock, and a default flip
-# would silently make the next run incomparable with all of them. Turn it on per
-# campaign, and record that you did -- the manifest line below is the record.
+# ON BY DEFAULT since generation 9. It was off through generation 8, on the
+# argument that every banked campaign (pb3g2, tr1, tl1, tl2, td1) ran the
+# record-age clock and a default flip would silently make the next run
+# incomparable with all of them. That argument no longer holds and a stronger
+# one now points the other way:
+#
+#   - Generation 9 already breaks comparability by design. MIDRUN_SILENCE moved
+#     240 -> 90 in the same change, so these runs are a new generation and are
+#     not poolable with the record-age campaigns whatever this flag says.
+#   - The two settings are COUPLED. 90 s sits below the ~180 s
+#     heartbeat-suppression tail, so it is only safe because the veto can tell a
+#     silent teammate from an absent one. Defaulting the threshold low and the
+#     veto off leaves the low clock running bare -- firing at a healthy peer
+#     that is merely deep in a PLAN loop.
+#
+#     And a BARE INVOCATION IS that combination, which an earlier draft of this
+#     comment denied. COMMS defaults to 0, so LINK_GATE=1 resolves to
+#     LINK_GATE_EFFECTIVE=0 and the 90 s clock runs with no veto. That is
+#     tolerable for a smoke test and intolerable for a campaign, which is why
+#     run_campaign.sh refuses it outright (see its guard, and
+#     campaign_guard_calib.sh for the known-answer cases). Here it is a loud
+#     WARNING at the manifest write, not a refusal.
+#   - g8r1 is what an unset gate costs in practice: it ran with the veto off and
+#     the only trace at the firing site was a "radio down -1s" sentinel, which
+#     reads like a measurement rather than "the check did not run".
+#
+# Set LINK_GATE=0 explicitly to reproduce a record-age campaign. The manifest
+# line below is still the record either way, and it is now the thing to check
+# first when comparing two runs.
 #
 # Only meaningful with COMMS=1: with no emulator there is no link topic, the
 # planner finds no samples, and it would spend the run warning about a gate it
@@ -396,7 +477,20 @@ EXPECT_OUTAGE="${EXPECT_OUTAGE:-1}"
 # `off` cannot reach the gated code at all (it needs rendezvous_enabled, which
 # is false there), so passing it the same parameters costs nothing and removes
 # a whole class of "did the arms differ in something else too" question.
-LINK_GATE="${LINK_GATE:-0}"
+LINK_GATE="${LINK_GATE:-1}"
+# Validated like COMMS and RECONNECT_MODE, and for the same reason: every value
+# that is not exactly "1" turns the veto off in the topic block below, so "true"
+# or "2" reads as a request and behaves as a refusal. Worse, it used to be
+# copied verbatim into LINK_GATE_EFFECTIVE, so the manifest recorded
+# link_gate_effective=2 for a run with no veto at all, and the safety WARNING is
+# conditioned on LINK_GATE="1" and so could not fire. Refuse the value instead
+# of recording a provenance line that disagrees with the run.
+case "$LINK_GATE" in
+  0|1) ;;
+  *) echo "FATAL: LINK_GATE='$LINK_GATE' is not 0 or 1. Any other value \
+disables the link veto while looking like a request for it, and the manifest \
+would record it as such." >&2; exit 2 ;;
+esac
 if [ "$LINK_GATE" = "1" ] && [ "$COMMS" = "1" ]; then
   LINK_GATE_TOPIC="${LINK_GATE_TOPIC:-/hmr_comms_sim/link_states}"
   LINK_GATE_INDEX="${LINK_GATE_INDEX:-/hmr_comms_sim/robot_index}"
@@ -404,9 +498,58 @@ else
   LINK_GATE_TOPIC=""
   LINK_GATE_INDEX=""
 fi
+# LINK_GATE is the REQUEST; LINK_GATE_EFFECTIVE is what the planner will
+# actually get, and only the second one describes the run. They diverge on
+# exactly one pairing -- gate asked for, emulator absent -- and that pairing is
+# silently unsafe rather than merely inert: MIDRUN_SILENCE now defaults BELOW
+# the ~180 s heartbeat-suppression tail on the understanding that the veto can
+# tell a quiet teammate from an absent one, so losing the veto leaves the low
+# threshold running bare. Say so at the top of the log instead of letting the
+# reader reconstruct it from two manifest lines.
+#
+# Only the flag is computed here: this is the defaults block and log() is not
+# defined until much later in the file, so the warning itself is emitted at the
+# manifest write where the rest of the run's configuration is reported.
+#
+# Derived from the OBSERVABLE, not re-derived from the inputs. LINK_GATE_TOPIC
+# being non-empty is the single fact that decides whether the node is handed
+# comms_link_states_topic at all (see the EXTRA block below), so reading it back
+# here means link_gate_effective cannot drift from what the run did if the
+# condition above is ever edited. An earlier version recomputed the same
+# conjunction a second time and assigned "$LINK_GATE" in the else branch, which
+# is only 0-or-1 because the validator above now makes it so.
+if [ -n "$LINK_GATE_TOPIC" ]; then
+  LINK_GATE_EFFECTIVE=1
+else
+  LINK_GATE_EFFECTIVE=0
+fi
 # Newest link sample older than this and the planner stands down to the legacy
 # clock rather than acting on a stale belief. The emulator publishes at 5 Hz.
 LINK_GATE_STALE="$(flt "${LINK_GATE_STALE:-3.0}")"
+# How long the radio must have been CONTINUOUSLY down before the veto lets a
+# mid-run chase through. Its own knob since generation 9; both veto sites used
+# to borrow RECONNECT_CONFIRM (3.0), which is the team-PRESENCE release confirm
+# and answers a different question. Decoupling them is right at any value.
+#
+# THE VALUE IS 0, AND THE 30 s DEBOUNCE THAT WAS HERE IS WITHDRAWN. At 0 the
+# veto is exactly its disjunct -- "never chase a peer whose radio is up right
+# now" -- which is the whole test. 30 was credited in an earlier draft of this
+# comment with moving wasted fires "from 50 % to 33 %", and that was a
+# misattribution: the table it pointed at held this conjunct FIXED at 30 and
+# varied the presence clock, so 50 -> 33 is the 150 -> 90 move, not this
+# parameter's effect. Measured properly on the untreated `off` arm, holding
+# MIDRUN_SILENCE at 90:
+#
+#     confirm   cells arm (of 23)   fires   wasted   beats natural recovery
+#        0            18             40      20 %            85 %
+#       30            12             26      15 %            92 %
+#
+# It buys 5 points of purity for A THIRD of the arm's activation -- 18 arming
+# cells down to 12, i.e. 6 of the 18 that armed. ("A quarter", in an earlier
+# draft, is 6/23: the share of the arm, not of the activation being traded.)
+# Dilution is the defect this generation exists to fix, so the trade goes the
+# other way.
+LINK_DOWN_CONFIRM="$(flt "${LINK_DOWN_CONFIRM:-0}")"
 # Reliable-relay backlog cap, in bytes. The emulator's shipped default is 64 MiB
 # and on overflow it drops the OLDEST queued map delta and never retransmits, so
 # the receiver's merged map loses those voxels for the rest of the run. That
@@ -1276,9 +1419,17 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # future readout has to infer it from a git hash — two of the hashes on the
   # last campaign were '-dirty' and could not have answered this.
   echo "link_gate=$LINK_GATE"
+  # link_gate is the REQUEST, link_gate_effective is what the planner got. They
+  # differ only when the gate was asked for with no emulator to feed it, and a
+  # reader comparing two campaigns needs the second one. g8r1 is why: its
+  # manifest honestly said link_gate=0 and the only trace at the firing site was
+  # a "radio down -1s" sentinel that reads like a measurement rather than like a
+  # check that never ran.
+  echo "link_gate_effective=$LINK_GATE_EFFECTIVE"
   echo "link_gate_topic=${LINK_GATE_TOPIC:-none}"
   echo "link_gate_index_topic=${LINK_GATE_INDEX:-none}"
   echo "link_gate_stale_sec=$LINK_GATE_STALE"
+  echo "reconnect_link_down_confirm_sec=$LINK_DOWN_CONFIRM"
   echo "reconnect_release_confirm_sec=$RECONNECT_RELEASE_CONFIRM"
   echo "reconnect_arrive_tol_m=$RECONNECT_ARRIVE_TOL"
   echo "reconnect_nav_max_sec=$RECONNECT_NAV_MAX"
@@ -1418,6 +1569,19 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
+# Deferred from the defaults block, where log() does not exist yet. The pairing
+# below is the one combination that is silently unsafe rather than merely inert:
+# MIDRUN_SILENCE now defaults BELOW the ~180 s heartbeat-suppression tail on the
+# understanding that the veto can tell a quiet teammate from an absent one, so
+# with no emulator the low threshold runs bare and a healthy in-range partner
+# deep in a PLAN loop reads as missing. The planner warns too; this says it
+# before the run rather than in a per-node log nobody opens until afterwards.
+if [ "$LINK_GATE" = "1" ] && [ "$LINK_GATE_EFFECTIVE" != "1" ]; then
+  log "WARNING: LINK_GATE=1 but COMMS=$COMMS -- no link emulator, so the veto" \
+      "CANNOT run and this run fires on the bare record-age clock with" \
+      "reconnect_midrun_silence_sec=$MIDRUN_SILENCE. Set COMMS=1, or raise" \
+      "MIDRUN_SILENCE above 200, or pass LINK_GATE=0 to say you meant it."
+fi
 # Built once, outside the loop. Empty unless the caller set something, and
 # expanded with the ${a[@]+"${a[@]}"} guard because `set -u` treats an empty
 # array expansion as an unbound variable on bash < 4.4.
@@ -1470,6 +1634,7 @@ for r in $ROBOTS; do
       -p rendezvous_enabled:=$RDV_ENABLED \
       -p rendezvous_max_wait_sec:=$RDV_MAX_WAIT \
       -p reconnect_confirm_sec:=$RECONNECT_CONFIRM \
+      -p reconnect_link_down_confirm_sec:=$LINK_DOWN_CONFIRM \
       -p reconnect_midrun_silence_sec:=$MIDRUN_SILENCE \
       -p reconnect_midrun_max_wait_sec:=$MIDRUN_MAX_WAIT \
       -p reconnect_midrun_max_attempts:=$MIDRUN_MAX_ATTEMPTS \

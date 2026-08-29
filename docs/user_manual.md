@@ -148,9 +148,13 @@ of which reconnected. The own anchor is now used only when the missing peer
 was never heard at all this run.
 
 Reconnection is no longer terminal-only. A robot also interrupts exploration
-to run its manoeuvre after `reconnect_midrun_silence_sec` (240 s) of
-continuous peer silence, up to `reconnect_midrun_max_attempts` (6) times; a
-mid-run attempt that times out resumes exploring rather than ending the run.
+to run its manoeuvre after `reconnect_midrun_silence_sec` (90 s, and 240 s
+through generation 8) of continuous peer silence, up to
+`reconnect_midrun_max_attempts` (6) times; a mid-run attempt that times out
+resumes exploring rather than ending the run. Below ~200 s the threshold is
+only safe with the link veto configured, because peer silence alone cannot
+tell a teammate behind a hill from one sitting two metres away in a long
+planning tick — see `reconnect_link_down_confirm_sec` in `docs/ros_api.md`.
 
 The records need no configuration; they build automatically from incoming
 peer intents. **`rendezvous_expected_peers` must be set to 1 by hand on a

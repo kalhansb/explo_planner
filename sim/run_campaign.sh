@@ -87,6 +87,7 @@ SCENARIO=""
 # exploration-finish numbers are a NEW endpoint never pooled with banked runs.
 # Pass --mission-return 0 only to reproduce the legacy park-in-place design.
 MISSION_RETURN_FLAG="1"
+DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --root)     ROOT="$2"; shift 2;;
@@ -104,6 +105,14 @@ while [ $# -gt 0 ]; do
     --done-criterion) DONE_CRITERION="$2"; shift 2;;
     --mission-return) MISSION_RETURN_FLAG="$2"; shift 2;;
     --env)      EXTRA_ENV="$2"; shift 2;;
+    # Run every validation, print the cell list, launch nothing. Added because
+    # the refusals above could not be calibrated any other way: checking that a
+    # legitimate campaign is NOT refused meant letting it start, and a harness
+    # that then killed the driver left the cell's gazebo, scovox and
+    # robot_state_publisher processes orphaned -- six of them, on the first
+    # attempt. A guard whose happy path cannot be tested without side effects is
+    # a guard whose happy path does not get tested.
+    --dry-run)  DRY_RUN=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -145,6 +154,67 @@ case " $EXTRA_ENV " in
     echo "       on resume; an --env passenger is neither." >&2
     exit 2;;
 esac
+# Read one KEY=VALUE out of EXTRA_ENV, exactly. Substring matching on the whole
+# string is what the first draft of the guard below did, and it is wrong in both
+# directions at once: `GATE_MIDRUN_SILENCE=240` (a variable for the gate script,
+# not the launcher) contains "MIDRUN_SILENCE=" and silently DISARMED the guard,
+# while `MY_LINK_GATE=0` contains "LINK_GATE=0" and would have armed it on a
+# campaign that never touched the veto. Splitting on whitespace and comparing
+# the key up to the first '=' removes both.
+env_val() {
+  _k="$1"; _v=""
+  for _tok in $EXTRA_ENV; do
+    case "$_tok" in
+      "$_k"=*) _v="${_tok#*=}";;
+    esac
+  done
+  printf '%s' "$_v"
+}
+env_has() {
+  for _tok in $EXTRA_ENV; do
+    case "$_tok" in "$1"=*) return 0;; esac
+  done
+  return 1
+}
+
+case "$COMMS_ON" in
+  0|1) ;;
+  *) echo "FATAL: --comms must be 0 or 1 (got '$COMMS_ON'). Anything else is" >&2
+     echo "       neither the emulated arm nor the ideal-comms control, and" >&2
+     echo "       run_explo_sim_rviz.sh treats every non-1 value as 0." >&2
+     exit 2;;
+esac
+# COMMS in --env would beat --comms: the per-cell `env COMMS="$COMMS_ON" ...`
+# assignment below is expanded BEFORE $EXTRA_ENV, and last assignment wins. So
+# `--comms 1 --env COMMS=0` runs an ideal-comms campaign whose manifest, index
+# and directory names all say the emulator was up. Same shape of failure as
+# MISSION_RETURN above; refuse it the same way.
+if env_has COMMS; then
+  echo "FATAL: set the emulator with --comms 0|1, not --env COMMS=... --" >&2
+  echo "       --env is expanded last, so the passenger wins over the flag and" >&2
+  echo "       every record of the campaign would name the wrong arm." >&2
+  exit 2
+fi
+# The last two per-cell assignments on the env line at the bottom of this file,
+# and the two worst to lose. RECONNECT_MODE is the treatment itself: an --env
+# passenger sets every cell to one arm while the OUTDIR names, the index and the
+# gate's arm parser all still read hybrid-vs-off, so the campaign looks like a
+# controlled comparison and is a single arm run twice. SEED is the world: one
+# value for all cells turns 30 replicates into 30 repeats of one map, and the
+# sim is nondeterministic run-to-run ([[sim-run-to-run-nondeterminism]]), so the
+# spread would look like real between-cell variation.
+for _blocked in RECONNECT_MODE SEED; do
+  if env_has "$_blocked"; then
+    echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
+    echo "       this script) and --env is expanded after it, so --env" >&2
+    echo "       $_blocked=... would override EVERY cell while the directory" >&2
+    echo "       names, the index and the gate all still claim otherwise." >&2
+    echo "       Use --arms/--cells for the arm and --seeds for the seed." >&2
+    exit 2
+  fi
+done
+unset _blocked
+
 case "$MISSION_RETURN_FLAG" in
   0|1) ;;
   *) echo "FATAL: --mission-return must be 0 or 1 (got '$MISSION_RETURN_FLAG')" >&2; exit 2;;
@@ -166,6 +236,136 @@ if [ -z "$CELLS" ]; then
       CELLS="${CELLS:+$CELLS,}$a:$s"
     done
   done
+fi
+
+# Unlike DONE_SEEK and MISSION_RETURN, LINK_GATE in --env is LEGITIMATE: it is
+# how you reproduce a record-age campaign, and it applies to every cell on
+# purpose because the arms must differ in RECONNECT_MODE alone. What is not
+# legitimate is running it against the generation-9 threshold.
+# reconnect_midrun_silence_sec defaults to 90, which is below the ~180 s
+# heartbeat-suppression tail, and that is only safe because the veto can tell a
+# quiet teammate from an absent one: the record-age clock ages whenever a peer is
+# not SENDING, so a healthy partner two metres away in a long PLAN loop reads as
+# missing at 90 s and the campaign spends its treatment arm chasing robots that
+# were never lost.
+#
+# --comms 0 is the same hazard by a different route. It is a documented arm (the
+# ideal-comms control), but with no emulator there is no link topic, so the veto
+# cannot run there either -- and heartbeat suppression is a property of the
+# beacon, not of the radio, so it does not go away just because the radio is
+# perfect.
+#
+# THE ESCAPE HATCH IS NOT "MENTION MIDRUN_SILENCE". The first draft disarmed on
+# the mere PRESENCE of the name, so `--env MIDRUN_SILENCE=5` -- which is worse
+# than the default in exactly the way the guard exists to prevent -- sailed
+# through, and so did a campaign that only ever mentioned GATE_MIDRUN_SILENCE.
+# The value is what matters, and it has to clear the suppression tail.
+#
+# AND THE ADVICE MATTERS TOO. Telling a --comms 0 operator to raise
+# MIDRUN_SILENCE would make the ideal-comms control differ from the treated arm
+# in TWO variables -- the radio and the trigger clock -- which is precisely the
+# compounded design this project has repeatedly been burned by
+# [[no-compound-experiments]]. Under --comms 0 the right answer is a different
+# one, so the guard says a different thing.
+#
+# IT RUNS HERE, BELOW THE CELL LIST, AND THAT PLACEMENT IS LOAD-BEARING. It used
+# to run above every other validation, so it read $ARMS and $CELLS raw and had
+# to invent an answer when neither was given -- and a campaign launched with no
+# arm selector at all, or with a bad --mission-return, was refused by THIS guard
+# with THIS message, which describes a hazard that campaign does not have. A
+# guard that answers a question nobody asked teaches the operator to route
+# around it. Below the construction, $CELLS is populated, validated and always
+# in "arm:seed" form, so the treated test is a plain read of the real cell list.
+MIDRUN_SILENCE_FLOOR=200
+_link_gate_req="$(env_val LINK_GATE)"
+# The launcher's own default, duplicated here because the guard has to decide
+# before anything is launched. run_explo_sim_rviz.sh spells it
+# `LINK_GATE="${LINK_GATE:-1}"`. If that ever changes, this guard would reason
+# about a run that does not happen -- so campaign_guard_calib.sh reads the
+# literal back out of the launcher and fails if the two disagree, which is the
+# only thing keeping the duplication honest.
+env_has LINK_GATE || _link_gate_req=1
+# Mirrors run_explo_sim_rviz.sh: the veto is live only when the request is
+# exactly "1" AND the emulator is up. Every other value -- "0", "false", "2",
+# empty -- is off there, so it must be off here.
+_veto_live=0
+[ "$_link_gate_req" = "1" ] && [ "$COMMS_ON" = "1" ] && _veto_live=1
+# Only the TREATED arms can chase a peer, so an off-only campaign is not exposed
+# to this at all and must not be blocked by it. Naming "off" rather than
+# "hybrid" keeps a future arm inside the guard by default.
+#
+# $CELLS is the single source: it is what actually runs, whether it came from
+# --cells or from crossing --arms with --seeds, so there is no second spelling
+# for the guard to go silent on. Cells are "arm:seed", and the trailing _seek is
+# a runtime switch stripped further down (cell_mode/cell_seek), not an arm -- so
+# "off_seek" is an untreated control and must not be classed as treated on the
+# strength of a suffix.
+_treated=0
+for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
+  _a="${_a%%:*}"
+  _a="${_a%_seek}"
+  [ "$_a" = "off" ] || _treated=1
+done
+_sil="$(env_val MIDRUN_SILENCE)"
+_sil_ok=0
+if env_has MIDRUN_SILENCE; then
+  case "$_sil" in
+    ''|*[!0-9.]*|*.*.*)
+      echo "FATAL: --env MIDRUN_SILENCE='$_sil' is not a number" >&2; exit 2;;
+  esac
+  # Integer compare on the whole-second part; the clock is never set in
+  # fractions and awk is not guaranteed to be on the path this early.
+  [ "${_sil%%.*}" -ge "$MIDRUN_SILENCE_FLOOR" ] 2>/dev/null && _sil_ok=1
+  # 0 DISABLES THE MID-RUN TRIGGER ENTIRELY -- it is the documented switch for
+  # reproducing pre-2026-08-17 behaviour bit-for-bit, and the node's own trigger
+  # requires reconnect_midrun_silence_sec_ > 0.0. Refusing it made the guard
+  # block the one configuration in which the hazard it names cannot occur.
+  case "${_sil%%.*}" in 0) _sil_ok=1;; esac
+fi
+if [ "$_treated" = "1" ] && [ "$_veto_live" = "0" ] && [ "$_sil_ok" = "0" ]; then
+  echo "FATAL: this campaign would run the mid-run trigger with NO link veto" >&2
+  echo "       (LINK_GATE=$_link_gate_req, --comms $COMMS_ON) while" >&2
+  echo "       reconnect_midrun_silence_sec is at ${_sil:-the generation-9 default of 90}s," >&2
+  echo "       below the ~180 s heartbeat-suppression tail. Without the veto the" >&2
+  echo "       trigger cannot tell a silent teammate from an absent one and the" >&2
+  echo "       treated arm will chase peers that are in range and fine." >&2
+  if [ "$COMMS_ON" = "0" ]; then
+    echo "       Under --comms 0 do NOT just raise MIDRUN_SILENCE: that makes the" >&2
+    echo "       ideal-comms control differ from the treated arm in two variables" >&2
+    echo "       at once. Either run --comms 0 with --arms off (the control needs" >&2
+    echo "       no reconnect trigger), or run the whole matrix at --comms 1." >&2
+  else
+    echo "       Add --env MIDRUN_SILENCE=$MIDRUN_SILENCE_FLOOR or more to" >&2
+    echo "       reproduce a record-age campaign, or drop LINK_GATE=0 to keep" >&2
+    echo "       the veto." >&2
+  fi
+  exit 2
+fi
+unset _link_gate_req _veto_live _treated _sil _sil_ok _a
+
+# The guard above scans only $EXTRA_ENV, and the launch line strips these two
+# from the inherited environment so that assumption holds. Say so when the
+# caller has one exported, rather than ignoring it in silence: whoever typed
+# `export LINK_GATE=0` meant something by it, and the useful answer is which
+# channel actually reaches the cells.
+for _amb in LINK_GATE MIDRUN_SILENCE; do
+  if [ -n "${!_amb+x}" ]; then
+    echo "NOTE: $_amb=${!_amb} is exported in this shell and will be IGNORED --" >&2
+    echo "      the per-cell launch strips it so the link-veto guard cannot be" >&2
+    echo "      bypassed by the ambient environment. Pass --env $_amb=... if you" >&2
+    echo "      meant it; the guard reads that." >&2
+  fi
+done
+unset _amb
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "DRY RUN: every validation passed, nothing launched."
+  echo "  tag=$TAG comms=$COMMS_ON tx=$TX duration=${DURATION}s record=$REC"
+  echo "  scenario=$SCENARIO mission_return=$MISSION_RETURN_FLAG"
+  echo "  done_criterion=$DONE_CRITERION done_unknown=$DONE_UNKNOWN"
+  echo "  env='$EXTRA_ENV'"
+  echo "  cells=$CELLS"
+  exit 0
 fi
 
 mkdir -p "$ROOT"
@@ -292,7 +492,25 @@ for cell in "${CELL_LIST[@]}"; do
   cell_expect="$EXPECT_OUT"
   [ "$COMMS_ON" = "0" ] && cell_expect=0
 
-  env OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
+  # -u LINK_GATE -u MIDRUN_SILENCE, and this is a correctness fix, not tidiness.
+  #
+  # `env` without -i inherits the caller's environment, and these two are the
+  # ONLY settings the link-veto guard reasons about that are not also assigned
+  # explicitly on this line. run_explo_sim_rviz.sh reads them as
+  # "${LINK_GATE:-1}" and "${MIDRUN_SILENCE:-90}", so an exported value from the
+  # launching shell -- a leftover debugging export, a line in a wrapper -- beat
+  # the launcher default while the guard, which scans only $EXTRA_ENV, computed
+  # the default and stayed silent. `export LINK_GATE=0` followed by a normal
+  # campaign launch would have run every treated cell of a multi-day matrix on
+  # the 90 s clock with no veto: exactly the configuration the guard exists to
+  # refuse, arriving through the one channel it could not see.
+  #
+  # Stripping them makes the guard's model true by construction rather than by
+  # assumption, and costs nothing: --env is expanded after these flags and env
+  # applies assignments after unsets, so `--env LINK_GATE=0` still works and is
+  # still the channel the guard reads.
+  env -u LINK_GATE -u MIDRUN_SILENCE \
+      OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \

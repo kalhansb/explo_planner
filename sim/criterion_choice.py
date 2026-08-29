@@ -10,7 +10,8 @@ long a run takes to scrape past a threshold near the floor.
 
 Raising the criterion moves the finish line back onto the linear part of the
 curve. But it cannot be raised freely, and the reason is the point of this
-script: a reconnect manoeuvre only fires after 240 s of peer silence, so a
+script: a reconnect manoeuvre only fires after a fixed span of peer silence
+(240 s when this was written; 90 s since generation 9), so a
 criterion set high enough ends runs BEFORE the treatment ever engages. Those
 cells are noise in an arm comparison -- the robots did the same thing in every
 arm. Optimising SD alone drives straight into that, since the cleanest possible
@@ -42,6 +43,22 @@ step event, and behaviour before the crossing is unaffected by where the finish
 line is drawn, so t_cross is valid for a criterion the run was not launched
 with. Only the metrics integrated over the whole run (disconnected fraction,
 distance) need the shorter window applied.
+
+STALE SINCE GENERATION 9 -- KEPT AS THE HISTORICAL RECORD, NOT AS ADVICE.
+The whole engagement column above was computed against a 240 s mid-run clock,
+and generation 9 moved it to 90. The direction of the error is known: a shorter
+clock dispatches earlier, so FEWER runs finish before their first dispatch and
+every "treatment stops engaging" figure here is pessimistic. The magnitude is
+not known, because the counts come from campaigns that no longer exist as a
+comparable population (see [[archive-pre-2026-08-20-binary]] and the four binary
+generations in [[binary-generations-and-the-link-gate]]).
+
+What this means in practice: 0.64 is the shipped DONE_UNKNOWN and it was NOT
+chosen by re-running this script under the new clock. Do not read the table as
+endorsing a different threshold, and do not re-derive one from it -- re-run the
+script against a generation-9 campaign first. The reasoning it demonstrates,
+that SD and treatment engagement have to be read together because the quietest
+measurement is the one where nothing happens, is what survives.
 """
 import collections
 import glob

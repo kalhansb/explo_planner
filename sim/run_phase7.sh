@@ -48,7 +48,8 @@
 # !! STALE AS OF THE 2026-08-17 REDESIGN -- THIS SCRIPT NO LONGER REPRODUCES
 # THE p7modes RUNS. The paragraph above was true when the campaign ran, but the
 # harness defaults moved underneath it: run_explo_sim_rviz.sh now ships
-# PURSUIT_STALENESS=900, MIDRUN_SILENCE=240, RECONNECT_RELEASE_CONFIRM=6 and
+# PURSUIT_STALENESS=900, MIDRUN_SILENCE=90 (240 through generation 8, then 90
+# with the link veto on by default), RECONNECT_RELEASE_CONFIRM=6 and
 # HOLD_ESCALATE=1 to match the planner's own code defaults. A bare re-run of
 # this script therefore executes the POST-redesign policy under the p7modes
 # tag. To reproduce the original cells bit-for-bit, export:

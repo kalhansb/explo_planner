@@ -638,7 +638,11 @@
     # all this run, and there is no pose pair to midpoint.
     #
     # Reconnection is also no longer terminal-only: reconnect_midrun_silence_sec
-    # (node default 240) interrupts exploration after continuous peer silence.
+    # (node default 90 since generation 9; 240 before it) interrupts
+    # exploration after continuous peer silence. At 90 it sits BELOW the ~180 s
+    # heartbeat-suppression tail and is only safe while the link veto is live,
+    # so the pairing to check before any campaign is this threshold against
+    # comms_link_states_topic / comms_link_robot_index_topic.
     # That family is NOT set here — it runs at the node defaults documented in
     # docs/ros_api.md. Pin any of it here before a campaign that A/Bs it.
     rendezvous_enabled: true
@@ -718,12 +722,37 @@
     # because a key PRESENT in this file overrides the node default it governed
     # every launch-file run including hardware.
     #
-    # 180 is not a mild setting, it is an off switch. The mid-run trigger fires
-    # at reconnect_midrun_silence_sec (240), so a mid-run dispatch carries a
-    # record age of ~240-251 s BY CONSTRUCTION. Every one of them is therefore
-    # older than a 180 s gate and declines. Pursuit and the chase half of
-    # hybrid are unreachable at mid-run, which is the defect campaign p13 was
-    # run to fix.
+    # 180 was not a mild setting, it was an off switch. The mid-run trigger
+    # fires at reconnect_midrun_silence_sec, which was 240 when this was
+    # written, so a mid-run dispatch carried a record age of ~240-251 s BY
+    # CONSTRUCTION. Every one of them was therefore older than a 180 s gate and
+    # declined. Pursuit and the chase half of hybrid were unreachable at
+    # mid-run, which is the defect campaign p13 was run to fix.
+    #
+    # That arithmetic no longer holds and the conclusion must not be reused: in
+    # generation 9 the trigger fires at 90 s, so dispatch record age is
+    # ~104-109 s and a 180 s gate would NOT decline it. The reason to keep 900
+    # is now the measured one below, not this coincidence of two numbers. The
+    # general point survives and is the one to carry forward: this gate and the
+    # mid-run clock are coupled, so a change to either has to be re-checked
+    # against the other rather than assumed safe.
+    #
+    # ~104-109, not threshold + the 5 s claim TTL. Two offsets stack and an
+    # earlier revision of this comment conflated them into one: the TTL adds
+    # 4.98-4.99 s (the five banked dispatches read 4.99, 4.99, 4.99, 4.99, 4.98
+    # -- an earlier draft's "5.01" upper end is not in the data), and the
+    # granularity of the mid-run path adds a further 9.02-13.82 s of
+    # overshoot. On g8r1's five real dispatches a nominal 240
+    # fired at record ages 254.01-258.80 s, i.e. T+14.0 to T+18.8. Measure the
+    # offset again rather than deriving it if either clock moves.
+    #
+    # HARDWARE READS THIS FILE. The mid-run clock's drop to 90 is safe only
+    # because the link veto can tell a quiet teammate from an absent one, and
+    # the sim harness wires that veto up automatically while the launch-file
+    # path does not. On a robot, set comms_link_states_topic and
+    # comms_link_robot_index_topic, or raise the clock above ~200; the node
+    # WARNs on the pairing but nothing on the hardware path refuses it, unlike
+    # run_campaign.sh in sim.
     #
     # The sizing argument this replaces was: at ~0.8 m/s a teammate silent for
     # 180 s can be ~140 m away, so past three minutes the guaranteed fallback

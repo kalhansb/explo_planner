@@ -771,14 +771,87 @@ private:
   // reads as missing and the trigger drives a manoeuvre at a robot that is in
   // range and fine. 0 restores the legacy terminal-only trigger.
   //
-  // Default 240: comfortably above that 180 s suppression tail (measured max
-  // over 2307 heartbeat episodes) and well below the outage tail, so it fires
-  // on genuine separation and not on a busy teammate.
-  double reconnect_midrun_silence_sec_  = 240.0;
+  // Default 90 since generation 9. It was 240 through generation 8, chosen to
+  // clear that 180 s suppression tail by pure waiting because the record-age
+  // clock could not tell a silent teammate from an absent one. The link veto
+  // below now makes that distinction directly from the radio, so the threshold
+  // no longer has to be set by the suppression tail — and 240 was measured to
+  // be far out in the tail of the outage distribution this binary actually
+  // produces. In g8r1's 23 hybrid cells the clock expired in 3, so 87 % of the
+  // treated arm ran behaviourally identical to the control (§32.15).
+  //
+  // HOW 90 WAS PICKED, AND HOW THE FIRST TWO ATTEMPTS AT IT WERE WRONG.
+  // First draft: 120, from a sweep that scored each candidate on "episodes that
+  // reach the gate AND are still disconnected when it expires", using the
+  // PRESENCE clock for both halves. Circular -- filter and score were the same
+  // quantity, so the reported "zero waste" restated the filter. The real check
+  // filters on the past and scores on the future, on two DIFFERENT clocks.
+  //
+  // Second draft: 90, re-scored on two clocks but on the 20 g8r1 HYBRID cells
+  // that never dispatched. That population is SELECTED ON THE OUTCOME the sweep
+  // varies, so its 240 row read "0/20 arm" by construction -- a definition
+  // printed as a measurement -- and the monotonicity below it was mostly the
+  // selection. The off arm never ran the trigger at all and was sitting there
+  // unused: 23 untreated cells, no contamination, no selection.
+  //
+  // Scored on the OFF arm's banked link_states.csv, with the veto as it ships
+  // (reconnect_link_down_confirm_sec = 0, i.e. "not up right now"):
+  //     presence   cells arm   fires   wasted   beats natural recovery
+  //        240        6/23       12      50 %           33 %
+  //        150       12/23       24      42 %           58 %
+  //        120       18/23       36      33 %           72 %
+  //         90       18/23       40      20 %           85 %
+  //         75       18/23       42      29 %           86 %
+  //         60       21/23       60      43 %           73 %
+  // "wasted" = the radio outage in progress ended within the ~14.6 s it takes
+  // to start moving. "beats natural recovery" = the fire happened more than
+  // one chase (~53 s, p13 median) before the radio next came up and STAYED up
+  // for 30 s, i.e. the manoeuvre had something real to buy.
+  //
+  // On THIS grid -- unwalked -- 90 is the argmin of wasted and within a point
+  // of the max of beats, and 120, 90 and 75 all arm the same 18/23 cells.
+  //
+  // THE MODEL IS OPTIMISTIC AND HERE IS BY HOW MUCH, AND THE GRID DOES NOT
+  // SURVIVE IT. The table evaluates the veto at the instant the presence clock
+  // crosses T. The binary evaluates on PLAN ticks, so coord_claim_ttl_sec
+  // (4.98-4.99 s measured) plus tick granularity (9.02-13.82 s measured) puts a
+  // real fire 14.0-18.8 s later, in which window a link can change state either
+  // way. Scored at T + that overshoot, at each of the three measured offsets,
+  // the waste argmin moves off 90 and onto 75 (+14.0: 20.0 % vs 90's 28.6 %;
+  // +16.4: 19.2 % vs 26.3 %; +18.8: 25.0 % vs 29.4 %) and the plateau breaks
+  // (120 -> 14/23, 15/23, 17/23 against 90's 18, 19, 17). An earlier draft of
+  // this comment said the walk "moves the hybrid-arm count 11/20 -> 12/20" and
+  // left the direction of the table unaffected; BOTH halves were wrong. The
+  // unwalked hybrid value is already 12/20 and walking gives 12, 10, 11 -- an
+  // overshoot cannot buy activation -- and the table does reorder.
+  //
+  // 90 IS THEREFORE NOT CHOSEN BY THIS GRID. A ranking that flips under a 4.8 s
+  // change in a nuisance offset is one 23 cells cannot resolve, and re-tuning to
+  // 75 on the same 23 cells would repeat the error the grid was already
+  // criticised for. What survives the walk is only the coarse verdict -- 240 far
+  // too high (4-6 of 23 at every offset), 60 past the point where waste turns
+  // back up -- and inside 120-75 the choice is made off the grid: 90 clears the
+  // p90 radio outage (52.0-111.0 s, nearest-rank, 13 tags) and sits far below
+  // the 240 s point where the presence clock stops filtering at all.
+  //
+  // Out-of-sample check: at generation 8's ACTUAL configuration (T = 240,
+  // confirm = 3) the model arms 4 of 23 off-arm cells, against the 3 of 23
+  // hybrid cells that really dispatched. Close, not exact, and quoted that way.
+  //
+  // WHAT THIS DOES NOT CLAIM. The rate is fitted on generation-8 traces and
+  // generation 9 changes behaviour, so 18/23 (~78 %) is an estimate of the
+  // treated fraction, not a prediction, against generation 8's measured 3/23.
+  // The analysis must carry the dilution rather than assume it away: the
+  // between-arm effect is intention-to-treat over a partly-treated hybrid arm.
+  double reconnect_midrun_silence_sec_  = 90.0;
   // Barrier give-up for MID-RUN manoeuvres only. A mid-run attempt that waits
-  // rendezvous_max_wait_sec (600 in the sim harness) costs 2.5x its own
-  // trigger threshold in lost exploration per failure; a short cap keeps the
-  // attempt proportionate. Terminal manoeuvres keep rendezvous_max_wait_sec.
+  // the full rendezvous_max_wait_sec (600 in the sim harness) burns ten minutes
+  // of exploration on one failed rendezvous; a shorter cap keeps the attempt
+  // proportionate to what triggered it. Terminal manoeuvres keep
+  // rendezvous_max_wait_sec, because for them there is no exploration left to
+  // lose. Deliberately NOT expressed as a multiple of the trigger threshold:
+  // it used to be commented as "2.5x", which was 600/240 and silently became
+  // false the moment the threshold moved to 90 in generation 9.
   double reconnect_midrun_max_wait_sec_ = 240.0;
   // Per-run cap on mid-run attempts. Every dispatch costs exploration time;
   // after this many failures the policy has had its chance and the robot
@@ -822,6 +895,44 @@ private:
   // rather than acting on a stale belief. The emulator publishes at 5 Hz, so
   // 3 s is 15 missed samples: a real gap, not jitter.
   double comms_link_stale_sec_ = 3.0;
+  // How long the radio must have been CONTINUOUSLY down before the veto lets a
+  // mid-run chase through. Its own parameter since generation 9; until then
+  // both veto sites borrowed reconnect_confirm_sec (3.0), which is the
+  // team-PRESENCE release confirm and answers a different question. Splitting
+  // them is right at any value: sharing meant anyone retuning the radio
+  // debounce silently moved the presence-release path with it.
+  //
+  // 0 IS THE DEFAULT, AND THE 30 s DEBOUNCE THAT WAS HERE IS WITHDRAWN.
+  // 30 was chosen off the outage distribution (above the 6.2-12.2 s median
+  // flicker, below the 52.0-111.0 s p90 -- nearest-rank over the 13 tags with
+  // >= 10 cells; linear interpolation would read 51.4-101.6) and credited in an
+  // earlier draft of this
+  // comment with moving wasted fires "from 50 % to 33 %". That was
+  // misattributed: the table it pointed at held this conjunct FIXED at 30 and
+  // varied the presence clock, so 50->33 is the 150->90 move, not this
+  // parameter's effect. Measured
+  // properly, with the presence clock pinned at 90 and only this varying:
+  //     confirm   cells arm (off arm)   fires   wasted   beats
+  //        0            18/23            40     20 %     85 %
+  //       30            12/23            26     15 %     92 %
+  // The debounce buys 5 points of fire purity for A THIRD of the arm's
+  // activation: 18 arming cells down to 12, i.e. 6 of the 18 that armed. (An
+  // earlier draft said "a QUARTER" -- that is 6/23, the share of the arm; the
+  // denominator the purity is traded against is the 18 that armed, not the 23
+  // that exist. The six-cell loss the paragraph below already costs out is the
+  // same six, so only the fraction was wrong, not the trade.)
+  // Dilution is the defect generation 9 exists to correct -- 87 %
+  // of g8r1's treated arm was behaviourally the control -- so trading
+  // activation for purity spends the fix on a refinement. The four extra
+  // wasted chases it would prevent cost ~53 s each against run times in the
+  // hundreds to thousands of seconds; the six lost treated cells cost power
+  // that no amount of analysis recovers.
+  //
+  // At 0 the veto is exactly "do not chase a peer that is on the radio right
+  // now", which the link_connected_ disjunct at both sites supplies. That guard
+  // is logically necessary and is kept; the debounce on top of it is a tuning
+  // knob the data does not support, so it defaults off and stays available.
+  double reconnect_link_down_confirm_sec_ = 0.0;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr
       link_states_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr link_index_sub_;
@@ -831,6 +942,14 @@ private:
   bool link_connected_     = false;  ///< newest own-pair connected bit
   bool link_have_sample_   = false;
   bool link_clock_anchored_ = false;
+  /// One-shot latch for the "gate went live" console line. The run_start param
+  /// link_gate_configured can only say the topics were NAMED; this is the only
+  /// record that a usable sample ever actually arrived and the veto was really
+  /// in force. Positive evidence on purpose: gate_g8.py check 3f asserts the
+  /// line is PRESENT, because asserting the absence of the not-usable warning
+  /// would pass a run whose logging broke ([[nav-global-planner-never-planned]]
+  /// -- absence of a log line needs a same-binary control).
+  bool link_gate_live_logged_ = false;
   rclcpp::Time link_last_sample_time_;  ///< receipt of the newest usable sample
   // Receipt time at which the link was last OBSERVED up. Down-duration is
   // measured from here rather than from a stored up->down edge, because
@@ -878,13 +997,29 @@ private:
   // The ceiling is the insurance policy: the ONE effect p14 proved is that
   // mid-run reconnection caps the worst outage (515 -> 308 s, p=0.0095), and
   // no info gate is allowed to trade that away by deferring forever. It
-  // therefore defaults to the LEGACY CLOCK, not above it: at 240 the gated
-  // arm can only ever fire earlier than the control, so the proven cap is a
-  // floor on its behaviour and the comparison carries no "gated runs waited
-  // longer" confound. A ceiling above reconnect_midrun_silence_sec is a
-  // deliberate choice to give that up.
+  // therefore defaults to the LEGACY CLOCK, not above it: the gated arm can
+  // then only ever fire earlier than the control, so the proven cap is a floor
+  // on its behaviour and the comparison carries no "gated runs waited longer"
+  // confound. A ceiling above reconnect_midrun_silence_sec is a deliberate
+  // choice to give that up. Because it is defined as TRACKING that clock, the
+  // initialiser below is only a mirror for readers: the value that actually
+  // takes effect is defaulted to the resolved reconnect_midrun_silence_sec at
+  // the parameter-read site, so the two cannot drift apart the way they did
+  // when generation 9 moved the clock and this line was hand-copied after it.
+  // THE FLOOR NOW BINDS OVER MOST OF THE USABLE RANGE, which it did not when
+  // the ceiling was 240. With the ceiling tracking 90, T = V*/2300 is pinned to
+  // the ceiling for anything above ~207k voxels and to the 60 s floor below
+  // ~138k, so the window in which V* -- rather than a clamp -- actually decides
+  // is roughly [138k, 207k]. It was [138k, 552k] at a 240 s ceiling. The
+  // sizing note above ("300k ~ 126 s, 500k ~ 210 s") describes the UNCLAMPED
+  // derivation and both of those now clamp to 90. Anyone enabling the info
+  // gate at generation-9 defaults must either pick V* inside that narrow
+  // window or raise the ceiling deliberately, otherwise the warning that
+  // comment gives -- a fixed clock wearing the gate's name -- is what they get.
+  // Both are inert while reconnect_min_share_voxels is 0, which is the default,
+  // so nothing in the shipping configuration depends on this.
   double reconnect_midrun_min_silence_sec_ = 60.0;
-  double reconnect_midrun_max_silence_sec_ = 240.0;
+  double reconnect_midrun_max_silence_sec_ = 90.0;  // mirrors the clock
   // True while the CURRENT manoeuvre was dispatched from exploration
   // exhaustion (the only kind that may end in DONE); false for mid-run
   // dispatches, which must always resume exploring instead. Default true so
@@ -2207,7 +2342,7 @@ ExploPlannerNode::ExploPlannerNode()
   // terminal-only trigger it replaces could not reconnect a team before its
   // exploration was already over, which is the whole value of reconnecting.
   // Set reconnect_midrun_silence_sec to 0 to restore the legacy behaviour.
-  reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 240.0);
+  reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 90.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
   // Post-latch coast (see the member comments). OFF by default so this binary
@@ -2283,12 +2418,34 @@ ExploPlannerNode::ExploPlannerNode()
         "clock. Set both or neither.",
         comms_link_states_topic_.c_str());
   }
+  reconnect_link_down_confirm_sec_ =
+      dp("reconnect_link_down_confirm_sec", 0.0);
+  if (reconnect_link_down_confirm_sec_ < 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "reconnect_link_down_confirm_sec=%.1f is negative; clamping to 0 "
+        "(veto blocks only while the radio is actually UP).",
+        reconnect_link_down_confirm_sec_);
+    reconnect_link_down_confirm_sec_ = 0.0;
+  }
   // Info gate (see the member comments). 0 = off, bit-identical legacy clock.
   reconnect_min_share_voxels_      = dp("reconnect_min_share_voxels", 0.0);
   reconnect_midrun_min_silence_sec_ =
       dp("reconnect_midrun_min_silence_sec", 60.0);
+  // Defaulted to the RESOLVED clock, not to a literal: the ceiling is defined
+  // as tracking reconnect_midrun_silence_sec, and expressing that as a copied
+  // constant is what let it sit at 240 for a run whose clock had moved. An
+  // explicit parameter still overrides, which is the deliberate opt-out.
   reconnect_midrun_max_silence_sec_ =
-      dp("reconnect_midrun_max_silence_sec", 240.0);
+      dp("reconnect_midrun_max_silence_sec", reconnect_midrun_silence_sec_);
+  // Degenerate shape the derived default introduced and the old hand-copied
+  // 240 could not: with the mid-run trigger OFF (clock 0) the ceiling derives
+  // to 0 while the floor stays 60, so min > max. Inert in practice -- the info
+  // gate rides the mid-run path, which a 0 clock disables -- but pinned rather
+  // than left lying around as a min > max the clamp would resolve to MAX.
+  if (reconnect_midrun_silence_sec_ <= 0.0 &&
+      reconnect_midrun_max_silence_sec_ < reconnect_midrun_min_silence_sec_) {
+    reconnect_midrun_max_silence_sec_ = reconnect_midrun_min_silence_sec_;
+  }
   if (reconnect_min_share_voxels_ > 0.0 &&
       reconnect_midrun_min_silence_sec_ >
           reconnect_midrun_max_silence_sec_) {
@@ -2300,14 +2457,20 @@ ExploPlannerNode::ExploPlannerNode()
         reconnect_midrun_min_silence_sec_, reconnect_midrun_max_silence_sec_,
         reconnect_midrun_max_silence_sec_);
   }
-  if (reconnect_min_share_voxels_ > 0.0 &&
-      reconnect_midrun_max_silence_sec_ > reconnect_midrun_silence_sec_ &&
+  // NOT conjoined with reconnect_min_share_voxels_ > 0. It used to be, and that
+  // made the invariant unfireable: the info gate ships at 0 on every path, so
+  // the docs promised "the node WARNs if the ceiling is set above the clock"
+  // about a branch no shipped configuration could reach. The ceiling/clock
+  // relation is worth reporting whenever someone has set it wrong, because it
+  // is exactly the drift that left the ceiling at 240 after the clock moved to
+  // 90 -- and that happened with the info gate off.
+  if (reconnect_midrun_max_silence_sec_ > reconnect_midrun_silence_sec_ &&
       reconnect_midrun_silence_sec_ > 0.0) {
     RCLCPP_WARN(get_logger(),
-        "reconnect_midrun_max_silence_sec=%.0f exceeds the legacy clock "
-        "%.0f s: a gated run can now wait LONGER than the ungated control, "
-        "so the proven longest-outage cap is no longer guaranteed and an A/B "
-        "against that control gains a confound.",
+        "reconnect_midrun_max_silence_sec=%.0f exceeds the mid-run clock "
+        "%.0f s. With the info gate ON a gated run could then wait LONGER "
+        "than the ungated control, giving up the proven longest-outage cap; "
+        "with it OFF this is inert but signals the two have drifted apart.",
         reconnect_midrun_max_silence_sec_, reconnect_midrun_silence_sec_);
   }
   if (reconnect_min_share_voxels_ > 0.0 &&
@@ -2342,14 +2505,38 @@ ExploPlannerNode::ExploPlannerNode()
         reconnect_release_confirm_sec_, coord_claim_ttl_sec_,
         coord_claim_ttl_sec_);
   }
-  if (reconnect_midrun_silence_sec_ > 0.0 &&
-      reconnect_midrun_silence_sec_ < 200.0) {
+  // Below the ~180 s heartbeat-suppression tail the RECORD-AGE clock alone
+  // cannot tell a silent teammate from an absent one. The link veto can, so
+  // this warns only when the veto is NOT configured — with the gate wired the
+  // low threshold is the intended generation-9 setting and warning on every
+  // run would be pure noise, which is how a guard stops being read at all
+  // (§32.14's inert-check family). Conversely a low threshold with no gate is
+  // now the genuinely dangerous combination, and it says so.
+  //
+  // Three conjuncts, each earning its place. rendezvous_enabled: with the
+  // manoeuvre off the trigger cannot fire whatever the threshold is, and the
+  // control arm runs exactly that way — without this the off arm would warn on
+  // every run about a risk it does not carry, and a warning that fires on half
+  // the campaign is one nobody reads. The index topic: it is what turns a pair
+  // row into "my pair", so states-without-index is a gate that stands down on
+  // every tick while looking configured, which is the same silent-veto-removal
+  // this guard exists to catch.
+  if (reconnect_midrun_silence_sec_ > 0.0 && rendezvous_enabled_ &&
+      reconnect_midrun_silence_sec_ < 200.0 &&
+      (comms_link_states_topic_.empty() ||
+       comms_link_robot_index_topic_.empty())) {
     RCLCPP_WARN(get_logger(),
         "reconnect_midrun_silence_sec=%.0f is below the measured "
-        "heartbeat-suppression tail (~180 s): a healthy teammate stuck in a "
-        "long PLAN loop can read as missing that long, and the trigger would "
-        "drive a manoeuvre at a robot that is in range and fine.",
-        reconnect_midrun_silence_sec_);
+        "heartbeat-suppression tail (~180 s) AND %s, so the link veto cannot "
+        "run: a healthy teammate stuck in a long PLAN loop can read as missing "
+        "that long, and the trigger would drive a manoeuvre at a robot that is "
+        "in range and fine. Either set BOTH link-gate topics or raise the "
+        "threshold above 200.",
+        reconnect_midrun_silence_sec_,
+        comms_link_states_topic_.empty()
+            ? "comms_link_states_topic is unset"
+            : "comms_link_robot_index_topic is unset (so link rows cannot be "
+              "matched to this robot)");
   }
 
   // Proximity stop (coordinated yield). ON by default and deliberately NOT
@@ -2571,6 +2758,42 @@ ExploPlannerNode::ExploPlannerNode()
                           reconnect_midrun_min_silence_sec_);
     exp_log_->addParamNum("reconnect_midrun_max_silence_sec",
                           reconnect_midrun_max_silence_sec_);
+    // Whether the link veto could run at all. run_explo_sim_rviz.sh does record
+    // this (`link_gate=` in run_manifest.txt), but the planner did not: an unset
+    // topic makes linkGateReady() return false on its first line and silently
+    // removes the veto from the trigger, and until now the only trace INSIDE the
+    // planner's own output was a -1 sentinel in a free-text console line that no
+    // reader parses. That split matters because the manifest describes what the
+    // launcher intended and the event log describes what the node actually got —
+    // when those disagree, only the second one explains the run. A parameter
+    // that decides whether a safety check exists belongs in both, especially now
+    // that generation 9's 90 s threshold is only safe while the veto is live.
+    exp_log_->addParamNum("reconnect_link_down_confirm_sec",
+                          reconnect_link_down_confirm_sec_);
+    exp_log_->addParamStr("comms_link_states_topic", comms_link_states_topic_);
+    exp_log_->addParamStr("comms_link_robot_index_topic",
+                          comms_link_robot_index_topic_);
+    // NAMED "configured", NOT "active", and the distinction is the whole point.
+    // This is computed from two strings being non-empty, so it reports what the
+    // launcher asked for. It CANNOT report whether a sample ever arrived: it is
+    // written at startRun, before any subscription has delivered anything. An
+    // earlier draft called it link_gate_active and its comment claimed it was
+    // "true only when both topics arrived", which would have passed a run with a
+    // dead emulator -- gate configured, veto absent for the whole run, 90 s
+    // clock running bare. That is the precise failure this generation exists to
+    // stop, dressed as the check for it.
+    //
+    // BOTH topics, not just the states one: the index is what turns a pair row
+    // into "my pair", so states-without-index is a gate that looks configured
+    // and stands down on every tick.
+    //
+    // The runtime half of the question is answered by the one-shot
+    // "link_gate_live:" console line emitted from the link-states subscription
+    // on the first usable sample; check 3f requires both.
+    exp_log_->addParamBool("link_gate_configured",
+                           !comms_link_states_topic_.empty() &&
+                               !comms_link_robot_index_topic_.empty());
+    exp_log_->addParamNum("comms_link_stale_sec", comms_link_stale_sec_);
     exp_log_->addParamNum("pursuit_budget_max_sec", pursuit_budget_max_sec_);
     exp_log_->addParamNum("pursuit_staleness_max_sec",
                           pursuit_staleness_max_sec_);
@@ -2973,6 +3196,29 @@ ExploPlannerNode::ExploPlannerNode()
           if (connected || !link_clock_anchored_) {
             link_up_last_seen_    = now;
             link_clock_anchored_  = true;
+          }
+          if (!link_gate_live_logged_) {
+            link_gate_live_logged_ = true;
+            // The token is matched verbatim by gate_g8.py check 3f. Do not
+            // reword it without updating the gate and its calibration: this
+            // line is the ONLY proof in the record that the veto was ever
+            // actually able to run, as opposed to configured on a topic
+            // nothing published to.
+            //
+            // Emitted HERE, from the subscription, and not from
+            // linkGateReady(). linkGateReady() is only ever called from the
+            // mid-run trigger branch and from pursuitFallback(), so a run
+            // whose team simply never went silent long enough to consult the
+            // gate would produce no line — and 3f would score a perfectly
+            // healthy run as a hard failure. Everything the token asserts is
+            // established at this point: the index resolved (checked at the
+            // top of this callback), a row addressed to us parsed, and the
+            // sample is by construction zero seconds old.
+            RCLCPP_INFO(get_logger(),
+                "link_gate_live: first usable link sample on '%s' (index ok, "
+                "link %s); the mid-run veto can now run.",
+                comms_link_states_topic_.c_str(),
+                connected ? "up" : "down");
           }
         });
     RCLCPP_INFO(get_logger(),
@@ -3865,15 +4111,30 @@ void ExploPlannerNode::doPlan() {
         // team_last_complete_time_ is stamped on the 1 Hz heartbeat while
         // livePeerCount() reads the team complete, and a peer stays live until
         // its claim expires coord_claim_ttl_sec (5 s) after its last beacon. So
-        // missing_for ~= peer_record_age_sec - TTL. Across all 6 banked
-        // dispatches it sat below the record age by 3.24-5.51 s: the point
-        // estimates are 3.74-5.01, but the only banked copy of missing_for is
-        // the %.0f-rounded plaintext number below, so every difference carries
-        // +/-0.5 s and the honest interval is the widened one. It straddles the
-        // 5 s TTL as predicted; a nominal 240 s gate fires at a record age of
-        // ~245 s. It is logged as its own column (team_incomplete_sec) so the
-        // fired inequality is recoverable offline at full precision — which no
-        // banked cell has, since that column is new in generation 8.
+        // missing_for ~= peer_record_age_sec - TTL. Measured on g8r1's 5 banked
+        // mid-run dispatches the difference is 4.98-4.99 s (4.99, 4.99, 4.99,
+        // 4.99, 4.98) -- the TTL, from below, to two decimals. A previous
+        // revision of this comment quoted 4.98-5.01; there is no 5.01 in the
+        // five, and an upper end ABOVE the TTL is not a value this quantity can
+        // take, so the typo was also self-refuting.
+        // An earlier draft widened this to 3.24-5.51 "because the only
+        // banked copy is a %.0f-rounded plaintext number"; that was wrong.
+        // team_incomplete_sec is a real 2-dp column and generation-8 cells DO
+        // carry it, so no rounding allowance is needed.
+        //
+        // TWO OFFSETS, NOT ONE, AND THE EARLIER "T + 5" CONFLATED THEM.
+        // The TTL offset above is the gap between the two CLOCKS. Separately,
+        // the trigger is evaluated on PLAN ticks, so the presence clock
+        // overshoots T before anyone looks: measured 9.02-13.82 s past 240.
+        // The record age at dispatch is therefore T + overshoot + TTL, and the
+        // 5 banked dispatches sat at 254.01-258.80 s against a nominal 240,
+        // i.e. T + 14 to T + 18.8 -- not T + 5. Only the TTL half is
+        // threshold-independent; the overshoot is set by tick cadence, which is
+        // why this is quoted as a measured range and not as arithmetic. At
+        // generation 9's T = 90 the same decomposition predicts a dispatch
+        // record age around 104-109 s.
+        // team_incomplete_sec is logged as its own column so the fired
+        // inequality is recoverable offline at full precision.
         //
         // It shares the defect record age has, which is what the veto below is
         // for: it ages whenever the peer is not SENDING, which includes a
@@ -3906,11 +4167,30 @@ void ExploPlannerNode::doPlan() {
           link_down_for = link_connected_
                               ? 0.0
                               : (trig_now - link_up_last_seen_).seconds();
-          // Debounced on the SAME constant the release path uses, so a
-          // one-sample flicker cannot launch a manoeuvre. Also makes
-          // link_down_sec on any dispatch unambiguous: >= confirm when the
-          // gate decided, -1 when it was not in play.
-          if (link_down_for < reconnect_confirm_sec_) {
+          // Debounced on reconnect_link_down_confirm_sec, which is the RADIO
+          // debounce and nothing else. It used to borrow reconnect_confirm_sec
+          // (the team-presence release confirm, 3.0): two unrelated questions
+          // on one constant. Also makes link_down_sec on any dispatch
+          // unambiguous: >= the confirm when the gate decided, -1 when the gate
+          // was not in play at all (every g8r1 dispatch reads -1, which is how
+          // we know that campaign ran with no veto).
+          //
+          // It ships at 0, so in the default configuration the test below IS
+          // the link_connected_ disjunct and nothing more. A positive debounce
+          // was tried at 30 s and withdrawn: it cost A THIRD of the arm's
+          // activation -- 18 arming cells down to 12, i.e. 6 of the 18 that
+          // armed -- for 5 points of fire purity (see the member comment). An
+          // earlier draft said "a quarter", which is 6/23, the share of the ARM;
+          // the denominator the purity is traded against is the 18, not the 23.
+          //
+          // The link_connected_ disjunct is not redundant. Whenever the radio
+          // is up link_down_for is exactly 0.0, so at a confirm of 0 the bare
+          // comparison is `0.0 < 0.0` -- false -- and the veto would pass a
+          // chase at a peer that is on the radio right now, which is the one
+          // case it exists to stop. Written this way "0" means the honest
+          // thing: veto only while the link is actually up.
+          if (link_connected_ ||
+              link_down_for < reconnect_link_down_confirm_sec_) {
             link_veto = true;
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                 "Reconnect (mid-run): standing down — team incomplete "
@@ -5096,6 +5376,10 @@ bool ExploPlannerNode::linkGateReady(const rclcpp::Time& now) {
         age, comms_link_stale_sec_);
     return false;
   }
+  // The "link_gate_live:" proof line is emitted from the link-states
+  // subscription, not from here: this function is reached only when something
+  // actually consults the gate, and a run whose team never went silent would
+  // otherwise leave no evidence that the veto was able to run.
   return true;
 }
 
@@ -6548,7 +6832,8 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
   if (linkGateReady(fb_now)) {
     const double link_down_for =
         link_connected_ ? 0.0 : (fb_now - link_up_last_seen_).seconds();
-    if (link_down_for < reconnect_confirm_sec_) {
+    if (link_connected_ ||
+        link_down_for < reconnect_link_down_confirm_sec_) {
       RCLCPP_INFO(get_logger(),
           "Pursuit fallback (%s): standing down — the radio link to '%s' is "
           "%s, so escalating would commit travel toward a peer that is already "

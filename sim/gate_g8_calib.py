@@ -71,6 +71,14 @@ PARAMS = {
     # calibration would have looked like a real hard failure on the first live
     # campaign, and the temptation then is to delete the check.
     "done_action": "idle",
+    # Generation 9, check 3f. These three are the whole treatment-reachability
+    # argument: the clock the mid-run trigger arms on, whether the link veto was
+    # wired up at all, and the debounce in front of it. g8r1 satisfied every
+    # other field in this dict and still ran a treatment that could not fire, so
+    # a fixture without them cannot exercise the check that exists to catch it.
+    "reconnect_midrun_silence_sec": 90.0,
+    "link_gate_configured": True,
+    "reconnect_link_down_confirm_sec": 0.0,
 }
 
 
@@ -172,8 +180,28 @@ NAV_LOG = ("[INFO] global plan ok: 41 poses\n"
            "[INFO] Nav2 recovery EXIT: resumed\n")
 
 
+# Check 3f's runtime half asserts the PRESENCE of this token, so the clean
+# fixture has to carry it. Copied from the RCLCPP_INFO in the link-states
+# subscription (explo_planner_node.cpp); if that wording is edited without
+# editing this, the clean case fails loudly, which is the right direction.
+#
+# It goes in the PER-ROBOT PLANNER LOG, which is where the node's stdout
+# actually lands (run_explo_sim_rviz.sh's start() redirects each node to
+# "$OUTDIR/planner_$r.log"). The first draft of this fixture planted it in
+# $ROOT/<cell>.console.log -- and so did the first draft of the check, so the
+# harness printed ALL PASS while agreeing with a bug that would have hard-failed
+# every treated robot-run of every real campaign. A calibration that shares the
+# code's mistake is [[checks-that-stopped-checking]] with extra steps, so the
+# planted-defect case below pins the file down and not just the wording.
+LIVE_LINE = (
+    "[explo_planner_node-3] [INFO] link_gate_live: first usable link sample on "
+    "'/comms/link_states' (index ok, link up); the mid-run veto can now run.\n")
+
+CONSOLE_LOG = "clean\n"
+
+
 def _cell(root, tag, arm, events_by_robot, planner_log, csv_text, manifest,
-          console=True):
+          console=True, console_text=None, live=True):
     cell = f"{tag}_{arm}_seed1"
     d = os.path.join(root, cell)
     os.makedirs(d, exist_ok=True)
@@ -182,17 +210,19 @@ def _cell(root, tag, arm, events_by_robot, planner_log, csv_text, manifest,
         with open(os.path.join(d, f"{r}.events.jsonl"), "w") as fh:
             for e in events_by_robot[r]:
                 fh.write(json.dumps(e) + "\n")
-        open(os.path.join(d, f"planner_{r}.log"), "w").write(planner_log)
+        open(os.path.join(d, f"planner_{r}.log"), "w").write(
+            planner_log + (LIVE_LINE if live else ""))
         open(os.path.join(d, f"planner_{r}.csv"), "w").write(csv_text)
         open(os.path.join(d, f"nav_{r}.log"), "w").write(NAV_LOG)
     if console:
-        open(os.path.join(root, cell + ".console.log"), "w").write("clean\n")
+        open(os.path.join(root, cell + ".console.log"), "w").write(
+            CONSOLE_LOG if console_text is None else console_text)
     return d
 
 
 def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
           manifest=MANIFEST, off_events=None, off_planner_log=OFF_PLANNER_LOG,
-          off_console=True, off_manifest=None):
+          off_console=True, off_manifest=None, console_text=None, live=True):
     """Write BOTH arms. Defects are planted in the hybrid cell.
 
     A one-armed fixture cannot exercise check 3e's off branch, and cannot
@@ -201,7 +231,7 @@ def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
     [[checks-that-stopped-checking]] got there.
     """
     d = _cell(root, tag, "hybrid", events_by_robot, planner_log, csv_text,
-              manifest)
+              manifest, console_text=console_text, live=live)
     _cell(root, tag, "off",
           off_events or {r: base_events("off", r) for r in ROBOTS},
           off_planner_log, csv_text, off_manifest or manifest,
@@ -398,6 +428,120 @@ case("hybrid directory with the reconnect logic disabled",
      lambda ev: _each_runstart(ev, lambda e: e["params"].update(
          rendezvous_enabled=False)),
      r"check 3e — arm=hybrid but rendezvous_enabled=False")
+
+
+print("\n=== check 3f: the treatment must have been able to happen ===")
+# g8r1 is the known-answer case this whole section is calibrated against: it
+# passed every other check in this file while 87 % of its treated arm was
+# behaviourally the control, because the mid-run clock sat at 240 s against an
+# outage distribution whose p90 is 52-111 s. Every case below is a way that can
+# recur, and each was confirmed to FAIL the gate before being written down --
+# the guard added without a plant-a-failure case is the guard that quietly stops
+# checking [[checks-that-stopped-checking]].
+case("mid-run clock set where the trigger cannot reach it",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         reconnect_midrun_silence_sec=240.0)),
+     r"check 3f — reconnect_midrun_silence_sec=240\.0, expected 90\.0")
+case("mid-run clock absent from run_start",
+     lambda ev: _each_runstart(
+         ev, lambda e: e["params"].pop("reconnect_midrun_silence_sec", None)),
+     r"check 3f — run_start params carry no reconnect_midrun_silence_sec")
+# A malformed param used to raise float() straight out of the gate: the process
+# died with a traceback instead of reporting a hard failure, which is the one
+# outcome a gate must never have -- an aborted gate is indistinguishable at a
+# glance from a gate that has not been run.
+case("mid-run clock present but not a number",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         reconnect_midrun_silence_sec="ninety")),
+     r"check 3f — reconnect_midrun_silence_sec='ninety' is not a number")
+case("link veto never wired up",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         link_gate_configured=False)),
+     r"check 3f — link_gate_configured=false")
+case("pre-generation-9 binary, which cannot carry the field",
+     lambda ev: _each_runstart(
+         ev, lambda e: e["params"].pop("link_gate_configured", None)),
+     r"check 3f — run_start params carry no link_gate_configured")
+# The case that CONFIGURED-only could never catch, and the reason the runtime
+# witness exists: the launcher typed both topic names, so link_gate_configured
+# is true, and no sample ever arrived. A dead emulator looks exactly like this.
+case("topics named but no link sample ever arrived",
+     lambda ev: {"live": False},
+     r"check 3f — link_gate_configured=true but no 'link_gate_live:' line")
+# The regression pin for the defect this fixture itself once carried: the token
+# present, but in $ROOT/<cell>.console.log, which holds only the two harness
+# scripts' own log() output and never a line the node emitted. The check and the
+# fixture agreed on the wrong file, so the harness printed ALL PASS for a check
+# that would have hard-failed every treated robot-run ever recorded.
+case("token present but in the harness console log, not the node's",
+     lambda ev: {"live": False,
+                 "console_text": "clean\n" + LIVE_LINE},
+     r"check 3f — link_gate_configured=true but no 'link_gate_live:' line")
+case("debounce reintroduced in front of the veto",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         reconnect_link_down_confirm_sec=30.0)),
+     r"check 3f — reconnect_link_down_confirm_sec=30\.0, expected 0\.0")
+
+# The planner log being ABSENT is a different verdict from the line being
+# absent: one is unanswerable, the other is a failure. Conflating them is how a
+# missing artefact reads as a pass.
+#
+# Deleting the log also blinds checks 17 and 20, which read the same file, so
+# this cell hard-fails for those reasons too and rc is 1. That is not what is
+# under test here, so the assertion is made directly on 3f's two verdicts: the
+# UNRESOLVED line must be present AND the "no link_gate_live:" hard failure must
+# NOT be, because a missing artefact must never be scored as a missing veto.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    build(root, "cal", ev)
+    for r in ROBOTS:
+        os.remove(os.path.join(root, "cal_hybrid_seed1", f"planner_{r}.log"))
+    rc, out = run_gate(root, "cal")
+    said_unresolved = re.search(
+        r"check 3f: cal_hybrid_seed1/\w+ — no planner log", out)
+    said_failure = "no 'link_gate_live:' line" in out
+    ok = bool(said_unresolved) and not said_failure
+    print(f"  {'PASS' if ok else 'FAIL'}  a treated cell with no planner log is "
+          f"3f-UNRESOLVED and not 3f-FAILED: unresolved="
+          f"{bool(said_unresolved)} failed={said_failure} (rc={rc})")
+    if not ok:
+        fails += 1
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# And the escape hatch has to actually work, or re-gating a banked campaign is
+# impossible and the temptation is to edit the expectations in place. An earlier
+# draft claimed GATE_MIDRUN_SILENCE alone did this; it does not, because the
+# three generation-9 fields have no override of their own.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    _each_runstart(ev, lambda e: [
+        e["params"].update(reconnect_midrun_silence_sec=240.0),
+        e["params"].pop("link_gate_configured", None),
+        e["params"].pop("reconnect_link_down_confirm_sec", None)])
+    # live=False because a generation-8 binary has no such line to emit; the
+    # escape hatch has to pass the artefact as it really is, not a hybrid of
+    # gen-8 params and a gen-9 console.
+    build(root, "cal", ev, live=False)
+    rc, out = run_gate(root, "cal")
+    strict_caught = rc == 1 and "check 3f" in out
+    rc2, out2 = run_gate(root, "cal", env_extra={
+        "GATE_MIDRUN_SILENCE": "240", "GATE_GEN9_PARAMS": "0"})
+    ok = strict_caught and rc2 == 0 and "HARD FAILURES: none" in out2
+    print(f"  {'PASS' if ok else 'FAIL'}  a generation-8 cell fails 3f by "
+          f"default (rc={rc}) and passes under GATE_MIDRUN_SILENCE=240 "
+          f"GATE_GEN9_PARAMS=0 (rc={rc2})")
+    if not ok:
+        fails += 1
+        for ln in out2.splitlines():
+            if "check" in ln or "HARD" in ln:
+                print(f"           | {ln}")
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== check 3b/18b/18c: a missing run_start is not a skip ===")
 
 
 def drop_run_start(ev):
