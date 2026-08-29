@@ -348,13 +348,12 @@ private:
   /// evaluated, selected by the caller to match `kind`: window movement for
   /// "frozen", closing distance for "approach". It is not interchangeable with
   /// `metric`, which is an instantaneous remaining distance sampled at the fire
-  /// instant — on the 2 banked g6pilot fires that log both, the two differ by
-  /// 4.1x and ~123x, and once in sign (the robot was receding). The other 5
-  /// banked fires log no delta at all, which is why this parameter exists; see
-  /// logHomeWatchdog in experiment_log.hpp for the full accounting, and note
-  /// that the "4x to 162x over 7 fires" this comment used to claim was wrong in
-  /// both the range and the n. The matching threshold is re-derived inside
-  /// from `kind`.
+  /// instant — on the 3 banked g6pilot fires that log both, the two differ by
+  /// 4.1x, 123x and 162x, and once in sign (the robot was receding). The other
+  /// 4 banked fires are retrace-mode and log no delta at all, which is why this
+  /// parameter exists; see logHomeWatchdog in experiment_log.hpp for the full
+  /// accounting, including the two ways this range has been miscounted. The
+  /// matching threshold is re-derived inside from `kind`.
   void homeWatchdogFire(const char* kind, float metric, float dist_home,
                         float test_delta);
   bool engageRetrace();

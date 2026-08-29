@@ -565,20 +565,31 @@ class ExperimentLog {
   /// value at all, and metric_m was documented as "the metric over
   /// window_sec", which reads exactly as if it were one. It is not.
   ///
-  /// The banked evidence, stated exactly: g6pilot has 7 approach fires, and
-  /// only 2 of them log the tested delta at all — it survives solely in the
-  /// planner's "metric moved X m in 40 s" text, which the other 5 (all
-  /// retrace-mode fires) do not print. On those 2, metric_m stood 4.1x and
-  /// ~123x above the delta, and on the second the robot was RECEDING (-0.03 m)
-  /// while the row read 3.69. The ~123x is only bounded, not measured: the
-  /// delta is printed to 2 dp and is near zero, so the true ratio lies
-  /// somewhere in 105x-148x.
+  /// The banked evidence, stated exactly: g6pilot has 7 approach fires, of
+  /// which 3 log the tested delta and 4 do not. The delta survives solely in
+  /// the planner's "metric moved X m in 40 s" text, which only the DIRECT-mode
+  /// fires print; the 4 retrace-mode fires print "fired in retrace mode"
+  /// instead and carry no delta at all. On the 3 that log it:
   ///
-  /// An earlier version of this comment said "4x to 162x" across all 7 fires.
-  /// Both halves were wrong — 162x reproduces from nothing, and 5 of the 7
-  /// carry no delta to compare against. Which is itself the argument for
-  /// test_delta_m: the quantity was unrecoverable from the log for most fires,
-  /// so even the case FOR logging it had to be made on two data points.
+  ///   metric_m 3.660852, delta  0.89 m  ->   4.11x   (2-dp bound 4.09-4.14)
+  ///   metric_m 3.691460, delta -0.03 m  -> 123.05x   (2-dp bound 105.5-147.7)
+  ///   metric_m 38.879211, delta 0.24 m  -> 161.997x  (2-dp bound 158.7-165.4)
+  ///
+  /// so "4.1x to 162x" is the correct min and max, and on the middle one the
+  /// robot was RECEDING while the row read 3.69. The deltas are printed to 2 dp
+  /// and two of them are near zero, hence the bounds; only the 4.11x is tight.
+  ///
+  /// This comment has now been wrong in BOTH directions, which is worth leaving
+  /// on the record. It first claimed "4x to 162x over all 7 fires" — right
+  /// range, wrong n, since 4 of the 7 log nothing to compare against. It was
+  /// then "corrected" to "4.1x and ~123x over 2 fires", which dropped the third
+  /// fire entirely: 6 of the 7 sit in one robot-run (g6pilot_hybrid_seed103/
+  /// bestla) and the 7th is the lone off-arm fire in g6pilot_off_seed102/atlas
+  /// — the largest metric_m in the bank, and the one that produces the 162x.
+  /// Measuring only the hybrid cells loses it silently. The lesson is narrower
+  /// than "check your arithmetic": a population defined by where the events are
+  /// dense is not the population, and the arm you are not studying still has
+  /// rows in it.
   ///
   /// A reader scoring the detector on the old contract would have called every
   /// fire spurious. The two are kept side by side rather than collapsed

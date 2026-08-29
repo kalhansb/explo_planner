@@ -28,9 +28,11 @@ construction.
 Generation 8 adds a MID-RUN trigger (explo_planner_node.cpp, the link-gated
 dispatch) that fires DURING exploration. The bank already records 302 mid-run
 dispatches across the hybrid cells -- not the 422 an earlier version of this
-line claimed, which was the sum of three different things: 302 dispatches, 113
-firings vetoed by the link gate, and 7 give-ups. Only the 302 are manoeuvres
-the robot actually performed, and only those can move a completion time.
+line claimed, which summed three unrelated line counts. Do not read the "302 +
+113 vetoes + 7 give-ups = 422" decomposition that briefly replaced it either:
+the link-gate veto line is throttled at 30 s, so 113 counts printed lines and
+is a lower bound, and 422 totals nothing. Only the 302 is a count of events,
+and only manoeuvres the robot actually performed can move a completion time.
 That breaks the argument above in both directions: the treatment
 can now move t_lead, and the "it can act inside `lag` and nowhere else" claim
 this module prints at runtime is simply false for such a campaign. This tool is

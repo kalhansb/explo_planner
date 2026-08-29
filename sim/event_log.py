@@ -74,15 +74,24 @@ import re
 # NameError instead of warning.
 import sys
 
-# The lowest event-log schema this reader accepts, as a MODULE-level constant so
-# the CLI can lower it deliberately (--min-schema) without editing source.
+# Two constants, not one, because they answer different questions.
 #
-# The default must track the current generation rather than being permissive:
-# the whole point is that scoring a generation-8 campaign should not quietly
-# read a generation-6 cell that happens to sit in the same directory. Lowering
-# it is legitimate for historical work; doing so silently is not, which is why
-# it is a flag and not a default.
-MIN_SCHEMA = 3
+# READER_SCHEMA is the schema this file was WRITTEN AGAINST — the vintage of the
+# code. It is fixed and the CLI must not move it; it is what "newer than this
+# reader" is measured against.
+#
+# MIN_SCHEMA is the lowest schema this INVOCATION will accept — a floor the
+# operator can lower with --min-schema. The default must track the current
+# generation rather than being permissive: scoring a generation-8 campaign
+# should not quietly read a generation-6 cell that happens to sit in the same
+# directory. Lowering it is legitimate for historical work; doing so silently is
+# not, which is why it is a flag and not a default.
+#
+# They were the same variable until round 4, which made `--min-schema 2` warn
+# that every current file was "newer than this reader's 2" and made
+# `--min-schema 4` announce that raising the bar "may pool binary generations".
+READER_SCHEMA = 3
+MIN_SCHEMA = READER_SCHEMA
 
 
 class EventLogError(Exception):
@@ -216,14 +225,29 @@ def summarise_robot(path):
         # be small integers -- schema 3 belongs to generation 8 -- and naming
         # the wrong one in the error is how a reader ends up believing the void
         # generation-7 cells are the ones being refused. Say "schema".
+        #
+        # And say WHICH refusal this is. "Refused by default" is a lie once the
+        # operator has raised the floor with --min-schema: they are then being
+        # told the tool made a conservative choice on their behalf, when in fact
+        # it is obeying an instruction they gave.
+        if MIN_SCHEMA == READER_SCHEMA:
+            raise EventLogError(
+                f"{path}: schema_version {ver} < {MIN_SCHEMA}. Refused by "
+                f"default so a schema-{MIN_SCHEMA} summary cannot silently pool "
+                f"cells from an older binary generation. Pass --min-schema "
+                f"{ver} to read it deliberately.")
         raise EventLogError(
-            f"{path}: schema_version {ver} < {MIN_SCHEMA}. Refused by default "
-            f"so a schema-{MIN_SCHEMA} summary cannot silently pool cells from "
-            f"an older binary generation. Pass --min-schema {ver} to read it "
-            f"deliberately.")
-    if ver > MIN_SCHEMA:
+            f"{path}: schema_version {ver} < the --min-schema {MIN_SCHEMA} you "
+            f"asked for (this reader understands {READER_SCHEMA}).")
+    # Compare against READER_SCHEMA, not MIN_SCHEMA. MIN_SCHEMA is a floor the
+    # operator can lower; the reader's own vintage does not move with it. When
+    # they were the same variable, `--min-schema 2` -- the documented way to
+    # read banked cells -- made every CURRENT schema-3 file print "newer than
+    # this reader's 2", which is false: the reader is not older, the floor is.
+    if ver > READER_SCHEMA:
         print(f"warning: {path}: schema_version {ver} is newer than this "
-              f"reader's {MIN_SCHEMA}; unknown fields ignored", file=sys.stderr)
+              f"reader's {READER_SCHEMA}; unknown fields ignored",
+              file=sys.stderr)
 
     completes = [e for e in evs if e["event"] == "exploration_complete"]
     # The planner states this in run_end; recomputing it from the event list is
@@ -325,7 +349,8 @@ def summarise_run(run_dir, expect_robots=2):
     unhealthy = [r for r, s in per.items() if not s["complete"]]
     if unhealthy:
         return dict(excluded=f"event log truncated for {','.join(unhealthy)}",
-                    run=os.path.basename(run_dir.rstrip("/")), per_robot=per)
+                    run=os.path.basename(run_dir.rstrip("/")), per_robot=per,
+                    arm=dir_arm)
 
     dones = [s["explore_done_sim_sec"] for s in per.values()]
     censored = any(d is None for d in dones)
@@ -387,7 +412,7 @@ def arm_summary(rows):
         rec = by_arm.setdefault(arm or "?", dict(
             arm=arm or "?", n=0, finished=0, censored=0, excluded=0, times=[],
             mission_done=0, mission_censored=0, times_mission=[],
-            times_explore=[]))
+            explore_done=0, explore_censored=0, times_explore=[]))
         rec["n"] += 1
         if "excluded" in r:
             rec["excluded"] += 1
@@ -404,8 +429,17 @@ def arm_summary(rows):
             rec["times_mission"].append(r["t_mission"])
         else:
             rec["mission_censored"] += 1
+        # t_explore gets a denominator for the same reason t_mission does, and
+        # it matters MORE, not less. Pre-registration 32.14 rule 4 promotes
+        # t_explore to the primary inference precisely when t_mission censoring
+        # is arm-unbalanced — so the case where the reader falls back to this
+        # endpoint is the case where a silent, differential drop of unlatched
+        # runs would bias it, with nothing on screen to show it happened.
         if r.get("t_explore") is not None:
+            rec["explore_done"] += 1
             rec["times_explore"].append(r["t_explore"])
+        else:
+            rec["explore_censored"] += 1
     for rec in by_arm.values():
         rec["mean_t_team"] = (sum(rec["times"]) / len(rec["times"])
                               if rec["times"] else None)
@@ -474,8 +508,12 @@ def main(argv):
 
     summ = arm_summary(rows)
     print()
+    # Every mean carries its own censoring count in the adjacent column. Before
+    # round 4 mean t_expl had none, which is the endpoint 32.14 rule 4 falls
+    # back to when t_mission censoring is unbalanced -- so the number the
+    # fallback rests on was the one number with no denominator on screen.
     print(f"{'arm':11s} {'n':>3s} {'done':>5s} {'cens':>5s} {'excl':>5s} "
-          f"{'mean t_team':>12s} {'mean t_expl':>12s} "
+          f"{'mean t_team':>12s} {'mean t_expl':>12s} {'e.cens':>6s} "
           f"{'mean t_missn':>12s} {'m.cens':>6s}")
     for s in summ:
         mt = "-" if s["mean_t_team"] is None else f"{s['mean_t_team']:12.1f}"
@@ -485,7 +523,8 @@ def main(argv):
               else f"{s['mean_t_mission']:12.1f}")
         print(f"{s['arm']:11s} {s['n']:3d} {s['finished']:5d} "
               f"{s['censored']:5d} {s['excluded']:5d} {mt:>12s} "
-              f"{me:>12s} {mm:>12s} {s['mission_censored']:6d}")
+              f"{me:>12s} {s['explore_censored']:6d} "
+              f"{mm:>12s} {s['mission_censored']:6d}")
     lost = [s for s in summ if s["censored"] or s["excluded"]]
     if lost:
         print()

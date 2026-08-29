@@ -14,6 +14,20 @@ gate_g8_calib.py:
      rows were wrong" and "no home_watchdog rows exist" are different
      statements and the second one is not a pass. Six guards went inert while
      still printing passes the last time this distinction was skipped.
+
+Usage:  gate_g8.py [TAG]            default TAG g8r1
+Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_campaign)
+        GATE_IDENTITY               path to the declared-identity file
+        GATE_EXPECT_<key>           override a single declared identity field
+        GATE_CELLS_PER_ARM          pre-registered cells per arm (default 30)
+Exit:   0  no hard failures, every population non-empty
+        1  hard failures, or no cells for the tag
+        2  the generation identity was never declared
+        3  no hard failures, but at least one population was UNRESOLVED
+
+Exit 3 exists because property 2 above was true of the printed output and
+false of the exit status: a wrapper branching on $? read "nothing was tested"
+as "everything passed", which is the exact failure this gate exists to catch.
 """
 import collections
 import csv
@@ -26,6 +40,13 @@ import sys
 # campaign of known-wrong cells. The identity in EXPECT is deliberately NOT
 # overridable this way — see the note there.
 ROOT = os.environ.get("GATE_ROOT", "/home/kalhan/hmr_campaign")
+if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1].startswith("-")):
+    # Not argparse, because the only positional is a tag and the rest of the
+    # interface is environment. But silently scoring a campaign tagged "--help"
+    # (which finds zero cells and exits 1) is a confusing way to answer a
+    # request for help, and silently ignoring argv[2:] is worse.
+    print(__doc__)
+    sys.exit(0 if sys.argv[1] in ("-h", "--help") else 2)
 TAG = sys.argv[1] if len(sys.argv) > 1 else "g8r1"
 ROBOTS = ["atlas", "bestla"]
 
@@ -71,7 +92,13 @@ def _declared_identity():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
+            # An empty right-hand side is not a declaration. Accepting it put
+            # "" into EXPECT, which is not FILL_ME, so the refusal below did
+            # not fire and every cell instead hard-failed with "expected "
+            # and nothing after it — pointing the operator at the cells when
+            # the fault is a truncated identity file.
+            if v.strip():
+                out[k.strip()] = v.strip()
     # Env wins, so the calibration can override a real identity file if one
     # happens to exist in its synthetic root.
     for k in ("git_explo_planner", "sha256_explo_planner_node"):
@@ -90,6 +117,13 @@ EXPECT = {
 }
 
 DONE_UNKNOWN_FRACTION = 0.640
+SCHEMA_VERSION = 3
+
+# The pre-registered shape of the campaign, checked so that a run which died
+# part-way cannot be scored as if it were the whole thing. run_campaign.sh is
+# seed-major, so an early abort is systematically arm-unbalanced rather than
+# randomly so — the truncated dataset is biased, not merely small.
+EXPECT_CELLS_PER_ARM = int(os.environ.get("GATE_CELLS_PER_ARM", "30"))
 
 LATCH_RE = re.compile(
     r"Exploration complete \[latch\]: ROI unknown fraction ([0-9.]+) <= ([0-9.]+)")
@@ -213,6 +247,7 @@ cells_by_arm = collections.Counter()
 # UNRESOLVED instead of passing by vacuity.
 n_csv_rows = n_hw_fire = n_hw_escape = n_reconnect_end = 0
 n_navfail_rows = n_peer_rows = n_runend_rows = n_midrun = 0
+n_disp_rows = n_runstart_rows = n_console_logs = 0
 
 for c in cells:
     d = os.path.join(ROOT, c)
@@ -248,18 +283,69 @@ for c in cells:
         plog = read_lines(os.path.join(d, f"planner_{r}.log"))
 
         # 3b/3c. baked rev and arm identity
+        #
+        # git_rev is NOT a top-level key of run_start. The node writes it with
+        # addParamStr (explo_planner_node.cpp:2520), so it lands in
+        # run_start.params.git_rev. Reading it at the top level yielded "" on
+        # every real cell, and `anything.startswith("")` is True, so BOTH this
+        # check and the -dirty witness below passed unconditionally — verified
+        # by planting params.git_rev="deadbee-dirty" against a manifest saying
+        # 322b6fc and getting "HARD FAILURES: none". A stale rev is exactly the
+        # generation mix this gate exists to catch, so this was the check
+        # failing at its one job while reporting a pass.
+        #
+        # A missing run_start is a hard failure rather than a skip. It used to
+        # be `if start:` with no else, which meant a robot log truncated at the
+        # head got none of 3b, 18b or 18c — and that is the robot-run whose
+        # provenance you most want checked, not least.
         start = [e for e in ev if e.get("event") == "run_start"]
-        if start:
-            rev = str(start[0].get("git_rev", "")).replace("-dirty", "")
-            if not m.get("git_explo_planner", "").startswith(rev[:7]):
-                hard_fail.append(
-                    f"{c}/{r}: JSONL git_rev={start[0].get('git_rev')} != "
-                    f"manifest {m.get('git_explo_planner')}")
-            if "-dirty" in str(start[0].get("git_rev", "")):
-                hard_fail.append(f"{c}/{r}: JSONL git_rev is -dirty")
+        if not start:
+            hard_fail.append(
+                f"{c}/{r}: no run_start event — checks 3b, 18b and 18c cannot "
+                f"run on this robot, and a head-truncated log is not a pass")
+        else:
+            n_runstart_rows += 1
             pr = start[0].get("params", {})
-            row.setdefault("mode_req", pr.get("reconnect_mode_requested", pr.get("arm")))
+            raw_rev = str(pr.get("git_rev", ""))
+            rev = raw_rev.replace("-dirty", "")
+            if not raw_rev:
+                hard_fail.append(
+                    f"{c}/{r}: check 3b — run_start params carry no git_rev, "
+                    f"so the baked rev cannot be compared to the manifest")
+            elif not m.get("git_explo_planner", "").startswith(rev[:7]):
+                hard_fail.append(
+                    f"{c}/{r}: check 3b — JSONL git_rev={raw_rev} != manifest "
+                    f"{m.get('git_explo_planner')}")
+            if "-dirty" in raw_rev:
+                hard_fail.append(f"{c}/{r}: check 3c — JSONL git_rev is -dirty")
+            # 3d. the schema stamp. The identity in section 32.14 pins schema 3,
+            # the binary writes it (experiment_log.cpp:265) and every reader
+            # downstream keys off it, but nothing here read it — so the one
+            # field that catches a generation mix at a glance was unchecked.
+            sv = start[0].get("schema_version", pr.get("schema_version"))
+            if sv != SCHEMA_VERSION:
+                hard_fail.append(
+                    f"{c}/{r}: check 3d — schema_version={sv!r}, expected "
+                    f"{SCHEMA_VERSION}")
+            row.setdefault("mode_req", pr.get("arm"))
             row.setdefault("rdv", pr.get("rendezvous_enabled"))
+            # 3e. the treatment variable must not come from the directory name
+            # alone. Everything downstream keys the arm off the cell directory,
+            # so a launcher bug or a leaked environment variable that runs the
+            # off configuration in a _hybrid_ directory corrupts the assignment
+            # silently and the gate would have said CLEAN. mode_req/rdv were
+            # parsed and PRINTED as an informational line; printing is not
+            # checking.
+            want_rdv = (arm == "hybrid")
+            if pr.get("arm") is not None and pr.get("arm") != arm:
+                hard_fail.append(
+                    f"{c}/{r}: check 3e — directory says arm={arm} but "
+                    f"run_start params say arm={pr.get('arm')!r}")
+            if pr.get("rendezvous_enabled") is not None \
+                    and bool(pr.get("rendezvous_enabled")) != want_rdv:
+                hard_fail.append(
+                    f"{c}/{r}: check 3e — arm={arm} but rendezvous_enabled="
+                    f"{pr.get('rendezvous_enabled')!r}")
             # 18b. the five nav timeout params must be echoed, or the
             # thresholds on nav_goal_failed rows cannot be audited against the
             # configuration that produced them.
@@ -396,6 +482,19 @@ for c in cells:
                         f"expression, so this cannot happen by imprecision)")
 
         # 19. schema migration actually took effect in the DATA
+        #
+        # Assert each field against the writer that actually emits it. An
+        # earlier version of this check demanded team_incomplete_sec on every
+        # peer_lost/peer_seen row, which no binary has ever written: PeerEvent
+        # has no such member and the only writer is logReconnectDispatch
+        # (experiment_log.cpp:436). Run against a real cell it produced 34 hard
+        # failures on clean data, and it survived calibration only because the
+        # fixture manufactured the field the binary does not write — the
+        # fixture asserting the gate's belief instead of the binary's output.
+        # That is why the calibration is now seeded from a real cell.
+        #
+        # What generation 8 actually did to the peer rows was REMOVE
+        # last_contact_age_sec. That half is the real migration witness.
         peers = [e for e in ev if e.get("event") in ("peer_lost", "peer_seen")]
         n_peer_rows += len(peers)
         for e in peers:
@@ -403,9 +502,14 @@ for c in cells:
                 hard_fail.append(
                     f"{c}/{r}: check 19 — {e.get('event')} still carries the "
                     f"removed last_contact_age_sec")
+        disp = [e for e in ev if e.get("event") == "reconnect_dispatch"]
+        n_disp_rows += len(disp)
+        for e in disp:
             if "team_incomplete_sec" not in e:
                 hard_fail.append(
-                    f"{c}/{r}: check 19 — {e.get('event')} missing team_incomplete_sec")
+                    f"{c}/{r}: check 19 — reconnect_dispatch missing "
+                    f"team_incomplete_sec, the left-hand side of the "
+                    f"inequality the mid-run trigger evaluated")
         for e in [x for x in ev if x.get("event") == "run_end"]:
             n_runend_rows += 1
             if "metrics_rows" in e:
@@ -467,14 +571,25 @@ for c in cells:
         poseloss += len([e for e in ev if e.get("event") == "pose_health" and e.get("lost")])
 
     # 9. deadman / process death
+    #
+    # The absent-file case is UNRESOLVED, not a skip. This check used to sit
+    # under a bare `if os.path.exists(con):` with no else, so deleting or
+    # failing to write the console log turned the whole process-death check off
+    # and printed nothing at all — and a cell whose console log never got
+    # written is precisely the cell most likely to have had a process die.
     con = os.path.join(ROOT, c + ".console.log")
     if os.path.exists(con):
+        n_console_logs += 1
         txt = open(con, errors="replace").read()
         for pat, label in (("sim clock frozen", "DEADMAN FIRED"),
                            ("died mid-run", "PROCESS DIED"),
                            ("/clock unreadable", "CLOCK UNREADABLE")):
             if pat in txt:
                 hard_fail.append(f"{c}: {label}")
+    else:
+        unresolved.append(
+            f"check 9: {c} — no console log at {os.path.basename(con)}, so the "
+            f"deadman/process-death check did not run on this cell")
 
     row.update(latched=lat, arrived=arrived, unknown=unknowns,
                navfail=navfails, poseloss=poseloss)
@@ -506,7 +621,10 @@ for label, n, check in (
         ("reconnect_end events",        n_reconnect_end, "17"),
         ("nav_goal_failed rows",        n_navfail_rows,  "18"),
         ("peer_lost/peer_seen rows",    n_peer_rows,     "19"),
+        ("reconnect_dispatch rows",     n_disp_rows,     "19"),
         ("run_end rows",                n_runend_rows,   "19"),
+        ("run_start rows",              n_runstart_rows, "3b"),
+        ("console logs present",        n_console_logs,   "9"),
         ("mid-run reconnect lines",     n_midrun,        "20")):
     mark = "" if n else "   <- EMPTY: check is UNRESOLVED, not passed"
     print(f"  check {check:>2}  {label:28} {n:6d}{mark}")
@@ -519,6 +637,22 @@ if agg_recovery_entries == 0:
     unresolved.append("gate E: zero recovery entries")
 else:
     print("  -> RESOLVED: the recovery path executed and every entry paired.")
+
+# 21. the campaign is the shape it was pre-registered as. Nothing above counts
+# cells, so a campaign that died after three of them scored CLEAN and invited
+# analysis of a truncated, arm-unbalanced dataset. Seed-major ordering makes an
+# early abort systematically unbalanced, so "small" here also means "biased".
+print(f"\ncampaign shape: {dict(cells_by_arm)} "
+      f"(pre-registered {EXPECT_CELLS_PER_ARM} per arm)")
+for a in ("hybrid", "off"):
+    if cells_by_arm.get(a, 0) != EXPECT_CELLS_PER_ARM:
+        hard_fail.append(
+            f"check 21 — arm {a} has {cells_by_arm.get(a, 0)} cells, "
+            f"pre-registered {EXPECT_CELLS_PER_ARM}. Set GATE_CELLS_PER_ARM to "
+            f"score a deliberately partial campaign; do not score it silently")
+extra = set(cells_by_arm) - {"hybrid", "off"}
+if extra:
+    hard_fail.append(f"check 21 — unexpected arm(s) {sorted(extra)}")
 
 print()
 if hard_fail:
@@ -536,4 +670,17 @@ if soft:
     for s in soft:
         print("  " + s)
 
-sys.exit(1 if hard_fail else 0)
+# Three states, three exit codes. UNRESOLVED is the gate's designed answer for
+# an empty population — the property the module docstring pins — and it was
+# invisible to $?, so any wrapper branching on the exit code read "nothing was
+# tested" as "everything passed". That is the failure this gate was written to
+# prevent, reproduced in the gate's own interface.
+#
+# 3 rather than 1 because unresolved is not a failure: it is a claim that part
+# of the gate had no data to run on, which the operator must read and judge. A
+# campaign with the off arm in it will legitimately have empty reconnect
+# populations, so 3 is expected and is not an error — it means "read the
+# UNRESOLVED list before believing this".
+if hard_fail:
+    sys.exit(1)
+sys.exit(3 if unresolved else 0)

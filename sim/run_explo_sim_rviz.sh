@@ -1397,8 +1397,14 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   if [ -e "$planner_params" ]; then
     echo "sha256_shared_params=$(sha256sum -b "$planner_params" 2>/dev/null \
       | cut -c1-16)"
-    echo "done_action_in_params=$(grep -o 'done_action:[[:space:]]*"[^"]*"' \
-      "$planner_params" 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')"
+    # Accept quoted OR bare scalars. The probe used to require double quotes,
+    # so `done_action: idle` — valid YAML, and what a hand-edited params file
+    # usually looks like — recorded "missing" while the parameter was present
+    # and load-bearing. A provenance probe that reports absence for a formatting
+    # choice is worse than no probe: it trains the reader to ignore the key.
+    echo "done_action_in_params=$(sed -n \
+      's/^[[:space:]]*done_action:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
+      "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
   else
     # BOTH keys, not just the hash. Dropping done_action_in_params here made a
     # missing params file the one case where the field vanishes from the
@@ -1649,10 +1655,14 @@ LAST_HB=0
 #
 # Why the margin has to be generous in this direction specifically: only the
 # hybrid arm manoeuvres at all. Across the banked hybrid cells the mid-run
-# reconnect logic fires 422 times — 302 actual dispatches, 113 vetoed by the
-# link gate, 7 give-ups — against 0 across 157 banked off cells. (The single
-# "422 dispatches" this comment used to claim was the sum of all three, and
-# only the 302 are dispatches.) So a false abort is drawn from ONE arm of a
+# reconnect logic produced 302 actual dispatches, against 0 across 157 banked
+# off cells. (This comment once claimed "422 dispatches", which was the sum of
+# three different line counts, and was then "corrected" to a 302 + 113 + 7
+# decomposition of that same 422. The decomposition does not hold either: the
+# link-gate veto line is RCLCPP_INFO_THROTTLE'd at 30 s, so 113 counts PRINTED
+# lines and is a lower bound on vetoes, and 422 is therefore not a total of
+# anything. Only the 302 is a count of events, and it is the only number the
+# argument needs.) So a false abort is drawn from ONE arm of a
 # 30x2 comparison, on the
 # primary endpoint. A late abort merely wastes wall time. The base rate of a
 # real hang is 0 in 500 banked cells, so the expected cost of the extra 600 s
@@ -1896,6 +1906,7 @@ while true; do
       [ "$DONE_SINCE" = -1 ] && { DONE_SINCE=$T; log "all planners DONE at t_sim=$T — holding ${DONE_GRACE_S}s for backlog drain"; }
       if [ $((T - DONE_SINCE)) -ge "$DONE_GRACE_S" ]; then
         RUN_END_REASON="all_done"
+        DONE_DRAIN_COMPLETE=1
         log "run complete: every planner DONE (makespan t_sim=$((DONE_SINCE - T0)) s)"
         break
       fi
@@ -1906,11 +1917,26 @@ while true; do
   fi
   # The horizon. A run that reaches it while the DONE drain grace is still
   # counting down did NOT get cut off unfinished: every planner had already
-  # declared, at DONE_SINCE, which is inside the horizon by construction. Only
-  # the ${DONE_GRACE_S}s drain hold spilled past it. Calling that "censored_at_T"
-  # labels a completed run as an incomplete one, and it does so ASYMMETRICALLY —
-  # the slower arm finishes nearer the horizon, so it collects more of these —
-  # which turns a labelling bug into an apparent arm effect.
+  # declared, at DONE_SINCE. Only the ${DONE_GRACE_S}s drain hold spilled past
+  # it. Calling that "censored_at_T" labels a completed run as an incomplete
+  # one, and it does so ASYMMETRICALLY — the slower arm finishes nearer the
+  # horizon, so it collects more of these — which turns a labelling bug into an
+  # apparent arm effect.
+  #
+  # DONE_SINCE is NOT guaranteed to precede the horizon. It is stamped from $T,
+  # and $T is only resampled every CLOCK_EVERY_S=${CLOCK_EVERY_S}s of wall time
+  # outside the grace path, so the reading that first satisfies the all-DONE
+  # condition can already be past T0+DURATION_S. The declaration is still real
+  # — every planner is DONE — but "inside the horizon by construction" is not a
+  # property this loop maintains, and an earlier version of this comment said
+  # it was.
+  #
+  # The drain is what guarantees the trailing rows are flushed, so a relabel
+  # that fires BEFORE it elapsed is promising a clean end the harness did not
+  # actually wait for. That is recorded as its own manifest key rather than as
+  # a third run_end_reason: gate_g8.py, modes_compare.py and reconnect_value.py
+  # all enumerate the two legal reasons, and a new string would silently drop
+  # those cells out of every one of them.
   #
   # The primary endpoint reader is immune (event_log.py decides censoring from
   # the planner's own events, never from this string), so this is a fix to the
@@ -1918,7 +1944,13 @@ while true; do
   if [ "$DURATION_S" != "0" ] && [ "$T" -ge $((T0 + DURATION_S)) ]; then
     if [ "$DONE_SINCE" != -1 ]; then
       RUN_END_REASON="all_done"
-      log "horizon reached at t_sim=+$((T - T0))s, but every planner was already DONE at t_sim=$((DONE_SINCE - T0)) s — the drain grace, not the run, overran"
+      DONE_DRAIN_ELAPSED=$((T - DONE_SINCE))
+      if [ "$DONE_DRAIN_ELAPSED" -ge "$DONE_GRACE_S" ]; then
+        DONE_DRAIN_COMPLETE=1
+      else
+        DONE_DRAIN_COMPLETE=0
+      fi
+      log "horizon reached at t_sim=+$((T - T0))s, but every planner was already DONE at t_sim=$((DONE_SINCE - T0)) s — the drain grace, not the run, overran (drain ${DONE_DRAIN_ELAPSED}/${DONE_GRACE_S}s, complete=${DONE_DRAIN_COMPLETE})"
     else
       RUN_END_REASON="censored_at_T"
     fi
@@ -1930,5 +1962,12 @@ done
 # the analysis must not average them together.
 echo "run_end_reason=${RUN_END_REASON:-censored_at_T}" >> "$OUTDIR/run_manifest.txt"
 echo "run_end_t_sim=$((T - T0))" >> "$OUTDIR/run_manifest.txt"
+# 1 = the full ${DONE_GRACE_S}s drain elapsed after the last planner declared,
+# 0 = all_done was reached but the horizon cut the drain short, empty = the run
+# never reached the all-DONE state at all. Emitted unconditionally, including
+# the empty case, so that an absent key means an OLD manifest and never "this
+# run happened not to drain" — the distinction that made done_action_in_params
+# worth fixing in the same file.
+echo "done_drain_complete=${DONE_DRAIN_COMPLETE:-}" >> "$OUTDIR/run_manifest.txt"
 log "run ended at t_sim=+$((T - T0))s (${RUN_END_REASON:-censored_at_T})"
 # teardown runs on EXIT

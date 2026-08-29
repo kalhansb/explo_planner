@@ -34,8 +34,31 @@ git_scovox=078d3f7
 sha256_explo_planner_node={SHA}
 """
 
+SCHEMA_VERSION = 3
+
+# The field names below are taken from the C++ WRITERS, not from what the gate
+# expects to find. That distinction is the whole reason this file was rewritten
+# in round 4: the fixture used to put git_rev at the top level of run_start and
+# team_incomplete_sec on peer_lost/peer_seen, matching two mistaken beliefs in
+# gate_g8.py. The two errors cancelled inside the harness, so it printed ALL
+# PASS while the gate was simultaneously unable to fail on a stale binary and
+# unable to pass on any real cell (34 spurious hard failures on the first real
+# one). A fixture that encodes the reader's assumptions tests nothing; see
+# audit_fixture_against_real_cell() at the bottom, which now checks this
+# mechanically against a banked cell whenever one is present.
+#
+#   run_start.params.git_rev        explo_planner_node.cpp:2520 (addParamStr)
+#   run_start.schema_version        experiment_log.cpp:265, top level
+#   peer_lost / peer_seen           experiment_log.cpp:377-398 -- peer,
+#                                   silent_sec, peers_live, expected_peers,
+#                                   and first_contact on peer_seen only
+#   reconnect_dispatch              experiment_log.cpp:401-437 -- the ONLY
+#                                   writer of team_incomplete_sec
 PARAMS = {
-    "reconnect_mode_requested": "hybrid",
+    # The node writes the arm and the baked rev as params, so this is where the
+    # gate must read them from.
+    "arm": "hybrid",
+    "git_rev": REV,
     "rendezvous_enabled": True,
     "goal_rotate_timeout_sec": 20.0,
     "nav_speed_estimate_mps": 0.5,
@@ -51,35 +74,80 @@ PARAMS = {
 }
 
 
-def base_events():
-    """A clean robot's event stream, one of each row the new checks read."""
-    return [
-        {"event": "run_start", "git_rev": REV, "params": copy.deepcopy(PARAMS)},
-        {"event": "exploration_complete", "reason": "coverage-latched",
-         "unknown_fraction": 0.638},
+# experiment_log.cpp begin() stamps these on EVERY row; run_start additionally
+# carries schema_version, t0_sim_sec and coverage_milestones. Copied from a real
+# banked line, not invented -- see audit_fixture_against_real_cell().
+def _row(event, seq, **fields):
+    r = {"event": event, "seq": seq, "robot": "atlas", "t_sim_sec": 100.0 + seq,
+         "t_rel_sec": 100.0 + seq, "t_wall_sec": 90.0 + seq,
+         "state": "NAVIGATE", "step": 1}
+    r.update(fields)
+    return r
+
+
+def base_events(arm="hybrid", robot="atlas"):
+    """A clean robot's event stream, one of each row the new checks read.
+
+    `arm` is honoured because the off arm is not a cosmetic variation: check 3e
+    asserts rendezvous_enabled tracks the directory's arm, and that branch had
+    never been executed by anything before round 4 -- the fixture built a hybrid
+    cell only, so the half of the check that guards against an off cell running
+    the reconnect logic was as untested as the reconnect logic it guards.
+    """
+    params = copy.deepcopy(PARAMS)
+    params["arm"] = arm
+    params["rendezvous_enabled"] = (arm == "hybrid")
+    ev = [
+        _row("run_start", 0, state="IDLE", step=0, t0_sim_sec=0.0,
+             schema_version=SCHEMA_VERSION, coverage_milestones=[],
+             params=params),
+        _row("exploration_complete", 1, reason="coverage-latched",
+             unknown_fraction=0.638),
         # nav_goal_failed: the inequality holds (elapsed exceeded the budget)
-        {"event": "nav_goal_failed", "reason": "budget", "budget_sec": 60.0,
-         "pose_stale": False, "test_name": "nav_elapsed_sec",
-         "test_value": 61.2, "test_threshold": 60.0},
+        _row("nav_goal_failed", 2, reason="budget", budget_sec=60.0,
+             pose_stale=False, test_name="nav_elapsed_sec",
+             test_value=61.2, test_threshold=60.0),
         # nav_goal_failed: the other direction (movement fell short)
-        {"event": "nav_goal_failed", "reason": "no-progress", "budget_sec": 60.0,
-         "pose_stale": False, "test_name": "window_progress_m",
-         "test_value": 0.02, "test_threshold": 0.50},
+        _row("nav_goal_failed", 3, reason="no-progress", budget_sec=60.0,
+             pose_stale=False, test_name="window_progress_m",
+             test_value=0.02, test_threshold=0.50),
         # a frozen fire at exactly zero movement — the canonical case that
         # forbids a numeric sentinel
-        {"event": "home_watchdog", "kind": "frozen", "test_delta_m": 0.0,
-         "test_threshold_m": 0.5},
+        _row("home_watchdog", 4, kind="frozen", test_delta_m=0.0,
+             test_threshold_m=0.5),
         # a receding approach fire — the canonical negative
-        {"event": "home_watchdog", "kind": "approach", "test_delta_m": -0.03,
-         "test_threshold_m": 1.0},
+        _row("home_watchdog", 5, kind="approach", test_delta_m=-0.03,
+             test_threshold_m=1.0),
         # a leg termination, which evaluates no inequality
-        {"event": "home_watchdog", "kind": "escape-end"},
-        {"event": "reconnect_end", "outcome": "gave_up"},
-        {"event": "peer_lost", "team_incomplete_sec": 41.0},
-        {"event": "peer_seen", "team_incomplete_sec": -1.0},
-        {"event": "mission_complete", "result": "arrived"},
-        {"event": "run_end", "metrics_timer_rows": 163},
+        _row("home_watchdog", 6, kind="escape-end"),
+        # logPeerLost / logPeerSeen, experiment_log.cpp:377-398. They carry
+        # peer/silent_sec/peers_live/expected_peers and NOTHING else: the
+        # fixture used to give them team_incomplete_sec, which no writer in the
+        # tree emits, and gate check 19 was asserting it there.
+        _row("peer_lost", 7, peer="bestla", silent_sec=5.09, peers_live=0,
+             expected_peers=1),
+        _row("peer_seen", 8, peer="bestla", silent_sec=41.3,
+             first_contact=False, peers_live=1, expected_peers=1),
+        _row("mission_complete", 9, result="arrived"),
+        _row("run_end", 10, metrics_timer_rows=163),
     ]
+    if arm == "hybrid":
+        # logReconnectDispatch, experiment_log.cpp:401-437 -- the only writer of
+        # team_incomplete_sec, and therefore the only event on which check 19
+        # can legitimately demand it. A real generation-6 dispatch row carries
+        # link_down_sec but not team_incomplete_sec, which is what makes this a
+        # valid migration witness rather than a field that was always there.
+        ev.insert(9, _row(
+            "reconnect_dispatch", 90, mode="midrun", terminal=False,
+            trigger="midrun", reason="team_incomplete", peer="bestla",
+            peer_record_age_sec=48.1, action="dispatch", dest_x=12.5,
+            dest_y=-3.0, budget_sec=600.0, decline_reason="", attempt=1,
+            gate_sec=40.0, est_unshared_vox=1820.0, link_down_sec=45.0,
+            team_incomplete_sec=45.0, peers_live=0, expected_peers=1))
+        ev.insert(10, _row("reconnect_end", 91, outcome="gave_up"))
+    for e in ev:
+        e["robot"] = robot
+    return ev
 
 
 PLANNER_LOG = """[INFO] Exploration complete [latch]: ROI unknown fraction 0.638 <= 0.640 (source=scovox) in state PLAN at t_sim=603.9 - 41 steps, 210.00 m traveled.
@@ -87,16 +155,26 @@ PLANNER_LOG = """[INFO] Exploration complete [latch]: ROI unknown fraction 0.638
 [INFO] Reconnect manoeuvre ended after 28.5 s sim: gave_up (-> RETURN_HOME).
 """
 
+# The off arm never dispatches, so its planner log has no reconnect lines at
+# all. Checks 17 and 20 read those lines; giving the off cell the hybrid log
+# would have hidden any check that keys on the arm.
+OFF_PLANNER_LOG = PLANNER_LOG.splitlines(True)[0]
+
 CSV = ("step,selected_score,selected_utility\n"
        "0,1.25,1.25\n"
        "1,0.80,0.80\n")
 
-NAV_LOG = "[INFO] global plan ok: 41 poses\n"
+# A PAIRED recovery episode. The fixture used to omit these entirely, so gate E
+# reported UNRESOLVED on the clean cell and its pairing arithmetic -- the part
+# that decides whether a run is scoreable -- had no known-answer case at all.
+NAV_LOG = ("[INFO] global plan ok: 41 poses\n"
+           "[WARN] Nav2 -> recovery: spin\n"
+           "[INFO] Nav2 recovery EXIT: resumed\n")
 
 
-def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
-          manifest=MANIFEST):
-    cell = f"{tag}_hybrid_seed1"
+def _cell(root, tag, arm, events_by_robot, planner_log, csv_text, manifest,
+          console=True):
+    cell = f"{tag}_{arm}_seed1"
     d = os.path.join(root, cell)
     os.makedirs(d, exist_ok=True)
     open(os.path.join(d, "run_manifest.txt"), "w").write(manifest)
@@ -107,11 +185,31 @@ def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
         open(os.path.join(d, f"planner_{r}.log"), "w").write(planner_log)
         open(os.path.join(d, f"planner_{r}.csv"), "w").write(csv_text)
         open(os.path.join(d, f"nav_{r}.log"), "w").write(NAV_LOG)
-    open(os.path.join(root, cell + ".console.log"), "w").write("clean\n")
+    if console:
+        open(os.path.join(root, cell + ".console.log"), "w").write("clean\n")
     return d
 
 
-def run_gate(root, tag):
+def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
+          manifest=MANIFEST, off_events=None, off_planner_log=OFF_PLANNER_LOG,
+          off_console=True, off_manifest=None):
+    """Write BOTH arms. Defects are planted in the hybrid cell.
+
+    A one-armed fixture cannot exercise check 3e's off branch, and cannot
+    exercise check 21 at all -- the campaign-shape check would have had no
+    known-answer case whatsoever, which is exactly how the six inert guards in
+    [[checks-that-stopped-checking]] got there.
+    """
+    d = _cell(root, tag, "hybrid", events_by_robot, planner_log, csv_text,
+              manifest)
+    _cell(root, tag, "off",
+          off_events or {r: base_events("off", r) for r in ROBOTS},
+          off_planner_log, csv_text, off_manifest or manifest,
+          console=off_console)
+    return d
+
+
+def run_gate(root, tag, cells_per_arm="1", env_extra=None):
     """Run the real gate, declaring the synthetic campaign's identity.
 
     This used to rewrite the gate's source to patch the two FILL_ME literals,
@@ -121,7 +219,9 @@ def run_gate(root, tag):
     """
     env = dict(os.environ, GATE_ROOT=root,
                GATE_EXPECT_git_explo_planner=REV,
-               GATE_EXPECT_sha256_explo_planner_node=SHA)
+               GATE_EXPECT_sha256_explo_planner_node=SHA,
+               GATE_CELLS_PER_ARM=cells_per_arm)
+    env.update(env_extra or {})
     p = subprocess.run([sys.executable, GATE, tag], capture_output=True,
                        text=True, env=env)
     return p.returncode, p.stdout + p.stderr
@@ -130,18 +230,24 @@ def run_gate(root, tag):
 fails = 0
 
 
-def case(label, mutate, expect_pat, expect_clean=False):
+def case(label, mutate, expect_pat, expect_clean=False, cells_per_arm="1"):
     """Plant one defect and assert the gate names the right check."""
     global fails
     root = tempfile.mkdtemp(prefix="gatecal_")
     try:
-        ev = {r: base_events() for r in ROBOTS}
+        ev = {r: base_events("hybrid", r) for r in ROBOTS}
         kw = mutate(ev) or {}
         build(root, "cal", ev, **kw)
-        rc, out = run_gate(root, "cal")
+        rc, out = run_gate(root, "cal", cells_per_arm)
         if expect_clean:
+            # rc must be 0, not merely "not 1": rc 3 means a population was
+            # empty, and the clean fixture is supposed to populate every one of
+            # them. Accepting 3 here would let a fixture rot back into the
+            # vacuous state this file exists to detect.
             ok = rc == 0 and "HARD FAILURES: none" in out
-            detail = "clean" if ok else "gate objected to a clean cell"
+            detail = "clean" if ok else (
+                "gate objected to a clean cell" if rc == 1 else
+                f"rc={rc}: a population the fixture should cover was empty")
         else:
             ok = rc == 1 and re.search(expect_pat, out) is not None
             detail = "caught" if ok else f"did NOT match /{expect_pat}/"
@@ -242,6 +348,9 @@ case("peer_lost still carrying the removed field",
 case("run_end carrying the old metrics_rows",
      lambda ev: find(ev, "atlas", "run_end").update(metrics_rows=163),
      r"check 19 .* old metrics_rows")
+case("reconnect_dispatch without the migrated team_incomplete_sec",
+     lambda ev: drop(ev, "reconnect_dispatch", "team_incomplete_sec"),
+     r"check 19 .* missing team_incomplete_sec")
 
 print("\n=== check 20: an unrecognised mid-run line ===")
 case("mid-run wording the parser does not know",
@@ -254,6 +363,78 @@ case("cell built from a different binary",
      lambda ev: {"manifest": MANIFEST.replace(REV, "deadbee")},
      r"git_explo_planner=deadbee expected")
 
+print("\n=== checks 3b-3e: the provenance the DATA carries, not the manifest ===")
+# Every case below fired zero times before round 4. 3b and 3c were inert
+# because they read git_rev from the top level of run_start, where the node has
+# never written it, so `rev` was always "" and startswith("") is always True.
+# The fixture agreed with the bug, which is why the harness printed ALL PASS.
+
+
+def _each_runstart(ev, fn):
+    for r in ROBOTS:
+        for e in ev[r]:
+            if e.get("event") == "run_start":
+                fn(e)
+
+
+case("JSONL built by a different binary than the manifest claims",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         git_rev="deadbee")),
+     r"check 3b — JSONL git_rev=deadbee")
+case("run_start carrying no git_rev at all",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].pop("git_rev")),
+     r"check 3b — run_start params carry no git_rev")
+case("binary built from a dirty tree",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         git_rev=REV + "-dirty")),
+     r"check 3c — JSONL git_rev is -dirty")
+case("event log written at the previous schema version",
+     lambda ev: _each_runstart(ev, lambda e: e.update(schema_version=2)),
+     r"check 3d — schema_version=2, expected 3")
+case("hybrid directory holding an off configuration",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(arm="off")),
+     r"check 3e — directory says arm=hybrid but run_start params say arm='off'")
+case("hybrid directory with the reconnect logic disabled",
+     lambda ev: _each_runstart(ev, lambda e: e["params"].update(
+         rendezvous_enabled=False)),
+     r"check 3e — arm=hybrid but rendezvous_enabled=False")
+
+
+def drop_run_start(ev):
+    # A robot whose planner died before it could stamp run_start. This used to
+    # be a silent skip -- `if start:` with no else -- so the cell most likely
+    # to be broken was the one three checks declined to examine.
+    for r in ROBOTS:
+        ev[r][:] = [e for e in ev[r] if e.get("event") != "run_start"]
+
+
+case("no run_start row at all", drop_run_start,
+     r"no run_start event — checks 3b, 18b and 18c cannot run")
+
+print("\n=== check 21: the campaign is the shape it was pre-registered as ===")
+# Seed-major ordering means an early abort truncates the LAST seeds of both
+# arms unevenly, so a short campaign is biased, not merely small. Nothing in
+# the gate counted cells before round 4.
+case("campaign shorter than pre-registered", lambda ev: None,
+     r"check 21 — arm hybrid has 1 cells, pre-registered 30",
+     cells_per_arm="30")
+
+
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    build(root, "cal", ev)
+    shutil.rmtree(os.path.join(root, "cal_off_seed1"))
+    rc, out = run_gate(root, "cal")
+    ok = rc == 1 and re.search(r"check 21 — arm off has 0 cells", out)
+    print(f"  {'PASS' if ok else 'FAIL'}  a missing arm is a hard failure, not "
+          f"a one-armed campaign scored CLEAN")
+    if not ok:
+        fails += 1
+        print(out[-1200:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
 print("\n=== the empty-population property: silence must not read as a pass ===")
 
 
@@ -264,56 +445,104 @@ def strip_watchdogs(ev):
 
 root = tempfile.mkdtemp(prefix="gatecal_")
 try:
-    ev = {r: base_events() for r in ROBOTS}
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    off = {r: base_events("off", r) for r in ROBOTS}
+    # BOTH arms, or the population is not empty and the case tests nothing --
+    # which is precisely the failure mode under test one level up.
     strip_watchdogs(ev)
-    build(root, "cal", ev)
+    strip_watchdogs(off)
+    build(root, "cal", ev, off_events=off)
     rc, out = run_gate(root, "cal")
-    ok = (rc == 0 and "HARD FAILURES: none" in out
-          and "EMPTY: check is UNRESOLVED" in out
-          and "UNRESOLVED" in out)
+    # rc 3, not 0. UNRESOLVED used to be invisible to the exit code, so a
+    # wrapper keying on $? read "nothing was tested" as "everything passed" --
+    # the same silence this whole section exists to make audible.
+    ok = (rc == 3 and "HARD FAILURES: none" in out
+          and "EMPTY: check is UNRESOLVED" in out)
     print(f"  {'PASS' if ok else 'FAIL'}  zero home_watchdog rows reported as "
-          f"UNRESOLVED, not silently passed")
+          f"UNRESOLVED and carried into the exit code (rc={rc}, want 3)")
     if not ok:
         fails += 1
         print(out[-1500:])
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("\n=== the identity FILE path, which is what the campaign actually uses ===")
 root = tempfile.mkdtemp(prefix="gatecal_")
 try:
-    ev = {r: base_events() for r in ROBOTS}
-    build(root, "cal", ev)
-    # No GATE_EXPECT_* env at all: the gate must find the identity in
-    # <ROOT>/<TAG>.identity.txt. Calibrated separately from the env path
-    # because the env path is the calibration harness's own shortcut, and a
-    # file-reading branch that only ever runs in production is a branch nobody
-    # has tested.
-    open(os.path.join(root, "cal.identity.txt"), "w").write(
-        f"# declared at launch\ngit_explo_planner={REV}\n"
-        f"sha256_explo_planner_node={SHA}\n")
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("GATE_EXPECT_")}
-    env["GATE_ROOT"] = root
-    p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
-                       text=True, env=env)
-    out = p.stdout + p.stderr
-    ok = "REFUSING TO RUN" not in out and "check 3" not in out
-    print(f"  {'PASS' if ok else 'FAIL'}  identity read from "
-          f"<TAG>.identity.txt (rc={p.returncode})")
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    build(root, "cal", ev, off_console=False)
+    rc, out = run_gate(root, "cal")
+    ok = rc == 3 and re.search(r"check 9: cal_off_seed1 — no console log", out)
+    print(f"  {'PASS' if ok else 'FAIL'}  a cell with no console log is "
+          f"UNRESOLVED, not skipped (rc={rc}, want 3)")
     if not ok:
         fails += 1
-        print("    " + "\n    ".join(out.splitlines()[:12]))
+        print(out[-1200:])
 finally:
     shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== the identity FILE path, which is what the campaign actually uses ===")
+
+
+def identity_file_case(label, body, expect_rc, expect_pat=None):
+    """Run the gate with NO GATE_EXPECT_* env, so it must read the file.
+
+    The assertion used to be `"REFUSING TO RUN" not in out and "check 3" not in
+    out`, which the gate cannot fail: it prints "check 3b"/"check 3e" but never
+    the bare token "check 3", and the return code was captured and discarded.
+    Both halves were inert, so the branch the campaign actually uses to learn
+    which binary it is gating had no working test.
+    """
+    global fails
+    root = tempfile.mkdtemp(prefix="gatecal_")
+    try:
+        ev = {r: base_events("hybrid", r) for r in ROBOTS}
+        build(root, "cal", ev)
+        open(os.path.join(root, "cal.identity.txt"), "w").write(body)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GATE_EXPECT_")}
+        env["GATE_ROOT"] = root
+        env["GATE_CELLS_PER_ARM"] = "1"
+        p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
+                           text=True, env=env)
+        out = p.stdout + p.stderr
+        ok = p.returncode == expect_rc
+        if ok and expect_pat:
+            ok = re.search(expect_pat, out) is not None
+        print(f"  {'PASS' if ok else 'FAIL'}  {label} (rc={p.returncode}, "
+              f"want {expect_rc})")
+        if not ok:
+            fails += 1
+            print("    " + "\n    ".join(out.splitlines()[:14]))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+identity_file_case(
+    "a correct identity file passes the same cell the env path passes",
+    f"# declared at launch\ngit_explo_planner={REV}\n"
+    f"sha256_explo_planner_node={SHA}\n", 0)
+identity_file_case(
+    "a WRONG sha in the identity file fails check 3",
+    f"git_explo_planner={REV}\n"
+    f"sha256_explo_planner_node=bbbbbbbbbbbbbbbb\n", 1,
+    r"sha256_explo_planner_node=" + SHA + r" expected bbbbbbbbbbbbbbbb")
+identity_file_case(
+    "an empty right-hand side refuses instead of comparing against ''",
+    # "" is not the literal FILL_ME, so a truncated identity file used to sail
+    # past the refusal and then hard-fail every cell with "expected " and
+    # nothing after it -- pointing the operator at the data when the fault is
+    # in the declaration.
+    f"git_explo_planner={REV}\nsha256_explo_planner_node=\n", 2,
+    r"REFUSING TO RUN")
 
 print("\n=== the gate must refuse to run before its identity is declared ===")
 root = tempfile.mkdtemp(prefix="gatecal_")
 try:
-    ev = {r: base_events() for r in ROBOTS}
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
     build(root, "cal", ev)
     p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
-                       text=True, env=dict(os.environ, GATE_ROOT=root))
+                       text=True, env=dict(os.environ, GATE_ROOT=root,
+                                           GATE_CELLS_PER_ARM="1"))
     ok = p.returncode == 2 and "REFUSING TO RUN" in p.stdout
     print(f"  {'PASS' if ok else 'FAIL'}  unfilled FILL_ME identity refuses "
           f"(rc={p.returncode})")
@@ -321,6 +550,78 @@ try:
         fails += 1
 finally:
     shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== the fixture must match the BINARY, not the gate's beliefs ===")
+
+
+def audit_fixture_against_real_cell():
+    """Compare the fixture's per-event key sets against a banked schema-3 cell.
+
+    This is the durable fix for the defect that motivated the rewrite. Two
+    hand-written shapes (git_rev at the top level of run_start,
+    team_incomplete_sec on peer_lost/peer_seen) matched two mistaken beliefs in
+    the gate, the errors cancelled, and the harness reported 18/18 PASS while
+    the gate could neither fail on a stale binary nor pass on a real cell. No
+    amount of extra negative cases would have caught that, because every one of
+    them was written against the same wrong shape.
+
+    Reports UNRESOLVED -- never PASS -- when no banked cell is reachable, since
+    "I could not check" and "I checked and it matched" are different answers.
+    """
+    global fails
+    root = os.environ.get("GATE_CALIB_REAL_ROOT", "/home/kalhan/hmr_campaign")
+    if not os.path.isdir(root):
+        print(f"  UNRESOLVED  no campaign root at {root}; fixture shapes were "
+              f"NOT compared against real data")
+        return
+    real = {}
+    for cell in sorted(os.listdir(root)):
+        d = os.path.join(root, cell)
+        if not os.path.isdir(d):
+            continue
+        for r in ROBOTS:
+            p = os.path.join(d, f"{r}.events.jsonl")
+            if not os.path.exists(p):
+                continue
+            for ln in open(p, errors="replace"):
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if e.get("event") == "run_start" and \
+                        e.get("schema_version") != SCHEMA_VERSION:
+                    real = {}
+                    break                      # wrong generation, skip the file
+                real.setdefault(e.get("event"), set()).update(e.keys())
+            if real:
+                break
+        if real:
+            break
+    if not real:
+        print(f"  UNRESOLVED  no schema-{SCHEMA_VERSION} cell found under "
+              f"{root}; fixture shapes were NOT compared against real data")
+        return
+    fixture = {}
+    for arm in ("hybrid", "off"):
+        for e in base_events(arm):
+            fixture.setdefault(e["event"], set()).update(e.keys())
+    bad = []
+    for event, keys in sorted(fixture.items()):
+        if event not in real:
+            continue                           # not exercised by that cell
+        invented = keys - real[event]
+        if invented:
+            bad.append(f"{event}: fixture invents {sorted(invented)}, which no "
+                       f"writer in the tree emits")
+    print(f"  {'PASS' if not bad else 'FAIL'}  fixture keys are a subset of a "
+          f"real cell's for {len(set(fixture) & set(real))} event type(s)")
+    for b in bad:
+        print(f"           | {b}")
+    if bad:
+        fails += 1
+
+
+audit_fixture_against_real_cell()
 
 print(f"\n{'ALL PASS' if fails == 0 else str(fails) + ' FAILURE(S)'}")
 sys.exit(1 if fails else 0)
