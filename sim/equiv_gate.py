@@ -112,6 +112,40 @@ VOLATILE_MANIFEST = {
 }
 VOLATILE_MANIFEST_PREFIXES = ("git_", "sha256_", "mtime_")
 
+# Manifest keys a phase ADDS to the record. A phase that ships a subsystem
+# default-off still writes that subsystem's whole knob block to the manifest,
+# deliberately: "this run had the knob and it was 0" and "this run predates the
+# knob" are different facts, and within one binary generation the node hash
+# cannot separate them. run_explo_sim_rviz.sh says so at the write site. So the
+# child's manifest legitimately carries keys the parent's does not, and a plain
+# set-difference reads EVERY phase boundary as a configuration difference —
+# which is the fastest way to get an equivalence gate switched off.
+#
+# The permission granted here is not "new keys are fine". It is the rule block 2
+# already applies to params, transposed: a new key is inert only if the switch
+# that would make it matter is present and OFF. "At its compiled default" is the
+# wrong test for these, because they are HARNESS variables and the harness
+# overrides several on purpose — CELL_COVERED_U ships 0.55 against a library
+# default of 0.15 (a world-calibrated knob, cf. done_unknown_fraction) and is
+# still inert while cell_world=0.
+#
+# Each entry is  gate key -> (off value, keys it gates). Hand-maintained, and
+# arranged to fail loudly like DERIVED_DEFAULTS above: a new key in neither the
+# gate-key position nor some group's dependent set is a hard failure, so
+# forgetting an entry cannot make the gate quietly accept a live knob.
+GATED_MANIFEST_GROUPS = {
+    "cell_world": ("0", {
+        "cell_size_m", "cell_census_period_s",
+        "cell_covered_max_unknown", "cell_exploring_min_unknown",
+        "cell_covered_max_frontier_frac",
+        # The roster is passed to the node only inside the CELL_WORLD=1 branch,
+        # so with the gate off it reaches nothing: robot_id and team_hash stay
+        # at the unconfigured -1/0 that DERIVED_DEFAULTS records. That is not
+        # assumed here — block 2 compares them, and would fail first.
+        "team_robot_names",
+    }),
+}
+
 
 class GateError(Exception):
     pass
@@ -440,11 +474,63 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
         notes.append("run_manifest.txt absent on at least one side; the arm "
                      "configuration was NOT compared")
     else:
+        # Which group each dependent key belongs to, and whether that group's
+        # switch is present and off ON THE CHILD SIDE. Read once, so a key is
+        # never excused by a switch that is itself absent.
+        gated_by = {d: g for g, (_, deps) in GATED_MANIFEST_GROUPS.items()
+                    for d in deps}
+        inert = set()
+        for g, (off, deps) in GATED_MANIFEST_GROUPS.items():
+            if cm.get(g) == off:
+                inert |= deps
+        relaxed = []
         for k in sorted(arm_keys(pm) | arm_keys(cm)):
             a, b = pm.get(k, "<absent>"), cm.get(k, "<absent>")
-            if a != b:
+            if a == b:
+                continue
+            if k in pm and k not in cm:
+                # Never relaxed, in either direction of the phase sequence. A
+                # key that stops being written is a hole in the record, and a
+                # hole cannot be distinguished from agreement by reading it.
+                fails.append(f"manifest {k}: the parent recorded {a!r} and the "
+                             f"child does not record it at all — the harness "
+                             f"stopped describing part of the arm; an absent "
+                             f"key is not an unchanged one")
+            elif k in pm:
                 fails.append(f"manifest {k}: parent {a!r} != child {b!r} — the "
                              f"two campaigns were not configured alike")
+            elif k in GATED_MANIFEST_GROUPS:
+                off = GATED_MANIFEST_GROUPS[k][0]
+                if b == off:
+                    relaxed.append(k)
+                else:
+                    fails.append(
+                        f"manifest {k}: new in the child at {b!r}, and its "
+                        f"declared off value is {off!r}. The phase's own switch "
+                        f"is ON — this is a treatment arm, not a defaults run, "
+                        f"and it proves nothing about default-off equivalence.")
+            elif k in gated_by:
+                g = gated_by[k]
+                if k in inert:
+                    relaxed.append(k)
+                else:
+                    fails.append(
+                        f"manifest {k}: new in the child ({b!r}) and declared "
+                        f"as gated by {g}, but the child's {g} is "
+                        f"{cm.get(g, '<absent>')!r}, not "
+                        f"{GATED_MANIFEST_GROUPS[g][0]!r}. Nothing here shows "
+                        f"the knob is inert, so it is read as live.")
+            else:
+                fails.append(
+                    f"manifest {k}: new in the child ({b!r}) and not declared "
+                    f"in GATED_MANIFEST_GROUPS, so this gate cannot tell "
+                    f"whether it is inert. Declare it under the switch that "
+                    f"gates it — adding the switch to the manifest if the "
+                    f"harness does not write one — and do not delete this "
+                    f"check.")
+        if relaxed:
+            notes.append(f"{len(relaxed)} new manifest key(s) recording a "
+                         f"subsystem that is OFF: {', '.join(relaxed)}")
     return fails, notes
 
 

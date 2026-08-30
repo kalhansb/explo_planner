@@ -356,6 +356,54 @@ case("an absent manifest is reported as NOT compared, not as agreement", 0,
      r"run_manifest.txt absent on at least one side; the arm configuration "
      r"was NOT compared", child_kw={"manifest": None})
 
+print("\n=== manifest keys a phase ADDS ===")
+
+# Copied from the P1 pair that first hit this: a run of the P1 harness with
+# CELL_WORLD unset writes all seven of these, and the P0 parent writes none of
+# them. Before GATED_MANIFEST_GROUPS the gate called that seven configuration
+# differences, which is a verdict of "not equivalent" against a subsystem that
+# was switched off.
+CELL_BLOCK_OFF = ("cell_world=0\n"
+                  "cell_size_m=10.0\n"
+                  "cell_census_period_s=5.0\n"
+                  "cell_covered_max_unknown=0.55\n"
+                  "cell_exploring_min_unknown=0.62\n"
+                  "cell_covered_max_frontier_frac=0.95\n"
+                  'team_robot_names=["atlas","bestla"]\n')
+
+case("the real P1 child: a whole knob block recorded with its switch off", 0,
+     r"7 new manifest key\(s\) recording a subsystem that is OFF:.*cell_world",
+     child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF})
+# The relaxation must not survive the switch being on. This is the injection
+# the whole group exists to still catch.
+case("the same block with its switch ON", 1,
+     r"manifest cell_world: new in the child at '1'.*treatment arm",
+     child_kw={"manifest": MANIFEST
+               + CELL_BLOCK_OFF.replace("cell_world=0", "cell_world=1")})
+# A dependent key with no switch beside it is not shown to be inert by
+# anything. This is the shape a half-written manifest block takes.
+case("gated keys present but the switch itself missing", 1,
+     r"manifest cell_size_m: .*gated by cell_world, but the child's "
+     r"cell_world is '<absent>'",
+     child_kw={"manifest": MANIFEST
+               + CELL_BLOCK_OFF.replace("cell_world=0\n", "")})
+case("a new manifest key belonging to no declared group", 1,
+     r"manifest brand_new_knob: .*not declared in GATED_MANIFEST_GROUPS",
+     child_kw={"manifest": MANIFEST + "brand_new_knob=3\n"})
+# Relaxed in one direction only: a key the parent described the arm with and
+# the child stopped writing is a hole in the record, not agreement.
+case("a manifest key the parent had and the child dropped", 1,
+     r"manifest cell_world: the parent recorded '0' and the child does not "
+     r"record it at all",
+     parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF})
+# And the excuse does not extend to keys BOTH sides write: once the parent has
+# the block too, the ordinary comparison is back in force.
+case("both sides carry the block and a gated knob is re-valued", 1,
+     r"manifest cell_covered_max_unknown: parent '0.55' != child '0.70'",
+     parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
+     child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF.replace(
+         "cell_covered_max_unknown=0.55", "cell_covered_max_unknown=0.70")})
+
 print("\n=== silence must never read as a pass ===")
 
 rc, out = run(parent_side(), child_side(), child_cells=())
