@@ -34,7 +34,22 @@ git_scovox=078d3f7
 sha256_explo_planner_node={SHA}
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# The schema the injected regression below downgrades TO. One less than the pin,
+# always: the case has to be a version the gate must reject, and hard-coding a 2
+# after the pin moved to 4 would have kept passing while testing a two-step
+# mismatch instead of the off-by-one a real generation mix produces.
+PREV_SCHEMA_VERSION = SCHEMA_VERSION - 1
+# Schemas whose EVENT SHAPES the fixture may be audited against, newest first.
+# Not the same question as the pin: v4 adds five default-off event kinds and no
+# field to any existing one, so a banked schema-3 cell is still an exact shape
+# reference for all sixteen legacy kinds. Keeping 3 here is what stops
+# audit_fixture_against_real_cell() from going UNRESOLVED — permanently silent —
+# on the very schema bump it most needs to be watching.
+#
+# Drop a version from this tuple the moment a bump CHANGES an existing event's
+# fields, because then its cells stop being a valid reference.
+AUDIT_SCHEMAS = (4, 3)
 
 # The field names below are taken from the C++ WRITERS, not from what the gate
 # expects to find. That distinction is the whole reason this file was rewritten
@@ -247,9 +262,15 @@ def run_gate(root, tag, cells_per_arm="1", env_extra=None):
     gate. Now that the identity is declared out of band it can be injected, so
     what runs here is byte-for-byte the file that will score the campaign.
     """
+    # GATE_SCHEMA_VERSION is pinned, not inherited. An operator who exported it
+    # to re-gate a banked campaign would otherwise run this calibration against
+    # a gate expecting a different schema from the one the fixture writes, and
+    # every case would fail on check 3d — a red harness that says nothing about
+    # the check it claims to be calibrating.
     env = dict(os.environ, GATE_ROOT=root,
                GATE_EXPECT_git_explo_planner=REV,
                GATE_EXPECT_sha256_explo_planner_node=SHA,
+               GATE_SCHEMA_VERSION=str(SCHEMA_VERSION),
                GATE_CELLS_PER_ARM=cells_per_arm)
     env.update(env_extra or {})
     p = subprocess.run([sys.executable, GATE, tag], capture_output=True,
@@ -419,8 +440,10 @@ case("binary built from a dirty tree",
          git_rev=REV + "-dirty")),
      r"check 3c — JSONL git_rev is -dirty")
 case("event log written at the previous schema version",
-     lambda ev: _each_runstart(ev, lambda e: e.update(schema_version=2)),
-     r"check 3d — schema_version=2, expected 3")
+     lambda ev: _each_runstart(ev, lambda e: e.update(
+         schema_version=PREV_SCHEMA_VERSION)),
+     rf"check 3d — schema_version={PREV_SCHEMA_VERSION}, expected "
+     rf"{SCHEMA_VERSION}")
 case("hybrid directory holding an off configuration",
      lambda ev: _each_runstart(ev, lambda e: e["params"].update(arm="off")),
      r"check 3e — directory says arm=hybrid but run_start params say arm='off'")
@@ -646,6 +669,7 @@ def identity_file_case(label, body, expect_rc, expect_pat=None):
                if not k.startswith("GATE_EXPECT_")}
         env["GATE_ROOT"] = root
         env["GATE_CELLS_PER_ARM"] = "1"
+        env["GATE_SCHEMA_VERSION"] = str(SCHEMA_VERSION)   # see run_gate()
         p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
                            text=True, env=env)
         out = p.stdout + p.stderr
@@ -686,6 +710,8 @@ try:
     build(root, "cal", ev)
     p = subprocess.run([sys.executable, GATE, "cal"], capture_output=True,
                        text=True, env=dict(os.environ, GATE_ROOT=root,
+                                           GATE_SCHEMA_VERSION=str(
+                                               SCHEMA_VERSION),
                                            GATE_CELLS_PER_ARM="1"))
     ok = p.returncode == 2 and "REFUSING TO RUN" in p.stdout
     print(f"  {'PASS' if ok else 'FAIL'}  unfilled FILL_ME identity refuses "
@@ -699,7 +725,7 @@ print("\n=== the fixture must match the BINARY, not the gate's beliefs ===")
 
 
 def audit_fixture_against_real_cell():
-    """Compare the fixture's per-event key sets against a banked schema-3 cell.
+    """Compare the fixture's per-event key sets against a banked real cell.
 
     This is the durable fix for the defect that motivated the rewrite. Two
     hand-written shapes (git_rev at the top level of run_start,
@@ -719,6 +745,7 @@ def audit_fixture_against_real_cell():
               f"NOT compared against real data")
         return
     real = {}
+    real_schema = None
     for cell in sorted(os.listdir(root)):
         d = os.path.join(root, cell)
         if not os.path.isdir(d):
@@ -727,23 +754,28 @@ def audit_fixture_against_real_cell():
             p = os.path.join(d, f"{r}.events.jsonl")
             if not os.path.exists(p):
                 continue
+            found = {}
+            schema = None
             for ln in open(p, errors="replace"):
                 try:
                     e = json.loads(ln)
                 except ValueError:
                     continue
-                if e.get("event") == "run_start" and \
-                        e.get("schema_version") != SCHEMA_VERSION:
-                    real = {}
-                    break                      # wrong generation, skip the file
-                real.setdefault(e.get("event"), set()).update(e.keys())
-            if real:
+                if e.get("event") == "run_start":
+                    schema = e.get("schema_version")
+                    if schema not in AUDIT_SCHEMAS:
+                        found = {}
+                        break            # shapes not comparable, skip the file
+                found.setdefault(e.get("event"), set()).update(e.keys())
+            if found:
+                real, real_schema = found, schema
                 break
         if real:
             break
     if not real:
-        print(f"  UNRESOLVED  no schema-{SCHEMA_VERSION} cell found under "
-              f"{root}; fixture shapes were NOT compared against real data")
+        print(f"  UNRESOLVED  no cell at schema "
+              f"{'/'.join(str(v) for v in AUDIT_SCHEMAS)} found under {root}; "
+              f"fixture shapes were NOT compared against real data")
         return
     fixture = {}
     for arm in ("hybrid", "off"):
@@ -757,8 +789,11 @@ def audit_fixture_against_real_cell():
         if invented:
             bad.append(f"{event}: fixture invents {sorted(invented)}, which no "
                        f"writer in the tree emits")
+    # Name the schema actually compared against. "PASS" alone would let a
+    # reader assume the current one was available when it was not.
     print(f"  {'PASS' if not bad else 'FAIL'}  fixture keys are a subset of a "
-          f"real cell's for {len(set(fixture) & set(real))} event type(s)")
+          f"real schema-{real_schema} cell's for "
+          f"{len(set(fixture) & set(real))} event type(s)")
     for b in bad:
         print(f"           | {b}")
     if bad:

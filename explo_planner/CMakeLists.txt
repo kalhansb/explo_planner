@@ -66,6 +66,7 @@ add_library(explo_planner_lib
   src/plan_map_query.cpp
   src/failed_goal_blacklist.cpp
   src/planner_util.cpp
+  src/fleet_identity.cpp
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
@@ -196,9 +197,18 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_experiment_log test/test_experiment_log.cpp)
   target_link_libraries(test_experiment_log explo_planner_lib)
+  # The declared event vocabulary (kEventKinds) is checked against the WRITER's
+  # own source, not against a copy of the list — same reasoning as the shared
+  # params path below. Source tree, not install tree: the claim is about the
+  # code that gets committed, and the installed copy can be stale or absent.
+  target_compile_definitions(test_experiment_log PRIVATE
+    EXPERIMENT_LOG_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/experiment_log.cpp")
 
   ament_add_gtest(test_planner_util test/test_planner_util.cpp)
   target_link_libraries(test_planner_util explo_planner_lib)
+
+  ament_add_gtest(test_fleet_identity test/test_fleet_identity.cpp)
+  target_link_libraries(test_fleet_identity explo_planner_lib)
 
   ament_add_gtest(test_target_queue test/test_target_queue.cpp)
   target_link_libraries(test_target_queue explo_planner_lib)

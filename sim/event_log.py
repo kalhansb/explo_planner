@@ -90,7 +90,18 @@ import sys
 # They were the same variable until round 4, which made `--min-schema 2` warn
 # that every current file was "newer than this reader's 2" and made
 # `--min-schema 4` announce that raising the bar "may pool binary generations".
-READER_SCHEMA = 3
+#
+# v4 (the M-TARE evolution) is the first bump that adds ONLY new event kinds and
+# changes no existing one, because every v4 mechanism ships default-off. A v4
+# cell run at defaults is therefore readable by this file's v3 logic and pools
+# legitimately with v3 cells — `--min-schema 3` is sound for such a mix, which
+# is not something that could be said of any earlier bump. It stops being sound
+# the moment a v4 arm is run with a mechanism ENABLED, and this file cannot tell
+# the two apart from the version alone: that is equiv_gate.py's job, and mixing
+# without it is the "don't pool across binary generations" mistake wearing a
+# newer number. The default stays at the current schema so the pooling decision
+# is always something an operator typed.
+READER_SCHEMA = 4
 MIN_SCHEMA = READER_SCHEMA
 
 

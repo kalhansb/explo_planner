@@ -387,7 +387,52 @@ class ExperimentLog {
   /// The gen-7 cells under /home/kalhan/hmr_campaign_void_gen7 are void for
   /// exactly these two incompatibilities; leaving the stamp at 2 would have
   /// made a void file and a live file indistinguishable to a script.
-  static constexpr int kSchemaVersion = 3;
+  /// v4: the M-TARE evolution (docs/mtare_evolution_plan.md). Nothing moved and
+  /// nothing was removed — every v3 field means exactly what it meant — but the
+  /// event VOCABULARY widens by five kinds:
+  ///
+  ///     cell_census         the coarse cell world's status histogram
+  ///     allocation          a global-allocator solve: tour, focus cell, cost
+  ///     rendezvous_agreed   a scheduled (cell, time) reached agreement
+  ///     rendezvous_outcome  how a scheduled meeting actually ended
+  ///     reconnect_gate      an info-gated dispatch decision and its arithmetic
+  ///
+  /// Vocabulary widening IS a schema change, on the precedent set by v3's
+  /// home_watchdog widening: a reader with an exhaustive match on `event` now
+  /// hits an unhandled case, and one that counts by kind silently undercounts.
+  /// Bumping the stamp is what lets such a reader refuse rather than guess.
+  ///
+  /// All five are emitted only when a mechanism is switched ON. At the shipped
+  /// defaults a v4 run emits exactly the v3 set — which is not a nicety but the
+  /// pre-registered per-phase equivalence gate (see sim/equiv_gate.py): "no new
+  /// kinds may appear at defaults" is one of its five run-invariant checks, and
+  /// kEventKinds below is the declared universe it scores against.
+  static constexpr int kSchemaVersion = 4;
+
+  /// Every `event` value this writer can emit, and the ONLY authority on that
+  /// set. It exists because the equivalence gate has to answer "did a new kind
+  /// appear?", and the only alternatives were a hand-maintained list in a
+  /// Python file (which drifts from the binary the moment someone adds an
+  /// event and forgets) or inferring the universe from one run's output (which
+  /// cannot distinguish "this kind is new" from "this run did not reach it").
+  ///
+  /// Ordered as: envelope, then v1-v3 kinds, then the v4 additions. Keep the
+  /// v4 block last and append to it — sim/equiv_gate.py reports the tail as the
+  /// opt-in set, and a v4 kind hidden in the middle would be scored as legacy.
+  static constexpr const char* kEventKinds[] = {
+      "run_start", "run_end", "step", "clock_anchor", "state_change",
+      "peer_lost", "peer_seen", "reconnect_dispatch", "reconnect_end",
+      "exploration_complete", "mission_complete", "nav_goal_failed",
+      "pose_health", "goal_amnesty", "home_watchdog", "coverage_milestone",
+      // --- v4, all default-off ---
+      "cell_census", "allocation", "rendezvous_agreed", "rendezvous_outcome",
+      "reconnect_gate",
+  };
+  static constexpr size_t kEventKindCount =
+      sizeof(kEventKinds) / sizeof(kEventKinds[0]);
+  /// Index of the first v4 kind in kEventKinds — the boundary between "a run at
+  /// defaults may emit this" and "only an opted-in arm may".
+  static constexpr size_t kFirstV4EventKind = 16;
 
   /// Decimal places used for every number written. Fixed, not significant
   /// digits: 6 decimals is microseconds on a sim timestamp and micrometres on a

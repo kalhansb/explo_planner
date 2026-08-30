@@ -28,6 +28,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -240,4 +241,78 @@ TEST(ExperimentLogHomeWatchdog, DefaultedCallStillEmitsBothFields) {
   // threshold rather than invisible as a missing field.
   EXPECT_NE(row.find("\"test_delta_m\""), std::string::npos) << row;
   EXPECT_NE(row.find("\"test_threshold_m\":0.000000"), std::string::npos) << row;
+}
+
+// --- The declared event vocabulary (schema v4) ---
+//
+// kEventKinds is what sim/equiv_gate.py scores "did a new event kind appear at
+// defaults?" against, and a declared universe that has drifted from the writer
+// answers that question wrongly in the silent direction: a kind missing from
+// the list reads as "new" on every run that emits it (noise, which gets the
+// gate loosened), and — worse — the gate's notion of which kinds are opt-in
+// comes from the list's tail, so an unlisted v4 kind is scored as legacy and
+// its appearance at defaults never fails anything.
+//
+// Nothing in C++ can enumerate the writer's calls, so the test reads the
+// writer's SOURCE, exactly as test_failed_goal_blacklist reads the shipped
+// YAML rather than a copy of its values. The path comes from CMake, so this
+// cannot silently pass by scanning a stale installed tree.
+TEST(ExperimentLogSchema, DeclaredKindsMatchTheWriter) {
+  std::ifstream src(EXPERIMENT_LOG_CPP);
+  ASSERT_TRUE(src.good()) << "cannot read " << EXPERIMENT_LOG_CPP;
+  std::stringstream buf;
+  buf << src.rdbuf();
+  const std::string text = buf.str();
+
+  // Every `begin("<kind>"` in the writer.
+  std::vector<std::string> emitted;
+  const std::string needle = "begin(\"";
+  for (size_t p = text.find(needle); p != std::string::npos;
+       p = text.find(needle, p + 1)) {
+    const size_t s = p + needle.size();
+    const size_t e = text.find('"', s);
+    ASSERT_NE(e, std::string::npos);
+    const std::string kind = text.substr(s, e - s);
+    if (std::find(emitted.begin(), emitted.end(), kind) == emitted.end()) {
+      emitted.push_back(kind);
+    }
+  }
+  ASSERT_FALSE(emitted.empty()) << "scanned " << EXPERIMENT_LOG_CPP
+                                << " and found no begin(\"...\") call — the "
+                                   "scan itself has stopped working";
+
+  std::vector<std::string> declared(
+      ExperimentLog::kEventKinds,
+      ExperimentLog::kEventKinds + ExperimentLog::kEventKindCount);
+
+  for (const std::string& k : emitted) {
+    EXPECT_NE(std::find(declared.begin(), declared.end(), k), declared.end())
+        << "the writer emits '" << k
+        << "' but kEventKinds does not declare it; sim/equiv_gate.py would "
+           "score it as a legacy kind and never notice it appearing at "
+           "defaults";
+  }
+  for (const std::string& k : declared) {
+    if (std::find(emitted.begin(), emitted.end(), k) != emitted.end()) continue;
+    // A declared-but-unemitted kind is legal only while its phase is unwritten,
+    // and only in the v4 block. One in the legacy block means a writer was
+    // deleted without the vocabulary following it.
+    const size_t idx = static_cast<size_t>(
+        std::find(declared.begin(), declared.end(), k) - declared.begin());
+    EXPECT_GE(idx, ExperimentLog::kFirstV4EventKind)
+        << "kEventKinds declares legacy kind '" << k
+        << "' that no writer emits any more";
+  }
+
+  // The boundary itself. If someone appends a v4 kind ABOVE the marker, the
+  // gate reads it as legacy — so pin that everything below the marker is a
+  // kind the writer already has, and the marker sits where v3 ended.
+  ASSERT_LE(ExperimentLog::kFirstV4EventKind, ExperimentLog::kEventKindCount);
+  for (size_t i = 0; i < ExperimentLog::kFirstV4EventKind; ++i) {
+    EXPECT_NE(std::find(emitted.begin(), emitted.end(),
+                        std::string(ExperimentLog::kEventKinds[i])),
+              emitted.end())
+        << "kEventKinds[" << i << "] = '" << ExperimentLog::kEventKinds[i]
+        << "' sits in the pre-v4 block but the writer does not emit it";
+  }
 }

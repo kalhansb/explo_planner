@@ -74,6 +74,7 @@
 #include "explo_planner/plan_map_query.hpp"
 #include "explo_planner/planner_util.hpp"
 #include "explo_planner/failed_goal_blacklist.hpp"
+#include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -504,6 +505,12 @@ private:
 
   // --- Parameters ---
   std::string robot_name_;
+  // Fleet identity: the ordered `team_robot_names` param resolved against
+  // robot_name_. Unconfigured (the default) is legal and is exactly the
+  // pre-M-TARE behaviour; every mechanism that needs numeric ids refuses to
+  // start without it rather than degrading. See fleet_identity.hpp.
+  std::vector<std::string> team_robot_names_;
+  FleetIdentity            fleet_;
   std::string output_csv_;
   // Event-log output (newline-delimited JSON, one file per robot per run).
   // Empty path = derive from output_csv (see the param load); enabled by
@@ -1765,6 +1772,29 @@ ExploPlannerNode::ExploPlannerNode()
 
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
+  // Fleet identity (docs/mtare_evolution_plan.md §3.0). The ordered list of
+  // every robot in this fleet, IDENTICAL on every robot: a robot's numeric id
+  // is its position in the array, and that id indexes every knowledge mask,
+  // gossip slot and cross-robot tie-break the shared world model uses.
+  //
+  // Defaults to empty, which means "unconfigured" and is not an error: that is
+  // every launch predating this, and the per-phase equivalence gate requires
+  // them to behave identically. A MALFORMED array is a different matter — it
+  // is a config error, and the node refuses to start rather than run on a
+  // fleet definition that would make its own masks lie.
+  team_robot_names_ =
+      dp("team_robot_names", std::vector<std::string>{});
+  fleet_ = makeFleetIdentity(team_robot_names_, robot_name_);
+  if (!fleet_.error.empty()) {
+    RCLCPP_FATAL(this->get_logger(), "team_robot_names: %s",
+                 fleet_.error.c_str());
+    throw std::runtime_error("team_robot_names: " + fleet_.error);
+  }
+  if (fleet_.configured) {
+    RCLCPP_INFO(this->get_logger(),
+                "Fleet identity: robot_id=%d of %d, team_hash=0x%08x",
+                fleet_.self_id, fleet_.size(), fleet_.team_hash);
+  }
   output_csv_   = dp("output_csv", std::string("/tmp/exploration.csv"));
   // Experiment event log — one newline-delimited JSON file per robot per run.
   // See experiment_log.hpp for what it exists to fix; in short, the CSV plus
@@ -2713,6 +2743,22 @@ ExploPlannerNode::ExploPlannerNode()
                           std::string(__DATE__) + " " + __TIME__);
     exp_log_->addParamStr("node_name", std::string(this->get_name()));
     exp_log_->addParamStr("robot_name", robot_name_);
+    // Fleet identity, as CONFIGURED and as RESOLVED. Both, because they answer
+    // different questions and a run whose masks turn out to be nonsense needs
+    // both answered from its own file: the joined array says which fleet the
+    // launcher believed in, and the id/hash pair says what this robot actually
+    // indexed its masks by. robot_id -1 / team_hash 0 is the unconfigured
+    // (legacy) run, which is what a defaults run must show.
+    {
+      std::string joined;
+      for (size_t i = 0; i < team_robot_names_.size(); ++i) {
+        if (i) joined += ",";
+        joined += team_robot_names_[i];
+      }
+      exp_log_->addParamStr("team_robot_names", joined);
+    }
+    exp_log_->addParamNum("robot_id", fleet_.self_id);
+    exp_log_->addParamNum("team_hash", fleet_.team_hash);
     exp_log_->addParamStr("reconnect_mode", reconnectModeName(reconnect_mode_));
     // THE arm this run belongs to, and the field an analysis must group by.
     //
@@ -9275,7 +9321,20 @@ int main(int argc, char** argv) {
   // subscription (non-blocking), so there is no blocking service future to
   // service on a second thread. All callbacks and timers run on one thread,
   // which also makes the map-callback / state-machine interaction race-free.
-  rclcpp::spin(std::make_shared<explo_planner::ExploPlannerNode>());
+  //
+  // Construction can refuse: a malformed fleet definition is a config error the
+  // node must not run past, because every knowledge mask it published would be
+  // indexed against a fleet the rest of the team does not share. Catching it
+  // here rather than letting it escape gives an operator one legible line and
+  // the harness a non-zero exit, instead of a std::terminate backtrace.
+  try {
+    rclcpp::spin(std::make_shared<explo_planner::ExploPlannerNode>());
+  } catch (const std::exception& e) {
+    RCLCPP_FATAL(rclcpp::get_logger("explo_planner"),
+                 "refusing to start: %s", e.what());
+    rclcpp::shutdown();
+    return 2;
+  }
   rclcpp::shutdown();
   return 0;
 }

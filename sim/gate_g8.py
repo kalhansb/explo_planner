@@ -20,6 +20,8 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
         GATE_IDENTITY               path to the declared-identity file
         GATE_EXPECT_<key>           override a single declared identity field
         GATE_CELLS_PER_ARM          pre-registered cells per arm (default 30)
+        GATE_SCHEMA_VERSION         event-log schema to require (default 4;
+                                    pass 3 to re-gate a banked gen-9 campaign)
 Exit:   0  no hard failures, every population non-empty
         1  hard failures, or no cells for the tag
         2  the generation identity was never declared
@@ -117,7 +119,22 @@ EXPECT = {
 }
 
 DONE_UNKNOWN_FRACTION = 0.640
-SCHEMA_VERSION = 3
+# The event-log schema this gate scores against (check 3d). Overridable for the
+# same reason as everything else in this block: a banked generation-9 campaign
+# was written at schema 3 and is still perfectly valid on its own terms, so
+# re-gating it must be possible WITHOUT editing the pin. Editing the pin is how
+# a gate stops checking; passing GATE_SCHEMA_VERSION=3 says out loud, in the
+# invocation, which generation is being scored.
+#
+#   GATE_SCHEMA_VERSION=3 GATE_MIDRUN_SILENCE=240 GATE_GEN9_PARAMS=0 \
+#       ./gate_g8.py g8r1
+#
+# Bumped to 4 for the M-TARE evolution. The v4 additions are all default-off, so
+# a v4 binary run at shipped defaults is behaviourally the same planner as v3 —
+# but "the same behaviour" is a claim for equiv_gate.py to prove per phase, not
+# something this file may assume. Here the stamp stays what it has always been:
+# a one-field tripwire on mixing generations in one campaign directory.
+SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "4"))
 # Generation-9 treatment configuration (check 3f). Overridable so the check can
 # be calibrated against a known-answer case — a gate that has never been shown
 # to FAIL on a bad input is not evidence of anything, which is the lesson the
@@ -409,10 +426,13 @@ for c in cells:
                     f"{m.get('git_explo_planner')}")
             if "-dirty" in raw_rev:
                 hard_fail.append(f"{c}/{r}: check 3c — JSONL git_rev is -dirty")
-            # 3d. the schema stamp. The identity in section 32.14 pins schema 3,
-            # the binary writes it (experiment_log.cpp:265) and every reader
+            # 3d. the schema stamp. The identity in section 32.14 pinned schema
+            # 3, the binary writes it (experiment_log.cpp:265) and every reader
             # downstream keys off it, but nothing here read it — so the one
             # field that catches a generation mix at a glance was unchecked.
+            # The pin now lives in SCHEMA_VERSION above, where an operator
+            # scoring a banked campaign can move it from the command line
+            # instead of from a diff nobody reviews.
             sv = start[0].get("schema_version", pr.get("schema_version"))
             if sv != SCHEMA_VERSION:
                 hard_fail.append(
