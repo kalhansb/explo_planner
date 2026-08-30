@@ -796,6 +796,31 @@ void ExperimentLog::logTeamExchange(const ExperimentContext& ctx,
   end();
 }
 
+void ExperimentLog::logAllocation(const ExperimentContext& ctx,
+                                  const AllocationEvent& e) {
+  if (!open_ || !started_) return;
+  begin("allocation", ctx);
+  // Decimal, like every other hash in this file: JSON has no hex literal.
+  integer("shared_hash", static_cast<long long>(e.shared_hash));
+  integer("grid_hash", static_cast<long long>(e.grid_hash));
+  integer("robots_in_problem", e.robots_in_problem);
+  integer("candidates", e.candidates);
+  integer("unassigned", e.unassigned);
+  // Always written, including as "": a reader filtering for refusals must not
+  // have to treat an absent key and an empty one as the same thing.
+  text("refused", e.refused);
+  num("solve_ms", e.solve_ms);
+  integer("focus_cell", e.focus_cell);
+  text("tour", e.tour);
+  text("peer_focus", e.peer_focus);
+  boolean("all_in_comms", e.all_in_comms);
+  integer("picked_rank", e.picked_rank);
+  boolean("reordered", e.reordered);
+  integer("focus_skips", e.focus_skips);
+  text("demoted", e.demoted);
+  end();
+}
+
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));

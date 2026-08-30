@@ -549,6 +549,84 @@ struct TeamExchangeEvent {
   int exploring_by_others = 0;
 };
 
+/// `allocation` payload (P3): one global-allocator solve, emitted from the
+/// planning tick that used it.
+///
+/// The P3 smoke gate is MECHANISM-level, not outcome-level — the redundancy
+/// metric it would otherwise want needs thousands of cells per arm and cannot
+/// resolve a single A/B pair. So this event has to carry enough to answer
+/// "did the allocator do its job" from the logs alone, which is three separate
+/// questions and three separate groups of fields below.
+struct AllocationEvent {
+  // --- 1. did both robots solve the SAME problem? -----------------------
+  //
+  // Solve-same-take-own is an arithmetic claim, and it is only meaningful
+  // over a converged world: two robots holding different beliefs SHOULD
+  // allocate differently, and counting that as a disagreement would report
+  // the comms model's dropouts as an allocator fault. `shared_hash` is the
+  // join key that separates the two — restrict to cycles where both robots
+  // logged the same value and the remaining disagreements are the allocator's.
+  unsigned int shared_hash = 0;
+  unsigned int grid_hash = 0;
+  /// Vehicles that survived into the problem, and how many candidate cells it
+  /// had. Both are needed to read an empty tour: no vehicles, no candidates
+  /// and "the mask took them all" are three different empty tours.
+  int robots_in_problem = 0;
+  int candidates = 0;
+  int unassigned = 0;
+  /// Empty when solved. Non-empty is a wholesale refusal with its reason —
+  /// distinct from "solved, nothing to do", which is an empty tour and no
+  /// reason. See GlobalAllocator::Allocation::refused.
+  std::string refused;
+  double solve_ms = -1.0;
+
+  // --- 2. did the two robots agree about who goes where? ----------------
+  //
+  // Each robot solves for the WHOLE fleet, so this robot's answer contains
+  // its BELIEF about the peer's focus cell as well as its own. Logging both
+  // makes the agreement check readable without aligning two files by
+  // timestamp: robot A's `peer_focus` against robot B's `focus_cell` is the
+  // same comparison, and it is exact rather than tolerance-windowed.
+  int focus_cell = -1;
+  /// This robot's whole tour, cell ids in visit order, comma-separated. Text
+  /// because it is variable-length and a reader that wants only the head has
+  /// `focus_cell` already.
+  std::string tour;
+  /// "id:cell" per OTHER vehicle, comma-separated; a vehicle with no tour is
+  /// written as "id:-1" rather than omitted, so an absent peer and a peer
+  /// allocated nothing do not render alike.
+  std::string peer_focus;
+  /// True while every vehicle in the problem is in comms. The gate's coincidence
+  /// fraction is only defined over these cycles — out of comms the two robots
+  /// are not expected to agree and a coincidence there means nothing.
+  bool all_in_comms = false;
+
+  // --- 3. did the allocation actually steer the planner? ----------------
+  //
+  // The field that stops this gate from becoming another one that cannot
+  // fail. An allocator that solves beautifully and never changes which goal
+  // is chosen is indistinguishable in every field above from one that works.
+  /// Tour rank of the candidate finally selected: 0 = the focus cell's
+  /// neighbourhood, 1 = the next tour cell's, and so on; -1 when no goal was
+  /// selected this tick, and `kAllocRankUnrestricted` when the goal came from
+  /// outside every tour cell (the documented fall-back).
+  int picked_rank = -1;
+  /// True when the ranking actually reordered the candidate list — i.e. at
+  /// least one frontier candidate fell outside the focus neighbourhood. False
+  /// means the filter was a no-op this tick and `picked_rank` proves nothing.
+  bool reordered = false;
+  /// Consecutive ticks the current focus cell has produced no admissible
+  /// candidate, and the cells the staleness rule demoted to COVERED on this
+  /// tick (comma-separated ids; empty for none).
+  int focus_skips = 0;
+  std::string demoted;
+};
+
+/// `AllocationEvent::picked_rank` for a goal that came from outside every
+/// tour cell's neighbourhood. A large sentinel rather than -1 so it sorts
+/// after every real rank and cannot be confused with "no goal".
+inline constexpr int kAllocRankUnrestricted = 9999;
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -872,6 +950,11 @@ class ExperimentLog {
   void logCellCensus(const ExperimentContext& ctx, const CellCensusEvent& e);
   void logTeamExchange(const ExperimentContext& ctx,
                        const TeamExchangeEvent& e);
+  /// Emits one `allocation` (schema v4). One per planning tick that ran the
+  /// global allocator; nothing is emitted when it is disabled, which is what
+  /// makes "no allocation events" a valid allocator-off control rather than an
+  /// ambiguous absence.
+  void logAllocation(const ExperimentContext& ctx, const AllocationEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;

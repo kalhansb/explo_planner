@@ -78,6 +78,7 @@
 #include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/team_model.hpp"
+#include "explo_planner/global_allocator.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -554,6 +555,25 @@ private:
   // peer's census under robot bit zero.
   double     team_world_hz_ = 0.0;
   TeamModel  team_model_;
+  // Global allocator (P3). OFF by default, and off means doPlan never calls
+  // solve(), never reorders a candidate, and emits no `allocation` event — the
+  // node is the P2 node exactly. This is the FIRST phase in which the cell
+  // world changes a decision, so it is also the first whose default-off
+  // equivalence claim is about more than an absent log line.
+  //
+  // Requires the cell world (it is the problem) and, in any fleet larger than
+  // one, the fleet identity (every vehicle is a numeric id). Both are checked
+  // at startup and are fatal rather than degrading: an allocator with no ids
+  // would put every peer at robot bit zero and solve a fleet of one, which
+  // looks like a working allocator in every field of the event it emits.
+  bool       global_alloc_enable_ = false;
+  GlobalAllocator::Config alloc_cfg_;
+  /// Consecutive planning ticks each cell has been the focus without yielding
+  /// an admissible candidate. Sized with the grid at configure time. The
+  /// staleness rule (§3.4) reads it; nothing else does.
+  std::vector<int> alloc_focus_skips_;
+  /// How many consecutive skips demote a phantom EXPLORING cell to COVERED.
+  int        alloc_focus_skip_k_ = 3;
   bool       team_merge_local_priority_ = true;
   std::string team_world_pub_topic_;
   std::vector<std::string> team_world_sub_topics_;
@@ -3256,6 +3276,72 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
 
+  // ---- Global allocator (P3) -----------------------------------------
+  //
+  // The first phase in which the cell world DECIDES something. Off by default;
+  // when off, doPlan takes exactly the path it took before this block existed.
+  global_alloc_enable_ = dp("global_alloc_enable", false);
+  if (global_alloc_enable_) {
+    if (!cell_world_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "global_alloc_enable=true but cell_world_enable=false: the cell "
+          "world IS the allocation problem, so there would be nothing to "
+          "solve.");
+      throw std::runtime_error("global_alloc_enable requires cell_world_enable");
+    }
+    // A single-robot fleet has nothing to allocate against, and the identity
+    // is what supplies the ids. Refused rather than degraded for the reason in
+    // the member comment: a fleet of one solves cleanly and logs cleanly.
+    const std::string idw = requireFleetIdentity(fleet_, "global_alloc_enable");
+    if (!idw.empty()) {
+      RCLCPP_FATAL(get_logger(), "%s", idw.c_str());
+      throw std::runtime_error(idw);
+    }
+    // Without the exchange there is no shared world, so "solve the same
+    // problem" is vacuous: every robot allocates the whole map to itself and
+    // takes the nearest cell. That is a fleet of one wearing the allocator's
+    // clothes, and every field of the `allocation` event it emits looks
+    // healthy — a refused focus, an agreeing peer_focus and a plausible tour.
+    // Fatal rather than warned for that reason: it is the failure mode that
+    // cannot be caught downstream.
+    if (team_world_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "global_alloc_enable=true but team_world_hz=0: with no exchange "
+          "there is no shared cell world to solve over, so the allocator "
+          "would divide the map among a fleet of one.");
+      throw std::runtime_error("global_alloc_enable requires team_world_hz>0");
+    }
+    // The no-comms mask is a SEPARATE knob and defaults off, because it is not
+    // part of the P3 claim: it is the machinery P4's reconnection value is
+    // built from, and turning it on here would fold an untested cost model
+    // into the phase whose gate is about focus agreement. See
+    // GlobalAllocator::Config::comms_mask.
+    alloc_cfg_.comms_mask     = dp("global_alloc_comms_mask", false);
+    alloc_cfg_.polish_passes  = dp("global_alloc_polish_passes", 2);
+    alloc_cfg_.max_candidates = dp("global_alloc_max_candidates", 256);
+    alloc_focus_skip_k_       = dp("global_alloc_focus_skip_k", 3);
+    if (alloc_focus_skip_k_ < 1) {
+      RCLCPP_WARN(get_logger(),
+          "global_alloc_focus_skip_k=%d is below 1; a cell would be demoted "
+          "the first tick it produced no candidate, which every cell does on "
+          "the tick it is first assigned. Clamping to 1.",
+          alloc_focus_skip_k_);
+      alloc_focus_skip_k_ = 1;
+    }
+    alloc_focus_skips_.assign(static_cast<size_t>(cell_world_.size()), 0);
+  }
+  if (exp_log_) {
+    exp_log_->addParamBool("global_alloc_enable", global_alloc_enable_);
+    if (global_alloc_enable_) {
+      exp_log_->addParamBool("global_alloc_comms_mask", alloc_cfg_.comms_mask);
+      exp_log_->addParamNum("global_alloc_polish_passes",
+                            alloc_cfg_.polish_passes);
+      exp_log_->addParamNum("global_alloc_max_candidates",
+                            alloc_cfg_.max_candidates);
+      exp_log_->addParamNum("global_alloc_focus_skip_k", alloc_focus_skip_k_);
+    }
+  }
+
   // The dscovox mapping node fuses every robot's voxels (multi-robot
   // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
   // subscribe with the matching latched QoS (KeepLast(1) reliable +
@@ -4824,13 +4910,159 @@ void ExploPlannerNode::doPlan() {
     }
   }
 
-  // Sort the selection order by utility descending. The cost-grid
-  // reachability filter runs after the sort as one of the candidate filters
-  // in the walk below.
+  // ---- Global allocator focus (P3) ------------------------------------
+  //
+  // Solve the team-wide allocation over the cell world, then rank every
+  // frontier candidate by WHICH tour cell it serves. That rank becomes the
+  // primary sort key below, which is how §3.4's restriction is implemented:
+  // rank 0 is the focus cell's 9-neighbourhood, rank k the k-th tour cell's,
+  // and anything outside every tour cell sorts last. Expressed as an ordering,
+  // that is exactly the specified behaviour — "if the focus neighbourhood
+  // yields no admissible candidate, advance to the next tour cell; if the tour
+  // is empty, fall back to today's unrestricted behaviour" — without a second
+  // and third walk over the candidate list to say it.
+  //
+  // Ordering rather than filtering is not a softening of the restriction. The
+  // walk below takes the FIRST admissible candidate in order, so an
+  // out-of-focus goal is still reached only when nothing in the focus
+  // neighbourhood survives the map, reachability, blacklist and MinPos checks.
+  // What the ordering buys is that the allocator cannot starve the planner:
+  // there is no path on which a focus cell gone bad leaves doPlan with no goal
+  // at all, which is the failure mode most of the guards in this function
+  // exist to prevent, and the one an allocator is most likely to introduce.
+  //
+  // The 9-neighbourhood, not the cell: frontier candidates are cluster
+  // CENTROIDS, and a cluster straddling a cell boundary parks its centroid in
+  // the neighbour. Filtering to the focus cell alone would starve exactly the
+  // cells whose clusters span it.
+  std::vector<int> alloc_rank(candidates.size(), 0);
+  std::vector<AllocRobot> alloc_robots;
+  Allocation alloc;
+  AllocationEvent alloc_ev;
+  bool alloc_ran = false;
+  if (global_alloc_enable_ && cell_world_.configured()) {
+    alloc_ran = true;
+    const CellGrid& g = cell_world_.grid();
+    const auto t_solve0 = std::chrono::steady_clock::now();
+
+    // Vehicle set: every live, unfinished robot at its freshest known
+    // position, gossip included (§3.4). Self first-hand; peers from the team
+    // model, which is the only place a relayed position is dated.
+    bool all_in_comms = true;
+    for (int id = 0; id < fleet_.size(); ++id) {
+      AllocRobot r;
+      r.id = id;
+      if (id == fleet_.self_id) {
+        r.cell = g.idAt(robot_pos.x(), robot_pos.y());
+        r.in_comms = true;
+        r.finished = false;   // we are planning, so we are not done
+      } else {
+        const TeamModel::Peer& p = team_model_.peer(id);
+        // No position at all is not "at the origin": an unlocatable robot is
+        // dropped from the problem (cell -1) rather than defaulted onto a cell
+        // it is not in, because a fictional position moves the makespan and so
+        // moves THIS robot's tour too.
+        r.cell = p.have_position
+                     ? g.idAt(static_cast<float>(p.position_x),
+                              static_cast<float>(p.position_y))
+                     : -1;
+        r.in_comms = team_model_.inComms(id);
+        r.finished = p.finished;
+        if (!r.in_comms && !r.finished) all_in_comms = false;
+      }
+      alloc_robots.push_back(r);
+    }
+
+    alloc = GlobalAllocator::solve(cell_world_, alloc_robots, alloc_cfg_);
+    const double solve_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_solve0).count();
+
+    // Rank the candidates. Local polar-ring candidates stay unrestricted
+    // (§3.4) and so keep rank 0, competing on utility with the focus
+    // neighbourhood; only frontier candidates are steered.
+    // Copied, not referenced: alloc_robots is index-aligned with the fleet, so
+    // this is a handful of ints, and a dangling reference into a structure the
+    // rest of this function keeps mutating is not worth saving them.
+    const int self_idx = fleet_.self_id;
+    std::vector<int> tour;
+    if (self_idx >= 0 && self_idx < static_cast<int>(alloc.tours.size()))
+      tour = alloc.tours[static_cast<size_t>(self_idx)];
+    bool reordered = false;
+    if (!tour.empty()) {
+      // cell id -> tour rank of the earliest tour cell whose neighbourhood
+      // contains it. Built once per tick; the alternative is a linear scan of
+      // the tour per candidate, which is the same work with worse constants.
+      std::vector<int> rank_of_cell(static_cast<size_t>(cell_world_.size()),
+                                    kAllocRankUnrestricted);
+      for (size_t k = 0; k < tour.size(); ++k) {
+        int nb[9];
+        const int n = cell_world_.neighbourhood9(tour[k], nb);
+        for (int i = 0; i < n; ++i) {
+          int& slot = rank_of_cell[static_cast<size_t>(nb[i])];
+          if (slot == kAllocRankUnrestricted) slot = static_cast<int>(k);
+        }
+      }
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (!candidates[i].is_frontier) continue;   // polar ring: unrestricted
+        const int cid = g.idAt(candidates[i].position.x(),
+                               candidates[i].position.y());
+        alloc_rank[i] = g.valid(cid)
+                            ? rank_of_cell[static_cast<size_t>(cid)]
+                            // Off the cell grid entirely: outside every tour
+                            // cell by definition, and the grid is derived from
+                            // the ROI, so this is a candidate the mission does
+                            // not want anyway.
+                            : kAllocRankUnrestricted;
+        if (alloc_rank[i] != 0) reordered = true;
+      }
+    }
+
+    alloc_ev.shared_hash       = cell_world_.sharedHash();
+    alloc_ev.grid_hash         = g.configHash();
+    for (int cid = 0; cid < cell_world_.size(); ++cid) {
+      const CellStatus s = cell_world_.status(cid);
+      if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
+        ++alloc_ev.candidates;
+    }
+    alloc_ev.unassigned        = static_cast<int>(alloc.unassigned.size());
+    alloc_ev.refused           = alloc.refused;
+    alloc_ev.solve_ms          = solve_ms;
+    alloc_ev.focus_cell        = tour.empty() ? -1 : tour.front();
+    alloc_ev.all_in_comms      = all_in_comms;
+    alloc_ev.reordered         = reordered;
+    for (const AllocRobot& r : alloc_robots)
+      if (r.cell >= 0 && !r.finished) ++alloc_ev.robots_in_problem;
+    for (int cid : tour)
+      alloc_ev.tour += (alloc_ev.tour.empty() ? "" : ",") + std::to_string(cid);
+    for (size_t i = 0; i < alloc_robots.size(); ++i) {
+      if (static_cast<int>(i) == self_idx) continue;
+      // Written even for a peer with no tour ("id:-1"), so an absent peer and
+      // a peer allocated nothing do not render alike in the log.
+      alloc_ev.peer_focus +=
+          (alloc_ev.peer_focus.empty() ? "" : ",") +
+          std::to_string(alloc_robots[i].id) + ":" +
+          std::to_string(alloc.focusFor(alloc_robots[i].id, alloc_robots));
+    }
+    if (!alloc_ev.refused.empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "Global allocator refused this tick (%s); planning unrestricted.",
+          alloc_ev.refused.c_str());
+    }
+  }
+
+  // Sort the selection order by utility descending, under the allocator's
+  // tour rank when it is enabled (rank is 0 everywhere when it is not, so this
+  // is the pre-P3 comparator exactly). The cost-grid reachability filter runs
+  // after the sort as one of the candidate filters in the walk below.
   std::vector<size_t> order(candidates.size());
   std::iota(order.begin(), order.end(), 0);
   std::sort(order.begin(), order.end(),
-      [&candidates](size_t a, size_t b) {
+      [&candidates, &alloc_rank](size_t a, size_t b) {
+        // Tour rank first: the focus neighbourhood before the next tour cell's
+        // before everything else. Equal ranks — which is every pair when the
+        // allocator is off — fall through to the utility comparison unchanged.
+        if (alloc_rank[a] != alloc_rank[b]) return alloc_rank[a] < alloc_rank[b];
         // NaN-safe descending order. A bare `>` is undefined behaviour for
         // std::sort if any score is NaN (breaks strict-weak-ordering); sort
         // NaNs to the bottom so a degenerate score can never corrupt `order`.
@@ -4981,6 +5213,70 @@ void ExploPlannerNode::doPlan() {
       break;
     }
   }
+
+  // ---- Allocator bookkeeping (P3) -------------------------------------
+  //
+  // Placed BEFORE the starvation return below, deliberately: a tick on which
+  // every candidate was rejected is the tick a reader most wants the
+  // allocation for, and an event stream that fell silent exactly when planning
+  // failed would make the allocator look innocent by omission.
+  if (alloc_ran) {
+    alloc_ev.picked_rank = found ? alloc_rank[selected_idx] : -1;
+
+    // Staleness (§3.4). A focus cell that yields no admissible candidate for
+    // k consecutive ticks is re-measured from the map and, if it still claims
+    // to be worth exploring, demoted to COVERED — mTARE's not-connected ->
+    // COVERED demotion, and the only thing that stops a phantom EXPLORING cell
+    // from being re-assigned forever and from dragging the rendezvous minimax
+    // toward ground nobody can clear.
+    //
+    // The counter advances only on a tick that selected a goal from OUTSIDE
+    // the focus neighbourhood. A tick that selected nothing at all is global
+    // starvation — the map, the blacklist or reachability rejected everything
+    // everywhere — and charging that to the focus cell would demote a cell for
+    // being unlucky about somebody else's failure.
+    const int focus = alloc_ev.focus_cell;
+    if (focus >= 0 && focus < static_cast<int>(alloc_focus_skips_.size())) {
+      if (found && alloc_ev.picked_rank == 0) {
+        alloc_focus_skips_[focus] = 0;
+      } else if (found) {
+        ++alloc_focus_skips_[focus];
+      }
+      alloc_ev.focus_skips = alloc_focus_skips_[focus];
+
+      if (alloc_focus_skips_[focus] >= alloc_focus_skip_k_) {
+        // Re-measure before believing the counter. The census runs on its own
+        // rate limiter, so the cell's observation can be a full
+        // cell_census_period_s old, and demoting on stale evidence is exactly
+        // how a cell that HAS been cleared gets written off.
+        if (map_cache_) {
+          cell_world_.applyObservation(
+              censusFromMap(*map_cache_, cell_world_.grid()));
+        }
+        if (shouldDemoteStaleFocus(alloc_focus_skips_[focus],
+                                   alloc_focus_skip_k_,
+                                   cell_world_.status(focus))) {
+          // A first-hand COVERED, which the merge guard will not let any peer
+          // lower again — so this is a one-way write-off of ground on behalf
+          // of the whole team, and it is logged on every fire for precisely
+          // that reason. What keeps it honest is the three conditions above:
+          // it must be the focus cell, it must have failed k consecutive
+          // times, and the map must still read it as unexplored after a fresh
+          // measurement taken this tick.
+          cell_world_.commitSelf(focus, CellStatus::COVERED);
+          alloc_ev.demoted = std::to_string(focus);
+          RCLCPP_WARN(get_logger(),
+              "Global allocator: focus cell %d produced no admissible "
+              "candidate for %d consecutive ticks and still reads unexplored "
+              "after a fresh census — demoting it to COVERED.",
+              focus, alloc_focus_skips_[focus]);
+        }
+        alloc_focus_skips_[focus] = 0;
+      }
+    }
+    if (exp_log_) exp_log_->logAllocation(expCtx(), alloc_ev);
+  }
+
   if (!found) {
     // Throttled, and carrying its own consecutive count because the throttle
     // alone would destroy the quantity that matters. doPlan runs at 10 Hz and
