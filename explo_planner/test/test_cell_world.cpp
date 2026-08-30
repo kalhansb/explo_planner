@@ -967,3 +967,456 @@ TEST(CensusFromMap, WorksOnANegativeOriginRoi) {
   // The other three cells are empty, not miscounted into cell 0.
   for (int i = 1; i < 4; ++i) EXPECT_EQ(o[i].observed_columns, 0);
 }
+
+// ===========================================================================
+// The wire codec and the merge guard table (P2, plan §3.2)
+// ===========================================================================
+
+namespace {
+
+/// Drive a cell to a first-hand status without going through the map: set the
+/// observation the classifier would need. `covered` uses a fully observed,
+/// frontier-free cell; `exploring` a half-observed one.
+void selfCover(CellWorld& w, int id) {
+  std::vector<CellWorld::CellObservation> o(w.size());
+  o[static_cast<size_t>(id)] = obs(100, 100, 0);
+  w.applyObservation(o);
+  ASSERT_EQ(w.status(id), CellStatus::COVERED);
+}
+
+void selfExplore(CellWorld& w, int id) {
+  std::vector<CellWorld::CellObservation> o(w.size());
+  o[static_cast<size_t>(id)] = obs(100, 50, 0);
+  w.applyObservation(o);
+  ASSERT_EQ(w.status(id), CellStatus::EXPLORING);
+}
+
+/// One wire cell, written the way a peer would send it.
+CellWorld::WireCell wc(int id, uint8_t status, uint32_t known_by = 0,
+                       uint32_t update_id = 0) {
+  CellWorld::WireCell w;
+  w.id        = static_cast<uint16_t>(id);
+  w.status    = status;
+  w.known_by  = known_by;
+  w.update_id = update_id;
+  return w;
+}
+
+}  // namespace
+
+TEST(CellWorldWire, NormalisesProvenanceAway) {
+  CellWorld w = makeWorld();
+  selfCover(w, 0);
+  selfExplore(w, 1);
+  // Cells 2 and 3 acquire their statuses from a peer, so they are the
+  // *_BY_OTHERS pair the wire vocabulary must not carry.
+  w.mergeWire(1, {wc(2, 2), wc(3, 1)});
+  ASSERT_EQ(w.status(2), CellStatus::COVERED_BY_OTHERS);
+  ASSERT_EQ(w.status(3), CellStatus::EXPLORING_BY_OTHERS);
+
+  const std::vector<CellWorld::WireCell> out = w.toWire();
+  ASSERT_EQ(out.size(), static_cast<size_t>(w.size()));
+  for (size_t i = 0; i < out.size(); ++i)
+    EXPECT_EQ(out[i].id, static_cast<uint16_t>(i)) << "full state, in id order";
+  EXPECT_EQ(out[0].status, 2u);
+  EXPECT_EQ(out[1].status, 1u);
+  EXPECT_EQ(out[2].status, 2u) << "covered_by_others must ship as covered";
+  EXPECT_EQ(out[3].status, 1u) << "exploring_by_others must ship as exploring";
+  for (const CellWorld::WireCell& c : out)
+    EXPECT_LE(c.status, 2u) << "no local-only status may reach the wire";
+}
+
+// ===========================================================================
+// sharedHash — the cross-robot convergence readout
+// ===========================================================================
+
+TEST(CellWorldSharedHash, AgreesAcrossRobotsAndSeparatesOneCell) {
+  CellWorld a = makeWorld();  // self 0
+  CellWorld b;
+  ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 1), "");
+  EXPECT_EQ(a.sharedHash(), b.sharedHash())
+      << "two freshly configured worlds hold the same (empty) shared belief";
+
+  selfCover(a, 0);
+  selfCover(b, 0);
+  EXPECT_EQ(a.sharedHash(), b.sharedHash());
+
+  selfExplore(a, 4);
+  EXPECT_NE(a.sharedHash(), b.sharedHash())
+      << "one cell apart must not hash the same — this is the whole point";
+  selfExplore(b, 4);
+  EXPECT_EQ(a.sharedHash(), b.sharedHash());
+}
+
+TEST(CellWorldSharedHash, IgnoresProvenanceAndLocalBookkeeping) {
+  // The three fields that legitimately differ between two agreeing robots.
+  // If any of them reached the digest, a healed pair would never read as
+  // converged and the P2 gate could not pass on correct behaviour.
+  CellWorld first_hand = makeWorld();   // self 0
+  selfCover(first_hand, 0);
+  selfExplore(first_hand, 1);
+
+  CellWorld second_hand;
+  ASSERT_EQ(second_hand.configure(
+                makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                goodConfig(), 1), "");
+  second_hand.mergeWire(0, first_hand.toWire());
+  ASSERT_EQ(second_hand.status(0), CellStatus::COVERED_BY_OTHERS);
+  ASSERT_EQ(second_hand.status(1), CellStatus::EXPLORING_BY_OTHERS);
+  // Different provenance, different update_ids (rule 1: the merge never
+  // touches them), different known_by masks — same shared belief.
+  ASSERT_NE(first_hand.cell(0).update_id, second_hand.cell(0).update_id);
+  ASSERT_NE(first_hand.cell(0).known_by, second_hand.cell(0).known_by);
+  EXPECT_EQ(first_hand.sharedHash(), second_hand.sharedHash());
+}
+
+TEST(CellWorldSharedHash, DoesNotCollideAcrossGridSizes) {
+  // Two all-UNSEEN worlds of different extent. Without the length prefix these
+  // differ only in how many zero bytes were folded in, and FNV's avalanche is
+  // no defence against that: the caller is supposed to compare grid_hash
+  // first, and this is what happens when it forgets.
+  CellWorld small = makeWorld();                    // 3x3
+  CellWorld large;
+  ASSERT_EQ(large.configure(makeCellGrid(-25.0f, 25.0f, -25.0f, 25.0f, 10.0f),
+                            goodConfig(), 0), "");
+  ASSERT_NE(small.size(), large.size());
+  EXPECT_NE(small.sharedHash(), large.sharedHash());
+}
+
+TEST(CellWorldSharedHash, ConvergesAfterAnOutageHeals) {
+  // The unit-level form of the P2 smoke gate. Two robots explore apart with
+  // the link down, diverge, then exchange full state once it heals.
+  //
+  // Counts alone cannot score this and the fixture is built to show why: at
+  // the point of maximum divergence both robots have covered exactly two
+  // cells, so every aggregate in cell_census reads identical while the two
+  // worlds disagree about four cells out of nine.
+  CellWorld a = makeWorld();  // self 0
+  CellWorld b;
+  ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 1), "");
+  selfCover(a, 0);
+  selfCover(a, 1);
+  selfCover(b, 7);
+  selfCover(b, 8);
+  ASSERT_EQ(a.census().covered + a.census().covered_by_others,
+            b.census().covered + b.census().covered_by_others)
+      << "fixture: the counts must AGREE while the worlds do not";
+  EXPECT_NE(a.sharedHash(), b.sharedHash())
+      << "the digest must see the divergence the counts cannot";
+
+  // The heal: one full-state message each way, which is all the exchange ever
+  // sends. Both directions are needed — one alone leaves the sender still
+  // ignorant of the receiver's ground.
+  const std::vector<CellWorld::WireCell> from_a = a.toWire();
+  const std::vector<CellWorld::WireCell> from_b = b.toWire();
+  a.mergeWire(1, from_b);
+  b.mergeWire(0, from_a);
+  EXPECT_EQ(a.sharedHash(), b.sharedHash()) << "converged after the heal";
+  EXPECT_EQ(a.census().covered + a.census().covered_by_others, 4);
+
+  // And it stays converged when the healed link redelivers what both already
+  // have, which is what a 1 Hz full-state broadcast does forever after.
+  const uint32_t settled = a.sharedHash();
+  a.mergeWire(1, b.toWire());
+  b.mergeWire(0, a.toWire());
+  EXPECT_EQ(a.sharedHash(), settled);
+  EXPECT_EQ(b.sharedHash(), settled);
+}
+
+TEST(CellWorldMerge, RoundTripThroughTheCodec) {
+  // The plan's gate: normalise, transmit, merge — not a copy of in-memory
+  // state. A robot that has seen everything hands its census to a robot that
+  // has seen nothing, and the receiver must end up agreeing about every cell.
+  CellWorld a = makeWorld();  // self id 0
+  CellWorld b;
+  ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 1),
+            "");
+  selfCover(a, 0);
+  selfCover(a, 4);
+  selfExplore(a, 8);
+
+  const CellWorld::MergeStats st = b.mergeWire(0, a.toWire());
+  EXPECT_EQ(st.refused, "");
+  EXPECT_EQ(st.examined(), b.size()) << "every offered cell must land in "
+                                        "exactly one bucket";
+  EXPECT_EQ(st.applied, 3);
+  EXPECT_EQ(b.status(0), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(4), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(8), CellStatus::EXPLORING_BY_OTHERS);
+  // Rule 1: the merge path never touches update_id, however much it changed.
+  for (int i = 0; i < b.size(); ++i) EXPECT_EQ(b.cell(i).update_id, 0u);
+  // Rule 2's merge-side form: the mask is the two robots that can vouch.
+  EXPECT_EQ(b.cell(0).known_by, robotBit(0) | robotBit(1));
+}
+
+TEST(CellWorldMerge, IsIdempotent) {
+  CellWorld a = makeWorld();
+  CellWorld b;
+  ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 1),
+            "");
+  selfCover(a, 0);
+  selfExplore(a, 5);
+  const std::vector<CellWorld::WireCell> msg = a.toWire();
+
+  b.mergeWire(0, msg);
+  std::vector<CellStatus> after1;
+  std::vector<uint32_t> mask1;
+  for (int i = 0; i < b.size(); ++i) {
+    after1.push_back(b.status(i));
+    mask1.push_back(b.cell(i).known_by);
+  }
+  // Full state, not deltas: replaying the same message must be a no-op, which
+  // is what makes a dropped or duplicated message cost latency and nothing
+  // else. Three replays, because a merge that alternated would pass on one.
+  for (int k = 0; k < 3; ++k) {
+    const CellWorld::MergeStats st = b.mergeWire(0, msg);
+    EXPECT_EQ(st.applied, 0) << "replay " << k << " changed a status";
+    EXPECT_EQ(st.known_by_only, 0) << "replay " << k << " changed a mask";
+  }
+  for (int i = 0; i < b.size(); ++i) {
+    EXPECT_EQ(b.status(i), after1[static_cast<size_t>(i)]);
+    EXPECT_EQ(b.cell(i).known_by, mask1[static_cast<size_t>(i)]);
+  }
+}
+
+TEST(CellWorldMerge, NeverDowngradesFirstHandCovered) {
+  CellWorld w = makeWorld();
+  selfCover(w, 0);
+  const uint32_t uid = w.cell(0).update_id;
+
+  const CellWorld::MergeStats st = w.mergeWire(1, {wc(0, 1)});  // peer EXPLORING
+  EXPECT_EQ(st.applied, 0);
+  EXPECT_EQ(st.refused_guard, 1);
+  EXPECT_EQ(w.status(0), CellStatus::COVERED);
+  EXPECT_EQ(w.cell(0).update_id, uid) << "the merge path may not move update_id";
+}
+
+TEST(CellWorldMerge, PeerCoveredOverridesOwnExploringOutsideTheNeighbourhood) {
+  CellWorld w = makeWorld();
+  selfExplore(w, 8);
+  // Local priority centred on cell 0, which in a 3x3 grid does not reach 8.
+  const CellWorld::MergeStats st = w.mergeWire(1, {wc(8, 2)}, /*centre=*/0);
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(w.status(8), CellStatus::COVERED_BY_OTHERS);
+}
+
+TEST(CellWorldMerge, LocalPriorityRefusesInMyOwnNeighbourhood) {
+  CellWorld w = makeWorld();
+  selfExplore(w, 4);   // the centre cell of a 3x3 grid
+  const uint32_t before = w.cell(4).known_by;
+
+  const CellWorld::MergeStats st = w.mergeWire(1, {wc(4, 2, robotBit(1))},
+                                               /*centre=*/4);
+  EXPECT_EQ(st.refused_local, 1);
+  EXPECT_EQ(st.applied, 0);
+  EXPECT_EQ(w.status(4), CellStatus::EXPLORING);
+  EXPECT_EQ(w.cell(4).known_by, before)
+      << "refused ENTIRELY: crediting the peer with knowing a status we are "
+         "standing in and about to change would suppress the very "
+         "reconnection that would correct it";
+
+  // Paired control: the same claim, with the rule disabled, must land. Without
+  // this the test above would still pass against a merge that ignored peer
+  // COVERED altogether.
+  CellWorld u = makeWorld();
+  selfExplore(u, 4);
+  EXPECT_EQ(u.mergeWire(1, {wc(4, 2)}, /*centre=*/-1).applied, 1);
+  EXPECT_EQ(u.status(4), CellStatus::COVERED_BY_OTHERS);
+}
+
+TEST(CellWorldMerge, LocalPriorityCoversTheEightNeighbours) {
+  // The rule is a neighbourhood, not a single cell. Centred on 4 in a 3x3
+  // grid, every cell is a neighbour; centred on 0, cells 0,1,3,4 are.
+  CellWorld w = makeWorld();
+  int n9[9];
+  EXPECT_EQ(w.neighbourhood9(4, n9), 9);
+  EXPECT_EQ(w.neighbourhood9(0, n9), 4) << "corner: clipped to the grid";
+  EXPECT_EQ(w.neighbourhood9(-1, n9), 0);
+  EXPECT_EQ(w.neighbourhood9(99, n9), 0);
+
+  selfExplore(w, 1);   // a neighbour of 0, not 0 itself
+  EXPECT_EQ(w.mergeWire(1, {wc(1, 2)}, /*centre=*/0).refused_local, 1);
+  EXPECT_EQ(w.status(1), CellStatus::EXPLORING);
+}
+
+TEST(CellWorldMerge, MatchingStatusesComposeKnowledge) {
+  // A and B agree the cell is COVERED, and B's mask says C has it too. A must
+  // come away crediting all three — this is what lets the knowledge gate at
+  // N>=3 conclude the team is in agreement without hearing from C.
+  CellWorld w = makeWorld();
+  selfCover(w, 0);
+  EXPECT_EQ(w.cell(0).known_by, robotBit(0));
+
+  const CellWorld::MergeStats st =
+      w.mergeWire(1, {wc(0, 2, robotBit(1) | robotBit(2))});
+  EXPECT_EQ(st.known_by_only, 1);
+  EXPECT_EQ(st.applied, 0) << "agreement is not a status change";
+  EXPECT_EQ(w.status(0), CellStatus::COVERED) << "and provenance stays "
+                                                 "first-hand";
+  EXPECT_EQ(w.cell(0).known_by, robotBit(0) | robotBit(1) | robotBit(2));
+
+  // Nothing new the second time: that is agreed_noop, not a guard refusal.
+  const CellWorld::MergeStats st2 =
+      w.mergeWire(1, {wc(0, 2, robotBit(1) | robotBit(2))});
+  EXPECT_EQ(st2.agreed_noop, 1);
+  EXPECT_EQ(st2.known_by_only, 0);
+}
+
+TEST(CellWorldMerge, AdoptionResetsTheMaskInsteadOfComposing) {
+  // The deliberate asymmetry with the test above. Adopting a status is already
+  // taking the peer's word for the status; crediting the peer's third parties
+  // on top would compound two levels of hearsay, and over-crediting is the
+  // direction that silently disables the knowledge gate.
+  CellWorld w = makeWorld();
+  const CellWorld::MergeStats st =
+      w.mergeWire(1, {wc(0, 2, robotBit(1) | robotBit(2) | robotBit(3))});
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(w.cell(0).known_by, robotBit(0) | robotBit(1))
+      << "only the two robots that can vouch for this status";
+}
+
+TEST(CellWorldMerge, ARetractionFromTheSourceIsHonoured) {
+  // Peer 1 said COVERED, then its own hysteresis released the cell and it now
+  // says EXPLORING. Full-state broadcast means that retraction is what
+  // arrives; refusing it would leave our view of peer 1 permanently unable to
+  // come back down.
+  CellWorld w = makeWorld();
+  ASSERT_EQ(w.mergeWire(1, {wc(0, 2)}).applied, 1);
+  ASSERT_EQ(w.status(0), CellStatus::COVERED_BY_OTHERS);
+  ASSERT_TRUE(maskHas(w.cell(0).known_by, 1));
+
+  const CellWorld::MergeStats st = w.mergeWire(1, {wc(0, 1)});
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(w.status(0), CellStatus::EXPLORING_BY_OTHERS);
+}
+
+TEST(CellWorldMerge, AThirdPartyCannotUndoSomeoneElsesCovered) {
+  // The same shape as the test above, from a robot that is NOT in the mask.
+  // This is the case the plan's table would have applied unconditionally; here
+  // it is a disagreement between two second-hand sources, and the
+  // more-explored ordering settles it so that reordering cannot regress the
+  // census. At N=2 this branch is unreachable, which is why it needs its own
+  // test rather than a smoke run.
+  CellWorld w = makeWorld();
+  ASSERT_EQ(w.mergeWire(1, {wc(0, 2)}).applied, 1);
+  ASSERT_EQ(w.status(0), CellStatus::COVERED_BY_OTHERS);
+  ASSERT_FALSE(maskHas(w.cell(0).known_by, 2));
+
+  const CellWorld::MergeStats st = w.mergeWire(2, {wc(0, 1)});
+  EXPECT_EQ(st.applied, 0);
+  EXPECT_EQ(st.refused_guard, 1);
+  EXPECT_EQ(w.status(0), CellStatus::COVERED_BY_OTHERS);
+}
+
+TEST(CellWorldMerge, NoRegressionUnderInterleavedLoss) {
+  // The plan's no-regression property. Two peers publish full state; messages
+  // are delivered in every order and some are dropped. The COVERED count must
+  // be monotone non-decreasing across the whole schedule — loss and reordering
+  // may DELAY the census, never regress it.
+  CellWorld a = makeWorld(), b = makeWorld(), c = makeWorld();
+  ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 1), "");
+  ASSERT_EQ(c.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), 2), "");
+  selfCover(b, 1);
+  const std::vector<CellWorld::WireCell> early_b = b.toWire();
+  selfCover(b, 2);
+  const std::vector<CellWorld::WireCell> late_b = b.toWire();
+  selfCover(c, 3);
+  const std::vector<CellWorld::WireCell> msg_c = c.toWire();
+
+  // Deliver late-then-early (reordered), c in the middle, early_b twice.
+  const std::vector<std::pair<int, const std::vector<CellWorld::WireCell>*>>
+      schedule = {{1, &late_b}, {2, &msg_c},   {1, &early_b},
+                  {1, &early_b}, {2, &msg_c},  {1, &late_b}};
+  int covered = 0;
+  for (const auto& [sender, msg] : schedule) {
+    a.mergeWire(sender, *msg);
+    const CellWorld::Census cen = a.census();
+    const int now = cen.covered + cen.covered_by_others;
+    EXPECT_GE(now, covered) << "the census regressed under reordering";
+    covered = now;
+  }
+  EXPECT_EQ(covered, 3) << "and it still converged to everything sent";
+}
+
+TEST(CellWorldMerge, RefusesRatherThanSilentlyDoingNothing) {
+  CellWorld w = makeWorld();      // self id 0
+  EXPECT_NE(w.mergeWire(-1, {wc(0, 2)}).refused, "");
+  EXPECT_NE(w.mergeWire(kMaxTeamSize, {wc(0, 2)}).refused, "");
+  EXPECT_NE(w.mergeWire(0, {wc(0, 2)}).refused, "")
+      << "our own relayed census must not re-enter through the path that does "
+         "not bump update_id";
+  CellWorld unconf;
+  EXPECT_NE(unconf.mergeWire(1, {wc(0, 2)}).refused, "");
+  // A refusal examines nothing, and says so, so a caller cannot read a
+  // zero-count refusal as a peer that agreed with us.
+  EXPECT_EQ(w.mergeWire(0, {wc(0, 2)}).examined(), 0);
+  EXPECT_EQ(w.status(0), CellStatus::UNSEEN);
+}
+
+TEST(CellWorldMerge, CountsGarbageRatherThanCoercingIt) {
+  CellWorld w = makeWorld();
+  const CellWorld::MergeStats st =
+      w.mergeWire(1, {wc(0, 3), wc(1, 4), wc(99, 2), wc(2, 2)});
+  EXPECT_EQ(st.bad_status, 2) << "3 and 4 are the local-only statuses: a peer "
+                                 "sending them did not normalise";
+  EXPECT_EQ(st.out_of_range, 1);
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(st.examined(), 4);
+  EXPECT_EQ(w.status(0), CellStatus::UNSEEN) << "not coerced into something";
+  EXPECT_EQ(w.status(1), CellStatus::UNSEEN);
+}
+
+TEST(CellWorldMerge, PeerUnseenChangesNothing) {
+  CellWorld w = makeWorld();
+  selfExplore(w, 0);
+  const CellWorld::MergeStats st = w.mergeWire(1, {wc(0, 0)});
+  EXPECT_EQ(st.applied, 0);
+  EXPECT_EQ(w.status(0), CellStatus::EXPLORING)
+      << "a robot that has not seen a cell is not evidence that nobody has";
+}
+
+TEST(CellWorldMerge, SelfObservationReclaimsProvenanceAndResetsTheMask) {
+  // Merge then observe: the relayed belief is upgraded to first-hand, which is
+  // a committed change, so update_id moves and the mask collapses to self.
+  CellWorld w = makeWorld();
+  ASSERT_EQ(w.mergeWire(1, {wc(0, 2, robotBit(1) | robotBit(2))}).applied, 1);
+  ASSERT_EQ(w.cell(0).known_by, robotBit(0) | robotBit(1));
+  selfCover(w, 0);
+  EXPECT_EQ(w.status(0), CellStatus::COVERED);
+  EXPECT_EQ(w.cell(0).update_id, 1u);
+  EXPECT_EQ(w.cell(0).known_by, robotBit(0));
+}
+
+TEST(CellWorldIntercept, ShrinksAsTheCellsThePeerKnewAboutChange) {
+  CellWorld w = makeWorld();
+  // Peer 1 tells us about three cells; we now believe it knows those three.
+  ASSERT_EQ(w.mergeWire(1, {wc(0, 1), wc(1, 1), wc(2, 1)}).applied, 3);
+  EXPECT_EQ(w.interceptCandidates(1).size(), 3u);
+  // Self is in the known_by of every cell just adopted, so without the
+  // self-id guard this would be the whole search list for the one robot that
+  // cannot be missing.
+  EXPECT_TRUE(w.interceptCandidates(0).empty());
+
+  // One of them is finished by us. Nobody is working there any more, so it is
+  // no longer somewhere to look for a missing peer.
+  selfCover(w, 0);
+  EXPECT_EQ(w.interceptCandidates(1).size(), 2u);
+
+  // And a cell whose status we CHANGED drops the peer from its mask entirely
+  // (rule 2), which is the whole reason this list can shrink to nothing.
+  selfExplore(w, 1);
+  const std::vector<int> left = w.interceptCandidates(1);
+  ASSERT_EQ(left.size(), 1u);
+  EXPECT_EQ(left[0], 2);
+  selfCover(w, 2);
+  EXPECT_TRUE(w.interceptCandidates(1).empty()) << "nowhere left to look";
+
+  EXPECT_TRUE(w.interceptCandidates(-1).empty()) << "no bit, no claim";
+  EXPECT_TRUE(w.interceptCandidates(kMaxTeamSize).empty());
+}

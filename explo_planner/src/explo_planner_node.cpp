@@ -57,6 +57,7 @@
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <scovox_msgs/msg/refinement_region.hpp>
 #include <explo_planner_msgs/msg/robot_intent.hpp>
+#include <explo_planner_msgs/msg/team_world.hpp>
 #include <explo_planner_msgs/msg/tree_target.hpp>
 #include <tf2/utils.h>
 #include <tf2_ros/buffer.h>
@@ -76,6 +77,7 @@
 #include "explo_planner/failed_goal_blacklist.hpp"
 #include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/cell_world.hpp"
+#include "explo_planner/team_model.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -505,6 +507,21 @@ private:
   /// Draw the cell world as a flat colour-coded grid on its own topic.
   void publishCellViz();
 
+  /// Broadcast this robot's whole cell census, comms mask and gossip. Called
+  /// from the `team_world_hz_` timer, and from nowhere else — the exchange is
+  /// deliberately NOT piggybacked on the planning tick, because a planner that
+  /// stops publishing its world while it is busy planning is a planner whose
+  /// peers conclude it went silent exactly when it had most to say.
+  void publishTeamWorld();
+  /// Drain `team_world_pending_` into the cell world and the comms model, then
+  /// advance the comms model's clock once. Called once per tick, from the tick.
+  ///
+  /// Once per TICK and not once per message: closure is a property of the
+  /// whole contact graph, so recomputing it per arriving message would produce
+  /// as many different answers per second as there are peers publishing, and
+  /// which one a consumer saw would depend on when it happened to look.
+  void drainTeamWorld();
+
   /// Standing / sightline height for an exploitation point at (x, y). Flat
   /// mode returns the fixed absolute vantage height. Terrain mode snaps to the
   /// local ground + candidate clearance, the same way exploration candidates
@@ -528,6 +545,55 @@ private:
   // path. See cell_world.hpp.
   bool       cell_world_enable_ = false;
   CellWorld  cell_world_;
+  // TeamWorld exchange (P2). `team_world_hz_` IS the switch: 0 = off, and off
+  // means no publisher, no subscription, no timer, no comms model and no
+  // event — the node is the P1 node exactly. Requires the cell world (the
+  // message carries its census) and a configured fleet identity (every mask in
+  // it is indexed by numeric id); both are checked at startup and are fatal
+  // rather than degrading, because a TeamWorld with no ids would merge every
+  // peer's census under robot bit zero.
+  double     team_world_hz_ = 0.0;
+  TeamModel  team_model_;
+  bool       team_merge_local_priority_ = true;
+  std::string team_world_pub_topic_;
+  std::vector<std::string> team_world_sub_topics_;
+  rclcpp::Publisher<explo_planner_msgs::msg::TeamWorld>::SharedPtr
+      team_world_pub_;
+  std::vector<rclcpp::Subscription<explo_planner_msgs::msg::TeamWorld>::SharedPtr>
+      team_world_subs_;
+  rclcpp::TimerBase::SharedPtr team_world_timer_;
+  /// Newest undrained message per sender id, with its local receipt time and
+  /// how many earlier ones it superseded.
+  ///
+  /// Newest-only is safe BECAUSE the message is full state: an older census
+  /// contains nothing the newer one lacks, so coalescing costs no information
+  /// (it does cost the record, which is why the count is kept and logged).
+  /// The subscription callback does nothing but write here — a 400-cell merge
+  /// inside a callback would run on the single-threaded executor between
+  /// planning passes, and the claim-grace episode is the standing evidence for
+  /// what that does to the other subscriptions.
+  struct PendingTeamWorld {
+    explo_planner_msgs::msg::TeamWorld::SharedPtr msg;
+    rclcpp::Time received;
+    int superseded = 0;
+  };
+  std::map<int, PendingTeamWorld> team_world_pending_;
+  /// Mission-elapsed baseline: sim seconds at the first tick with a live
+  /// clock, -1 before that. TeamWorld's two scheduling quantities are defined
+  /// as mission-elapsed and not as absolute stamps, and float32 makes that
+  /// mandatory rather than stylistic — an absolute epoch stamp in a float32
+  /// quantises to ~128 s, which would round every freshness measure this
+  /// subsystem makes into uselessness on a real robot.
+  ///
+  /// Kept here rather than read from exp_log_->t0Sec() so the comms model does
+  /// not silently change behaviour when the event log is switched off.
+  double     mission_t0_sec_ = -1.0;
+  /// Sim seconds since mission_t0_sec_, or -1 before the clock is live.
+  /// LATCHES the baseline on its first call with a live clock, which is why it
+  /// is not const: the publish timer and the tick both need the mission clock
+  /// and either can be the first to fire, so a baseline set in only one of
+  /// them would be a startup-order dependency nothing would ever notice.
+  double     missionElapsed();
   double     cell_census_period_s_ = 5.0;
   /// Sim-time stamp of the last census, -1 = none yet.
   double     last_cell_census_sec_ = -1.0;
@@ -3101,6 +3167,95 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
 
+  // --- TeamWorld exchange + comms model (P2, plan §3.2/§3.3) --------------
+  //
+  // `team_world_hz` is the switch and 0.0 is off, which is the shipped
+  // default: at 0 nothing below is created and the node cannot be
+  // distinguished from its P1 parent by any observable this branch's
+  // equivalence gate reads.
+  //
+  // The two prerequisites are hard failures, not degradations. Without the
+  // cell world there is no census to send; without fleet identity `self_id` is
+  // -1, so every mask this robot published would be empty and every peer's
+  // census would merge under a sender id it does not have. Both of those
+  // produce a fleet that looks like it is sharing and is not, which is the
+  // single most expensive failure mode this whole plan exists to remove.
+  team_world_hz_ = dp("team_world_hz", 0.0);
+  if (team_world_hz_ > 0.0) {
+    if (!cell_world_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "team_world_hz=%.3f but cell_world_enable=false: the TeamWorld "
+          "message IS the cell census, so there would be nothing to send.",
+          team_world_hz_);
+      throw std::runtime_error("team_world_hz requires cell_world_enable");
+    }
+    const std::string idw = requireFleetIdentity(fleet_, "team_world_hz");
+    if (!idw.empty()) {
+      RCLCPP_FATAL(get_logger(), "%s", idw.c_str());
+      throw std::runtime_error(idw);
+    }
+    TeamModel::Config tmc;
+    // Defaults to the intent-claim TTL rather than a number of its own: the
+    // two answer the same question ("is this peer still there?") off two
+    // streams published at similar rates, and two independently-tuned
+    // liveness clocks would let peer_lost and LOST_COMMS disagree about the
+    // same outage, in a log where both are written.
+    tmc.direct_ttl_sec     = dp("team_comms_ttl_sec", coord_claim_ttl_sec_);
+    tmc.closure_enabled    = dp("team_comms_closure", true);
+    tmc.gossip_max_age_sec = dp("team_gossip_max_age_sec", 120.0);
+    const std::string terr = team_model_.configure(fleet_, tmc);
+    if (!terr.empty()) {
+      RCLCPP_FATAL(get_logger(), "team_model: %s", terr.c_str());
+      throw std::runtime_error("team_model: " + terr);
+    }
+    // mTARE's local-priority rule: while this robot is standing in a cell and
+    // exploring it, a peer's claim about that cell is refused. On by default
+    // because the alternative — accepting it — silently credits the peer with
+    // knowing a status we are about to change.
+    team_merge_local_priority_ = dp("cell_merge_local_priority", true);
+
+    // Split pub/sub, mirroring the intent stream exactly. The emulator gates a
+    // stream by relaying it per-link, which it can only do if the publisher
+    // and the subscribers are on different topics; a run that silently fell
+    // back to a shared bus would show perfect comms in an arm meant to have
+    // none, and would look like a null result rather than a plumbing fault.
+    team_world_pub_topic_ =
+        resolve_topic(dp("team_world_pub_topic", std::string("")));
+    if (team_world_pub_topic_.empty())
+      team_world_pub_topic_ = "/exploration/team_world";
+    team_world_sub_topics_ =
+        dp("team_world_sub_topics", std::vector<std::string>{});
+    for (auto& t : team_world_sub_topics_) t = resolve_topic(t);
+    team_world_sub_topics_.erase(
+        std::remove(team_world_sub_topics_.begin(),
+                    team_world_sub_topics_.end(), std::string("")),
+        team_world_sub_topics_.end());
+    if (team_world_sub_topics_.empty())
+      team_world_sub_topics_ = {team_world_pub_topic_};
+  }
+  if (exp_log_) {
+    // Written even when off, for the reason the cell-world block is: a run
+    // record must say the feature EXISTED and was disabled, or an equivalence
+    // control run is indistinguishable from a run of a binary that never had
+    // the knob.
+    exp_log_->addParamNum("team_world_hz", team_world_hz_);
+    if (team_world_hz_ > 0.0) {
+      exp_log_->addParamNum("team_comms_ttl_sec",
+                            team_model_.config().direct_ttl_sec);
+      exp_log_->addParamBool("team_comms_closure",
+                             team_model_.config().closure_enabled);
+      exp_log_->addParamNum("team_gossip_max_age_sec",
+                            team_model_.config().gossip_max_age_sec);
+      exp_log_->addParamBool("cell_merge_local_priority",
+                             team_merge_local_priority_);
+      exp_log_->addParamStr("team_world_pub_topic", team_world_pub_topic_);
+      std::string subs;
+      for (const auto& t : team_world_sub_topics_)
+        subs += (subs.empty() ? "" : ",") + t;
+      exp_log_->addParamStr("team_world_sub_topics", subs);
+    }
+  }
+
   // The dscovox mapping node fuses every robot's voxels (multi-robot
   // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
   // subscribe with the matching latched QoS (KeepLast(1) reliable +
@@ -3245,6 +3400,66 @@ ExploPlannerNode::ExploPlannerNode()
         (coord_intent_sub_topics_.size() == 1 &&
          coord_intent_sub_topics_[0] == coord_intent_pub_topic_)
             ? " (shared bus: no external process can gate this stream)" : "");
+  }
+
+  // --- TeamWorld pub/sub. Nothing is created when the switch is off, so a
+  //     defaults run does not even advertise the topic.
+  if (team_world_hz_ > 0.0) {
+    // KeepLast(2), not (8) like intents. Full state means an older message
+    // carries nothing a newer one lacks, so a deep queue would only buy the
+    // right to merge stale censuses after the fresh one — work that changes
+    // nothing and delays the drain. Two, not one, so a message arriving while
+    // the executor is inside a planning pass is not dropped by the middleware
+    // before the copy-only callback ever runs.
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(2)).reliable();
+    team_world_pub_ = create_publisher<explo_planner_msgs::msg::TeamWorld>(
+        team_world_pub_topic_, qos);
+    auto on_team_world =
+        [this](explo_planner_msgs::msg::TeamWorld::SharedPtr msg) {
+          // COPY ONLY. Everything that could take time — the config check, the
+          // merge, the comms recompute, the event — happens in drainTeamWorld
+          // on the tick. See PendingTeamWorld.
+          const int sid = static_cast<int>(msg->robot_id);
+          // Our own broadcast, looped back by a shared bus. Dropped here
+          // rather than in the merge so it never occupies the single pending
+          // slot a real peer would have used.
+          if (sid == fleet_.self_id) return;
+          auto& slot = team_world_pending_[sid];
+          if (slot.msg) ++slot.superseded;
+          slot.msg      = msg;
+          slot.received = this->now();
+        };
+    for (const auto& topic : team_world_sub_topics_) {
+      team_world_subs_.push_back(
+          create_subscription<explo_planner_msgs::msg::TeamWorld>(
+              topic, qos, on_team_world));
+    }
+    // On its own timer rather than the planning tick: a robot that stops
+    // publishing its world while it is busy planning goes silent from its
+    // peers' point of view at exactly the moment it has most to say, and the
+    // TTL cannot tell that apart from a radio outage.
+    // SIM clock, like every other timer in this node. A wall timer would pace
+    // the broadcast in real seconds while direct_ttl_sec is measured in sim
+    // seconds off this->now(), so at RTF 0.3 a healthy peer publishing at
+    // "1 Hz" would arrive every 3.3 sim-seconds and a 5 s TTL would be one
+    // dropped message from declaring it lost.
+    auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / team_world_hz_));
+    team_world_timer_ = rclcpp::create_timer(
+        this, get_clock(), period, [this]() { publishTeamWorld(); });
+    std::string subs;
+    for (const auto& t : team_world_sub_topics_)
+      subs += (subs.empty() ? "" : ", ") + t;
+    RCLCPP_INFO(get_logger(),
+        "TeamWorld: %.2f Hz, pub '%s' -> sub [%s]%s; comms ttl %.1fs, "
+        "closure %s, gossip max age %.0fs",
+        team_world_hz_, team_world_pub_topic_.c_str(), subs.c_str(),
+        (team_world_sub_topics_.size() == 1 &&
+         team_world_sub_topics_[0] == team_world_pub_topic_)
+            ? " (shared bus: no external process can gate this stream)" : "",
+        team_model_.config().direct_ttl_sec,
+        team_model_.config().closure_enabled ? "on" : "off",
+        team_model_.config().gossip_max_age_sec);
   }
 
   // --- Link-state gate wiring (§30.11). Only two fields of the emulator's
@@ -3746,6 +3961,16 @@ void ExploPlannerNode::tick() {
 
   updatePoseFromTF();
   trackDistance();
+
+  // Fold in whatever TeamWorld arrived since the last tick and advance the
+  // comms model's clock. AFTER updatePoseFromTF because the local-priority
+  // rule is anchored on the cell this robot is standing in, and a merge run
+  // against last tick's pose defends the ground the robot has just left.
+  // BEFORE the state dispatch so a planning pass this tick sees the merged
+  // census rather than one that is a tick behind — and unconditionally, ahead
+  // of the proximity-hold return below, because a held robot is exactly the
+  // one whose peers most need it to keep tracking them.
+  drainTeamWorld();
 
   // Any tick spent outside PLAN ends an all-rejected episode. The counter must
   // be cleared here and not only where a goal is finally selected: doPlan has
@@ -9500,6 +9725,7 @@ void ExploPlannerNode::updateCellWorld(double roi_unknown_fraction,
   ev.nx                   = cell_world_.grid().nx;
   ev.ny                   = cell_world_.grid().ny;
   ev.grid_hash            = cell_world_.grid().configHash();
+  ev.shared_hash          = cell_world_.sharedHash();
 
   // Commits and edges in one sweep over the unordered neighbour pairs. Only
   // the +x, +y and the two diagonals are visited, so each edge is counted
@@ -9628,6 +9854,312 @@ void ExploPlannerNode::publishCellViz() {
   }
 
   cell_viz_pub_->publish(ma);
+}
+
+// ==================================================================
+// TeamWorld exchange (P2)
+// ==================================================================
+
+double ExploPlannerNode::missionElapsed() {
+  if (mission_t0_sec_ < 0.0) {
+    // The same guard startExperimentLog uses, for the same reason: under
+    // use_sim_time this->now() reads exactly 0 until the first /clock message
+    // lands, and a baseline of 0 would make every mission-elapsed quantity
+    // this subsystem publishes an absolute sim time wearing a relative name —
+    // which a float32 then quantises to ~128 s and destroys.
+    const auto now = this->now();
+    if (now.nanoseconds() <= 0) return -1.0;
+    mission_t0_sec_ = now.seconds();
+  }
+  // Clamped at 0 rather than allowed negative. A sim clock that jumps
+  // backwards (a reset simulator) would otherwise hand out negative elapsed
+  // times, which TeamModel::observe refuses outright — so the whole exchange
+  // would go silent on a condition that ought to cost one tick.
+  return std::max(0.0, this->now().seconds() - mission_t0_sec_);
+}
+
+void ExploPlannerNode::publishTeamWorld() {
+  if (!team_world_pub_ || !cell_world_.configured()) return;
+
+  const double t = missionElapsed();
+  if (t < 0.0) return;   // clock not live yet; nothing can be dated
+
+  // No pose, no publish. `position` is a mandatory field and is the
+  // allocator's vehicle-start for this robot; the message has no way to say
+  // "unknown", so publishing before the first TF would put this robot at the
+  // map origin in every peer's world model — and it would be a plausible
+  // position, arriving on a healthy link, that nothing downstream could tell
+  // from a real one. A few seconds of silence at startup is the cheaper error.
+  if (!have_pose_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "TeamWorld: not publishing yet — no pose. The message cannot express "
+        "'position unknown', so an early publish would place this robot at "
+        "the map origin for the whole fleet.");
+    return;
+  }
+
+  explo_planner_msgs::msg::TeamWorld m;
+  // Diagnostic only, as the message header says. Nothing times anything off
+  // it; the two scheduling quantities below are mission-elapsed.
+  m.header.stamp    = this->now();
+  m.header.frame_id = map_frame_;
+  m.robot_id  = static_cast<uint8_t>(fleet_.self_id);
+  m.team_hash = fleet_.team_hash;
+  m.grid_hash = cell_world_.grid().configHash();
+  m.position.x = latest_pos_.x();
+  m.position.y = latest_pos_.y();
+  m.position.z = latest_pos_.z();
+
+  // directMask(), NOT inCommsMask(). Publishing the closure result would make
+  // the handshake circular: A would claim to hear C because B said C was
+  // reachable, C would conclude the same about A from its own copy of the same
+  // relay, and the mutual test that exists to catch one-way contact would pass
+  // with neither having heard the other. See TeamModel::inCommsMask.
+  m.in_range_mask = team_model_.directMask();
+
+  const std::vector<CellWorld::WireCell> wire = cell_world_.toWire();
+  m.cells.reserve(wire.size());
+  for (const CellWorld::WireCell& w : wire) {
+    explo_planner_msgs::msg::CellState c;
+    c.id        = w.id;
+    c.status    = w.status;
+    c.known_by  = w.known_by;
+    c.update_id = w.update_id;
+    m.cells.push_back(c);
+  }
+
+  // P3 and P5 fields, written explicitly at their "absent" values rather than
+  // left to the struct's zero-init. -1 is the documented no-proposal encoding
+  // and 0 is a valid cell id; leaving it defaulted would broadcast a standing
+  // proposal to meet in cell 0 at mission time zero the moment P5's consumer
+  // lands, and it would be a receiver-side bug when it was written here.
+  m.my_tour.clear();
+  m.rendezvous_cell_id  = -1;
+  m.rendezvous_time_sec = -1.0f;
+
+  // The done LATCH, not State::DONE. DONE is reached at the end of the
+  // mission-return leg, minutes after this robot's map stopped gaining, and a
+  // peer keyed on it would keep planning around a robot that had already
+  // finished exploring. Under done_criterion=streak this stays false for the
+  // whole run — that criterion has no latch to report — which is honest and
+  // costs only the optimisation a `finished` peer would have enabled.
+  m.finished = coverage_latched_;
+
+  // --- gossip ---------------------------------------------------------
+  //
+  // Sized to the fleet and indexed by id ALWAYS, including where nothing is
+  // known: the receiver's length check reads a short array as "the sender is
+  // running a smaller team definition" and refuses the whole message. Absence
+  // is expressed by a negative last-heard, not by a missing entry.
+  const size_t n = static_cast<size_t>(fleet_.size());
+  m.robot_positions.assign(n, geometry_msgs::msg::Point());
+  m.robot_last_heard_sec.assign(n, -1.0f);
+  for (size_t i = 0; i < n; ++i) {
+    const int id = static_cast<int>(i);
+    if (id == fleet_.self_id) {
+      // Our own entry is our publish time, and it is the reference point the
+      // whole array is read against — the receiver recovers each peer's age as
+      // (our entry - that entry), an interval, which is the only thing that
+      // transfers between two mission clocks that started at different wall
+      // times. Without it the array is uninterpretable and is dropped whole.
+      m.robot_positions[i]      = m.position;
+      m.robot_last_heard_sec[i] = static_cast<float>(t);
+      continue;
+    }
+    const TeamModel::Peer& p = team_model_.peer(id);
+    // last_direct_sec, not last_known_sec: the field is defined as DIRECT
+    // contact, which bounds relay to a single hop and keeps this consistent
+    // with closure's two-hop bound. Relaying our own second-hand knowledge
+    // would extend position gossip further than status can reach, so a
+    // consumer would hold a position for a robot the model cannot place.
+    //
+    // Position and freshness are published as a PAIR or not at all. The wire
+    // has no "fresh but positionless" encoding — the receiver validates a
+    // position by its matching last-heard being non-negative — so a lone
+    // freshness entry would hand the peer (0, 0, 0) as a real position.
+    if (p.last_direct_sec >= 0.0 && p.have_position && p.position_first_hand) {
+      m.robot_last_heard_sec[i] = static_cast<float>(p.last_direct_sec);
+      m.robot_positions[i].x    = p.position_x;
+      m.robot_positions[i].y    = p.position_y;
+      m.robot_positions[i].z    = p.position_z;
+    }
+  }
+
+  team_world_pub_->publish(m);
+}
+
+void ExploPlannerNode::drainTeamWorld() {
+  if (!team_model_.configured() || !cell_world_.configured()) return;
+
+  const double t = missionElapsed();
+  // Before the clock is live nothing can be dated, and TeamModel refuses a
+  // non-finite or negative receipt time outright. The pending slots are LEFT
+  // rather than dropped: they are full state, so the first tick with a live
+  // clock merges them intact and loses only the (zero) elapsed time.
+  if (t < 0.0) return;
+
+  std::map<int, PendingTeamWorld> batch;
+  batch.swap(team_world_pending_);
+
+  // One row per drained message, filled in two passes: the merge fields here,
+  // the comms fields after the single tick below. The split IS the design —
+  // closure is a property of the whole contact graph, so a comms picture
+  // recomputed per message would give every row a different answer to the same
+  // question and which row a reader believed would be an accident of arrival
+  // order. See the declaration and TeamModel::tick.
+  std::vector<TeamExchangeEvent> rows;
+  rows.reserve(batch.size());
+
+  for (auto& kv : batch) {
+    const int sid = kv.first;
+    const explo_planner_msgs::msg::TeamWorld& msg = *kv.second.msg;
+
+    TeamExchangeEvent e;
+    e.peer_id       = sid;
+    e.peer          = fleet_.nameOf(sid);
+    e.coalesced     = kv.second.superseded;
+    e.queue_age_sec =
+        std::max(0.0, this->now().seconds() - kv.second.received.seconds());
+    e.cells_in_msg  = static_cast<int>(msg.cells.size());
+    e.peer_in_range_mask = msg.in_range_mask;
+
+    // --- config checks, before anything is believed -------------------
+    //
+    // Both are hard drops rather than partial merges. A mismatched fleet or
+    // grid does not corrupt the data in a way the data can show: every id is
+    // in range, every status is valid, and the merge succeeds — onto the wrong
+    // ground, or crediting the wrong robot. There is no degraded mode here
+    // that is better than not listening.
+    if (sid < 0 || sid >= fleet_.size()) {
+      e.drop_reason = "sender_id_out_of_fleet";
+    } else if (msg.team_hash != fleet_.team_hash) {
+      e.drop_reason = "team_hash_mismatch";
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 30000,
+          "TeamWorld from robot %d: team_hash 0x%08x != ours 0x%08x — that "
+          "fleet's robot ids and mask bits address different robots than "
+          "ours. Dropping every message from it.",
+          sid, msg.team_hash, fleet_.team_hash);
+    } else if (msg.grid_hash != cell_world_.grid().configHash()) {
+      e.drop_reason = "grid_hash_mismatch";
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 30000,
+          "TeamWorld from %s: grid_hash 0x%08x != ours 0x%08x — its cell ids "
+          "name different ground than ours (different ROI or cell size). "
+          "Dropping; merging would be a confident census of the wrong map.",
+          e.peer.c_str(), msg.grid_hash, cell_world_.grid().configHash());
+    }
+
+    if (e.drop_reason.empty()) {
+      // --- comms model ------------------------------------------------
+      TeamModel::Observation o;
+      o.sender_id     = sid;
+      o.in_range_mask = msg.in_range_mask;
+      o.finished      = msg.finished;
+      o.have_position = true;   // mandatory field; the sender withholds the
+                                // whole message rather than send a fake pose
+      o.x = msg.position.x;
+      o.y = msg.position.y;
+      o.z = msg.position.z;
+      o.last_heard_sec.reserve(msg.robot_last_heard_sec.size());
+      for (float v : msg.robot_last_heard_sec)
+        o.last_heard_sec.push_back(static_cast<double>(v));
+      const size_t gn = msg.robot_positions.size();
+      o.gx.resize(gn); o.gy.resize(gn); o.gz.resize(gn);
+      // The wire carries no have_gossip_pos flag; the message defines a
+      // position as meaningful exactly when its matching last-heard is
+      // non-negative, so that test IS the flag and is reconstructed here.
+      o.have_gossip_pos.assign(gn, 0u);
+      for (size_t k = 0; k < gn; ++k) {
+        o.gx[k] = msg.robot_positions[k].x;
+        o.gy[k] = msg.robot_positions[k].y;
+        o.gz[k] = msg.robot_positions[k].z;
+        o.have_gossip_pos[k] =
+            (k < msg.robot_last_heard_sec.size() &&
+             msg.robot_last_heard_sec[k] >= 0.0f) ? 1u : 0u;
+      }
+      const std::string err = team_model_.observe(o, t);
+      if (!err.empty()) {
+        // The model refused it, so the cell world must not merge it either:
+        // the refusals are all statements that this sender's ids do not mean
+        // what ours do, and that applies to cell ids as much as robot ids.
+        e.drop_reason = "team_model: " + err;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+            "TeamWorld from %s refused by the comms model: %s",
+            e.peer.c_str(), err.c_str());
+      }
+    }
+
+    if (e.drop_reason.empty()) {
+      // --- cell world merge -------------------------------------------
+      std::vector<CellWorld::WireCell> wire;
+      wire.reserve(msg.cells.size());
+      for (const auto& c : msg.cells) {
+        CellWorld::WireCell w;
+        w.id        = c.id;
+        w.status    = c.status;
+        w.known_by  = c.known_by;
+        w.update_id = c.update_id;
+        wire.push_back(w);
+      }
+      // Local priority is anchored on the cell we are STANDING IN, recomputed
+      // per drain rather than cached: the rule is "the robot is here and the
+      // peer is not", and a stale centre would defend ground this robot left
+      // while conceding the ground it is actually working. -1 outside the ROI
+      // (idAt's out-of-range answer), which disables the rule — correctly, a
+      // robot off the map has no neighbourhood to claim.
+      const int centre =
+          team_merge_local_priority_
+              ? cell_world_.grid().idAt(latest_pos_.x(), latest_pos_.y())
+              : -1;
+      const CellWorld::MergeStats st = cell_world_.mergeWire(sid, wire, centre);
+      e.drop_reason    = st.refused;   // "" unless refused wholesale
+      e.applied        = st.applied;
+      e.known_by_only  = st.known_by_only;
+      e.agreed_noop    = st.agreed_noop;
+      e.refused_guard  = st.refused_guard;
+      e.refused_local  = st.refused_local;
+      e.out_of_range   = st.out_of_range;
+      e.bad_status     = st.bad_status;
+    }
+
+    rows.push_back(std::move(e));
+  }
+
+  // Once, for the whole batch, and unconditionally — including when the batch
+  // was empty. TTL expiry is a function of time, not of arrivals: a model that
+  // only advanced when a message came in could never notice that they stopped,
+  // which is the one thing it exists to notice.
+  team_model_.tick(t);
+
+  if (!exp_log_ || rows.empty()) return;
+
+  // Second pass. Every row gets the SAME post-tick comms picture, which is the
+  // one every other consumer will read this tick.
+  const CellWorld::Census cs = cell_world_.census();
+  const uint32_t self_mask   = team_model_.directMask();
+  const int lost             = team_model_.lostCount();
+  for (TeamExchangeEvent& e : rows) {
+    if (e.peer_id >= 0 && e.peer_id < team_model_.size()) {
+      const TeamModel::Peer& p = team_model_.peer(e.peer_id);
+      e.in_comms  = p.status == CommsStatus::IN_COMMS;
+      e.direct    = p.direct;
+      e.one_way   = p.heard_one_way;
+      e.via_relay = p.via_relay;
+      e.last_direct_age_sec = team_model_.lastDirectAgeSec(e.peer_id, t);
+      e.last_known_age_sec  = team_model_.lastKnownAgeSec(e.peer_id, t);
+    }
+    e.peers_lost      = lost;
+    e.self_direct_mask = self_mask;
+    // The census that this merge produced, on the same line as the merge. A
+    // convergence check ("did both robots' worlds agree after the dropout
+    // healed?") is then a read of one field per robot, rather than a join of
+    // two robots' files on a timestamp neither of them shares.
+    e.covered_fraction    = cs.coveredFraction();
+    e.covered             = cs.covered;
+    e.covered_by_others   = cs.covered_by_others;
+    e.exploring           = cs.exploring;
+    e.exploring_by_others = cs.exploring_by_others;
+    exp_log_->logTeamExchange(expCtx(), e);
+  }
 }
 
 } // namespace explo_planner

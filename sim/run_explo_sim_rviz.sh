@@ -465,6 +465,35 @@ CELL_CENSUS_S="$(flt "${CELL_CENSUS_S:-5.0}")"
 CELL_COVERED_U="$(flt "${CELL_COVERED_U:-0.55}")"
 CELL_EXPLORING_U="$(flt "${CELL_EXPLORING_U:-0.62}")"
 CELL_FRONTIER_FRAC="$(flt "${CELL_FRONTIER_FRAC:-0.95}")"
+# --- TeamWorld exchange (M-TARE evolution, P2) ----------------------------
+# TEAM_WORLD=1 makes the robots actually SHARE the cell world: each publishes
+# its whole census at TEAM_WORLD_HZ and merges what it receives through the
+# guard table, and a comms model derives per-peer status from the mutual
+# handshake in those messages.
+#
+# OFF by default and off means NO PARAMETER IS PASSED, for the same reason
+# CELL_WORLD is gated the same way — see that block.
+#
+# Requires CELL_WORLD=1: the message IS the cell census, so the planner treats
+# the combination as fatal and refuses to start. Checked here as well, because
+# a planner that throws at construction takes both robots down several seconds
+# into a bring-up that otherwise looks normal, and the reason scrolls past in
+# two separate log files.
+#
+# Worth being explicit about what TEAM_WORLD=1 COMMS=0 measures: the exchange
+# over a perfect shared bus, i.e. both robots converging immediately and
+# staying converged. That is the right control for the merge itself, and it is
+# NOT the P2 gate — the gate needs a dropout to heal, which needs COMMS=1.
+TEAM_WORLD="${TEAM_WORLD:-0}"
+# 1 Hz: the rate the message was sized for (a few kB of full state per publish
+# at <=400 cells), and comfortably inside the default 5 s comms TTL so a single
+# dropped message is not read as a dropout.
+TEAM_WORLD_HZ="$(flt "${TEAM_WORLD_HZ:-1.0}")"
+if [ "$TEAM_WORLD" = "1" ] && [ "$CELL_WORLD" != "1" ]; then
+  echo "TEAM_WORLD=1 requires CELL_WORLD=1 (the TeamWorld message is the cell" >&2
+  echo "census, so there would be nothing to send). Set CELL_WORLD=1." >&2
+  exit 2
+fi
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.
@@ -1339,6 +1368,16 @@ if [ "$COMMS" = "1" ]; then
     COMMS_BAG_TOPICS+=( "/$r/exploration/intents"
                         "/$r/rx/$p/exploration/intents"
                         "/$r/rx/$p/scovox_node/scovox_bin" )
+    # Both ends of the exchange: what this robot SENT and what actually
+    # arrived. The pair is what makes the P2 convergence claim checkable
+    # offline — a bag of only the sent copies shows two robots that both
+    # published diligently through a blackout neither of them received across.
+    # Only when the stream exists; a topic nobody publishes just makes
+    # `ros2 bag record` warn once per run about a name it cannot find.
+    if [ "$TEAM_WORLD" = "1" ]; then
+      COMMS_BAG_TOPICS+=( "/$r/exploration/team_world"
+                          "/$r/rx/$p/exploration/team_world" )
+    fi
   done
   # /hmr_comms_sim/stats carries backlog_bytes and the drop_* counters
   # (drop_airtime, drop_ber, drop_overflow). Those are the ONLY evidence for
@@ -1433,6 +1472,11 @@ if [ "$CELL_WORLD" = "1" ]; then
   log "  ROI [-$ROI_HALF,$ROI_HALF]^2 at ${CELL_SIZE_M}m -> $(awk -v h="$ROI_HALF" -v c="$CELL_SIZE_M" 'BEGIN{n=int((2*h)/c); if (n*c < 2*h) n++; printf "%dx%d", n, n}') cells"
 else
   log "cell world OFF (CELL_WORLD=0) — no cell params passed, planner is the pre-M-TARE binary at defaults"
+fi
+if [ "$TEAM_WORLD" = "1" ]; then
+  log "team world exchange ON: ${TEAM_WORLD_HZ} Hz$([ "$COMMS" = 1 ] && echo " through the emulator" || echo " on the shared bus (COMMS=0: no dropout is possible, so this measures the merge, not the healing)")"
+else
+  log "team world exchange OFF (TEAM_WORLD=0) — no team_world params passed; the cell world is per-robot and never shared"
 fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
@@ -1541,6 +1585,12 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "cell_exploring_min_unknown=$CELL_EXPLORING_U"
   echo "cell_covered_max_frontier_frac=$CELL_FRONTIER_FRAC"
   echo "team_robot_names=$TEAM_NAMES_ARG"
+  # Recorded even when off, same rule. team_world=1 with comms=0 is a
+  # materially different experiment from team_world=1 with comms=1 — the first
+  # cannot produce a dropout to heal — and neither is recoverable from the
+  # other fields, so both knobs have to be on the record together.
+  echo "team_world=$TEAM_WORLD"
+  echo "team_world_hz=$TEAM_WORLD_HZ"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -1727,6 +1777,24 @@ for r in $ROBOTS; do
              -p cell_covered_max_frontier_frac:="$CELL_FRONTIER_FRAC"
              -p publish_cell_markers:="$CELL_MARKERS_ARG" )
   fi
+  # TeamWorld exchange. Split pub/sub exactly like the intent stream and for
+  # exactly the same reason: the emulator gates a stream by relaying it
+  # per-link, which it can only do when publisher and subscriber sit on
+  # different topics. With COMMS=0 no topic params are passed, so both ends
+  # default to the shared /exploration/team_world bus — correct for a
+  # perfect-comms run, and the reason a COMMS=0 TeamWorld run cannot be read as
+  # evidence about gating.
+  if [ "$TEAM_WORLD" = "1" ]; then
+    EXTRA+=( -p team_world_hz:="$TEAM_WORLD_HZ" )
+    if [ "$COMMS" = "1" ]; then
+      peer=$(peer_of "$r")
+      EXTRA+=( -p team_world_pub_topic:=exploration/team_world
+               -p team_world_sub_topics:="[\"rx/$peer/exploration/team_world\"]" )
+      log "$r team_world: pub /$r/exploration/team_world  sub /$r/rx/$peer/exploration/team_world"
+    else
+      log "$r team_world: ${TEAM_WORLD_HZ} Hz on the shared /exploration/team_world bus (COMMS=0)"
+    fi
+  fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \
       -r __ns:=/$r -r __node:=explo_planner \
@@ -1852,8 +1920,17 @@ if [ "$COMMS" = "1" ]; then
   # change the failure semantics of every other pipeline in here (several
   # legitimately end in `|| true` grep counts), so the status is taken directly
   # instead.
+  # The TeamWorld relay is required to exist only when the stream is on;
+  # team_world_hz defaults to 0.0, so demanding the relay unconditionally would
+  # fail every COMMS=1 run without the exchange for being configured correctly.
+  GATE_EXTRA=()
+  if [ "$TEAM_WORLD" = "1" ]; then
+    GATE_EXTRA=( --gated-extra exploration/team_world )
+    log "gates: also requiring the exploration/team_world relay"
+  fi
   python3 "$HERE/comms_gates.py" check --robots "$ROBOT_CSV" \
-      --report "$GATE_REPORT" >"$OUTDIR/gates_check.out" 2>&1
+      --report "$GATE_REPORT" ${GATE_EXTRA[@]+"${GATE_EXTRA[@]}"} \
+      >"$OUTDIR/gates_check.out" 2>&1
   GATE_RC=$?
   cat "$OUTDIR/gates_check.out" | tee -a "$OUTDIR/gates.log"
   if [ "$GATE_RC" = 0 ]; then
@@ -1871,7 +1948,7 @@ if [ "$COMMS" = "1" ]; then
   # exist before it can judge anything, still starts here.
   start gateswatch "$OUTDIR/gates_watch.log" \
     python3 "$HERE/comms_gates.py" watch --robots "$ROBOT_CSV" \
-      --report "$GATE_REPORT" \
+      --report "$GATE_REPORT" ${GATE_EXTRA[@]+"${GATE_EXTRA[@]}"} \
       --expect-outage "$([ "$EXPECT_OUTAGE" = 0 ] && echo no || echo yes)"
 fi
 

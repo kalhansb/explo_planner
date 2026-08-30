@@ -404,6 +404,13 @@ struct CellCensusEvent {
   /// differs do not mean the same ground by the same cell id, and no
   /// cross-robot comparison of their cell ids is valid.
   unsigned int grid_hash = 0;
+  /// FNV-1a over every cell's WIRE status in id order, per
+  /// CellWorld::sharedHash(). The cross-robot convergence readout: two robots
+  /// with the same grid_hash and the same shared_hash hold the same shared
+  /// belief cell for cell. The counts above cannot say that — identical
+  /// totals over different ground read as agreement — which is exactly the
+  /// mistake a post-dropout convergence check would make.
+  unsigned int shared_hash = 0;
   /// Enabled / possible edges in the cell adjacency graph. A collapse here is
   /// how a plan-map outage shows up before it becomes an allocation failure.
   int edges_enabled = 0;
@@ -465,6 +472,83 @@ struct CellCensusEvent {
   double cell_frontier_frac_at_best_unknown = -1.0;
 };
 
+/// `team_exchange` payload: one received TeamWorld, from the moment it was
+/// drained rather than the moment it arrived. Emitted per MESSAGE MERGED, not
+/// per message received — see `coalesced`.
+///
+/// It carries three things that a reader would otherwise have to join three
+/// streams to assemble, and the join would be wrong because the sim is
+/// nondeterministic enough that two events a tick apart are two different
+/// worlds: what the merge did, what the comms model concluded, and where the
+/// local census stood immediately afterwards. The last is what makes the P2
+/// convergence check readable from one robot's file: after a dropout heals,
+/// `covered_by_others` climbing toward the peer's own COVERED count IS the
+/// convergence, and reading it off the same line as the merge that caused it
+/// needs no timestamp alignment between two robots' logs.
+struct TeamExchangeEvent {
+  /// Sender's name from `team_robot_names`, and its numeric id. The name is
+  /// carried because every other peer-keyed event in this file is keyed by
+  /// name, and a file where half the peer references are ids and half are
+  /// names cannot be grouped without a lookup table nobody has.
+  std::string peer;
+  int peer_id = -1;
+
+  /// "" when the message was merged. Otherwise why it was not, verbatim from
+  /// whichever check refused it — a config-mismatch drop and a merge that
+  /// found nothing to do are opposite diagnoses and must never render alike.
+  std::string drop_reason;
+
+  /// Messages from this sender superseded before this one was drained. Full
+  /// state means the newest message contains everything the older ones did, so
+  /// coalescing loses no information — but it does lose the RECORD, and a run
+  /// where this is persistently non-zero is a run whose planning tick is
+  /// slower than `team_world_hz`, which is worth seeing rather than inferring.
+  int coalesced = 0;
+  /// Seconds between local receipt and this merge: the drain latency the
+  /// callback-copies-only design trades for. Bounded by the tick period in a
+  /// healthy run; large values mean the executor was starved.
+  double queue_age_sec = -1.0;
+
+  // --- what the merge did (CellWorld::MergeStats) ---------------------
+  int cells_in_msg = 0;
+  int applied = 0;
+  int known_by_only = 0;
+  int agreed_noop = 0;
+  int refused_guard = 0;
+  int refused_local = 0;
+  int out_of_range = 0;
+  int bad_status = 0;
+
+  // --- what the comms model concluded, AFTER this message ---------------
+  /// The dispatch-decision answer. Never a statement about data freshness:
+  /// with closure on, this can be true for a peer whose every byte is minutes
+  /// old, which is what the two age fields below are for.
+  bool in_comms = false;
+  /// The handshake completed both ways.
+  bool direct = false;
+  /// Received inside the TTL, but the peer's mask did not name us back — the
+  /// one-way contact of doc/limitations.md §10, logged as its own condition so
+  /// it can be counted rather than deduced from `in_comms == false`.
+  bool one_way = false;
+  /// IN_COMMS only because someone else is bridging.
+  bool via_relay = false;
+  double last_direct_age_sec = -1.0;
+  double last_known_age_sec = -1.0;
+  /// Peers (excluding self) the model currently calls LOST_COMMS.
+  int peers_lost = 0;
+  /// The sender's published direct-contact mask, and ours. Written as decimal
+  /// integers; bit k is robot k.
+  unsigned int peer_in_range_mask = 0;
+  unsigned int self_direct_mask = 0;
+
+  // --- where the local census stood immediately after the merge ---------
+  double covered_fraction = -1.0;
+  int covered = 0;
+  int covered_by_others = 0;
+  int exploring = 0;
+  int exploring_by_others = 0;
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -495,13 +579,23 @@ class ExperimentLog {
   /// made a void file and a live file indistinguishable to a script.
   /// v4: the M-TARE evolution (docs/mtare_evolution_plan.md). Nothing moved and
   /// nothing was removed — every v3 field means exactly what it meant — but the
-  /// event VOCABULARY widens by five kinds:
+  /// event VOCABULARY widens by six kinds:
   ///
   ///     cell_census         the coarse cell world's status histogram
+  ///     team_exchange       one received TeamWorld: merge result + comms picture
   ///     allocation          a global-allocator solve: tour, focus cell, cost
   ///     rendezvous_agreed   a scheduled (cell, time) reached agreement
   ///     rendezvous_outcome  how a scheduled meeting actually ended
   ///     reconnect_gate      an info-gated dispatch decision and its arithmetic
+  ///
+  /// `team_exchange` was added by P2 to a v4 that P0 had declared with five
+  /// kinds. It is an AMENDMENT to v4 rather than a bump to v5, and the reason
+  /// is what the stamp is for: it protects readers of files already written,
+  /// and there are none — v4 exists only on this unmerged branch, no campaign
+  /// has run against it, and the only v4 artifacts in existence are the phase
+  /// equivalence pairs, which are unaffected because the kind cannot appear at
+  /// defaults. Once a v4 file exists outside this branch this reasoning
+  /// expires and the next widening must bump.
   ///
   /// Vocabulary widening IS a schema change, on the precedent set by v3's
   /// home_watchdog widening: a reader with an exhaustive match on `event` now
@@ -532,7 +626,7 @@ class ExperimentLog {
       "pose_health", "goal_amnesty", "home_watchdog", "coverage_milestone",
       // --- v4, all default-off ---
       "cell_census", "allocation", "rendezvous_agreed", "rendezvous_outcome",
-      "reconnect_gate",
+      "reconnect_gate", "team_exchange",
   };
   static constexpr size_t kEventKindCount =
       sizeof(kEventKinds) / sizeof(kEventKinds[0]);
@@ -776,6 +870,8 @@ class ExperimentLog {
   /// crossings, and a latched sampler cannot show a status going backwards.
   /// The caller decides the rate.
   void logCellCensus(const ExperimentContext& ctx, const CellCensusEvent& e);
+  void logTeamExchange(const ExperimentContext& ctx,
+                       const TeamExchangeEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;

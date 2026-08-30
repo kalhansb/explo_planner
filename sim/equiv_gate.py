@@ -144,6 +144,19 @@ GATED_MANIFEST_GROUPS = {
         # assumed here — block 2 compares them, and would fail first.
         "team_robot_names",
     }),
+    "team_world": ("0", {
+        # team_world_hz is written to the manifest as 1.0 even when the exchange
+        # is off, because the launcher's TEAM_WORLD_HZ default is 1.0 and the
+        # manifest records the harness variable, not what reached the node. The
+        # PARAM dump is the other way round — the -p is passed only inside the
+        # TEAM_WORLD=1 branch, so with the switch off the node logs the compiled
+        # 0.0 and block 2 above compares it against dp("team_world_hz", 0.0).
+        # Both facts are wanted: block 2 proves the binary ran at its default,
+        # this block proves the harness knob that would have changed that was
+        # off. Neither substitutes for the other, and the pair is why the two
+        # values may legitimately disagree here.
+        "team_world_hz",
+    }),
 }
 
 

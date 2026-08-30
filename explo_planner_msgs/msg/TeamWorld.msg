@@ -42,6 +42,23 @@ uint8 robot_id
 # degrade through: the mismatch is reported loudly and the message dropped.
 uint32 team_hash
 
+# FNV-1a 32-bit hash of the producer's CELL GRID geometry (origin, cell size,
+# nx, ny), per CellGrid::configHash(). team_hash above cannot cover this: two
+# robots can share an identical `team_robot_names` and still derive different
+# grids from different ROI params, and then every `id` in `cells` names
+# different ground on the two of them. Nothing in the cell data would look
+# wrong — the ids are all in range, the statuses are all valid, and the merge
+# succeeds — so the receiver would hold a confident census of the wrong
+# ground. The only way to catch it is to compare the geometry directly, which
+# is what this field is for.
+#
+# The field is NOT in the plan's §3.2 field list; it was added when the check
+# was implemented, because cell_world.hpp's own contract ("a cell id names the
+# same ground on every robot ONLY if all of them derived it from the same ROI
+# and cell size, which is why configHash() exists and why TeamWorld's config
+# check must fold it in") requires a carrier and §3.2 gave it none.
+uint32 grid_hash
+
 # Producer's current pose (map frame). The allocator's vehicle-start position
 # for this robot, and the freshest first-hand position anyone has for it.
 geometry_msgs/Point position

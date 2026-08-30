@@ -315,6 +315,199 @@ void CellWorld::markKnownBy(int cell_id, int robot_id) {
   cells_[static_cast<size_t>(cell_id)].known_by |= robotBit(robot_id);
 }
 
+// --- Wire codec and merge --------------------------------------------------
+
+std::vector<CellWorld::WireCell> CellWorld::toWire() const {
+  std::vector<WireCell> out;
+  out.reserve(cells_.size());
+  for (size_t i = 0; i < cells_.size(); ++i) {
+    WireCell w;
+    w.id        = static_cast<uint16_t>(i);
+    w.status    = normaliseForWire(cells_[i].status);  // rule 3
+    w.known_by  = cells_[i].known_by;
+    w.update_id = cells_[i].update_id;
+    out.push_back(w);
+  }
+  return out;
+}
+
+uint32_t CellWorld::sharedHash() const {
+  Fnv1a f;
+  // The cell COUNT is folded in first, and it is not redundant with the
+  // per-cell bytes: an empty world and a world of one UNSEEN cell would
+  // otherwise differ only by one zero byte, and — more to the point — two
+  // grids of different size are not comparable at all, so their digests must
+  // not be able to collide by accident. configHash() covers the geometry
+  // properly; this is the cheap guard for a caller that compares digests
+  // without having compared grids.
+  f.i64(static_cast<int64_t>(cells_.size()));
+  for (const auto& c : cells_) f.byte(normaliseForWire(c.status));
+  return f.h;
+}
+
+int CellWorld::neighbourhood9(int id, int* out) const {
+  if (!grid_.valid(id) || out == nullptr) return 0;
+  const int c0 = grid_.col(id), r0 = grid_.row(id);
+  int n = 0;
+  for (int dr = -1; dr <= 1; ++dr) {
+    for (int dc = -1; dc <= 1; ++dc) {
+      const int c = c0 + dc, r = r0 + dr;
+      if (c < 0 || c >= grid_.nx || r < 0 || r >= grid_.ny) continue;
+      out[n++] = r * grid_.nx + c;
+    }
+  }
+  return n;
+}
+
+CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
+                                           const std::vector<WireCell>& cells,
+                                           int local_priority_centre) {
+  MergeStats st;
+  char buf[160];
+  if (!configured()) {
+    st.refused = "cell world is not configured";
+    return st;
+  }
+  // An out-of-range sender would make robotBit() zero, and every mask
+  // operation below a no-op that still reported "applied". Refuse instead: the
+  // caller has a fleet-identity problem and needs to be told, not accommodated.
+  if (sender_id < 0 || sender_id >= kMaxTeamSize) {
+    std::snprintf(buf, sizeof(buf),
+                  "sender robot id %d is outside [0, %d)", sender_id,
+                  kMaxTeamSize);
+    st.refused = buf;
+    return st;
+  }
+  if (sender_id == self_id_) {
+    // Not merely useless: it would let this robot's own relayed census
+    // overwrite its first-hand statuses through the peer path, which is the
+    // one path that does not bump update_id.
+    st.refused = "sender is this robot";
+    return st;
+  }
+
+  // The local-priority neighbourhood, resolved once.
+  int priority_ids[9];
+  int n_priority = 0;
+  if (local_priority_centre >= 0)
+    n_priority = neighbourhood9(local_priority_centre, priority_ids);
+
+  const uint32_t sender_bit = robotBit(sender_id);
+
+  for (const WireCell& w : cells) {
+    const int id = static_cast<int>(w.id);
+    if (!grid_.valid(id)) { ++st.out_of_range; continue; }
+    if (w.status > 2)     { ++st.bad_status;   continue; }
+
+    Cell& c = cells_[static_cast<size_t>(id)];
+    const CellStatus peer  = fromWire(w.status);
+    const CellStatus local = c.status;
+
+    // mTARE's local-priority rule. Refused ENTIRELY — not even the known_by
+    // OR — because while this robot is standing in a cell and actively
+    // exploring it, a peer's claim about that ground is the one claim we have
+    // positive reason to distrust, and crediting the peer with knowledge of a
+    // status we are about to change would suppress exactly the reconnection
+    // that would tell it otherwise.
+    if (n_priority > 0 && local == CellStatus::EXPLORING) {
+      bool mine = false;
+      for (int k = 0; k < n_priority; ++k)
+        if (priority_ids[k] == id) { mine = true; break; }
+      if (mine) { ++st.refused_local; continue; }
+    }
+
+    // Statuses AGREE on the wire: nothing to adopt, but the peer's knowledge
+    // composes with ours. The peer's own mask is ORed in as well, and that is
+    // what makes the knowledge gate work at N>=3 without hearing from
+    // everybody: if A and B agree a cell is COVERED and B's mask says C has it
+    // too, A can conclude the whole team has it.
+    //
+    // Note the ASYMMETRY with adoption below, which is deliberate. Here the
+    // peer's mask is a claim about the SAME status we already hold first-hand
+    // or otherwise, so composing it adds one level of hearsay. When we ADOPT a
+    // status we are already taking the peer's word for the status itself, and
+    // crediting third parties on top of that compounds two levels — so
+    // adoption resets to {self, sender} instead. Over-crediting is the
+    // expensive direction: it makes the knowledge gate suppress a reconnection
+    // that was needed, and nothing later can recover the lost information.
+    if (normaliseForWire(local) == w.status) {
+      const uint32_t before = c.known_by;
+      c.known_by |= w.known_by | sender_bit;
+      if (c.known_by != before) ++st.known_by_only;
+      else                      ++st.agreed_noop;
+      continue;
+    }
+
+    // --- the guard table, on disagreement -----------------------------------
+    CellStatus adopt = local;
+
+    if (peer == CellStatus::COVERED) {
+      // A peer's first-hand COVERED beats anything of ours that is not itself
+      // a first-hand COVERED — and a first-hand COVERED cannot disagree with
+      // it, because it would have matched on the wire above.
+      adopt = CellStatus::COVERED_BY_OTHERS;
+    } else if (peer == CellStatus::EXPLORING) {
+      if (local == CellStatus::UNSEEN) {
+        adopt = CellStatus::EXPLORING_BY_OTHERS;
+      } else if (local == CellStatus::COVERED_BY_OTHERS) {
+        // THE ONE PLACE THIS DELIBERATELY STRENGTHENS THE PLAN'S TABLE (§3.2).
+        //
+        // The plan makes peer-EXPLORING apply to a local COVERED_BY_OTHERS
+        // unconditionally. That is right for the case it was written for — the
+        // SAME peer retracting, because its own hysteresis released the cell —
+        // and full-state broadcast means the peer's latest census is what
+        // arrives, so retractions must be trackable or our view of that peer
+        // can never come back down.
+        //
+        // But applied unconditionally it also lets a THIRD robot's staler
+        // EXPLORING undo a COVERED we adopted from someone else, which is a
+        // regression of the census under mere reordering — the thing rule 1
+        // and the more-explored ordering exist to prevent. known_by already
+        // records who we took the COVERED from, so the two cases are
+        // distinguishable and there is no reason to conflate them: honour a
+        // retraction from a robot that is in the mask, refuse a contradiction
+        // from one that is not. At N=2 there is only ever one peer, so this is
+        // identical to the plan's rule; it only bites at N>=3, where the plan's
+        // version is wrong.
+        if (maskHas(c.known_by, sender_id)) adopt = CellStatus::EXPLORING_BY_OTHERS;
+      }
+      // local first-hand COVERED: never downgraded by a peer. local
+      // EXPLORING/EXPLORING_BY_OTHERS: matched on the wire above.
+    }
+    // peer UNSEEN carries no information and changes nothing: a robot that has
+    // not seen a cell is not evidence that nobody has.
+
+    if (adopt == local) { ++st.refused_guard; continue; }
+
+    c.status = adopt;
+    // NOT commitSelf(): this is relayed belief, so update_id must not move
+    // (rule 1). The mask collapses to the two robots that can actually vouch
+    // for this status — see the asymmetry note above.
+    c.known_by = robotBit(self_id_) | sender_bit;
+    ++st.applied;
+  }
+  return st;
+}
+
+std::vector<int> CellWorld::interceptCandidates(int robot_id) const {
+  std::vector<int> out;
+  if (robotBit(robot_id) == 0u) return out;   // no bit, so no claim to check
+  // Asking where to look for OURSELVES has no answer, and the honest one is
+  // "nowhere". It is not "nowhere" by accident: self is in the known_by of
+  // every cell we have observed or adopted, so without this the query would
+  // return most of the map, and a caller that looped over the fleet without
+  // excluding itself would get a large, plausible, entirely spurious search
+  // list for the one robot that is definitely not missing.
+  if (robot_id == self_id_) return out;
+  for (size_t i = 0; i < cells_.size(); ++i) {
+    const Cell& c = cells_[i];
+    if (!maskHas(c.known_by, robot_id)) continue;
+    if (exploredRank(c.status) >= 2) continue;  // finished: nobody works here
+    out.push_back(static_cast<int>(i));
+  }
+  return out;
+}
+
 double CellWorld::Census::coveredFraction() const {
   const int total = unseen + exploring + covered + exploring_by_others +
                     covered_by_others;

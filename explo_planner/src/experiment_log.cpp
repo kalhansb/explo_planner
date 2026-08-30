@@ -743,6 +743,7 @@ void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
   // literal, and a quoted "0x..." would read as a string in half the tools
   // that open this file.
   integer("grid_hash", static_cast<long long>(e.grid_hash));
+  integer("shared_hash", static_cast<long long>(e.shared_hash));
   integer("edges_enabled", e.edges_enabled);
   integer("edges_total", e.edges_total);
   integer("cells_measured", e.cells_measured);
@@ -754,6 +755,44 @@ void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
   num("cell_frontier_frac_median", e.cell_frontier_frac_median);
   num("cell_frontier_frac_at_best_unknown",
       e.cell_frontier_frac_at_best_unknown);
+  end();
+}
+
+void ExperimentLog::logTeamExchange(const ExperimentContext& ctx,
+                                    const TeamExchangeEvent& e) {
+  if (!open_ || !started_) return;
+  begin("team_exchange", ctx);
+  text("peer", e.peer);
+  integer("peer_id", e.peer_id);
+  // Always written, including as "": a reader filtering for drops must not
+  // have to treat an absent key and an empty one as the same thing.
+  text("drop_reason", e.drop_reason);
+  integer("coalesced", e.coalesced);
+  num("queue_age_sec", e.queue_age_sec);
+  integer("cells_in_msg", e.cells_in_msg);
+  integer("applied", e.applied);
+  integer("known_by_only", e.known_by_only);
+  integer("agreed_noop", e.agreed_noop);
+  integer("refused_guard", e.refused_guard);
+  integer("refused_local", e.refused_local);
+  integer("out_of_range", e.out_of_range);
+  integer("bad_status", e.bad_status);
+  boolean("in_comms", e.in_comms);
+  boolean("direct", e.direct);
+  boolean("one_way", e.one_way);
+  boolean("via_relay", e.via_relay);
+  num("last_direct_age_sec", e.last_direct_age_sec);
+  num("last_known_age_sec", e.last_known_age_sec);
+  integer("peers_lost", e.peers_lost);
+  // Decimal, for the same reason grid_hash is: JSON has no hex literal and a
+  // quoted "0x.." reads as a string in half the tools that open this file.
+  integer("peer_in_range_mask", static_cast<long long>(e.peer_in_range_mask));
+  integer("self_direct_mask", static_cast<long long>(e.self_direct_mask));
+  num("covered_fraction", e.covered_fraction);
+  integer("covered", e.covered);
+  integer("covered_by_others", e.covered_by_others);
+  integer("exploring", e.exploring);
+  integer("exploring_by_others", e.exploring_by_others);
   end();
 }
 

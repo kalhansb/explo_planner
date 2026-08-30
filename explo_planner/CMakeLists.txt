@@ -68,6 +68,7 @@ add_library(explo_planner_lib
   src/planner_util.cpp
   src/fleet_identity.cpp
   src/cell_world.cpp
+  src/team_model.cpp
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
@@ -213,6 +214,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_cell_world test/test_cell_world.cpp)
   target_link_libraries(test_cell_world explo_planner_lib)
+
+  ament_add_gtest(test_team_model test/test_team_model.cpp)
+  target_link_libraries(test_team_model explo_planner_lib)
 
   ament_add_gtest(test_target_queue test/test_target_queue.cpp)
   target_link_libraries(test_target_queue explo_planner_lib)

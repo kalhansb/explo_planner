@@ -308,6 +308,125 @@ public:
   /// status. Merging uses this; it never bumps update_id.
   void markKnownBy(int cell_id, int robot_id);
 
+  // --- Wire codec and merge ----------------------------------------------
+  //
+  // The codec is here, next to the status machine, rather than in the node.
+  // Normalisation is rule 3 and the merge guard table is written against the
+  // NORMALISED vocabulary; if the two lived apart, a change to one could be
+  // made without the other, and the failure — a `*_BY_OTHERS` reaching a
+  // receiver — is silent at the point it happens and only shows up as an
+  // allocator that disagrees with itself several phases later.
+
+  /// One cell as it travels: exactly the fields of CellState.msg, decoupled
+  /// from the generated type so this unit and its tests do not depend on ROS.
+  /// `status` is the RAW wire byte, not a CellStatus, so a peer sending a
+  /// value outside {0,1,2} can be counted rather than silently coerced.
+  struct WireCell {
+    uint16_t id        = 0;
+    uint8_t  status    = 0;
+    uint32_t known_by  = 0;
+    uint32_t update_id = 0;
+  };
+
+  /// This robot's whole census in the wire vocabulary, one entry per cell, in
+  /// id order. Full state every time — see TeamWorld.msg on why there are no
+  /// deltas.
+  std::vector<WireCell> toWire() const;
+
+  /// FNV-1a over the SHARED part of the census: every cell's wire status, in
+  /// id order, and nothing else. Two robots holding the same shared belief
+  /// produce the same value; one cell apart produces a different one.
+  ///
+  /// This exists because the aggregate counts cannot answer the question the
+  /// P2 gate asks. "Both cell worlds converged" is a claim about which cells,
+  /// and two robots can hold identical unseen/exploring/covered totals over
+  /// completely different ground — most easily right after a dropout, when
+  /// each has covered about as much as the other somewhere else. A count-based
+  /// readout calls that convergence. This does not.
+  ///
+  /// Deliberately NOT a hash of the whole cell record:
+  ///   * update_id is LOCAL and never comparable across robots (rule 1), so
+  ///     folding it in would guarantee two agreeing robots disagree here.
+  ///   * known_by is reset to {self} on every committed change (rule 2), so it
+  ///     legitimately differs between two robots that reached the same status
+  ///     by different routes.
+  ///   * the status is NORMALISED, for the same reason it is on the wire: a
+  ///     cell this robot covered itself and one it learned a peer covered are
+  ///     the same shared fact, and the `*_BY_OTHERS` distinction is local
+  ///     bookkeeping about provenance.
+  /// What is left is exactly the state the exchange is supposed to make agree.
+  uint32_t sharedHash() const;
+
+  /// What one mergeWire() call did. Every refusal has its own counter because
+  /// "the merge changed nothing" has several causes with opposite meanings: a
+  /// peer that agrees with us (healthy), a peer whose every update the local
+  /// -priority rule refused (healthy, and expected while exploring), and a
+  /// peer whose ids do not land in our grid at all (a config fault that would
+  /// otherwise look exactly like agreement).
+  struct MergeStats {
+    /// Non-empty when the merge was refused WHOLESALE and no cell was
+    /// examined. A zero-count result with an empty reason (a peer that agrees)
+    /// and one with a reason (a bug upstream) are different events, and a
+    /// caller that cannot tell them apart will report the second as the first.
+    std::string refused;
+
+    int applied         = 0;  ///< cells whose local status changed
+    int known_by_only   = 0;  ///< statuses already agreed; only the mask grew
+    int agreed_noop     = 0;  ///< agreed, and we already knew everyone it named
+    int refused_guard   = 0;  ///< the guard table declined the peer's claim
+    int refused_local   = 0;  ///< local-priority: my neighbourhood, my call
+    int out_of_range    = 0;  ///< id not in this grid — config fault, not noise
+    int bad_status      = 0;  ///< byte outside {0,1,2}: not a wire status
+
+    /// Every entry offered lands in exactly one bucket, so a caller can assert
+    /// this against the message's cell count and catch a merge that silently
+    /// skipped a case the table does not handle.
+    int examined() const {
+      return applied + known_by_only + agreed_noop + refused_guard +
+             refused_local + out_of_range + bad_status;
+    }
+  };
+
+  /// Merge a peer's normalised census (mTARE's guard table; §3.2).
+  ///
+  /// `sender_id` is the peer's fleet id and must be inside the policy cap: an
+  /// out-of-range id would make every mask operation a silent no-op, so it is
+  /// refused wholesale instead.
+  ///
+  /// `local_priority_centre` is the cell this robot currently occupies, or -1
+  /// to disable the rule. That cell and its 8 neighbours are this robot's own
+  /// neighbourhood: while it holds a FIRST-HAND EXPLORING there, a peer's
+  /// claim about the same ground is refused outright. The robot is standing in
+  /// it and the peer is not.
+  ///
+  /// Never touches update_id (rule 1) and never lowers a first-hand COVERED.
+  MergeStats mergeWire(int sender_id, const std::vector<WireCell>& cells,
+                       int local_priority_centre = -1);
+
+  /// `id` and its up-to-8 grid neighbours, written to `out` (room for 9
+  /// required), returning the count. Used by the local-priority rule now and
+  /// by P3's focus filtering later — one definition of "neighbourhood", so the
+  /// two cannot drift apart.
+  int neighbourhood9(int id, int* out) const;
+
+  /// Where a search for a peer that has gone missing could plausibly find it:
+  /// cells this robot believes `robot_id` has seen IN THEIR CURRENT STATUS and
+  /// which nobody considers finished. Port of mTARE's CheckLostRobot — an
+  /// empty result means there is nowhere left to look, which is what "lost"
+  /// means operationally.
+  ///
+  /// This is only meaningful BECAUSE of rule 2. known_by resets on every
+  /// committed status change, so a cell the peer knew about and which has
+  /// since changed drops out of the set on its own. Without the reset the mask
+  /// would only grow and this would return everywhere the peer had ever been,
+  /// forever — a search list that never shrinks, and a lost test that can
+  /// never fire.
+  ///
+  /// Empty for this robot's own id: self is in almost every mask, so the
+  /// answer would otherwise be most of the map for the one robot that cannot
+  /// be missing.
+  std::vector<int> interceptCandidates(int robot_id) const;
+
   /// Counts by status, for the census event and the RViz layer.
   struct Census {
     int unseen = 0, exploring = 0, covered = 0;

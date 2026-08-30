@@ -274,6 +274,16 @@ case("a new param NOT at its compiled default", 1,
 case("a new numeric param off its derived default", 1,
      r"new param 'robot_id' is NOT at its default",
      child_ev=set_param(child_side(), robot_id=0.0))
+# P2's own new param, both ways round. The default is read from the live
+# dp("team_world_hz", 0.0) in explo_planner_node.cpp, so this pair also pins
+# that the switch's shipped value really is off: move the source default to
+# anything non-zero and the first of these two starts failing.
+case("the new team_world_hz at its compiled default", 0,
+     r"new param\(s\) at defaults:.*team_world_hz",
+     child_ev=set_param(child_side(), team_world_hz=0.0))
+case("team_world_hz dumped with the exchange running", 1,
+     r"new param 'team_world_hz' is NOT at its default",
+     child_ev=set_param(child_side(), team_world_hz=1.0))
 case("a param the parent had and the child dropped", 1,
      r"'done_criterion' present in the parent and gone in the child",
      child_ev=drop_param(child_side(), "done_criterion"))
@@ -403,6 +413,34 @@ case("both sides carry the block and a gated knob is re-valued", 1,
      parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
      child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF.replace(
          "cell_covered_max_unknown=0.55", "cell_covered_max_unknown=0.70")})
+
+# P2 adds a second block on top of P1's, so its equivalence pair has the cell
+# block on BOTH sides and the team block on the child only. Note the recorded
+# rate: TEAM_WORLD_HZ defaults to 1.0 in the launcher and the manifest records
+# the harness variable, so "off" here reads as team_world=0 with a non-zero
+# hz — the value that never reached the node, because the -p is passed only
+# inside the TEAM_WORLD=1 branch. If this case ever starts failing on the hz,
+# the fix is not to zero it in the manifest: block 2 of the gate is what proves
+# the node ran at its compiled 0.0, and this block is what proves the harness
+# knob was off. They are different facts and they are allowed to differ.
+TEAM_BLOCK_OFF = ("team_world=0\n"
+                  "team_world_hz=1.0\n")
+
+case("the real P2 child: the team block recorded with its switch off", 0,
+     r"2 new manifest key\(s\) recording a subsystem that is OFF:.*team_world",
+     parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
+     child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF + TEAM_BLOCK_OFF})
+case("the team block with its switch ON", 1,
+     r"manifest team_world: new in the child at '1'.*treatment arm",
+     parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
+     child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF
+               + TEAM_BLOCK_OFF.replace("team_world=0", "team_world=1")})
+case("the team rate present but its switch missing", 1,
+     r"manifest team_world_hz: .*gated by team_world, but the child's "
+     r"team_world is '<absent>'",
+     parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
+     child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF
+               + TEAM_BLOCK_OFF.replace("team_world=0\n", "")})
 
 print("\n=== silence must never read as a pass ===")
 

@@ -52,6 +52,13 @@ DEFAULT_ALLOW = ["rosbag", "rviz", "transform_listener", "_ros2cli"]
 # Topic suffixes that must cross the emulator when COMMS=1. A subscriber on the
 # pre-relay copy of one of these is the leak that silently disables the
 # experiment.
+#
+# These two are unconditional: every COMMS=1 run has both streams. Streams that
+# only some runs carry go in via --gated-extra instead of being added here —
+# gate_relay_set FAILS on a relay that does not exist, so listing a topic
+# nothing publishes would make every run without that feature fail a gate for
+# behaving exactly as configured, which is the same "baseline arm always FAILs"
+# trap --expect-outage exists to avoid.
 GATED_SUFFIXES = ["scovox_node/scovox_bin", "exploration/intents"]
 
 
@@ -172,21 +179,30 @@ def gate_leakage(robots, allow, rep):
                          f"{full} subscribes to {topic} — cross-robot data "
                          f"bypassing the emulator")
 
-    # The shared bus, explicitly. This one bypasses the emulator by construction
-    # rather than by accident: it is a single global topic, so nothing can sit
+    # The shared buses, explicitly. These bypass the emulator by construction
+    # rather than by accident: each is a single global topic, so nothing can sit
     # between two robots on it. Under COMMS=1 the planners must have moved off
-    # it, and any remaining subscriber means at least one planner did not.
-    out = run(["ros2", "topic", "info", "-v", "/exploration/intents"])
-    if out:
+    # them, and any remaining subscriber means at least one planner did not.
+    #
+    # Driven off GATED_SUFFIXES rather than hard-coded, so a stream added by
+    # --gated-extra gets this check too. Only the /exploration/* suffixes have a
+    # shared-bus form to fall back to; the scovox stream is per-robot already.
+    for suffix in GATED_SUFFIXES:
+        if not suffix.startswith("exploration/"):
+            continue
+        bus = f"/{suffix}"
+        out = run(["ros2", "topic", "info", "-v", bus])
+        if not out:
+            continue
         subs = [n for n, _ in parse_endpoints(out, "Subscription")
                 if not any(a in n for a in allow)]
         if subs:
             rep.fail("leakage",
-                     f"/exploration/intents still has subscribers {subs} — the "
-                     f"shared intent bus cannot be gated, so no outage can ever "
-                     f"make a peer read as missing")
+                     f"{bus} still has subscribers {subs} — a shared "
+                     f"broadcast bus cannot be gated, so no outage can ever "
+                     f"make a peer read as missing on this stream")
         else:
-            rep.note("leakage", "/exploration/intents has no live subscribers")
+            rep.note("leakage", f"{bus} has no live subscribers")
 
     if checked == 0:
         rep.fail("leakage", "no gated topics found at all — checked nothing; "
@@ -484,6 +500,15 @@ def main():
     ap.add_argument("--period", type=float, default=30.0,
                     help="watch mode poll period, seconds")
     ap.add_argument("--odom-timeout", type=float, default=10.0)
+    # Extra gated suffixes for streams only some runs carry. The M-TARE
+    # TeamWorld exchange is the first: team_world_hz defaults to 0.0, so a
+    # COMMS=1 run without it publishes nothing on that topic and its relay
+    # correctly never forms. The caller that turned the stream ON is the only
+    # one that knows it should be there, so it is the caller that says so.
+    ap.add_argument("--gated-extra", default="",
+                    help="comma-separated extra topic suffixes to treat as "
+                         "must-cross-the-emulator (e.g. "
+                         "exploration/team_world when team_world_hz > 0)")
     # The outage gate is the one gate that is wrong for a deliberate control
     # run. Phase 1 of the plan runs the control THROUGH the emulator at high
     # tx_power_dbm — so the relay path (extra hop, delay_ms, rx QoS) is present
@@ -501,6 +526,13 @@ def main():
 
     robots = [r.strip() for r in args.robots.split(",") if r.strip()]
     allow = DEFAULT_ALLOW + [a.strip() for a in args.allow.split(",") if a.strip()]
+    # Mutated in place, deliberately: gate_leakage and expected_relays both read
+    # the module global, and threading the list through them instead would leave
+    # two call sites that could be updated apart. Every gate must see the same
+    # set or a topic could be required to exist and not checked for leaks.
+    for s in (x.strip().strip("/") for x in args.gated_extra.split(",")):
+        if s and s not in GATED_SUFFIXES:
+            GATED_SUFFIXES.append(s)
     rep = Report(args.report)
 
     if not run(["ros2", "topic", "list"]):
