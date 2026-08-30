@@ -79,6 +79,7 @@
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/team_model.hpp"
 #include "explo_planner/global_allocator.hpp"
+#include "explo_planner/reconnect_gate.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -555,6 +556,18 @@ private:
   // peer's census under robot bit zero.
   double     team_world_hz_ = 0.0;
   TeamModel  team_model_;
+  /// The allocation problem's vehicle set at position (x, y): every robot in
+  /// the fleet identity, self first-hand and peers from the team model.
+  ///
+  /// ONE definition, because there are now two callers — the allocator and the
+  /// §3.6 reconnect gate — and the gate's whole output is a comparison between
+  /// two solves over this set. Two copies of "who is in the fleet, where are
+  /// they, who is reachable" that drift by one robot would move C_no and C_re
+  /// against each other and there is no field in either event that would show
+  /// it. `all_in_comms` is optional (nullptr to ignore).
+  std::vector<AllocRobot> allocVehicles(float x, float y,
+                                        bool* all_in_comms) const;
+
   // Global allocator (P3). OFF by default, and off means doPlan never calls
   // solve(), never reorders a candidate, and emits no `allocation` event — the
   // node is the P2 node exactly. This is the FIRST phase in which the cell
@@ -574,6 +587,15 @@ private:
   std::vector<int> alloc_focus_skips_;
   /// How many consecutive skips demote a phantom EXPLORING cell to COVERED.
   int        alloc_focus_skip_k_ = 3;
+
+  // §3.6. false = `reconnect_gate: silence`, today's exact behaviour: the
+  // mid-run silence clock alone decides. true = `info`, which layers the
+  // knowledge + value gate ON TOP of that clock. The gate can only ever
+  // SUPPRESS a dispatch the clock already allowed — it never brings one
+  // forward — so the silence floor of §3.6.3 is kept structurally rather than
+  // by a second comparison someone could later drop.
+  bool       reconnect_gate_info_ = false;
+
   bool       team_merge_local_priority_ = true;
   std::string team_world_pub_topic_;
   std::vector<std::string> team_world_sub_topics_;
@@ -3342,6 +3364,79 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
 
+  // ---- Utility-gated reconnection (P4) --------------------------------
+  //
+  // §3.6. `silence` is today's exact behaviour: the mid-run silence clock
+  // decides alone. `info` layers the knowledge + value gate on top of that
+  // clock, and can only ever SUPPRESS a dispatch the clock already allowed —
+  // never bring one forward — which is how the §3.6.3 silence floor is kept.
+  //
+  // NAMING: this is NOT the "info gate" the existing midrunGateSec() implements.
+  // That one is an adaptive silence clock that lengthens the wait while our own
+  // voxel backlog is small. This one is a value comparison at the moment that
+  // clock expires. Both can be on; they compose in that order.
+  {
+    const std::string rg = dp("reconnect_gate", std::string("silence"));
+    if (rg == "silence") {
+      reconnect_gate_info_ = false;
+    } else if (rg == "info") {
+      reconnect_gate_info_ = true;
+    } else {
+      const std::string msg =
+          "reconnect_gate='" + rg + "' is not one of {silence, info}";
+      RCLCPP_FATAL(get_logger(), "%s", msg.c_str());
+      throw std::runtime_error(msg);
+    }
+  }
+  if (reconnect_gate_info_) {
+    if (!cell_world_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "reconnect_gate=info but cell_world_enable=false: the knowledge gate "
+          "reads cell statuses and known_by masks, and the value gate solves "
+          "the allocation problem. Neither exists without the cell world.");
+      throw std::runtime_error("reconnect_gate=info requires cell_world_enable");
+    }
+    const std::string idw = requireFleetIdentity(fleet_, "reconnect_gate=info");
+    if (!idw.empty()) {
+      RCLCPP_FATAL(get_logger(), "%s", idw.c_str());
+      throw std::runtime_error(idw);
+    }
+    // Without the exchange, known_by is {self} on every cell forever, so the
+    // knowledge gate is vacuously true for the whole run and the gate degrades
+    // into a pure value test — while still logging a perfectly healthy verdict
+    // with a large unshared_cells. Fatal for the same reason P3 refuses it: it
+    // is the failure mode that cannot be caught downstream.
+    if (team_world_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "reconnect_gate=info but team_world_hz=0: with no exchange no peer "
+          "ever enters a known_by mask, so the knowledge gate would answer "
+          "'they know nothing' on every cell for the entire run.");
+      throw std::runtime_error("reconnect_gate=info requires team_world_hz>0");
+    }
+    // Not fatal: a run with reconnection disabled entirely is a legitimate
+    // control, and the gate simply never evaluates. Warned because asking for
+    // `info` in that configuration is almost certainly a harness mistake.
+    if (!rendezvous_enabled_) {
+      RCLCPP_WARN(get_logger(),
+          "reconnect_gate=info with rendezvous_enabled=false: there is no "
+          "mid-run reconnection to gate, so the gate will never evaluate.");
+    }
+    // The gate prices its two futures with the allocator's own solver, so it
+    // needs a Config even when the allocator itself is off. Declaring a ROS
+    // parameter twice throws, so these are only read on the path where the P3
+    // block above did not already read them; comms_mask is deliberately not
+    // read at all, since the gate overwrites it per solve (that difference IS
+    // the measurement) — see evaluateReconnectGate.
+    if (!global_alloc_enable_) {
+      alloc_cfg_.polish_passes  = dp("global_alloc_polish_passes", 2);
+      alloc_cfg_.max_candidates = dp("global_alloc_max_candidates", 256);
+    }
+  }
+  if (exp_log_) {
+    exp_log_->addParamStr("reconnect_gate",
+                          reconnect_gate_info_ ? "info" : "silence");
+  }
+
   // The dscovox mapping node fuses every robot's voxels (multi-robot
   // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
   // subscribe with the matching latched QoS (KeepLast(1) reliable +
@@ -4408,6 +4503,49 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
   }
 }
 
+// Vehicle set: every live, unfinished robot at its freshest known position,
+// gossip included (§3.4). Self first-hand at (x, y); peers from the team model,
+// which is the only place a relayed position is dated.
+//
+// Callers: the P3 allocator (from doPlan, at the planning pose) and the §3.6
+// reconnect gate (from tick, at the current pose). Shared on purpose — the
+// gate's entire output is the difference between two solves over THIS set, so a
+// second copy of "who is in the fleet, where are they, who is reachable" that
+// drifted by one robot would move C_no and C_re against each other, and no
+// field in either event would show it.
+std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
+    float x, float y, bool* all_in_comms) const {
+  std::vector<AllocRobot> out;
+  if (all_in_comms) *all_in_comms = true;
+  if (!cell_world_.configured()) return out;
+
+  const CellGrid& g = cell_world_.grid();
+  for (int id = 0; id < fleet_.size(); ++id) {
+    AllocRobot r;
+    r.id = id;
+    if (id == fleet_.self_id) {
+      r.cell = g.idAt(x, y);
+      r.in_comms = true;
+      r.finished = false;   // we are planning, so we are not done
+    } else {
+      const TeamModel::Peer& p = team_model_.peer(id);
+      // No position at all is not "at the origin": an unlocatable robot is
+      // dropped from the problem (cell -1) rather than defaulted onto a cell
+      // it is not in, because a fictional position moves the makespan and so
+      // moves THIS robot's tour too.
+      r.cell = p.have_position
+                   ? g.idAt(static_cast<float>(p.position_x),
+                            static_cast<float>(p.position_y))
+                   : -1;
+      r.in_comms = team_model_.inComms(id);
+      r.finished = p.finished;
+      if (!r.in_comms && !r.finished && all_in_comms) *all_in_comms = false;
+    }
+    out.push_back(r);
+  }
+  return out;
+}
+
 // ==================================================================
 // PLAN state
 // ==================================================================
@@ -4679,29 +4817,93 @@ void ExploPlannerNode::doPlan() {
           // table, and a quiet-but-connected teammate would otherwise buy that
           // walk on every PLAN tick for the rest of the run.
           const double gate_sec = midrunGateSec(missing_for, &est_unshared);
+          bool gate_refuses = false;
           if (missing_for >= gate_sec) {
-            ++midrun_attempts_;
-            reconnect_terminal_ = false;
-            hold_escalated_ = false;
-            dispatch_gate_sec_      = gate_sec;
-            dispatch_est_unshared_  = est_unshared;
-            dispatch_link_down_sec_ = link_down_for;
-            dispatch_team_incomplete_sec_ = missing_for;
-            // "team incomplete", not "peer silent": missing_for measures the
-            // team-presence clock, which lags the peer's record age by
-            // coord_claim_ttl_sec. Through generation 7 this line said "peer
-            // silent", and read against the JSONL's peer_record_age_sec the two
-            // disagreed by 3.24-5.51 s (point estimates 3.74-5.01, widened by
-            // the +/-0.5 s this %.0f costs) with no way to tell which was the
-            // tested one. Naming it here and logging it beside gate_sec makes the
-            // inequality the code evaluated readable off the line itself.
-            RCLCPP_INFO(get_logger(),
-                "Reconnect (mid-run): team incomplete %.0fs >= gate %.0fs "
-                "(radio down %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
-                "interrupting exploration for the reconnect manoeuvre.",
-                missing_for, gate_sec, link_down_for, est_unshared,
-                midrun_attempts_, reconnect_midrun_max_attempts_);
-            if (dispatchReconnect("peer-lost")) return;
+            // §3.6 knowledge + value gate. Strictly downstream of the silence
+            // clock above, so it can only refuse a dispatch that clock already
+            // allowed — the floor is structural, not a second comparison.
+            //
+            // Only the mid-run trigger is gated. The exhausted-chase escalation
+            // in pursuitFallback is a fallback WITHIN a manoeuvre already under
+            // way, not a decision to leave exploration, and §3.6's arbitration
+            // table names exactly one mid-run trigger per mode.
+            if (reconnect_gate_info_) {
+              // Same vehicle set the allocator would solve over, at the pose we
+              // would actually leave from, and the missing list read straight
+              // off it so the two cannot disagree about who is reachable.
+              const std::vector<AllocRobot> vehicles =
+                  allocVehicles(latest_pos_.x(), latest_pos_.y(), nullptr);
+              std::vector<MissingPeer> missing;
+              std::string peers_str;
+              for (const AllocRobot& r : vehicles) {
+                if (r.id == fleet_.self_id || r.in_comms) continue;
+                missing.push_back(MissingPeer{r.id, r.cell, r.finished});
+                peers_str += (peers_str.empty() ? "" : ",") +
+                             std::to_string(r.id) + ":" +
+                             std::to_string(r.cell);
+              }
+              const GateVerdict gv = evaluateReconnectGate(
+                  cell_world_, vehicles, missing, alloc_cfg_);
+
+              if (exp_log_) {
+                // Emitted on EVERY evaluation, fired or not: a gate is judged by
+                // what it suppressed, and a suppression that logs nothing is
+                // indistinguishable from a trigger that never armed.
+                ReconnectGateEvent ev;
+                ev.dispatched          = gv.dispatch;
+                ev.knowledge           = gv.knowledge;
+                ev.unshared_cells      = gv.unshared_cells;
+                ev.c_no_mm             = gv.c_no_mm;
+                ev.c_re_mm             = gv.c_re_mm;
+                ev.leg_mm              = gv.leg_mm;
+                ev.unassigned          = gv.unassigned;
+                ev.refused             = gv.refused;
+                ev.team_incomplete_sec = missing_for;
+                ev.gate_sec            = gate_sec;
+                ev.attempts_used       = midrun_attempts_;
+                ev.peers               = peers_str;
+                exp_log_->logReconnectGate(expCtx(), ev);
+              }
+
+              if (!gv.dispatch) {
+                // Fall through to ordinary exploration — no attempt consumed
+                // and no cooldown armed, because nothing was dispatched.
+                // Spending budget here would let a stretch of correctly
+                // suppressed evaluations exhaust the manoeuvre the run may
+                // still need later, when the gate does say go.
+                gate_refuses = true;
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+                    "Reconnect (mid-run): gate says stay — %d unshared cells, "
+                    "C_re %lld mm vs C_no %lld mm (leg %lld mm).",
+                    gv.unshared_cells, gv.c_re_mm, gv.c_no_mm, gv.leg_mm);
+              }
+            }
+
+            if (!gate_refuses) {
+              ++midrun_attempts_;
+              reconnect_terminal_ = false;
+              hold_escalated_ = false;
+              dispatch_gate_sec_      = gate_sec;
+              dispatch_est_unshared_  = est_unshared;
+              dispatch_link_down_sec_ = link_down_for;
+              dispatch_team_incomplete_sec_ = missing_for;
+              // "team incomplete", not "peer silent": missing_for measures the
+              // team-presence clock, which lags the peer's record age by
+              // coord_claim_ttl_sec. Through generation 7 this line said "peer
+              // silent", and read against the JSONL's peer_record_age_sec the
+              // two disagreed by 3.24-5.51 s (point estimates 3.74-5.01,
+              // widened by the +/-0.5 s this %.0f costs) with no way to tell
+              // which was the tested one. Naming it here and logging it beside
+              // gate_sec makes the inequality the code evaluated readable off
+              // the line itself.
+              RCLCPP_INFO(get_logger(),
+                  "Reconnect (mid-run): team incomplete %.0fs >= gate %.0fs "
+                  "(radio down %.0fs, est unshared %.0f vox, attempt %d/%d) -> "
+                  "interrupting exploration for the reconnect manoeuvre.",
+                  missing_for, gate_sec, link_down_for, est_unshared,
+                  midrun_attempts_, reconnect_midrun_max_attempts_);
+              if (dispatchReconnect("peer-lost")) return;
+            }
           }
         }
       }
@@ -4945,33 +5147,8 @@ void ExploPlannerNode::doPlan() {
     const CellGrid& g = cell_world_.grid();
     const auto t_solve0 = std::chrono::steady_clock::now();
 
-    // Vehicle set: every live, unfinished robot at its freshest known
-    // position, gossip included (§3.4). Self first-hand; peers from the team
-    // model, which is the only place a relayed position is dated.
     bool all_in_comms = true;
-    for (int id = 0; id < fleet_.size(); ++id) {
-      AllocRobot r;
-      r.id = id;
-      if (id == fleet_.self_id) {
-        r.cell = g.idAt(robot_pos.x(), robot_pos.y());
-        r.in_comms = true;
-        r.finished = false;   // we are planning, so we are not done
-      } else {
-        const TeamModel::Peer& p = team_model_.peer(id);
-        // No position at all is not "at the origin": an unlocatable robot is
-        // dropped from the problem (cell -1) rather than defaulted onto a cell
-        // it is not in, because a fictional position moves the makespan and so
-        // moves THIS robot's tour too.
-        r.cell = p.have_position
-                     ? g.idAt(static_cast<float>(p.position_x),
-                              static_cast<float>(p.position_y))
-                     : -1;
-        r.in_comms = team_model_.inComms(id);
-        r.finished = p.finished;
-        if (!r.in_comms && !r.finished) all_in_comms = false;
-      }
-      alloc_robots.push_back(r);
-    }
+    alloc_robots = allocVehicles(robot_pos.x(), robot_pos.y(), &all_in_comms);
 
     alloc = GlobalAllocator::solve(cell_world_, alloc_robots, alloc_cfg_);
     const double solve_ms =

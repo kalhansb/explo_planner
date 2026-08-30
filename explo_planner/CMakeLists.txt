@@ -70,6 +70,7 @@ add_library(explo_planner_lib
   src/cell_world.cpp
   src/team_model.cpp
   src/global_allocator.cpp
+  src/reconnect_gate.cpp
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
@@ -221,6 +222,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_global_allocator test/test_global_allocator.cpp)
   target_link_libraries(test_global_allocator explo_planner_lib)
+
+  ament_add_gtest(test_reconnect_gate test/test_reconnect_gate.cpp)
+  target_link_libraries(test_reconnect_gate explo_planner_lib)
 
   ament_add_gtest(test_target_queue test/test_target_queue.cpp)
   target_link_libraries(test_target_queue explo_planner_lib)

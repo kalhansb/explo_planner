@@ -821,6 +821,27 @@ void ExperimentLog::logAllocation(const ExperimentContext& ctx,
   end();
 }
 
+void ExperimentLog::logReconnectGate(const ExperimentContext& ctx,
+                                     const ReconnectGateEvent& e) {
+  if (!open_ || !started_) return;
+  begin("reconnect_gate", ctx);
+  boolean("dispatched", e.dispatched);
+  boolean("knowledge", e.knowledge);
+  integer("unshared_cells", e.unshared_cells);
+  integer("c_no_mm", e.c_no_mm);
+  integer("c_re_mm", e.c_re_mm);
+  integer("leg_mm", e.leg_mm);
+  integer("unassigned", e.unassigned);
+  // Always written, including as "": a reader counting fail-open passes must
+  // not have to treat an absent key and an empty one as the same thing.
+  text("refused", e.refused);
+  num("team_incomplete_sec", e.team_incomplete_sec);
+  num("gate_sec", e.gate_sec);
+  integer("attempts_used", e.attempts_used);
+  text("peers", e.peers);
+  end();
+}
+
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));

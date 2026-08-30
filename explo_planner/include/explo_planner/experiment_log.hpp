@@ -627,6 +627,56 @@ struct AllocationEvent {
 /// after every real rank and cannot be confused with "no goal".
 inline constexpr int kAllocRankUnrestricted = 9999;
 
+/// `reconnect_gate` payload: one utility-gate decision (§3.6) and the whole
+/// arithmetic behind it.
+///
+/// Emitted on EVERY evaluation, not only on the ones that dispatch. That is
+/// the point of the event: a gate is judged by what it SUPPRESSED, and a log
+/// that records only the fires is indistinguishable between "the gate is
+/// working" and "the gate is stuck closed". Cross-check the count of
+/// `dispatched=false` lines against the arm's `reconnect_dispatch` count.
+///
+/// The evaluation sits behind the silence clock, the link veto and the attempt
+/// budget, so these lines appear only during a confirmed outage and are rare
+/// (order tens per robot-run), not per-tick.
+struct ReconnectGateEvent {
+  /// The verdict actually acted on. False = exploration continued.
+  bool dispatched = false;
+
+  /// The knowledge half. `false` with an empty `refused` is the clean
+  /// suppression: every missing peer already holds the current status of every
+  /// cell we have an opinion about.
+  bool knowledge      = false;
+  int  unshared_cells = 0;
+
+  /// The value half, in the allocator's quantised unit (mm). All -1 when the
+  /// knowledge gate declined first, which is how a knowledge suppression is
+  /// told apart from a value suppression that happened to agree.
+  long long c_no_mm = -1;
+  long long c_re_mm = -1;
+  long long leg_mm  = -1;
+
+  /// Candidate cells no vehicle could take under the no-comms mask. Expected
+  /// 0; a nonzero value means C_no is understating the cost of staying apart.
+  int unassigned = 0;
+
+  /// Non-empty when the gate could not evaluate and therefore FAILED OPEN
+  /// (`dispatched` is then true). Counting these separates "the gate let it
+  /// through" from "the gate never ran".
+  std::string refused;
+
+  /// What the silence clock had already decided when the gate was consulted —
+  /// the inequality this gate is layered on top of, so a suppression can be
+  /// read against the dispatch that would otherwise have happened.
+  double team_incomplete_sec = -1.0;
+  double gate_sec            = -1.0;
+  int    attempts_used       = 0;
+
+  /// The peers the gate was asked about: "id:cell" comma-separated, cell -1
+  /// for a peer we could not locate.
+  std::string peers;
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -955,6 +1005,10 @@ class ExperimentLog {
   /// makes "no allocation events" a valid allocator-off control rather than an
   /// ambiguous absence.
   void logAllocation(const ExperimentContext& ctx, const AllocationEvent& e);
+
+  /// Emits one `reconnect_gate` (schema v4). One per evaluation, fired or not.
+  void logReconnectGate(const ExperimentContext& ctx,
+                        const ReconnectGateEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;
