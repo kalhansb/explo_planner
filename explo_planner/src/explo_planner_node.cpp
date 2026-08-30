@@ -2897,20 +2897,6 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("robot_id", fleet_.self_id);
     exp_log_->addParamNum("team_hash", fleet_.team_hash);
     exp_log_->addParamStr("reconnect_mode", reconnectModeName(reconnect_mode_));
-    // THE arm this run belongs to, and the field an analysis must group by.
-    //
-    // reconnect_mode alone is NOT the arm. The control arm is "no reconnection
-    // at all", which is not a reconnect_mode value — it is expressed as
-    // rendezvous_enabled=false, and the harness has to pass SOME mode alongside
-    // it (it passes "hybrid"). So a control run is stamped reconnect_mode
-    // "hybrid", and anything grouping on that column pools the control into the
-    // hybrid cell: the hybrid mean becomes the average of treatment and
-    // control, and the control arm ceases to exist. The information was always
-    // in the file, split across two fields; nothing was reading both. This
-    // collapses them once, here, where the planner knows the answer.
-    exp_log_->addParamStr("arm", rendezvous_enabled_
-                                     ? reconnectModeName(reconnect_mode_)
-                                     : "off");
     exp_log_->addParamBool("use_sim_time", this->get_parameter("use_sim_time")
                                                .as_bool());
     exp_log_->addParamStr("output_csv", output_csv_);
@@ -3435,6 +3421,41 @@ ExploPlannerNode::ExploPlannerNode()
   if (exp_log_) {
     exp_log_->addParamStr("reconnect_gate",
                           reconnect_gate_info_ ? "info" : "silence");
+  }
+
+  // THE arm this run belongs to, and the field an analysis must group by.
+  //
+  // Stamped HERE, not up with reconnect_mode among the other param lines,
+  // because it is a function of knobs that are not read until this point in
+  // the constructor. Written earlier it would compile, run, and record every
+  // M-TARE cell as plain "hybrid" for the whole campaign — the flags it reads
+  // are still false that far up. Order within the dump is cosmetic; being
+  // downstream of every input is not.
+  //
+  // reconnect_mode alone is NOT the arm. The control arm is "no reconnection
+  // at all", which is not a reconnect_mode value — it is expressed as
+  // rendezvous_enabled=false, and the harness has to pass SOME mode alongside
+  // it (it passes "hybrid"). So a control run is stamped reconnect_mode
+  // "hybrid", and anything grouping on that column pools the control into the
+  // hybrid cell: the hybrid mean becomes the average of treatment and control,
+  // and the control arm ceases to exist. The information was always in the
+  // file, split across two fields; nothing was reading both. This collapses
+  // them once, here, where the planner knows the answer.
+  //
+  // The M-TARE prefix follows the same principle one phase further out. P1 and
+  // P2 are pure observation — their whole claim is that they change no
+  // decision — so they do not rename the arm. P3 and P4 DO change decisions:
+  // the allocator reorders candidates and the §3.6 gate suppresses dispatches.
+  // A run with either engaged is not the hybrid arm, and pooling it into the
+  // hybrid cell would do to that comparison exactly what grouping on
+  // reconnect_mode does to the control.
+  if (exp_log_) {
+    const bool mtare = global_alloc_enable_ || reconnect_gate_info_;
+    std::string arm = rendezvous_enabled_
+                          ? std::string(reconnectModeName(reconnect_mode_))
+                          : std::string("off");
+    if (mtare) arm = "mtare_" + arm;
+    exp_log_->addParamStr("arm", arm);
   }
 
   // The dscovox mapping node fuses every robot's voxels (multi-robot

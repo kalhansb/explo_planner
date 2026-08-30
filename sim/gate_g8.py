@@ -20,6 +20,10 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
         GATE_IDENTITY               path to the declared-identity file
         GATE_EXPECT_<key>           override a single declared identity field
         GATE_CELLS_PER_ARM          pre-registered cells per arm (default 30)
+        GATE_ARMS                   pre-registered arms, comma-separated
+                                    (default "hybrid,off")
+        GATE_CONTROL_ARMS           arms that run with the manoeuvre disabled
+                                    (default "off,mtare_off")
         GATE_SCHEMA_VERSION         event-log schema to require (default 4;
                                     pass 3 to re-gate a banked gen-9 campaign)
 Exit:   0  no hard failures, every population non-empty
@@ -169,6 +173,24 @@ LINK_GATE_LIVE_REQUIRED = (
 # seed-major, so an early abort is systematically arm-unbalanced rather than
 # randomly so — the truncated dataset is biased, not merely small.
 EXPECT_CELLS_PER_ARM = int(os.environ.get("GATE_CELLS_PER_ARM", "30"))
+# The arms the campaign was pre-registered with. Was the literal pair
+# ("hybrid", "off") in check 21, which made every campaign that is not
+# hybrid-vs-off fail as "unexpected arm(s)" — including off vs mtare_hybrid,
+# which is the same experiment with a different treatment. Declared rather than
+# inferred from the directories on disk: inferring it would make check 21
+# incapable of noticing the truncation it exists to catch, since a campaign that
+# only ever ran one arm would "expect" exactly that arm.
+EXPECT_ARMS = tuple(
+    a for a in os.environ.get("GATE_ARMS", "hybrid,off").split(",") if a)
+
+# The control arm, and the ONLY arm that runs with rendezvous_enabled=false.
+# Everything else — hybrid, pursuit, rendezvous, mtare_hybrid — reaches the
+# manoeuvre and must have it enabled. Check 3e used to spell this as
+# `arm == "hybrid"`, which asserted rendezvous_enabled=False for a pursuit or
+# rendezvous cell and would have hard-failed a correct run of either.
+CONTROL_ARMS = frozenset(
+    a for a in os.environ.get("GATE_CONTROL_ARMS", "off,mtare_off").split(",")
+    if a)
 
 LATCH_RE = re.compile(
     r"Exploration complete \[latch\]: ROI unknown fraction ([0-9.]+) <= ([0-9.]+)")
@@ -447,7 +469,7 @@ for c in cells:
             # silently and the gate would have said CLEAN. mode_req/rdv were
             # parsed and PRINTED as an informational line; printing is not
             # checking.
-            want_rdv = (arm == "hybrid")
+            want_rdv = arm not in CONTROL_ARMS
             if pr.get("arm") is not None and pr.get("arm") != arm:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — directory says arm={arm} but "
@@ -478,7 +500,7 @@ for c in cells:
             # pursuit, rendezvous, a future one — reaches the same trigger and
             # has the same way of being configured out of existence. Naming the
             # one arm would have exempted the rest by accident.
-            if arm != "off":
+            if arm not in CONTROL_ARMS:
                 n_3f_runs += 1
 
                 def _num(key):
@@ -881,13 +903,13 @@ else:
 # early abort systematically unbalanced, so "small" here also means "biased".
 print(f"\ncampaign shape: {dict(cells_by_arm)} "
       f"(pre-registered {EXPECT_CELLS_PER_ARM} per arm)")
-for a in ("hybrid", "off"):
+for a in EXPECT_ARMS:
     if cells_by_arm.get(a, 0) != EXPECT_CELLS_PER_ARM:
         hard_fail.append(
             f"check 21 — arm {a} has {cells_by_arm.get(a, 0)} cells, "
             f"pre-registered {EXPECT_CELLS_PER_ARM}. Set GATE_CELLS_PER_ARM to "
             f"score a deliberately partial campaign; do not score it silently")
-extra = set(cells_by_arm) - {"hybrid", "off"}
+extra = set(cells_by_arm) - set(EXPECT_ARMS)
 if extra:
     hard_fail.append(f"check 21 — unexpected arm(s) {sorted(extra)}")
 

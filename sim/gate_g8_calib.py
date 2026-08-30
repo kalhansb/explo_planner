@@ -119,7 +119,11 @@ def base_events(arm="hybrid", robot="atlas"):
     """
     params = copy.deepcopy(PARAMS)
     params["arm"] = arm
-    params["rendezvous_enabled"] = (arm == "hybrid")
+    # Every arm but the control reaches the manoeuvre. Was `arm == "hybrid"`,
+    # which made the fixture unable to express any OTHER treated arm: an
+    # mtare_hybrid cell would have been written with rendezvous_enabled=False
+    # and check 3e would have "caught" a defect the fixture invented.
+    params["rendezvous_enabled"] = arm not in ("off", "mtare_off")
     ev = [
         _row("run_start", 0, state="IDLE", step=0, t0_sim_sec=0.0,
              schema_version=SCHEMA_VERSION, coverage_milestones=[],
@@ -154,7 +158,7 @@ def base_events(arm="hybrid", robot="atlas"):
         _row("mission_complete", 9, result="arrived"),
         _row("run_end", 10, metrics_timer_rows=163),
     ]
-    if arm == "hybrid":
+    if arm not in ("off", "mtare_off"):
         # logReconnectDispatch, experiment_log.cpp:401-437 -- the only writer of
         # team_incomplete_sec, and therefore the only event on which check 19
         # can legitimately demand it. A real generation-6 dispatch row carries
@@ -237,7 +241,8 @@ def _cell(root, tag, arm, events_by_robot, planner_log, csv_text, manifest,
 
 def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
           manifest=MANIFEST, off_events=None, off_planner_log=OFF_PLANNER_LOG,
-          off_console=True, off_manifest=None, console_text=None, live=True):
+          off_console=True, off_manifest=None, console_text=None, live=True,
+          treated_arm="hybrid"):
     """Write BOTH arms. Defects are planted in the hybrid cell.
 
     A one-armed fixture cannot exercise check 3e's off branch, and cannot
@@ -245,7 +250,7 @@ def build(root, tag, events_by_robot, planner_log=PLANNER_LOG, csv_text=CSV,
     known-answer case whatsoever, which is exactly how the six inert guards in
     [[checks-that-stopped-checking]] got there.
     """
-    d = _cell(root, tag, "hybrid", events_by_robot, planner_log, csv_text,
+    d = _cell(root, tag, treated_arm, events_by_robot, planner_log, csv_text,
               manifest, console_text=console_text, live=live)
     _cell(root, tag, "off",
           off_events or {r: base_events("off", r) for r in ROBOTS},
@@ -718,6 +723,77 @@ try:
           f"(rc={p.returncode})")
     if not ok:
         fails += 1
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== the m-tare arm: a second treated arm the gate had never seen ===")
+# Every arm assertion in this gate used to be spelled `arm == "hybrid"` or the
+# literal pair ("hybrid", "off"). That is not a check of the campaign, it is a
+# check of one campaign's spelling, and the three cases below are the
+# known-answer set for the generalisation.
+#
+# The first is the one that matters: an off-vs-mtare_hybrid campaign is the
+# same experiment with a different treatment, and before this it hard-failed on
+# a correct run — check 3e demanded rendezvous_enabled=False of every arm that
+# was not literally "hybrid", and check 21 called mtare_hybrid unexpected.
+
+
+def _mtare_campaign(root, tag, treated_stamp="mtare_hybrid"):
+    """off vs mtare_hybrid. `treated_stamp` is what the NODE recorded, which
+    is a different question from what the directory is named."""
+    ev = {r: base_events(treated_stamp, r) for r in ROBOTS}
+    build(root, tag, ev, treated_arm="mtare_hybrid")
+
+
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    _mtare_campaign(root, "cal")
+    rc, out = run_gate(root, "cal",
+                       env_extra={"GATE_ARMS": "mtare_hybrid,off"})
+    ok = rc == 0 and "HARD FAILURES: none" in out
+    print(f"  {'PASS' if ok else 'FAIL'}  a clean off-vs-mtare_hybrid campaign "
+          f"scores CLEAN (rc={rc}, want 0)")
+    if not ok:
+        fails += 1
+        print(out[-1500:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# The failure the arm token exists to prevent, and the reason run_explo_sim_rviz
+# refuses a contradicting environment variable: a cell NAMED for the treatment
+# whose node was never handed it. Nothing else in the run says so — the
+# manoeuvre still fires, the run still ends all_done, every other check passes.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    _mtare_campaign(root, "cal", treated_stamp="hybrid")
+    rc, out = run_gate(root, "cal",
+                       env_extra={"GATE_ARMS": "mtare_hybrid,off"})
+    ok = rc == 1 and re.search(
+        r"check 3e — directory says arm=mtare_hybrid but run_start params "
+        r"say arm='hybrid'", out)
+    print(f"  {'PASS' if ok else 'FAIL'}  a cell named mtare_hybrid whose node "
+          f"ran plain hybrid: caught")
+    if not ok:
+        fails += 1
+        print(out[-1500:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# The pre-registration must still be a pre-registration. If GATE_ARMS could be
+# satisfied by whatever happens to be on disk, check 21 would stop being able
+# to notice that a campaign ran the wrong arms — which is the same class of
+# defect as scoring a truncated campaign CLEAN.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    _mtare_campaign(root, "cal")
+    rc, out = run_gate(root, "cal")   # default GATE_ARMS = hybrid,off
+    ok = rc == 1 and re.search(r"check 21 — unexpected arm\(s\) \['mtare_hybrid'\]",
+                               out)
+    print(f"  {'PASS' if ok else 'FAIL'}  an mtare campaign scored against the "
+          f"default hybrid,off pre-registration: caught")
+    if not ok:
+        fails += 1
+        print(out[-1500:])
 finally:
     shutil.rmtree(root, ignore_errors=True)
 

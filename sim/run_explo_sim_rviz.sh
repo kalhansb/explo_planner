@@ -190,13 +190,47 @@ EXPLOIT="${EXPLOIT:-1}"
 # rendezvous arm twice and the control-vs-treatment contrast would be a
 # comparison of an arm with itself. Unknown values are rejected below rather
 # than quietly mapped, for the same reason.
+#
+# `mtare_hybrid` is a FIFTH value and the same kind of thing as `off`: an ARM,
+# not a mode. It is `hybrid` with the M-TARE decision stack engaged — the cell
+# world, the TeamWorld exchange, the global allocator and the §3.6 reconnect
+# gate — and it is one token rather than four environment variables because the
+# arm token is the only thing that survives into the directory name, the index
+# row and every gate's arm parser. Four independent knobs would let a campaign
+# run cells labelled mtare_hybrid with, say, the allocator off, and nothing
+# downstream could tell.
 RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
 case "$RECONNECT_MODE" in
-  rendezvous|pursuit|hybrid|off) ;;
+  rendezvous|pursuit|hybrid|off|mtare_hybrid) ;;
   *) echo "FATAL: RECONNECT_MODE='$RECONNECT_MODE' is not one of \
-rendezvous|pursuit|hybrid|off. The planner would silently fall back to \
-rendezvous and the run would be mislabelled." >&2; exit 2 ;;
+rendezvous|pursuit|hybrid|off|mtare_hybrid. The planner would silently fall \
+back to rendezvous and the run would be mislabelled." >&2; exit 2 ;;
 esac
+# The arm token IS the configuration. Set here, before the CELL_WORLD /
+# TEAM_WORLD / GLOBAL_ALLOC / RECONNECT_GATE default blocks below read their
+# environment, so the arm decides and those blocks only validate.
+#
+# An explicit environment variable that CONTRADICTS the token is refused, not
+# honoured. `RECONNECT_MODE=mtare_hybrid GLOBAL_ALLOC=0` would otherwise
+# produce a run in a directory named mtare_hybrid, stamped as a treated cell in
+# the index, that is missing a quarter of the treatment — and no gate reads
+# four separate knobs to notice. Refusing costs an operator one re-run; the
+# silent version costs the campaign.
+if [ "$RECONNECT_MODE" = "mtare_hybrid" ]; then
+  for _kv in CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info; do
+    _k="${_kv%%:*}"; _want="${_kv#*:}"
+    eval "_got=\${$_k-}"
+    if [ -n "$_got" ] && [ "$_got" != "$_want" ]; then
+      echo "FATAL: RECONNECT_MODE=mtare_hybrid implies $_k=$_want, but $_k='$_got'" >&2
+      echo "       was set explicitly. The arm token names the whole stack; a" >&2
+      echo "       cell that contradicts one part of it would still be recorded," >&2
+      echo "       named and analysed as mtare_hybrid." >&2
+      exit 2
+    fi
+    eval "$_k=\$_want"
+  done
+  unset _kv _k _want _got
+fi
 # Barrier cap. The planner's code default is 0 = wait forever, which is the
 # right field behaviour and the wrong experiment: a robot that gives up on the
 # chase raises the barrier at its current pose and never lowers it, so the run
@@ -492,6 +526,71 @@ TEAM_WORLD_HZ="$(flt "${TEAM_WORLD_HZ:-1.0}")"
 if [ "$TEAM_WORLD" = "1" ] && [ "$CELL_WORLD" != "1" ]; then
   echo "TEAM_WORLD=1 requires CELL_WORLD=1 (the TeamWorld message is the cell" >&2
   echo "census, so there would be nothing to send). Set CELL_WORLD=1." >&2
+  exit 2
+fi
+# --- Global allocator (M-TARE evolution, P3) ------------------------------
+# GLOBAL_ALLOC=1 makes the shared cell world DECIDE: each robot solves the same
+# assignment over the same converged world and takes its own tour, and the
+# focus cell it wins re-ranks that tick's candidates.
+#
+# OFF by default and off means NO PARAMETER IS PASSED, for the reason the two
+# blocks above are gated the same way — the per-phase equivalence gate requires
+# every param new in the child to sit at its compiled default.
+#
+# Requires TEAM_WORLD=1, and the planner refuses the pairing outright. Without
+# the exchange there is no shared world, so "solve the same problem" is vacuous:
+# every robot divides the whole map among a fleet of one and emits an
+# `allocation` event whose every field looks healthy. Checked here as well
+# because a planner that throws at construction takes both robots down several
+# seconds into an otherwise-normal bring-up, and the reason scrolls past in two
+# separate log files.
+GLOBAL_ALLOC="${GLOBAL_ALLOC:-0}"
+case "$GLOBAL_ALLOC" in
+  0|1) ;;
+  *) echo "FATAL: GLOBAL_ALLOC='$GLOBAL_ALLOC' is not 0 or 1." >&2; exit 2 ;;
+esac
+if [ "$GLOBAL_ALLOC" = "1" ] && [ "$TEAM_WORLD" != "1" ]; then
+  echo "GLOBAL_ALLOC=1 requires TEAM_WORLD=1 (with no exchange every robot" >&2
+  echo "would allocate the whole map to itself and call that agreement)." >&2
+  exit 2
+fi
+# --- Utility-gated reconnection (M-TARE evolution, P4) --------------------
+# RECONNECT_GATE=info arms the §3.6 knowledge + value gate: when the mid-run
+# silence clock expires, dispatch only if the missing peer is actually missing
+# something we know AND the reconnect leg pays for itself against the no-comms
+# plan. `silence` is the planner's compiled default and today's behaviour.
+#
+# NOT the same thing as the adaptive silence clock the planner already calls an
+# "info gate" (reconnect_min_share_voxels / midrunGateSec). That one lengthens
+# the WAIT while our own backlog is small; this one is a value comparison at
+# the moment the wait expires. Both are on in an mtare_hybrid cell and they
+# compose in that order.
+#
+# `silence` is the default and means NO PARAMETER IS PASSED, same rule as the
+# blocks above. Requires TEAM_WORLD=1: without the exchange no peer ever enters
+# a `known_by` mask, so the knowledge half would answer "they know nothing" on
+# every cell for the whole run while logging a perfectly healthy verdict. The
+# planner treats that pairing as fatal; refused here for the bring-up reason.
+RECONNECT_GATE="${RECONNECT_GATE:-silence}"
+case "$RECONNECT_GATE" in
+  silence|info) ;;
+  *) echo "FATAL: RECONNECT_GATE='$RECONNECT_GATE' is not silence or info." >&2
+     exit 2 ;;
+esac
+if [ "$RECONNECT_GATE" = "info" ] && [ "$TEAM_WORLD" != "1" ]; then
+  echo "RECONNECT_GATE=info requires TEAM_WORLD=1 (with no exchange no peer" >&2
+  echo "ever enters a known_by mask, so the knowledge gate is vacuously true" >&2
+  echo "for the entire run)." >&2
+  exit 2
+fi
+# The gate can only ever SUPPRESS a dispatch the mid-run silence clock already
+# allowed, so with the manoeuvre disabled it never evaluates at all. That is a
+# legitimate control configuration, but asking for `info` in it is almost
+# certainly a mistake in whatever set the arm.
+if [ "$RECONNECT_GATE" = "info" ] && [ "$RECONNECT_MODE" = "off" ]; then
+  echo "FATAL: RECONNECT_GATE=info with RECONNECT_MODE=off. There is no" >&2
+  echo "       mid-run reconnection to gate, so the cell would be labelled as" >&2
+  echo "       carrying the P4 treatment and would not carry it." >&2
   exit 2
 fi
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
@@ -1444,8 +1543,15 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # gates the manoeuvre on. reconnect_mode is left at its yaml value in that case
 # and is inert, since shouldRendezvous() returns false before the mode is
 # consulted.
+#
+# `mtare_hybrid` maps the same way and for the same reason: it is not a
+# reconnect_mode either, it is `hybrid` plus the P1-P4 stack the blocks above
+# have already switched on. The planner reconstitutes the arm label itself from
+# what it was handed (see its addParamStr("arm", ...)), so nothing here has to
+# carry the name forward.
 RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
 if [ "$RECONNECT_MODE" = "off" ]; then RDV_ENABLED="false"; MODE_ARG="hybrid"; fi
+if [ "$RECONNECT_MODE" = "mtare_hybrid" ]; then MODE_ARG="hybrid"; fi
 log "done_seek_enabled=$DONE_SEEK_ARG done_seek_max_sec=$DONE_SEEK_MAX (DONE_SEEK=$DONE_SEEK)"
 log "mission_return_enabled=$MISSION_RETURN_ARG home_tol=${MISSION_HOME_TOL}m max=${MISSION_RETURN_MAX}s (MISSION_RETURN=$MISSION_RETURN)"
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
@@ -1477,6 +1583,16 @@ if [ "$TEAM_WORLD" = "1" ]; then
   log "team world exchange ON: ${TEAM_WORLD_HZ} Hz$([ "$COMMS" = 1 ] && echo " through the emulator" || echo " on the shared bus (COMMS=0: no dropout is possible, so this measures the merge, not the healing)")"
 else
   log "team world exchange OFF (TEAM_WORLD=0) — no team_world params passed; the cell world is per-robot and never shared"
+fi
+if [ "$GLOBAL_ALLOC" = "1" ]; then
+  log "global allocator ON: solve-same-take-own over the shared cell world; the won focus cell re-ranks each tick's frontier candidates"
+else
+  log "global allocator OFF (GLOBAL_ALLOC=0) — no allocation event, candidate ordering is the per-robot utility alone"
+fi
+if [ "$RECONNECT_GATE" = "info" ]; then
+  log "reconnect gate = info: the mid-run silence clock is a FLOOR; past it, dispatch only if the peer is missing something we hold AND the leg pays for itself (C_re < C_no). Every evaluation is logged, suppressed or not."
+else
+  log "reconnect gate = silence (planner default) — the mid-run clock decides alone; no reconnect_gate param passed"
 fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
@@ -1591,6 +1707,13 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # other fields, so both knobs have to be on the record together.
   echo "team_world=$TEAM_WORLD"
   echo "team_world_hz=$TEAM_WORLD_HZ"
+  # The two knobs that make the cell world DECIDE something, and so the two
+  # that separate an mtare_hybrid cell from a hybrid one. Recorded even when
+  # off, same rule as every knob above: a control run must say the feature
+  # existed and was disabled, or it is indistinguishable from a run of a binary
+  # that never had it.
+  echo "global_alloc=$GLOBAL_ALLOC"
+  echo "reconnect_gate=$RECONNECT_GATE"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -1794,6 +1917,16 @@ for r in $ROBOTS; do
     else
       log "$r team_world: ${TEAM_WORLD_HZ} Hz on the shared /exploration/team_world bus (COMMS=0)"
     fi
+  fi
+  # Global allocator and the §3.6 reconnect gate. Every other knob of both is
+  # left at its compiled default on purpose: the arm under test is the
+  # mechanism, not a tuning of it, and each sim-side override is one more thing
+  # that has to be held identical across arms and re-justified per campaign.
+  if [ "$GLOBAL_ALLOC" = "1" ]; then
+    EXTRA+=( -p global_alloc_enable:=true )
+  fi
+  if [ "$RECONNECT_GATE" = "info" ]; then
+    EXTRA+=( -p reconnect_gate:=info )
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \
