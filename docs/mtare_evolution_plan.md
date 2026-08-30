@@ -153,6 +153,111 @@ ground-robot assumption already stated in planner_method.md §14.
   low single-digit milliseconds per cycle (Floyd–Warshall at 400 nodes;
   Dijkstra-per-source if that ever shows up in `plan_time_ms`).
 
+#### 3.1.1 Threshold calibration (measured during P1, not assumed)
+
+The first P1 build shipped the thresholds this section implies by analogy
+with mTARE: `covered_max_unknown = 0.15`, `exploring_min_unknown = 0.35`,
+and a frontier veto expressed as an absolute voxel count (`≤ 4`). A full
+1800 s two-robot run, reaching the harness's own completion criterion
+(`u_roi = 0.634` against `done_unknown_fraction = 0.64`), promoted
+**exactly zero cells**. Every cell in both robots' censuses sat at
+EXPLORING from start to finish.
+
+An all-EXPLORING census is what you get from a broken census *and* from a
+threshold nothing can satisfy, and nothing in the census row could
+distinguish them. So the row was widened rather than the thresholds
+guessed at: `cell_census` now also carries `cells_measured`,
+`cells_frontier_ok`, and order statistics of both per-cell measures over
+the measured cells (`cell_unknown_{min,p10,median}`,
+`cell_frontier_frac_{min,median}`, and the joint reading
+`cell_frontier_frac_at_best_unknown`). The two marginals alone cannot
+answer whether promotion is *possible*, because the best-unknown cell and
+the best-frontier cell need not be the same cell; the joint field asks that
+question directly.
+
+Measured on a 900 s run, stable across both robots and flat from
+t ≈ 300 s onward:
+
+| quantity | value |
+|---|---|
+| `cell_unknown_min` (best cell on the map) | 0.360 |
+| `cell_unknown_p10` | 0.422 |
+| `cell_unknown_median` | 0.496 |
+| ROI-wide `coverageUnknownFraction` | 0.637 |
+| `cell_frontier_frac_min` | 0.333 |
+| `cell_frontier_frac_median` | 0.881 |
+| `cell_frontier_frac_at_best_unknown` | 0.833 |
+
+The best-observed cell never gets below 0.360 unknown, so `0.15` was
+unreachable by construction — there was no defect to fix.
+
+The first response was to re-scale the library defaults to that
+distribution: promote at the p10 (0.42), release at the median (0.50). A
+fresh run then scored `sim/gate_p1.py` and **failed it again**, with the
+best cell bottoming out at 0.4232 against the 0.42 threshold. That second
+run was shorter (makespan 332 s against the calibration run's 495 s and
+still going), so its cells had less dwell and the floor sat higher. A
+threshold fitted to one run's tail did not survive the next run.
+
+That failure is the useful one, because it identifies the real category
+error. **These are world-calibrated knobs, not constants.** The codebase
+already contains the precedent, and it is exactly parallel:
+`done_unknown_fraction` ships at `0.05` in `shared_params.yaml` and the sim
+harness overrides it to **0.64**, because — in that file's own words —
+"never-visited out-of-AO columns put a permanent floor under the unknown
+fraction: calibrate `done_unknown_fraction` above that floor". The per-cell
+measure counts the same thing over a smaller footprint and inherits the
+same floor for the same reason. Pinning a library default to one world's
+floor was the mistake; the fix is to put the calibration where the world is
+described.
+
+So:
+
+- **Library defaults stay with the saturating-map world model**
+  (`covered_max_unknown = 0.15`, `exploring_min_unknown = 0.35`,
+  `covered_max_frontier_frac = 0.90`), consistent with the shipped
+  `done_unknown_fraction: 0.05`. Wrong elsewhere, but *loudly* wrong: a
+  floor above the threshold pins every cell at EXPLORING.
+- **The sim harness calibrates them**, next to its `DONE_UNKNOWN=0.64`:
+  `CELL_COVERED_U=0.55`, `CELL_EXPLORING_U=0.62`, `CELL_FRONTIER_FRAC=0.95`,
+  all recorded in `run_manifest.txt` because a census is not comparable
+  across two runs that disagree about what COVERED means.
+
+The sim values are placed by the same rule as `DONE_UNKNOWN`: release just
+under the level the mission itself accepts for the whole ROI (0.64), since
+a cell that has degraded to the mission's own accept level is not
+distinguishably explored, and promote a band's width below that. The band
+has to clear the run-to-run spread of the floor (0.36–0.43 observed), not
+one run's point estimate — which is the specific thing 0.42 failed to do.
+
+The frontier veto changed **type**, not just value. An absolute voxel count
+is not a quantity that can be set correctly: it means something different
+at every cell size and map resolution, and at 10 m cells with 0.1 m voxels
+a thoroughly swept cell holds tens of thousands of voxels and hundreds of
+boundary ones. `covered_max_frontier_frac` is the same measure with the
+scale divided out, so one number means the same thing at any cell size.
+`frontierFraction()` reports "cannot measure" as `-1.0`; note that a
+negative sentinel passes an upper-bound comparison, so `classify()` tests
+for a real measurement rather than trusting that it got one. How much the
+veto discriminates is itself world-dependent — a frontier voxel is one with
+an absent 6-neighbour, so a densely ray-traced map isolates the true
+boundary while this sparse surface-shell map puts 79–89% of every cell's
+voxels in that category. A threshold inside that band splits the population
+near its own median and reports mostly noise, which is why the sim raises it
+to 0.95 and lets the column measure do the discriminating.
+
+Three disciplines this imposes on anyone re-tuning these:
+
+- **Re-read, do not re-guess.** The quantiles are on every census row. Take
+  them from a fresh run of the build in question.
+- **Do not fit and certify on the same run.** The 900 s run above chose the
+  first set of thresholds and was therefore disqualified from scoring
+  `sim/gate_p1.py` — which is the only reason the 0.42 failure was caught
+  before the number reached P3.
+- **Fit to the spread, not to a point.** This sim is nondeterministic
+  run-to-run; a threshold set from one run's plateau is a threshold set from
+  one draw of it.
+
 ### 3.2 `TeamWorld` + `CellState` messages (explo_planner_msgs)
 
 Two new messages — *not* an extension of `RobotIntent` (its own comment
@@ -419,6 +524,29 @@ Gate: unit tests (status transitions, hysteresis, update_id locality,
 known_by reset-on-change, guard table); smoke run shows census converging
 to COVERED as coverage saturates, agreeing with `coverageUnknownFraction`
 to within a cell-quantisation bound.
+Realised as `sim/gate_p1.py`, scored on a smoke run's event log. The
+agreement bound is *derived* rather than picked:
+
+    roi_unknown_fraction  ≤  R · ( thr · f  +  1 · (1 − f) )
+
+where `f` is the first-hand COVERED fraction, `thr` is
+`cell_exploring_min_unknown` — the hysteresis **release** threshold, since
+that is what `classify()` actually enforces on an already-COVERED cell, not
+the promotion threshold — and `R = grid_area / roi_area ≥ 1`, because the
+grid rounds up and can overhang the ROI. `covered_by_others` is excluded
+from `f`: it is relayed belief with no local measurement behind it (always
+0 in P1, but excluded now so P2 does not fail spuriously).
+The gate also checks one **exact** identity — `Σ changed` over all census
+rows equals the final `commits_total`, since every change goes through
+`commitSelf` and every `applyObservation` emits — which doubles as a
+lost-event check. It refuses to pass vacuously: an agreement bound is
+trivially satisfied at `f = 0`, so a run that never promotes enough cells
+is reported as an explicit **NOT-APPLICABLE failure**, not a pass. Its own
+guards are calibrated by `sim/gate_p1_calib.py` (25 injections), and the
+`cell_world` assertions by six known-answer source injections.
+Default-off equivalence is owned by `sim/equiv_pair.sh`, which verifies the
+binary's compile-time-baked `git_rev` out of the run's own event log rather
+than trusting that a build happened.
 
 **P2 — TeamWorld exchange + team_model.**
 Publish/subscribe TeamWorld through the comms emulator; wire normalisation
@@ -586,6 +714,17 @@ shared tours (and P3 to make tours non-trivial).
 
 ## 9. Revision history
 
+- **v3** — during P1 implementation: §3.1.1 added, recording that the
+  mTARE-analogy thresholds were unsatisfiable against this map
+  representation (zero cells promoted over a full run), that re-scaling them
+  to one run's measured distribution then failed a second run by 0.003, and
+  that the cell status thresholds are consequently **world-calibrated knobs
+  in the same family as `done_unknown_fraction`** — library defaults keep
+  the saturating-map world model, the sim harness overrides them next to its
+  own `DONE_UNKNOWN=0.64`. The frontier veto re-typed from an absolute voxel
+  count to a scale-free fraction; `cell_census` widened with the order
+  statistics that made the diagnosis possible; P1's gate written up with its
+  derived agreement bound and its non-vacuity rule.
 - **v2** — after round-1 adversarial review (independent reviewer, both
   codebases): added wire normalisation + allocator input set (was a
   solve-same-breaking inconsistency); known_by reset semantics (knowledge

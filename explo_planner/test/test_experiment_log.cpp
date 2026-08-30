@@ -243,6 +243,120 @@ TEST(ExperimentLogHomeWatchdog, DefaultedCallStillEmitsBothFields) {
   EXPECT_NE(row.find("\"test_threshold_m\":0.000000"), std::string::npos) << row;
 }
 
+// --- cell_census (schema v4) ---
+//
+// P1's gate is read off this row and nothing else: it asks whether the coarse
+// census converges to COVERED as the ROI's continuous unknown fraction falls.
+// Both numbers therefore have to be ON THE SAME ROW — the sim is nondetermin-
+// istic enough run-to-run that joining `cell_census` to `coverage_milestone`
+// on a timestamp would be comparing two ticks and reporting the difference as
+// a disagreement between the measures. If a future edit moves either number
+// off this event, the gate silently degrades into that join, so the pairing is
+// asserted at the byte level rather than assumed.
+TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
+  TempLogPath tmp("census");
+  std::string row;
+  {
+    ExperimentLog log(tmp.path, "testbot",
+                      rclcpp::get_logger("test_experiment_log"));
+    ASSERT_TRUE(log.open()) << "could not open " << tmp.path;
+    ExperimentContext ctx;
+    ctx.sim_time_sec = 10.0;
+    ctx.state = "EXPLORE";
+    ctx.step = 3;
+    log.startRun(ctx, {});
+    ctx.sim_time_sec = 55.0;
+
+    CellCensusEvent e;
+    e.cells_total = 9;
+    e.unseen = 2; e.exploring = 3; e.covered = 4;
+    e.exploring_by_others = 0; e.covered_by_others = 0;
+    e.covered_fraction = 4.0 / 9.0;
+    e.roi_unknown_fraction = 0.375;
+    e.coverage_source = "scovox";
+    e.changed = 1;
+    e.commits_total = 12;
+    e.cell_size_m = 10.0;
+    e.nx = 3; e.ny = 3;
+    e.grid_hash = 0xdeadbeefu;
+    e.edges_enabled = 15; e.edges_total = 20;
+    e.cells_measured = 7; e.cells_frontier_ok = 5;
+    e.cell_unknown_min = 0.08;
+    e.cell_unknown_p10 = 0.11;
+    e.cell_unknown_median = 0.42;
+    e.cell_frontier_frac_min = 0.01;
+    e.cell_frontier_frac_median = 0.07;
+    e.cell_frontier_frac_at_best_unknown = 0.03;
+    log.logCellCensus(ctx, e);
+  }
+  std::ifstream in(tmp.path);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.find("\"cell_census\"") != std::string::npos) row = line;
+  }
+  ASSERT_FALSE(row.empty()) << "no cell_census row was written at all";
+
+  // The pairing the gate depends on, read back from the emitted bytes.
+  double covered_fraction = -99.0, roi_unknown = -99.0;
+  ASSERT_TRUE(readNum(row, "covered_fraction", &covered_fraction)) << row;
+  ASSERT_TRUE(readNum(row, "roi_unknown_fraction", &roi_unknown)) << row;
+  EXPECT_NEAR(covered_fraction, 4.0 / 9.0, 1e-6);
+  EXPECT_NEAR(roi_unknown, 0.375, 1e-6);
+  EXPECT_NE(row.find("\"coverage_source\":\"scovox\""), std::string::npos)
+      << row;
+
+  // The five statuses stay five fields. Collapsing the second-hand pair into
+  // the first-hand counts would erase the only record of how much of this
+  // robot's belief it never observed itself.
+  double v = -99.0;
+  for (const char* f : {"unseen", "exploring", "covered",
+                        "exploring_by_others", "covered_by_others"}) {
+    EXPECT_TRUE(readNum(row, f, &v)) << "missing '" << f << "' in " << row;
+  }
+
+  // The flap detector. Zero here on a run whose statuses moved would mean the
+  // commit counter was never wired, and the hysteresis band would then look
+  // healthy in every run regardless of how hard the cells were oscillating.
+  ASSERT_TRUE(readNum(row, "commits_total", &v)) << row;
+  EXPECT_DOUBLE_EQ(v, 12.0);
+
+  // Geometry: without grid_hash a cell id in this file means nothing across
+  // robots, and a hash written as a quoted hex string reads as text to half
+  // the tools that open the file.
+  ASSERT_TRUE(readNum(row, "grid_hash", &v)) << row;
+  EXPECT_DOUBLE_EQ(v, 3735928559.0);
+
+  // Reachability of the COVERED threshold. Without these, a census reporting
+  // zero COVERED cells is indistinguishable from a census that is broken, and
+  // P1's first run produced exactly that row: an entire run to the completion
+  // criterion with not one promotion and nothing to say why. They are checked
+  // by VALUE, not just presence — a distribution wired to the wrong cells (the
+  // whole grid rather than the measured ones) still writes all five fields,
+  // and reads as a world where nothing is mappable.
+  ASSERT_TRUE(readNum(row, "cells_measured", &v)) << row;
+  EXPECT_DOUBLE_EQ(v, 7.0);
+  ASSERT_TRUE(readNum(row, "cells_frontier_ok", &v)) << row;
+  EXPECT_DOUBLE_EQ(v, 5.0);
+  ASSERT_TRUE(readNum(row, "cell_unknown_min", &v)) << row;
+  EXPECT_NEAR(v, 0.08, 1e-6);
+  ASSERT_TRUE(readNum(row, "cell_unknown_p10", &v)) << row;
+  EXPECT_NEAR(v, 0.11, 1e-6);
+  ASSERT_TRUE(readNum(row, "cell_unknown_median", &v)) << row;
+  EXPECT_NEAR(v, 0.42, 1e-6);
+
+  // The frontier veto's own distribution. `_at_best_unknown` is the joint
+  // reading and the only one that can answer whether the two thresholds are
+  // simultaneously satisfiable, so it is pinned to a value DISTINCT from both
+  // marginals — wiring it to either of them would otherwise pass this test
+  // while silently answering a different question.
+  ASSERT_TRUE(readNum(row, "cell_frontier_frac_min", &v)) << row;
+  EXPECT_NEAR(v, 0.01, 1e-6);
+  ASSERT_TRUE(readNum(row, "cell_frontier_frac_median", &v)) << row;
+  EXPECT_NEAR(v, 0.07, 1e-6);
+  ASSERT_TRUE(readNum(row, "cell_frontier_frac_at_best_unknown", &v)) << row;
+  EXPECT_NEAR(v, 0.03, 1e-6);
+}
+
 // --- The declared event vocabulary (schema v4) ---
 //
 // kEventKinds is what sim/equiv_gate.py scores "did a new event kind appear at

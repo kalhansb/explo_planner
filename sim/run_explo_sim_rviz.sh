@@ -48,6 +48,17 @@
 #                                           # exploration exhaustion
 #                                           # (rendezvous | pursuit | hybrid)
 #                                           # — see below
+#   CELL_WORLD=1 ./run_explo_sim_rviz.sh    # + the coarse M-TARE cell layer:
+#                                           # cell_census events in the jsonl
+#                                           # and a colour-coded grid in RViz.
+#                                           # Observation only in P1 — nothing
+#                                           # reads it. CELL_SIZE_M /
+#                                           # CELL_CENSUS_S tune it;
+#                                           # CELL_COVERED_U / CELL_EXPLORING_U
+#                                           # / CELL_FRONTIER_FRAC are the
+#                                           # world-calibrated status
+#                                           # thresholds, overridden here for
+#                                           # the same reason DONE_UNKNOWN is
 #   FOV_VFOV=0.785 FOV_V_RAYS=12 ./run_explo_sim_rviz.sh
 #                                           # A/B: override the EIG evaluator's
 #                                           # modelled sensor geometry for this
@@ -405,6 +416,55 @@ HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
 # rejected_by_minpos and goal selection therefore do not mean the same thing they
 # did in that campaign's CSVs, and the two are not directly comparable.
 COMMS="${COMMS:-0}"
+# --- Coarse cell world (M-TARE evolution, P1) -----------------------------
+# CELL_WORLD=1 turns on the coarse global layer: the ROI diced into
+# CELL_SIZE_M cells, each carrying a status derived from this robot's own map,
+# sampled into `cell_census` events every CELL_CENSUS_S sim-seconds and drawn
+# on /<r>/explo_planner/cell_world.
+#
+# OFF by default, and off means NO PARAMETER IS PASSED — not `cell_world_enable
+# :=false`. The per-phase equivalence gate reads the run_start param dump and
+# requires every param new in the child to sit at its compiled default; passing
+# the knob explicitly would still satisfy that, but passing `team_robot_names`
+# would NOT, and the two have to travel together because the cell world refuses
+# to configure without a fleet identity. So the whole block is gated.
+#
+# In this phase the layer is pure observation: nothing reads it to make a
+# decision. What a CELL_WORLD=1 run therefore costs is one extra sweep of the
+# voxel grid per census tick and one JSONL row; what it buys is the P1 gate,
+# which reads `covered_fraction` against `roi_unknown_fraction` on those rows.
+CELL_WORLD="${CELL_WORLD:-0}"
+CELL_SIZE_M="$(flt "${CELL_SIZE_M:-10.0}")"
+CELL_CENSUS_S="$(flt "${CELL_CENSUS_S:-5.0}")"
+# The cell status thresholds, overridden here for the same reason DONE_UNKNOWN
+# is overridden to 0.64 below: this world has a permanent coverage floor.
+#
+# A cell's unknown fraction counts x/y columns holding no observed voxel. The
+# map stores lidar returns plus a thin free shell, not dense ray-traced free
+# space, so even ground a robot drove straight over keeps a large fraction of
+# its 0.1 m columns empty forever. Measured over two runs, the per-cell floor
+# (`cell_unknown_min`) plateaus at 0.36-0.42 and the mature median at
+# 0.50-0.55, against an ROI-wide 0.63 — which is exactly why DONE_UNKNOWN is
+# 0.64 and not the shipped 0.05. The library defaults (0.15/0.35) assume a map
+# that saturates and are unreachable here: the first P1 run at those values
+# promoted zero cells over its entire length.
+#
+# Placed by the same rule as DONE_UNKNOWN. Release just under the level the
+# mission itself accepts for the whole ROI, because a cell that has degraded to
+# the mission's own accept level is not distinguishably explored; promote a
+# band's width below that. The band must clear the run-to-run spread of the
+# floor, not just one run's: 0.42 was set from a single long run's p10 and a
+# later, shorter run floored at 0.4232 and promoted nothing.
+#
+# Re-derive rather than nudge: cell_census carries
+# cell_unknown_{min,p10,median} and cell_frontier_frac_{min,median} on every
+# row. 0.95 for the frontier veto because in this sparse map 79-89% of a
+# cell's voxels are boundary voxels, so a threshold inside that band splits the
+# population near its median and reports mostly noise; at 0.95 it guards
+# outliers and the column measure discriminates.
+CELL_COVERED_U="$(flt "${CELL_COVERED_U:-0.55}")"
+CELL_EXPLORING_U="$(flt "${CELL_EXPLORING_U:-0.62}")"
+CELL_FRONTIER_FRAC="$(flt "${CELL_FRONTIER_FRAC:-0.95}")"
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.
@@ -1352,6 +1412,28 @@ log "mission_return_enabled=$MISSION_RETURN_ARG home_tol=${MISSION_HOME_TOL}m ma
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
 log "proximity_hold/resume_dist_m=$PROX_HOLD_M/$PROX_RESUME_M m (yaml field defaults 5.0/6.0 overridden for sim)"
 EXPLOIT_ARG="true"; [ "$EXPLOIT" = "0" ] && EXPLOIT_ARG="false"
+# Cell-world args. Built here rather than in the launch loop so the ordered
+# team array is constructed ONCE and every robot is handed the identical
+# literal — building it per robot invites a future edit that reorders it for
+# one of them, and an id that means a different robot on each side is exactly
+# the failure the whole known_by scheme cannot detect from inside.
+TEAM_NAMES_ARG="["
+for r in $ROBOTS; do
+  [ "$TEAM_NAMES_ARG" = "[" ] || TEAM_NAMES_ARG="$TEAM_NAMES_ARG,"
+  TEAM_NAMES_ARG="$TEAM_NAMES_ARG\"$r\""
+done
+TEAM_NAMES_ARG="$TEAM_NAMES_ARG]"
+# Markers follow RVIZ: the planner gates publication on subscriber count, so
+# asking for them headless costs a publisher and nothing else, but it also puts
+# a topic on the graph that no run needs.
+CELL_MARKERS_ARG="false"; [ "$RVIZ" = "1" ] && CELL_MARKERS_ARG="true"
+if [ "$CELL_WORLD" = "1" ]; then
+  log "cell world ON: team=$TEAM_NAMES_ARG cell_size=${CELL_SIZE_M}m census_period=${CELL_CENSUS_S}s markers=$CELL_MARKERS_ARG"
+  log "  status thresholds: covered<=${CELL_COVERED_U} release>${CELL_EXPLORING_U} frontier_frac<=${CELL_FRONTIER_FRAC} (world-calibrated, cf. done_unknown_fraction=$DONE_UNKNOWN; library defaults 0.15/0.35 assume a saturating map and promote nothing here)"
+  log "  ROI [-$ROI_HALF,$ROI_HALF]^2 at ${CELL_SIZE_M}m -> $(awk -v h="$ROI_HALF" -v c="$CELL_SIZE_M" 'BEGIN{n=int((2*h)/c); if (n*c < 2*h) n++; printf "%dx%d", n, n}') cells"
+else
+  log "cell world OFF (CELL_WORLD=0) — no cell params passed, planner is the pre-M-TARE binary at defaults"
+fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
 log "reconnect_mode=$MODE_ARG rendezvous_enabled=$RDV_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
@@ -1447,6 +1529,18 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # The arm's label for the outage gate, recorded because it is a claim about
   # what this run was FOR, not something recoverable from tx_power_dbm alone.
   echo "expect_outage=$EXPECT_OUTAGE"
+  # The M-TARE layer. Recorded even when off, because "this run had the knob
+  # and it was 0" and "this run predates the knob" are different facts and the
+  # binary hash alone cannot separate them within a generation.
+  echo "cell_world=$CELL_WORLD"
+  echo "cell_size_m=$CELL_SIZE_M"
+  echo "cell_census_period_s=$CELL_CENSUS_S"
+  # World-calibrated, so they define what COVERED means on this run and a
+  # census is not comparable across two runs that disagree about them.
+  echo "cell_covered_max_unknown=$CELL_COVERED_U"
+  echo "cell_exploring_min_unknown=$CELL_EXPLORING_U"
+  echo "cell_covered_max_frontier_frac=$CELL_FRONTIER_FRAC"
+  echo "team_robot_names=$TEAM_NAMES_ARG"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -1618,6 +1712,20 @@ for r in $ROBOTS; do
              -p comms_link_robot_index_topic:="$LINK_GATE_INDEX"
              -p comms_link_stale_sec:="$LINK_GATE_STALE" )
     log "$r link gate: $LINK_GATE_TOPIC (index $LINK_GATE_INDEX, stale ${LINK_GATE_STALE}s)"
+  fi
+  # Coarse cell world. team_robot_names travels with it and is the SAME
+  # ordered list on every robot — a robot's id is its index in this array, so
+  # two robots given different orderings would disagree about which mask bit
+  # means whom while both looking perfectly healthy on their own.
+  if [ "$CELL_WORLD" = "1" ]; then
+    EXTRA+=( -p team_robot_names:="$TEAM_NAMES_ARG"
+             -p cell_world_enable:=true
+             -p cell_size_m:="$CELL_SIZE_M"
+             -p cell_census_period_s:="$CELL_CENSUS_S"
+             -p cell_covered_max_unknown:="$CELL_COVERED_U"
+             -p cell_exploring_min_unknown:="$CELL_EXPLORING_U"
+             -p cell_covered_max_frontier_frac:="$CELL_FRONTIER_FRAC"
+             -p publish_cell_markers:="$CELL_MARKERS_ARG" )
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \

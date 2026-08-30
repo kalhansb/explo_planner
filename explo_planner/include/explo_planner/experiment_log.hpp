@@ -359,6 +359,112 @@ struct RunEndEvent {
   double mission_home_sim_sec = -1.0;         ///< sim stamp of the resolution, -1 = none
 };
 
+/// `cell_census` payload: one sample of the coarse cell world's status
+/// histogram (see cell_world.hpp), plus the planner's own ROI-wide coverage
+/// measure taken on the SAME tick from the SAME map.
+///
+/// The two coverage numbers ride on one event deliberately. P1's gate asks
+/// whether the census converges to COVERED as the ROI's unknown fraction
+/// falls, and this sim is nondeterministic enough run-to-run that joining two
+/// event streams on a timestamp would be comparing two different ticks and
+/// calling the difference a disagreement. Here they are one measurement.
+struct CellCensusEvent {
+  int cells_total = 0;
+  // The five local statuses, counted separately. `*_by_others` is a LOCAL-only
+  // vocabulary (it never goes on the wire), so these two counts are the only
+  // record of how much of this robot's belief is second-hand.
+  int unseen = 0;
+  int exploring = 0;
+  int covered = 0;
+  int exploring_by_others = 0;
+  int covered_by_others = 0;
+  /// Fraction of cells believed finished by anyone. Comparable to
+  /// (1 - roi_unknown_fraction) only up to CELL QUANTISATION: a cell counts as
+  /// wholly covered or not at all, so with 10 m cells over a 30 m ROI the
+  /// census can only ever take ten values and lags the continuous measure by
+  /// up to one cell's worth of ground in each direction.
+  double covered_fraction = -1.0;
+  /// The planner's existing continuous measure and where it came from
+  /// ("planning_map" / "scovox" / "none") — the same pair fed to
+  /// noteCoverage() on this tick.
+  double roi_unknown_fraction = -1.0;
+  const char* coverage_source = "none";
+  /// Cells whose status changed on the tick that produced this sample.
+  int changed = 0;
+  /// Sum over cells of update_id: every first-hand status commit this robot
+  /// has ever made. A flap detector. If this climbs while the histogram above
+  /// sits still, the hysteresis band is too narrow — and each of those commits
+  /// reset a known_by mask that the §3.6 knowledge gate reads, so flapping is
+  /// not merely cosmetic churn, it silently re-arms reconnection forever.
+  long long commits_total = 0;
+  // --- geometry, so a cell id in this file can be located --------------
+  double cell_size_m = 0.0;
+  int nx = 0, ny = 0;
+  /// FNV-1a over the quantised grid geometry. Two robots whose grid_hash
+  /// differs do not mean the same ground by the same cell id, and no
+  /// cross-robot comparison of their cell ids is valid.
+  unsigned int grid_hash = 0;
+  /// Enabled / possible edges in the cell adjacency graph. A collapse here is
+  /// how a plan-map outage shows up before it becomes an allocation failure.
+  int edges_enabled = 0;
+  int edges_total = 0;
+  // --- is the COVERED threshold reachable at all? ----------------------
+  //
+  // The status histogram above says how many cells were promoted; it cannot
+  // say whether promotion was POSSIBLE. Those look identical in the log — an
+  // all-EXPLORING census is what you get both from a census that is broken and
+  // from a `covered_max_unknown` set below anything this world's map ever
+  // reaches. The first run of P1 landed on exactly that ambiguity: zero
+  // COVERED cells over an entire run that reached the harness's completion
+  // criterion, with nothing in the row to say which of the two it was.
+  //
+  // These five fields settle it from the row itself. They are order statistics
+  // over the MEASURED cells only, so a grid overhanging the ROI does not drag
+  // the distribution toward 1.0 with cells nobody could have seen, and the two
+  // promotion vetoes are reported separately because they fail for unrelated
+  // reasons and a single "not promoted" count cannot be acted on.
+  /// Cells with observed_columns >= min_observed_columns. Denominator for the
+  /// four below; the rest of the grid has no evidence either way.
+  int cells_measured = 0;
+  /// Measured cells clearing covered_max_frontier_frac. Compare against
+  /// cell_unknown_p10: if this is high while the unknown fractions sit far
+  /// above covered_max_unknown, the column measure is the binding veto, and
+  /// vice versa.
+  int cells_frontier_ok = 0;
+  /// Unknown-column fraction over the measured cells: the best cell, the 10th
+  /// percentile, and the median. -1 when nothing was measured.
+  ///
+  /// cell_unknown_min is the one that answers the reachability question
+  /// directly — no cell can ever be promoted if the best-observed cell on the
+  /// map is still above covered_max_unknown.
+  double cell_unknown_min = -1.0;
+  double cell_unknown_p10 = -1.0;
+  double cell_unknown_median = -1.0;
+  /// Frontier voxels as a fraction of the cell's observed voxels: the best
+  /// cell and the median, over the measured cells.
+  ///
+  /// A fraction and not the raw count, because the raw count is what made the
+  /// veto unusable in the first place. The knob used to be an absolute number
+  /// of voxels, so its meaning depended on the cell size and the map
+  /// resolution — at 10 m cells and 0.1 m voxels a thoroughly swept cell holds
+  /// tens of thousands of voxels and hundreds of boundary ones, and the
+  /// small-looking default vetoed everything forever. The fraction is the same
+  /// quantity with the scale divided out, so a threshold on it means the same
+  /// thing at any cell size; see covered_max_frontier_frac.
+  double cell_frontier_frac_min = -1.0;
+  double cell_frontier_frac_median = -1.0;
+  /// The frontier fraction of the cell with the LOWEST unknown fraction —
+  /// i.e. of the single best promotion candidate on the map.
+  ///
+  /// The two medians above cannot answer whether promotion is possible,
+  /// because the best-unknown cell and the best-frontier cell need not be the
+  /// same cell, and a threshold pair chosen from two independent marginals can
+  /// be satisfiable by nothing. This field is the joint question asked
+  /// directly: if covered_max_unknown were set just above cell_unknown_min,
+  /// would the frontier veto still reject that very cell?
+  double cell_frontier_frac_at_best_unknown = -1.0;
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -663,6 +769,13 @@ class ExperimentLog {
   void noteCoverage(const ExperimentContext& ctx, double unknown_fraction,
                     const char* coverage_source, double distance_m,
                     double x, double y);
+
+  /// Emits one `cell_census` (schema v4). Unconditional — unlike
+  /// noteCoverage() there is no ladder and no latch, because the question this
+  /// answers is about the TRAJECTORY of the histogram, not about first
+  /// crossings, and a latched sampler cannot show a status going backwards.
+  /// The caller decides the rate.
+  void logCellCensus(const ExperimentContext& ctx, const CellCensusEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;

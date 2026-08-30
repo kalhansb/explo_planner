@@ -75,6 +75,7 @@
 #include "explo_planner/planner_util.hpp"
 #include "explo_planner/failed_goal_blacklist.hpp"
 #include "explo_planner/fleet_identity.hpp"
+#include "explo_planner/cell_world.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -496,6 +497,14 @@ private:
   void republishGoal(const CandidateViewpoint& vp);
   void publishCandidateViz(const std::vector<CandidateViewpoint>& candidates);
 
+  /// Re-census the coarse cell world from the current map and emit one
+  /// `cell_census`, at most every `cell_census_period_s_` SIM seconds. Takes
+  /// the ROI coverage measure of the calling tick so the two ride one event.
+  /// No-op unless the cell world is enabled and configured.
+  void updateCellWorld(double roi_unknown_fraction, const char* coverage_source);
+  /// Draw the cell world as a flat colour-coded grid on its own topic.
+  void publishCellViz();
+
   /// Standing / sightline height for an exploitation point at (x, y). Flat
   /// mode returns the fixed absolute vantage height. Terrain mode snaps to the
   /// local ground + candidate clearance, the same way exploration candidates
@@ -511,6 +520,18 @@ private:
   // start without it rather than degrading. See fleet_identity.hpp.
   std::vector<std::string> team_robot_names_;
   FleetIdentity            fleet_;
+  // Coarse cell world (P1). OFF by default: when disabled nothing is
+  // configured, no census runs, no event is emitted and no publisher exists,
+  // so the node is the pre-M-TARE node exactly. Enabling it is still
+  // observation-only — nothing in this phase READS cell_world_ to make a
+  // decision, which is what makes the census safe to sample from the metrics
+  // path. See cell_world.hpp.
+  bool       cell_world_enable_ = false;
+  CellWorld  cell_world_;
+  double     cell_census_period_s_ = 5.0;
+  /// Sim-time stamp of the last census, -1 = none yet.
+  double     last_cell_census_sec_ = -1.0;
+  bool       publish_cell_markers_ = false;
   std::string output_csv_;
   // Event-log output (newline-delimited JSON, one file per robot per run).
   // Empty path = derive from output_csv (see the param load); enabled by
@@ -1664,6 +1685,14 @@ private:
   // that is brought up, restarted, or re-configured after the planner.
   bool            goal_had_subscriber_ = false;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
+  // Cell-world markers get their OWN topic rather than a namespace on
+  // viz_pub_: publishCandidateViz() clears with a DELETEALL, which in RViz
+  // wipes the whole display, so sharing the topic would make the two layers
+  // delete each other on alternating ticks. Created only when the cell world
+  // is enabled AND markers are asked for — a publisher that exists changes the
+  // ROS graph, and default-off means default-invisible.
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      cell_viz_pub_;
   rclcpp::Publisher<explo_planner_msgs::msg::RobotIntent>::SharedPtr intent_pub_;
   // One subscription per configured source topic. Single-element in the
   // default (shared-bus) wiring; one entry per peer when the stream is split
@@ -2984,6 +3013,93 @@ ExploPlannerNode::ExploPlannerNode()
   roi_max_x_ = ccfg.roi_max_x;
   roi_min_y_ = ccfg.roi_min_y;
   roi_max_y_ = ccfg.roi_max_y;
+
+  // --- Coarse cell world (P1) ---------------------------------------
+  // The M-TARE-style global layer: the ROI diced into cells, each carrying a
+  // status derived from this robot's own map. In this phase it is pure
+  // observation — the census is logged and optionally drawn, and NOTHING
+  // reads it. Off by default, and when off it is not even configured.
+  //
+  // The grid is derived from the ROI rather than given its own bounds on
+  // purpose: a cell world covering different ground than the planner's ROI
+  // would report coverage of an area the robot is forbidden to enter, and the
+  // P1 gate compares the census against a measure taken over exactly the ROI.
+  cell_world_enable_ = dp("cell_world_enable", false);
+  if (cell_world_enable_) {
+    // Cell ids are only comparable between robots that agree on the geometry,
+    // so every input here is logged (below) and hashed into grid_hash.
+    const double cell_size_m = dp("cell_size_m", 10.0);
+    CellWorld::Config ccw;
+    // The status thresholds. PROVISIONAL until the P1 smoke run calibrates
+    // them: `covered_max_unknown` is what "this cell is finished" means, and
+    // the band up to `exploring_min_unknown` is the hysteresis that stops a
+    // cell flapping. The band is load-bearing rather than cosmetic — every
+    // committed status change resets the cell's known_by mask, so a flapping
+    // cell would re-arm the §3.6 knowledge gate forever.
+    // The defaults are the saturating-map values and are WORLD-CALIBRATED
+    // knobs, in the same family as done_unknown_fraction — see CellWorldConfig
+    // for the floor that makes them so, and how to read replacements off the
+    // cell_census quantiles rather than guess them.
+    ccw.covered_max_unknown   = dp("cell_covered_max_unknown", 0.15);
+    ccw.exploring_min_unknown = dp("cell_exploring_min_unknown", 0.35);
+    ccw.covered_max_frontier_frac =
+        dp("cell_covered_max_frontier_frac", 0.90);
+    ccw.min_observed_columns  = dp("cell_min_observed_columns", 4);
+    ccw.edge_max_blocked_fraction =
+        dp("cell_edge_max_blocked_fraction", 0.5);
+    const CellGrid grid = makeCellGrid(roi_min_x_, roi_max_x_,
+                                       roi_min_y_, roi_max_y_,
+                                       static_cast<float>(cell_size_m));
+    // Requires a configured fleet identity: without one self_id is -1, every
+    // known_by mask this robot sets would be empty, and the gate downstream
+    // would compute a confident answer out of nothing. Refuse, don't degrade.
+    const std::string err = cell_world_.configure(grid, ccw, fleet_.self_id);
+    if (!err.empty()) {
+      RCLCPP_FATAL(this->get_logger(), "cell_world: %s", err.c_str());
+      throw std::runtime_error("cell_world: " + err);
+    }
+    cell_census_period_s_ = dp("cell_census_period_s", 5.0);
+    publish_cell_markers_ = dp("publish_cell_markers", false);
+    RCLCPP_INFO(this->get_logger(),
+                "Cell world: %dx%d cells of %.2f m over ROI "
+                "[%.1f,%.1f]x[%.1f,%.1f], grid_hash=0x%08x",
+                grid.nx, grid.ny, static_cast<double>(grid.cell_size_m),
+                static_cast<double>(roi_min_x_),
+                static_cast<double>(roi_max_x_),
+                static_cast<double>(roi_min_y_),
+                static_cast<double>(roi_max_y_), grid.configHash());
+    if (publish_cell_markers_) {
+      cell_viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+          "~/cell_world", 10);
+    }
+  }
+  if (exp_log_) {
+    // Logged even when off, so a run record says the feature EXISTED and was
+    // disabled — which is what distinguishes an equivalence-gate control run
+    // from a run of the parent binary that never had the knob.
+    exp_log_->addParamBool("cell_world_enable", cell_world_enable_);
+    if (cell_world_enable_) {
+      exp_log_->addParamNum("cell_size_m", cell_world_.grid().cell_size_m);
+      exp_log_->addParamNum("cell_covered_max_unknown",
+                            cell_world_.config().covered_max_unknown);
+      exp_log_->addParamNum("cell_exploring_min_unknown",
+                            cell_world_.config().exploring_min_unknown);
+      exp_log_->addParamNum("cell_covered_max_frontier_frac",
+                            cell_world_.config().covered_max_frontier_frac);
+      exp_log_->addParamNum("cell_min_observed_columns",
+                            cell_world_.config().min_observed_columns);
+      exp_log_->addParamNum("cell_edge_max_blocked_fraction",
+                            cell_world_.config().edge_max_blocked_fraction);
+      exp_log_->addParamNum("cell_census_period_s", cell_census_period_s_);
+      exp_log_->addParamBool("publish_cell_markers", publish_cell_markers_);
+      // Derived, not a dp() param, but the one number that says whether two
+      // robots' cell ids name the same ground. Kept beside the inputs it is
+      // computed from so a mismatch can be traced to which input differed.
+      exp_log_->addParamNum("cell_grid_hash", cell_world_.grid().configHash());
+      exp_log_->addParamNum("cell_nx", cell_world_.grid().nx);
+      exp_log_->addParamNum("cell_ny", cell_world_.grid().ny);
+    }
+  }
 
   // The dscovox mapping node fuses every robot's voxels (multi-robot
   // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
@@ -7525,6 +7641,13 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
                            static_cast<double>(latest_pos_.y()));
   }
 
+  // The coarse cell census, taken here for the same reason the milestones are:
+  // it reads the map that `uf` above was just measured on, on this tick. P1's
+  // gate asks whether the census agrees with `uf` as coverage saturates, and
+  // this sim is nondeterministic enough that sampling the two from different
+  // hooks would have them measuring different maps. No-op when disabled.
+  updateCellWorld(uf, cov_src);
+
   // Aggregate map stats from map_cache_ (the fused ROI grid). The dscovox node
   // no longer computes these — scoring and stats both live in the planner now.
   // The grid walk + frontier-neighbour logic lives in MapCache::computeStats()
@@ -9307,6 +9430,204 @@ void ExploPlannerNode::publishCandidateViz(
   ma.markers.push_back(sel);
 
   viz_pub_->publish(ma);
+}
+
+// ==================================================================
+// Coarse cell world (P1)
+// ==================================================================
+
+void ExploPlannerNode::updateCellWorld(double roi_unknown_fraction,
+                                       const char* coverage_source) {
+  if (!cell_world_enable_ || !cell_world_.configured() || !map_cache_) return;
+
+  // Rate-limited on SIM time, the same axis every event in the log lives on.
+  // The census walks the whole voxel grid once — the cost of a single
+  // unknownColumnFraction call, which this tick already paid — so the limit is
+  // about not doubling that on every CSV row, not about it being expensive.
+  const double t = this->now().seconds();
+  if (last_cell_census_sec_ >= 0.0 &&
+      t - last_cell_census_sec_ < cell_census_period_s_)
+    return;
+  last_cell_census_sec_ = t;
+
+  const int changed =
+      cell_world_.applyObservation(censusFromMap(*map_cache_,
+                                                 cell_world_.grid()));
+
+  // Edges follow the plan map as it fills. Rebuilt every census rather than
+  // once at startup because at startup the plan map is empty and EVERY edge
+  // would be blocked. With no map the probe is null and every edge is enabled,
+  // which is the right default: the graph is a ranking input, and an
+  // all-disabled graph would silently rank nothing.
+  if (latest_plan_map_) {
+    const nav_msgs::msg::OccupancyGrid& pm = *latest_plan_map_;
+    cell_world_.rebuildEdges(
+        [&pm](float x0, float y0, float x1, float y1) -> double {
+          // Sample the straight line between two cell centroids. 16 intervals:
+          // at a 10 m cell an 8-neighbour span is <= 14.1 m, so samples are
+          // under a metre apart — coarse next to the plan map's resolution,
+          // but this decides an edge, not a path.
+          constexpr int kSamples = 16;
+          int blocked = 0;
+          for (int i = 0; i <= kSamples; ++i) {
+            const float u = static_cast<float>(i) / kSamples;
+            const Eigen::Vector3f p(x0 + (x1 - x0) * u,
+                                    y0 + (y1 - y0) * u, 0.0f);
+            // NOT isCellOccupied: unknown must count as blocked here. An
+            // unexplored corridor is exactly the case where a straight-line
+            // edge would claim a connection nobody has verified.
+            if (!explo_planner::isCellFree(pm, p)) ++blocked;
+          }
+          return static_cast<double>(blocked) / (kSamples + 1);
+        });
+  } else {
+    cell_world_.rebuildEdges();
+  }
+
+  const CellWorld::Census cs = cell_world_.census();
+  CellCensusEvent ev;
+  ev.cells_total          = cell_world_.size();
+  ev.unseen               = cs.unseen;
+  ev.exploring            = cs.exploring;
+  ev.covered              = cs.covered;
+  ev.exploring_by_others  = cs.exploring_by_others;
+  ev.covered_by_others    = cs.covered_by_others;
+  ev.covered_fraction     = cs.coveredFraction();
+  ev.roi_unknown_fraction = roi_unknown_fraction;
+  ev.coverage_source      = coverage_source;
+  ev.changed              = changed;
+  ev.cell_size_m          = cell_world_.grid().cell_size_m;
+  ev.nx                   = cell_world_.grid().nx;
+  ev.ny                   = cell_world_.grid().ny;
+  ev.grid_hash            = cell_world_.grid().configHash();
+
+  // Commits and edges in one sweep over the unordered neighbour pairs. Only
+  // the +x, +y and the two diagonals are visited, so each edge is counted
+  // once; the mirror pairs are the same edge.
+  const CellGrid& g = cell_world_.grid();
+  static const int kDx[4] = {1, 0, 1,  1};
+  static const int kDy[4] = {0, 1, 1, -1};
+  // Unknown fractions of the MEASURED cells, gathered here and reduced below.
+  // Only cells that cleared min_observed_columns go in: an unmeasured cell
+  // reports unknownFraction() == 1 by construction, and letting those into the
+  // distribution would make the median a statement about how far the grid
+  // overhangs the ROI rather than about how well the seen ground is mapped.
+  std::vector<double> cell_u, cell_ff;
+  cell_u.reserve(static_cast<size_t>(cell_world_.size()));
+  cell_ff.reserve(static_cast<size_t>(cell_world_.size()));
+  double best_u = 2.0, ff_at_best_u = -1.0;
+  for (int id = 0; id < cell_world_.size(); ++id) {
+    const CellWorld::Cell& c = cell_world_.cell(id);
+    ev.commits_total += c.update_id;
+    if (c.obs.observed_columns >= cell_world_.config().min_observed_columns) {
+      ++ev.cells_measured;
+      const double u = c.obs.unknownFraction();
+      // Frontier as a fraction of the cell's own observed voxels. observed
+      // cannot be 0 here: a cell with no voxels at all has no observed columns
+      // either and never reaches this branch. Guarded anyway, because the
+      // consequence of being wrong is a division that poisons a quantile.
+      const double ff =
+          c.obs.observed_voxels > 0
+              ? static_cast<double>(c.obs.frontier_voxels) /
+                    static_cast<double>(c.obs.observed_voxels)
+              : 0.0;
+      cell_u.push_back(u);
+      cell_ff.push_back(ff);
+      // Strict <, so ties keep the FIRST cell rather than the last. Which cell
+      // wins a tie does not matter; that the choice is deterministic does,
+      // since this field is read across rows as if it tracked one candidate.
+      if (u < best_u) { best_u = u; ff_at_best_u = ff; }
+      if (ff <= cell_world_.config().covered_max_frontier_frac)
+        ++ev.cells_frontier_ok;
+    }
+    const int cx = g.col(id), cy = g.row(id);
+    for (int k = 0; k < 4; ++k) {
+      const int nx2 = cx + kDx[k], ny2 = cy + kDy[k];
+      if (nx2 < 0 || nx2 >= g.nx || ny2 < 0 || ny2 >= g.ny) continue;
+      ++ev.edges_total;
+      if (cell_world_.edgeEnabled(id, ny2 * g.nx + nx2)) ++ev.edges_enabled;
+    }
+  }
+  if (!cell_u.empty()) {
+    std::sort(cell_u.begin(), cell_u.end());
+    // Nearest-rank percentiles, so every reported value is a real cell's
+    // measurement rather than an interpolation between two of them. With a
+    // handful of measured cells an interpolated p10 can sit below every cell
+    // on the map, which is exactly the wrong answer to "is the threshold
+    // reachable".
+    auto pct = [&cell_u](double q) {
+      const size_t n = cell_u.size();
+      size_t k = static_cast<size_t>(std::ceil(q * static_cast<double>(n)));
+      if (k == 0) k = 1;
+      return cell_u[std::min(k, n) - 1];
+    };
+    ev.cell_unknown_min    = cell_u.front();
+    ev.cell_unknown_p10    = pct(0.10);
+    ev.cell_unknown_median = pct(0.50);
+    // Sorted separately and deliberately: these are the frontier marginal, not
+    // the frontier of the cells that produced the unknown quantiles. The joint
+    // question is the field below, which was captured before either sort.
+    std::sort(cell_ff.begin(), cell_ff.end());
+    ev.cell_frontier_frac_min    = cell_ff.front();
+    ev.cell_frontier_frac_median =
+        cell_ff[std::min(static_cast<size_t>(std::ceil(0.5 * cell_ff.size())),
+                         cell_ff.size()) - 1];
+    ev.cell_frontier_frac_at_best_unknown = ff_at_best_u;
+  }
+
+  if (exp_log_) exp_log_->logCellCensus(expCtx(), ev);
+  publishCellViz();
+}
+
+void ExploPlannerNode::publishCellViz() {
+  if (!cell_viz_pub_ || cell_viz_pub_->get_subscription_count() == 0) return;
+
+  const CellGrid& g = cell_world_.grid();
+  visualization_msgs::msg::MarkerArray ma;
+  visualization_msgs::msg::Marker clear;
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  ma.markers.push_back(clear);
+
+  for (int id = 0; id < cell_world_.size(); ++id) {
+    float cx = 0.0f, cy = 0.0f;
+    g.centre(id, cx, cy);
+
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = map_frame_;
+    m.header.stamp = this->now();
+    m.ns = "cells";
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::CUBE;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.position.x = cx;
+    m.pose.position.y = cy;
+    // Below the robot and below the candidate arrows, and flat: this is a
+    // ground shading layer, not an obstacle.
+    m.pose.position.z = -0.05;
+    m.pose.orientation.w = 1.0;
+    // Inset so the cell boundaries stay legible without a separate line list.
+    m.scale.x = m.scale.y = g.cell_size_m * 0.92;
+    m.scale.z = 0.02;
+    // First-hand statuses are saturated, second-hand ones are the same hue
+    // desaturated — so "I saw this" and "somebody told me" are distinguishable
+    // at a glance, which is the whole point of keeping them separate locally.
+    switch (cell_world_.status(id)) {
+      case CellStatus::UNSEEN:
+        m.color.r = 0.35f; m.color.g = 0.35f; m.color.b = 0.35f; break;
+      case CellStatus::EXPLORING:
+        m.color.r = 0.95f; m.color.g = 0.75f; m.color.b = 0.10f; break;
+      case CellStatus::COVERED:
+        m.color.r = 0.10f; m.color.g = 0.85f; m.color.b = 0.25f; break;
+      case CellStatus::EXPLORING_BY_OTHERS:
+        m.color.r = 0.60f; m.color.g = 0.55f; m.color.b = 0.35f; break;
+      case CellStatus::COVERED_BY_OTHERS:
+        m.color.r = 0.35f; m.color.g = 0.60f; m.color.b = 0.40f; break;
+    }
+    m.color.a = 0.35f;
+    ma.markers.push_back(m);
+  }
+
+  cell_viz_pub_->publish(ma);
 }
 
 } // namespace explo_planner

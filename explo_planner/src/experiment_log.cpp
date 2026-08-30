@@ -719,6 +719,44 @@ void ExperimentLog::noteCoverage(const ExperimentContext& ctx,
   }
 }
 
+void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
+                                  const CellCensusEvent& e) {
+  if (!open_ || !started_) return;
+  begin("cell_census", ctx);
+  integer("cells_total", e.cells_total);
+  integer("unseen", e.unseen);
+  integer("exploring", e.exploring);
+  integer("covered", e.covered);
+  integer("exploring_by_others", e.exploring_by_others);
+  integer("covered_by_others", e.covered_by_others);
+  num("covered_fraction", e.covered_fraction);
+  // The planner's continuous ROI measure, on this same tick and this same map.
+  // Kept beside the histogram so the P1 agreement check needs no join.
+  num("roi_unknown_fraction", e.roi_unknown_fraction);
+  text("coverage_source", e.coverage_source);
+  integer("changed", e.changed);
+  integer("commits_total", e.commits_total);
+  num("cell_size_m", e.cell_size_m);
+  integer("nx", e.nx);
+  integer("ny", e.ny);
+  // Written as a decimal integer, not hex: the JSON number type has no hex
+  // literal, and a quoted "0x..." would read as a string in half the tools
+  // that open this file.
+  integer("grid_hash", static_cast<long long>(e.grid_hash));
+  integer("edges_enabled", e.edges_enabled);
+  integer("edges_total", e.edges_total);
+  integer("cells_measured", e.cells_measured);
+  integer("cells_frontier_ok", e.cells_frontier_ok);
+  num("cell_unknown_min", e.cell_unknown_min);
+  num("cell_unknown_p10", e.cell_unknown_p10);
+  num("cell_unknown_median", e.cell_unknown_median);
+  num("cell_frontier_frac_min", e.cell_frontier_frac_min);
+  num("cell_frontier_frac_median", e.cell_frontier_frac_median);
+  num("cell_frontier_frac_at_best_unknown",
+      e.cell_frontier_frac_at_best_unknown);
+  end();
+}
+
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));
