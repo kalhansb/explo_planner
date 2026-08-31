@@ -164,6 +164,91 @@ def pair_samples(a, b, tol):
     return pairs, unpaired_a, len(b_sorted) - len(used)
 
 
+def precondition_stages(robots, census, exch, outages, require_exchange=True):
+    """The checks that must hold before a convergence verdict means anything.
+
+    Yields one list of failure messages per stage; the caller stops at the
+    first non-empty list. The stages are ORDERED, not independent — the grid
+    comparison assumes there are census rows to compare and would raise on a
+    run that failed the stage before it — which is why this is a generator and
+    not one flat list.
+
+    `require_exchange` is the only switch, and it exists for exactly one
+    caller: team_convergence_control.py scores a run with the exchange
+    deliberately off, which is the single precondition that control is
+    entitled to drop. Everything else it inherits from here, so a precondition
+    added to this gate is added to its control in the same edit. The control
+    used to carry its own copy of none of these, which is how it came to have
+    four separate ways to raise a traceback on the runs it exists to describe.
+    """
+    stage = []
+    for r in robots:
+        if not census[r]:
+            stage.append(f"{r} logged no cell_census events — CELL_WORLD was "
+                         f"off, so there is no cell world to converge")
+        if require_exchange and not exch[r]:
+            stage.append(f"{r} logged no team_exchange events — nothing was "
+                         f"ever merged, so a convergence verdict would be "
+                         f"about two robots that never spoke")
+    yield stage
+
+    # A shared_hash comparison is meaningless across different grids, exactly
+    # as cell_world.hpp says. Check it rather than assume it: two robots given
+    # different ROI params would otherwise score a permanent divergence and be
+    # reported as an exchange failure.
+    stage = []
+    grids = {r: {e.get("grid_hash") for e in census[r]} for r in robots}
+    for r in robots:
+        if len(grids[r]) != 1:
+            stage.append(f"{r} changed grid_hash mid-run ({sorted(grids[r])}) "
+                         f"— its own cell ids stopped meaning the same ground")
+    if not stage and grids[robots[0]] != grids[robots[1]]:
+        stage.append(f"the two robots ran different cell grids "
+                     f"({grids[robots[0]]} vs {grids[robots[1]]}) — no "
+                     f"cross-robot cell comparison is valid, and the exchange "
+                     f"should have dropped every message with "
+                     f"grid_hash_mismatch")
+    if any("shared_hash" not in e for e in census[robots[0]]):
+        stage.append("cell_census rows carry no shared_hash — this cell was "
+                     "produced by a binary older than the convergence readout")
+    yield stage
+
+    # --- was there a dropout at all? ----------------------------------------
+    # Read BEFORE anything is scored, because a run in which the link never
+    # dropped is not a run this gate has an opinion about. The verdict sentence
+    # is "diverged under a dropout and agreed again after it healed"; with no
+    # dropout there is no such claim to make.
+    #
+    # This is a REFUSAL (2), not a failure (1). The exchange may be working
+    # perfectly — nothing in a permanently-connected run can tell — and
+    # returning 1 would blame the planner for a scenario that never separated
+    # the robots.
+    #
+    # It is here because the first real run scored by this gate had exactly
+    # this shape (connected in all 6493 link samples, drop_disconnected == 0 on
+    # every poll) and an earlier version of this code printed PASS over it: the
+    # per-outage loop simply never executed, `scored` stayed 0, the guard below
+    # that catches that was itself written `if outages and scored == 0`, and an
+    # empty fails list reads as success. Two robots sampling a SHARED fused map
+    # at slightly different sim times disagree on shared_hash now and then from
+    # timing skew alone, so even the "must have diverged somewhere" requirement
+    # was satisfied — by something that is not a dropout. Every ingredient of
+    # the pass was real except the dropout.
+    stage = []
+    if outages is None:
+        stage.append("no link_states.csv in this cell — without the emulator's "
+                     "link trace there is no outage to measure a heal against, "
+                     "and the planner's own peer_lost events are not a "
+                     "substitute (they are downstream of the gate under test)")
+    elif not outages:
+        stage.append("the link never dropped: connected on every sample in "
+                     "link_states.csv, so there is no heal to score and the "
+                     "comms arm never differed from the control. Re-run with "
+                     "more separation, denser canopy between the robots, or a "
+                     "lower tx_power_dbm")
+    yield stage
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("celldir")
@@ -196,79 +281,15 @@ def main():
     fails, notes = [], []
 
     # --- preconditions: the run must be the one the gate is about -----------
-    for r in robots:
-        if not census[r]:
-            fails.append(f"{r} logged no cell_census events — CELL_WORLD was "
-                         f"off, so there is no cell world to converge")
-        if not exch[r]:
-            fails.append(f"{r} logged no team_exchange events — nothing was "
-                         f"ever merged, so a convergence verdict would be "
-                         f"about two robots that never spoke")
-    if fails:
-        for m in fails:
-            print(f"FAIL\tprecondition\t{m}")
-        return 2
-
-    # A shared_hash comparison is meaningless across different grids, exactly
-    # as cell_world.hpp says. Check it rather than assume it: two robots given
-    # different ROI params would otherwise score a permanent divergence and be
-    # reported as an exchange failure.
-    grids = {r: {e.get("grid_hash") for e in census[r]} for r in robots}
-    for r in robots:
-        if len(grids[r]) != 1:
-            fails.append(f"{r} changed grid_hash mid-run ({sorted(grids[r])}) "
-                         f"— its own cell ids stopped meaning the same ground")
-    if not fails and grids[robots[0]] != grids[robots[1]]:
-        fails.append(f"the two robots ran different cell grids "
-                     f"({grids[robots[0]]} vs {grids[robots[1]]}) — no "
-                     f"cross-robot cell comparison is valid, and the exchange "
-                     f"should have dropped every message with "
-                     f"grid_hash_mismatch")
-    if any("shared_hash" not in e for e in census[robots[0]]):
-        fails.append("cell_census rows carry no shared_hash — this cell was "
-                     "produced by a binary older than the convergence readout")
-    if fails:
-        for m in fails:
-            print(f"FAIL\tprecondition\t{m}")
-        return 2
-
-    # --- was there a dropout at all? ----------------------------------------
-    # Read BEFORE anything is scored, because a run in which the link never
-    # dropped is not a run this gate has an opinion about. The verdict sentence
-    # is "diverged under a dropout and agreed again after it healed"; with no
-    # dropout there is no such claim to make.
-    #
-    # This is a REFUSAL (2), not a failure (1). The exchange may be working
-    # perfectly — nothing in a permanently-connected run can tell — and
-    # returning 1 would blame the planner for a scenario that never separated
-    # the robots.
-    #
-    # It is here because the first real run scored by this gate had exactly
-    # this shape (connected in all 6493 link samples, drop_disconnected == 0 on
-    # every poll) and an earlier version of this code printed PASS over it: the
-    # per-outage loop simply never executed, `scored` stayed 0, the guard below
-    # that catches that was itself written `if outages and scored == 0`, and an
-    # empty fails list reads as success. Two robots sampling a SHARED fused map
-    # at slightly different sim times disagree on shared_hash now and then from
-    # timing skew alone, so even the "must have diverged somewhere" requirement
-    # was satisfied — by something that is not a dropout. Every ingredient of
-    # the pass was real except the dropout.
+    # Shared with team_convergence_control.py, which drops exactly one of them
+    # and inherits the rest. Stage by stage, stopping at the first that fails:
+    # a later stage may assume an earlier one held.
     outages = read_outages(os.path.join(d, "link_states.csv"))
-    if outages is None:
-        fails.append("no link_states.csv in this cell — without the emulator's "
-                     "link trace there is no outage to measure a heal against, "
-                     "and the planner's own peer_lost events are not a "
-                     "substitute (they are downstream of the gate under test)")
-    elif not outages:
-        fails.append("the link never dropped: connected on every sample in "
-                     "link_states.csv, so there is no heal to score and the "
-                     "comms arm never differed from the control. Re-run with "
-                     "more separation, denser canopy between the robots, or a "
-                     "lower tx_power_dbm")
-    if fails:
-        for m in fails:
-            print(f"FAIL\tprecondition\t{m}")
-        return 2
+    for stage in precondition_stages(robots, census, exch, outages):
+        if stage:
+            for m in stage:
+                print(f"FAIL\tprecondition\t{m}")
+            return 2
     notes.append(f"{len(outages)} link outage(s), longest "
                  f"{max(b - a for a, b, _ in outages):.0f} s, "
                  f"{sum(b - a for a, b, _ in outages):.0f} s down in total")
