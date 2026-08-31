@@ -181,6 +181,36 @@ GATED_MANIFEST_GROUPS = {
     # line, which is the habit the P3/P4 note above was written to enforce
     # after that habit was skipped once.
     "rendezvous_schedule": ("0", set()),
+    # P6. Its off value is a WORD, not "0": the knob selects which aimer the
+    # chase uses and the shipped one is the trail, so "off" for this group is
+    # pursuit_predictor=trail. Registering it as ("0", ...) would make an
+    # honest defaults child fail here and an mdp child fail for the right
+    # reason by accident — equiv_gate_calib.py pins both directions.
+    #
+    # And this one was, again, added to the manifest by one commit and to this
+    # registry by a later one — the same lapse the P3/P4 note above records,
+    # repeated by the author of that note. The habit does not stick by being
+    # written down; what catches it is the hard failure at the bottom of this
+    # ladder, which is why that failure is not softened.
+    "pursuit_predictor": ("trail", set()),
+}
+
+# Manifest keys that RESTATE a key both sides already record, rather than
+# describing a switch. P7 writes the roster (robots, n_robots) into the
+# manifest; it is derived from the scenario YAML, which the manifest has always
+# recorded and which the comparison above already fails on when it differs.
+#
+# These cannot go in GATED_MANIFEST_GROUPS: there is no "off" value for a
+# roster, and inventing one would mean declaring some team size inert. The rule
+# applied instead is narrower than the gated-group rule, not looser — the key
+# is relaxed only when its SOURCE key is present on BOTH sides and equal, so a
+# pair that changed scenario, or that cannot show which scenario it ran, still
+# fails. Relaxing them is not a new permission: the parent had a roster too,
+# it simply did not write it down, so nothing that was previously compared
+# stops being compared here.
+DERIVED_MANIFEST = {
+    "robots": "scenario",
+    "n_robots": "scenario",
 }
 
 
@@ -520,7 +550,7 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
         for g, (off, deps) in GATED_MANIFEST_GROUPS.items():
             if cm.get(g) == off:
                 inert |= deps
-        relaxed = []
+        relaxed, derived_ok = [], []
         for k in sorted(arm_keys(pm) | arm_keys(cm)):
             a, b = pm.get(k, "<absent>"), cm.get(k, "<absent>")
             if a == b:
@@ -557,17 +587,33 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                         f"{cm.get(g, '<absent>')!r}, not "
                         f"{GATED_MANIFEST_GROUPS[g][0]!r}. Nothing here shows "
                         f"the knob is inert, so it is read as live.")
+            elif k in DERIVED_MANIFEST:
+                s = DERIVED_MANIFEST[k]
+                sp, sc = pm.get(s, "<absent>"), cm.get(s, "<absent>")
+                if sp == sc and s in pm and s in cm:
+                    derived_ok.append(k)
+                else:
+                    fails.append(
+                        f"manifest {k}: new in the child ({b!r}) and declared "
+                        f"as derived from {s}, but {s} is {sp!r} on the parent "
+                        f"and {sc!r} on the child. It restates a key the two "
+                        f"sides do not share, so it is read as a difference of "
+                        f"its own.")
             else:
                 fails.append(
                     f"manifest {k}: new in the child ({b!r}) and not declared "
                     f"in GATED_MANIFEST_GROUPS, so this gate cannot tell "
                     f"whether it is inert. Declare it under the switch that "
                     f"gates it — adding the switch to the manifest if the "
-                    f"harness does not write one — and do not delete this "
-                    f"check.")
+                    f"harness does not write one — or, if it only restates a "
+                    f"key both sides already record, in DERIVED_MANIFEST. Do "
+                    f"not delete this check.")
         if relaxed:
             notes.append(f"{len(relaxed)} new manifest key(s) recording a "
                          f"subsystem that is OFF: {', '.join(relaxed)}")
+        if derived_ok:
+            notes.append(f"{len(derived_ok)} new manifest key(s) restating a "
+                         f"key both sides record: {', '.join(derived_ok)}")
     return fails, notes
 
 

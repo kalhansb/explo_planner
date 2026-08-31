@@ -83,6 +83,7 @@ comms=1
 seed=1
 tx_power_dbm=30.0
 record=0
+scenario=flatforest_dense_2robot_lidar.yaml
 git_explo_planner=3d4306c
 sha256_explo_planner_node=aaaaaaaaaaaaaaaa
 run_end_reason=all_done
@@ -284,6 +285,17 @@ case("the new team_world_hz at its compiled default", 0,
 case("team_world_hz dumped with the exchange running", 1,
      r"new param 'team_world_hz' is NOT at its default",
      child_ev=set_param(child_side(), team_world_hz=1.0))
+# P6's knob, the same pair. This one is a STRING default read out of
+# dp("pursuit_predictor", std::string("trail")), so it also pins that
+# _literal() still understands that initialiser form: teach the parser to
+# mis-read std::string(...) and the first of these two fails on a message about
+# the parser refusing to guess, not on a message about the arm.
+case("the new pursuit_predictor at its compiled default", 0,
+     r"new param\(s\) at defaults:.*pursuit_predictor",
+     child_ev=set_param(child_side(), pursuit_predictor="trail"))
+case("pursuit_predictor dumped as mdp", 1,
+     r"new param 'pursuit_predictor' is NOT at its default",
+     child_ev=set_param(child_side(), pursuit_predictor="mdp"))
 case("a param the parent had and the child dropped", 1,
      r"'done_criterion' present in the parent and gone in the child",
      child_ev=drop_param(child_side(), "done_criterion"))
@@ -441,6 +453,75 @@ case("the team rate present but its switch missing", 1,
      parent_kw={"manifest": MANIFEST + CELL_BLOCK_OFF},
      child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF
                + TEAM_BLOCK_OFF.replace("team_world=0\n", "")})
+
+# P3 through P6. Four gate keys with no dependents, so there is no
+# switch-missing case to write for them — the switch IS the whole group. What
+# there is instead, and what the P1/P2 blocks above cannot test, is that two of
+# the four are off at a WORD rather than at "0". A registry entry of
+# ("0", set()) for either would fail an honest defaults child on a bookkeeping
+# line, and the fix somebody reaches for under time pressure is to delete the
+# check. Both directions are pinned below, per key.
+#
+# These blocks exist at all because the registry has now been forgotten twice:
+# global_alloc and reconnect_gate were written to the manifest one commit
+# before they were declared, and pursuit_predictor one commit before that
+# again. Neither lapse was caught by a calibration case, because until now the
+# calibration stopped at P2 — it tested the mechanism on the two oldest groups
+# and said nothing about the four that came after.
+STACK_BLOCK_OFF = ("global_alloc=0\n"
+                   "reconnect_gate=silence\n"
+                   "rendezvous_schedule=0\n"
+                   "pursuit_predictor=trail\n")
+BELOW = MANIFEST + CELL_BLOCK_OFF + TEAM_BLOCK_OFF
+
+case("the P3-P6 stack recorded with all four switches off", 0,
+     r"4 new manifest key\(s\) recording a subsystem that is OFF:.*"
+     r"global_alloc.*pursuit_predictor",
+     parent_kw={"manifest": BELOW},
+     child_kw={"manifest": BELOW + STACK_BLOCK_OFF})
+for key, on, off in (("global_alloc", "1", "0"),
+                     ("reconnect_gate", "info", "silence"),
+                     ("rendezvous_schedule", "1", "0"),
+                     ("pursuit_predictor", "mdp", "trail")):
+    case(f"{key} recorded ON is a treatment arm, not a defaults run", 1,
+         rf"manifest {key}: new in the child at '{on}'.*treatment arm",
+         parent_kw={"manifest": BELOW},
+         child_kw={"manifest": BELOW + STACK_BLOCK_OFF.replace(
+             f"{key}={off}", f"{key}={on}")})
+
+# P7 writes the roster into the manifest. It is not a switch and has no off
+# value; it restates the scenario, which both sides record and which the gate
+# already compares. So the relaxation is conditional on the source key agreeing
+# — and the two cases that matter are the ones where it does not.
+ROSTER = ("robots=atlas,bestla\n"
+          "n_robots=2\n")
+STACKED = BELOW + STACK_BLOCK_OFF
+
+case("the P7 roster, derived from a scenario both sides record", 0,
+     r"2 new manifest key\(s\) restating a key both sides record: "
+     r"n_robots, robots",
+     parent_kw={"manifest": STACKED},
+     child_kw={"manifest": STACKED + ROSTER})
+case("the roster with no scenario on either side to derive it from", 1,
+     r"manifest n_robots: .*derived from scenario, but scenario is '<absent>' "
+     r"on the parent",
+     parent_kw={"manifest": STACKED.replace(
+         "scenario=flatforest_dense_2robot_lidar.yaml\n", "")},
+     child_kw={"manifest": STACKED.replace(
+         "scenario=flatforest_dense_2robot_lidar.yaml\n", "") + ROSTER})
+# The one that would matter in practice: a three-robot child compared against a
+# two-robot parent. The scenario mismatch fails on its own line, but the roster
+# must not be waved through beside it — a reader who sees only "scenario
+# differs" can talk themselves into "same code, bigger world".
+case("a roster whose scenario changed under it", 1,
+     r"manifest n_robots: .*derived from scenario, but scenario is "
+     r"'flatforest_dense_2robot_lidar.yaml' on the parent and "
+     r"'flatforest_3robot_lidar.yaml' on the child",
+     parent_kw={"manifest": STACKED},
+     child_kw={"manifest": STACKED.replace(
+         "scenario=flatforest_dense_2robot_lidar.yaml",
+         "scenario=flatforest_3robot_lidar.yaml")
+         + "robots=atlas,bestla,husky\nn_robots=3\n"})
 
 print("\n=== silence must never read as a pass ===")
 
