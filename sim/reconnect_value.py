@@ -52,7 +52,6 @@ ROOT = os.environ.get("HMR_CAMPAIGN_ROOT", "/tmp/hmr_campaign")
 SETTLE_SEC = 120.0     # window after link return in which the merge lands
 SUSTAIN_SEC = 10.0     # connected must hold this long to count as restored
 MIN_OUTAGE_SEC = 60.0  # ignore brief flicker; real outages are minutes
-ROBOTS = ("atlas", "bestla")
 CACHE_RE = re.compile(r"\[INFO\] \[(\d+\.\d+)\].*local map_cache_: (\d+) voxels")
 
 
@@ -65,6 +64,28 @@ def manifest(d):
                 k, _, v = ln.strip().partition("=")
                 m[k] = v
     return m
+
+
+def roster(d):
+    """The cell's robot names, from the record rather than from a constant.
+
+    This was `ROBOTS = ("atlas", "bestla")` at module scope, and it was the
+    ONLY source of iteration for the dispatch and gate scans. Since P7 the
+    roster comes from the scenario and a scenario may name its robots anything,
+    so on a cell whose names are not those two the scans read nothing, every
+    classification list comes back empty, and every outage prints `silent` --
+    the headline "the planner never reacted" claim, from a run where it did.
+    Wrong-answer-shaped, exit 0, no warning.
+
+    Manifest first (P7 writes `robots=`), event-log filenames otherwise, so
+    cells recorded before that key existed still read.
+    """
+    r = manifest(d).get("robots", "").split()
+    if r:
+        return tuple(r)
+    return tuple(sorted(
+        os.path.basename(f)[: -len(".events.jsonl")]
+        for f in glob.glob(os.path.join(d, "*.events.jsonl"))))
 
 
 def events(d, rob):
@@ -193,6 +214,26 @@ def sep_at(lk, t):
 def analyse(d):
     mf = manifest(d)
     cell = os.path.basename(d)
+    robs = roster(d)
+    if len(robs) != 2:
+        # Refuse, do not score. Everything below is pairwise: link_states.csv
+        # carries one row PER PAIR per tick, and outages() folds the whole file
+        # into a single connected series. On three robots that is three
+        # interleaved link traces, so a genuine A-B outage is cancelled by the
+        # healthy A-C rows at the same t_sim and sep_at() returns whichever
+        # pair's row happened to be last. The result is not a degraded answer,
+        # it is an arbitrary one -- a 3-robot cell with A-B down for 300 s
+        # reports zero outages and an empty table, which reads as "no reconnect
+        # opportunities arose".
+        #
+        # An N-robot version needs a per-link outage series and a per-link
+        # separation, i.e. the whole table re-keyed on the pair. Until that
+        # exists this says so instead of guessing.
+        print(f"SKIP\t{cell}\tthis script is pairwise and the cell has "
+              f"{len(robs)} robot(s) {list(robs)}: link_states.csv carries one "
+              f"row per PAIR, and folding several links into one connected "
+              f"series would invent outages that no link had.", file=sys.stderr)
+        return None
     outs, lk = outages(d)
     # reconnect_mode_requested, NOT reconnect_mode_param: an `off` cell still
     # records mode_param=hybrid (the mode is simply never consulted), so keying
@@ -205,9 +246,9 @@ def analyse(d):
            "t_complete": mf.get("run_end_t_sim"),
            "end_reason": mf.get("run_end_reason"),
            "gates": mf.get("run_gates_verdict"),
-           "outages": outs, "robots": {}}
+           "outages": outs, "roster": robs, "robots": {}}
 
-    for rob in ROBOTS:
+    for rob in robs:
         evs = events(d, rob)
         ser = cache_series(d, rob, w2s_factory(evs))
         chases = pursue_intervals(evs)
@@ -301,16 +342,16 @@ def timing_table(cells):
         # a property of the pair, so an outage counts as acted-on if EITHER
         # robot armed a manoeuvre in it.
         et = lambda e: float(e.get("t_sim_sec") or 0)
-        acted_t = sorted(et(e) for rob in ROBOTS
+        acted_t = sorted(et(e) for rob in c["roster"]
                          for e in c["robots"][rob]["_disp"]
                          if e.get("action") in ACTED)
-        other_t = sorted(et(e) for rob in ROBOTS
+        other_t = sorted(et(e) for rob in c["roster"]
                          for e in c["robots"][rob]["_disp"]
                          if e.get("action") not in ACTED)
         # `dispatched` is a JSON bool; a missing key means a log written before
         # the field existed, and treating that as a refusal would invent
         # suppressions. Only an explicit false counts.
-        gated_t = sorted(et(e) for rob in ROBOTS
+        gated_t = sorted(et(e) for rob in c["roster"]
                          for e in c["robots"][rob]["_gate"]
                          if e.get("dispatched") is False)
         durs, cls = [], {"acted": [], "gated": [], "declined": [], "silent": []}
@@ -355,20 +396,32 @@ def timing_table(cells):
 
 def main(argv):
     tags = argv or ["p13smoke", "p12"]
-    cells = []
+    cells, skipped = [], 0
     for tag in tags:
         for d in sorted(glob.glob(os.path.join(ROOT, tag + "_*"))):
             if os.path.isdir(d) and not d.endswith(".attempts"):
-                cells.append(analyse(d))
+                c = analyse(d)
+                if c is None:
+                    skipped += 1
+                else:
+                    cells.append(c)
+    # Announced, not silent. A run that quietly dropped half a campaign and
+    # printed a clean table for the rest is the shape this repo has been bitten
+    # by: the tables below say nothing about the cells that are missing from
+    # them.
+    if skipped:
+        print(f"note: {skipped} cell(s) refused as not pairwise — see the SKIP "
+              f"lines on stderr. Nothing below covers them.")
     if not cells:
-        print("no cells matched")
+        print("no cells matched" if not skipped else
+              "no PAIRWISE cells matched — every cell found was refused")
         return
 
     print("=== PER-OUTAGE: what each reconnection cost and returned ===")
     print(f"{'cell':<24} {'rob':<7} {'outage':>15} {'dur_s':>7} "
           f"{'sepDrop':>8} {'chase_s':>8} {'vox_pre':>9} {'vox_gain':>9} {'self/s':>7}")
     for c in cells:
-        for rob in ROBOTS:
+        for rob in c["roster"]:
             r = c["robots"][rob]
             for (t_drop, t_res, pre, gain, rate, net) in r["gains"]:
                 # chase seconds overlapping this outage window
@@ -394,13 +447,13 @@ def main(argv):
           f"{'chase_s':>8} {'vox_gain':>9} {'vox_net':>11} {'disp':>5} "
           f"{'chased':>6} {'outg':>5}")
     for c in cells:
-        chase = sum(c["robots"][r]["chase_sec"] for r in ROBOTS)
-        gain = sum(g or 0 for r in ROBOTS
+        chase = sum(c["robots"][r]["chase_sec"] for r in c["roster"])
+        gain = sum(g or 0 for r in c["roster"]
                    for (_, _, _, g, _, _) in c["robots"][r]["gains"])
-        net = sum(n or 0 for r in ROBOTS
+        net = sum(n or 0 for r in c["roster"]
                   for (_, _, _, _, _, n) in c["robots"][r]["gains"])
-        nd = sum(c["robots"][r]["n_dispatch"] for r in ROBOTS)
-        nc = sum(c["robots"][r]["n_chase_dispatch"] for r in ROBOTS)
+        nd = sum(c["robots"][r]["n_dispatch"] for r in c["roster"])
+        nc = sum(c["robots"][r]["n_chase_dispatch"] for r in c["roster"])
         print(f"{c['cell']:<24} {c['arm']:<11} {c['budget']:>5} "
               f"{str(c['end_reason']):<13} {str(c['t_complete'] or '-'):>7} "
               f"{chase:8.1f} {gain:9d} {net:9.0f} {nd:5d} {nc:6d} "
@@ -412,13 +465,13 @@ def main(argv):
         if c["end_reason"] not in ("all_done", "censored_at_T"):
             continue
         k = (c["arm"], c["budget"])
-        chase = sum(c["robots"][r]["chase_sec"] for r in ROBOTS)
-        gain = sum(g or 0 for r in ROBOTS
+        chase = sum(c["robots"][r]["chase_sec"] for r in c["roster"])
+        gain = sum(g or 0 for r in c["roster"]
                    for (_, _, _, g, _, _) in c["robots"][r]["gains"])
-        net = sum(n or 0 for r in ROBOTS
+        net = sum(n or 0 for r in c["roster"]
                   for (_, _, _, _, _, n) in c["robots"][r]["gains"])
-        nc = sum(c["robots"][r]["n_chase_dispatch"] for r in ROBOTS)
-        nd = sum(c["robots"][r]["n_dispatch"] for r in ROBOTS)
+        nc = sum(c["robots"][r]["n_chase_dispatch"] for r in c["roster"])
+        nd = sum(c["robots"][r]["n_dispatch"] for r in c["roster"])
         by.setdefault(k, []).append((float(c["t_complete"] or 0), chase, gain, nc, nd, net))
     print(f"{'arm':<11} {'bud':>5} {'n':>3} {'t_done med':>11} {'chase_s med':>12} "
           f"{'vox_gain med':>13} {'vox_net med':>12} {'chase/disp':>11}")
