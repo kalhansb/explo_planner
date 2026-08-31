@@ -72,6 +72,7 @@ add_library(explo_planner_lib
   src/global_allocator.cpp
   src/reconnect_gate.cpp
   src/rendezvous_scheduler.cpp
+  src/pursuit_predictor.cpp
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
@@ -229,6 +230,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_rendezvous_scheduler test/test_rendezvous_scheduler.cpp)
   target_link_libraries(test_rendezvous_scheduler explo_planner_lib)
+
+  ament_add_gtest(test_pursuit_predictor test/test_pursuit_predictor.cpp)
+  target_link_libraries(test_pursuit_predictor explo_planner_lib)
 
   ament_add_gtest(test_target_queue test/test_target_queue.cpp)
   target_link_libraries(test_target_queue explo_planner_lib)
