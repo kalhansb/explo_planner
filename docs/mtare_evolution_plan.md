@@ -51,7 +51,7 @@ campaign generations — several things mTARE also has, in different form:
 | Local viewpoint planning | EIG candidates + `U = EIG/(ε+cost)^γ` in `doPlan` | ViewPointManager + local TSP | **Keep ours** as the local layer, scoped by the global layer |
 | Goal deconfliction | MinPos intents (`coordination.*`) | implicit via shared VRP | Keep as backstop under the allocator |
 | Comms sensing | link-gate (`link_states.csv` emulator) + intent TTL | range+liveness+handshake+closure | Generalise to N robots, add handshake + closure |
-| Rendezvous | reactive: return to last-contact anchor | scheduled: agreed (cell, time) | Add scheduled mode; keep anchor mode as legacy |
+| Rendezvous | reactive: return to midpoint of last-contact pair | scheduled: agreed (cell, time), proposal/echo protocol | Appointment `(cell, t_meet)` derived from the allocator's tours — agreement by construction, no protocol (§3.5); midpoint survives as the floor |
 | Pursuit | chase trail = [peer_goal, peer_pose], staleness budget | MDP prediction over peer's shared route + TOPwTVR | Keep chase skeleton; upgrade target via MDP over shared tour |
 | Hybrid | pursuit budget, then midpoint of last-contact pair | relay plan accepted iff strictly better than no-comms baseline | Add the utility gate; midpoint fallback unchanged |
 | Global structure | none (flat) | GridWorld cells + VRP tours | **The core new work** |
@@ -403,54 +403,201 @@ the campaign already measures.
   MapCache and, if still admissible-candidate-free, demoted to `COVERED`
   (the analogue of mTARE's not-connected → COVERED demotion). This stops a
   phantom EXPLORING cell from being re-assigned forever and from polluting
-  the rendezvous minimax.
+  the rendezvous objective, which ranges over the solved tours (§3.5).
 
-### 3.5 `rendezvous_scheduler` — planned meetings
+### 3.5 `rendezvous_scheduler` — pre-planned meetings from the grid world
 
-**This is a redesign inspired by mTARE, not a port** — mTARE's
-implementation carries a piggybacked `[cell, interval]` encoding, a
-robot-0-only adoption marked "tmp fix", and a commented-out travel-time
-dispatch test. We take the *idea* (agree on the next meeting before
-separating; minimax cell; broadcast-and-converge) and specify our own
-protocol, which therefore needs its own convergence argument and tests:
+**A redesign, not a port.** Since v4 the *objective* differs from mTARE's
+as well as the protocol; §3.5.1 records the audit that forced both changes.
 
-- Proposal: rendezvous cell = the allocator-input cell minimising its
-  maximum cell-graph distance to all others (minimax 1-centre;
-  `nearest`/`farthest` variants behind a param for ablation), time =
-  `now + clamp(min_interval + farthest_dist/(2·v̂), min, max)` on the
-  mission clock.
-- Agreement: proposals ride in `TeamWorld`; everyone adopts the lowest-id
-  live proposal; agreed when all live peers echo the same (cell, time).
-  **Chatter control**: once agreed, a robot *freezes* its proposal and
-  re-proposes only on invalidation (cell demoted to COVERED, time passed,
-  or team membership changed) — without the freeze, the lowest-id robot's
-  per-cycle re-solve would move the proposal faster than 0.5 Hz echoes can
-  converge and "agreed" would flap. Convergence within
-  `2/team_world_hz + jitter` after the last invalidation is the unit-tested
-  property.
-- Execution: countdown against **mission-elapsed time** (robot clocks in
-  the field are hours apart; absolute stamps are never compared — the same
-  reasoning as claim-TTL-from-local-receipt). When remaining time ≤ my
-  travel time to the cell + margin, dispatch through the **existing**
-  `startReturnTo → RETURN_NAV → RETURN_SYNC` machinery with the cell
-  centroid as destination — arrival tolerance, wait caps, hold escalation,
-  release-on-contact invariant, and the barrier reused unchanged.
-- On meeting (all peers in comms): agree the next rendezvous, resume after
-  a bounded wait. On no-show: the existing wait-cap ladder applies, then
-  resume exploring with the next schedule armed — a missed meeting
-  degrades to "try again later", never to a deadlock.
-- **Arbitration** (see also §3.6): `reconnect_mode: scheduled` **disables
-  the mid-run silence/info dispatch entirely** — the countdown is the only
-  reconnection trigger in that mode. mTARE makes the same choice (its
-  rendezvous and relay-comms modes are an else-if chain and never run
-  together). Composing a countdown with the reactive dispatch would put
-  two triggers on one state machine with whoever-fires-first semantics.
+The governing idea: **a meeting is not a detour to a landmark, it is a
+constraint on the tours the robots were already driving.** Two robots
+exploring a shared ROI pass near each other repeatedly; the rendezvous is
+the cheapest of those space-time near-misses, not a third place both must
+pay to reach.
+
+- **What is agreed**: a `(cell, t_meet)` pair.
+- **Cell.** Candidates are the cells already on some robot's tour,
+  `∪ᵢ tours[i]`, plus the last-contact midpoint as a guaranteed-available
+  floor (§3.6). Score each by the makespan penalty of forcing *every*
+  robot's tour through it:
+
+      penalty(c) = makespan(tours, each with c inserted at its best position)
+                 − makespan(tours as solved)
+
+  and take the argmin. For the robot whose tour already contains `c` the
+  detour is zero; the other pays only an insertion. Both terms are
+  `routeCost` and the makespan loop §3.4 already computes — no new cost
+  model. **This replaces the v2/v3 minimax 1-centre**, which optimised
+  distance *between frontier cells*: a quantity no robot pays, blind to
+  where the robots are, where they are going, and what the trip costs.
+  mTARE's own minimax has the same defect and worse — it offsets past the
+  robot rows of its distance matrix (§3.5.1), so robot positions are
+  excluded from the objective by construction and nothing bounds the
+  meeting point's distance from the team.
+- **Time.** `t_meet = maxᵢ τᵢ(c)` — the later robot's arrival under its own
+  tour. **Not a formula**: no `min_interval + farthest/(2·v̂)`, no clamps to
+  tune, because the tours already determine it. Capped by the
+  map-divergence model already in the node (`rate_sum`,
+  `explo_planner_node.cpp:6334-6340`, the summed map-growth rate of both
+  robots): meet sooner when the maps are diverging fast enough that the
+  exchange is worth more than the tours alone imply. That model is already
+  symmetric in the two robots, so both cap identically.
+- **Agreement needs no protocol.** §3.4 already guarantees tours are
+  bit-identical *across processes* (integer-mm quantisation, total
+  tie-break order, no clock/random/address-derived value). A rendezvous
+  derived purely from the allocation output is therefore bit-identical too.
+  There is no proposal, no echo, no lowest-id adoption, no freeze/chatter
+  control, and no convergence bound to unit-test — agreement is a
+  consequence of identical arithmetic over a shared world, exactly the
+  argument `global_allocator.hpp` already makes for allocation itself.
+  **This deletes the entire v2/v3 agreement protocol**, which was the bulk
+  of P5's cost, and removes the flapping failure mode the chatter control
+  existed to suppress.
+- **Clock.** The countdown runs on **mission-elapsed time**, never absolute
+  stamps: field clocks drift hours apart (the 2026-07-06 bunker/curt bags
+  were 4531 s apart while recording simultaneously). Robots start their
+  mission together, so elapsed-since-start is the only clock both ends can
+  trust without synchronising. Same reasoning as claim-TTL-from-local-receipt.
+- **Freeze at contact loss.** After separation the worlds diverge, so the
+  tours diverge, so a re-derived rendezvous would differ between robots.
+  Each robot freezes the pair derived from the last **bidirectionally
+  confirmed** TeamWorld snapshot (§3.4's handshake). Bidirectional is
+  load-bearing: under one-way loss the two ends otherwise disagree about
+  when contact ended and freeze different pairs. This extends the snapshot
+  discipline already at `explo_planner_node.cpp:6354-6360`, where the
+  reconnect pair is frozen for exactly the same reason.
+- **Execution reuses existing machinery unchanged**: `startReturnTo →
+  RETURN_NAV → RETURN_SYNC` with the cell centroid as destination; arrival
+  tolerance, wait caps, hold escalation and the release-on-contact
+  invariant all as-is. Departure is when
+
+      t_meet − mission_elapsed  ≤  travel_time(me → cell) · safety + margin
+
+  which is **per-robot**: departures stagger, arrivals coincide. The robot
+  further from the cell leaves earlier. This is precisely the leave-early
+  rule mTARE computes and then discards (§3.5.1, edge 1).
+- **Candidate admissibility**: only cells present in every live peer's
+  `cell_world` and reachable on the proposer's roadmap are eligible. mTARE
+  omits this check and `exit(1)`s on its absence (§3.5.1, edge 4).
+- **No-show**: the existing wait-cap ladder, then resume exploring with the
+  next schedule armed. A missed meeting degrades to "try again later",
+  never to a standstill — mTARE deadlocks permanently here (§3.5.1, edge 5).
+
+#### 3.5.1 What the reference actually does (audit, 2026-08-31)
+
+Audited against `mtare_planner_ref/` @ `57b0a18` (the repo's only commit,
+"initial commit", 2024-01-08; squashed import, no upstream history). This
+is a **vendored reference copy, not our planner**. Recorded because several
+of our design choices are reactions to specific defects, and a future
+reader must be able to check that the reactions are still warranted.
+
+**Provenance first: rendezvous is mTARE's baseline, not its method.** The
+repo's `README.md` documents the pursuit/relay strategy as the paper's
+contribution and never mentions rendezvous. `kRendezvous` defaults false
+and is not parameter-controlled: `SetCommsConfig()`
+(`grid_world.cpp:5004-5089`) unconditionally overwrites it from `kTestID`,
+so `coordination.yaml`'s rendezvous knobs are inert. `kRendezvousTimeInterval`
+is read and **never used** (its two defaults, 10 and 20, disagree with each
+other and with the real hardcoded 120/300). `kRendezvousType` is dead, so
+the "middle/nearest/farthest" variants are the same algorithm — which is
+why our own `nearest`/`farthest` ablation params were dropped in v4 rather
+than ported. **There are zero tests** on any of it: `CMakeLists.txt:195` is
+a commented-out `# # Testing ##` banner with no targets. We are not
+adopting a proven rival design; we are taking an idea from an untested
+comparison arm.
+
+Defects that our spec above is written against:
+
+1. **The travel-time departure test is commented out.**
+   `rendezvous_manager.cpp:141-142` keeps `if (remaining_exploration_time < 0)`
+   and comments out `if (time_to_rendezvous >= remaining_exploration_time)`.
+   `time_to_rendezvous` is the function's only parameter and is never read —
+   a dead argument. Its producer is in a different file
+   (`grid_world.cpp:4838`, `path_length / 2.0`, an implicit 2.0 m/s
+   hardcoded rather than read from `kRobotSpeed`). Consequence: robots
+   depart *at* zero rather than early, so each is late by its own travel
+   time and **the lateness is heterogeneous** — a far robot arrives much
+   later than a near one. Partial compensation exists (the interval folds
+   in `distance_to_farthest_cell / 2`) but the ordering is still wrong.
+   Our departure rule above is the restored form of the deleted test.
+2. **Adoption is hardcoded to robot 0**, not lowest-id:
+   `if (robots[i].in_comms_ && i == 0) // tmp fix: only get from robot 0`,
+   with the lower-id rule commented out above it. Leader-follower in
+   practice. Only `SyncNextRendezvous` retains `i < self_id`, and it
+   ascends and breaks on first match, so it adopts the **lowest**-id
+   in-comms peer — determinism a convergence argument would need, and which
+   "any peer" would not give. We avoid the whole question: agreement by
+   identical arithmetic (above) has no adoption step.
+3. **Agreement is exact integer equality on both fields**, no tolerance and
+   no versioning, over `ExplorationInfo.global_cell_ids` — a field named
+   for something else, with the pair framed by `-2`/`-1` sentinels
+   (`grid_world.cpp:3120-3127`; the trailing `-1` is load-bearing, without
+   it `DecodeToOrderedCellIDs` never emits the row). Cell ids and intervals
+   share an integer namespace with the sentinels, unescaped. In rendezvous
+   mode the real relay-comms plan is not transmitted at all — the channel
+   is fully repurposed.
+4. **Unreachable rendezvous cell is an `exit(1)`.** `PlanForRendezvous`
+   guards only the *from* node (`grid_world.cpp:4832-4836`); inside,
+   `Graph::GetShortestPath` asserts `HasNode(to_node_id)` (`graph.h:478`)
+   and `MY_ASSERT` is `exit(1)` (`misc_utils.h:39-45`), live in release.
+   Reachable in practice: the cell may be adopted from another robot's
+   exploring set and name a region this robot has not mapped. That it is an
+   oversight rather than an invariant is shown by `PlanGlobalConvoy`, which
+   guards **both** ends before the identical call. The crash sits on a path
+   whose result is discarded (defect 1) — deleting the dead call would
+   delete the crash. Hence our admissibility rule above.
+5. **A no-show deadlocks permanently.** `AllRobotsInComms`
+   (`grid_world.cpp:4916-4926`) requires *every* robot, with no timeout, no
+   quorum and no exclusion. One absent peer sends `PlanForRendezvous` down
+   the `else` at `:4879` forever, emitting `[cur, cur]` with `wait_ = true`
+   while the countdown never resets (it only resets on all-in-comms paths).
+   The robot stands still indefinitely. The information to break it is
+   computed and ignored: `CheckLostRobot` (`:4347-4401`) sets
+   `robots[i].lost_`, and nothing in the rendezvous path ever reads it. The
+   5-cycle `wait_at_rendezvous_count_` cap (`:4855-4860`) is **not** the
+   no-show handler — it sits inside `AllRobotsInComms` and after
+   `AllRobotsSyncedWithRendezvous`, so it only runs once everyone has
+   arrived *and* agreed. It is a disperse-after-meeting hold. The
+   genuinely-unsynced wait at `:4870-4877` has no counter at all.
+6. **Same-shape failure on the initial rendezvous.** Each robot latches its
+   own first cell (`grid_world.cpp:285-289`) with no exchange and no
+   agreement step; consistency is a deployment assumption ("they start
+   together"), unenforced by any code in the tree. If it fails, each robot
+   drives to a different cell, `AllRobotsInComms` is never true, and the
+   deadlock in (5) follows on the first meeting.
+7. **A robot fails the sync test against its own stale advertisement.**
+   Self's pair is published at `grid_world.cpp:1967-1974`, and only
+   afterwards (`:2039`) does `PlanForRendezvous` run, possibly changing
+   `next_*`, before `AllRobotsSyncedWithRendezvous` reads the fresh value
+   (`:4935-4936`) and loops over **all** robots with no `i == kRobotID`
+   skip (`:4939`). On any cycle where the proposal changes, sync fails for
+   that reason alone. This is what freeze-ordering looks like when it is
+   wrong, and it is the direct argument for freezing our pair at the last
+   *bidirectionally confirmed* snapshot rather than at publish time.
+8. **A size guard is inert in both copies** — operator precedence.
+   `rendezvous_manager.cpp:46` and `:125` write
+   `!x.relay_comms_ordered_cell_ids_.front().size() < 2`, which parses as
+   `(!size()) < 2`: a bool compared against 2, always true. The intended
+   `!(size() < 2)` never happens, and the following lines index `front()[1]`
+   unguarded. The correct form of the same guard exists at
+   `grid_world.cpp:4947`. Textbook `[[checks-that-stopped-checking]]`, and
+   the reason our equivalents get known-answer calibration.
+9. **`AllRobotsSyncedWithRendezvous` mutates negotiation state.** On success
+   it calls `ResetPlannedNextRendezvous()` (`:4965-4968`), clearing the
+   latch that otherwise freezes a robot's own proposal. Calling the
+   predicate for its boolean alone changes behaviour.
+10. **Dead state**: `Robot::rendezvous_cell_id_` (`robot.h:81`) is never
+    read or written; two dead `robot_cell_id` locals at `grid_world.cpp:1936`
+    and `:4881`. Vestiges of an earlier design where the pair had its own
+    home before being moved into the relay slot.
 
 ### 3.6 Utility-gated reconnection (the mTARE "hybrid")
 
 Today reconnection dispatch is gated by silence timers (the 90 s mid-run
 clock, by design — the deliberate info gate). The mTARE gate is economic.
-Applies in `pursuit`/`hybrid` modes only (never in `scheduled`, per §3.5):
+Applies wherever a chase can be armed — `pursuit` and `hybrid` (§3.6.1).
+`rendezvous` has no mid-run chase, so there is nothing for it to gate:
 
 1. **Knowledge gate** (port of `HasKnowledgeToShare`): attempt reconnection
    only if some allocator-input or COVERED cell is not in the missing
@@ -465,13 +612,79 @@ Applies in `pursuit`/`hybrid` modes only (never in `scheduled`, per §3.5):
    today's exact behaviour). The silence floor is kept even under `info`
    (never dispatch at a peer heard < min-silence ago).
 
-Reconnection trigger arbitration, complete table:
+#### 3.6.1 Two mechanisms, four arms (v4 — reverses the v2 arbitration rule)
 
-| `reconnect_mode` | Mid-run trigger | Terminal trigger |
-| --- | --- | --- |
-| `rendezvous` / `pursuit` / `hybrid` | silence or info gate (param) | finish-time dispatch, unchanged |
-| `scheduled` | countdown only | barrier at the agreed cell |
-| `off` | none | none (today's off arm) |
+v2 forbade composing the countdown with the reactive dispatch, on the
+grounds that it "would put two triggers on one state machine with
+whoever-fires-first semantics". That objection was correct about the
+composition v2 had in mind and **does not apply to the one specified here**,
+because the departure rule (§3.5) partitions the timeline instead of racing
+on it:
+
+    [ contact lost ................ departure deadline ....... t_meet + wait ]
+    |<------ CHASE owns this ------>|<---- APPOINTMENT owns this ---------->|
+
+Exactly one mechanism is armed at any instant, and the boundary is a
+computed deadline, not an arrival order. That is admissible; the v2 form was
+not. Recorded as a reversal so a reader who remembers the v2 rule can see it
+was reconsidered rather than forgotten.
+
+The modes are therefore not three strategies but **two independent
+mechanisms, each on or off**:
+
+| `reconnect_mode` | chase | appointment | Mid-run trigger | Fallback destination |
+| --- | --- | --- | --- | --- |
+| `off` | — | — | none | — (today's off arm) |
+| `pursuit` | ✓ | — | silence or info gate | none by design; explore-fallback then barrier |
+| `rendezvous` | — | ✓ | departure deadline only | the agreed cell |
+| `hybrid` | ✓ | ✓ | silence or info gate; chase preempted by the departure deadline | the agreed cell, midpoint as floor |
+
+Terminal (finish-time) dispatch is unchanged in every mode.
+
+Three consequences worth stating explicitly, because each contradicts
+something in v2/v3:
+
+- **The chase trigger does not change and is not synchronised.** Each robot
+  still dispatches on its own silence/info gate, exactly as today. What
+  makes the two robots *arrive together* is the shared `t_meet`, not a
+  synchronised start: each departs when its own travel time consumes the
+  remaining countdown, so departures stagger and arrivals coincide.
+  Synchronising the trigger was considered and rejected — it would require
+  the info gate to run on frozen shared state, which is a strictly larger
+  change for a property the appointment already provides.
+- **`hybrid`'s fallback destination changes** from the last-contact midpoint
+  to the agreed cell. §3.7's note that the midpoint "remains" is superseded.
+  The midpoint survives as the **floor** in the `penalty` argmin of §3.5:
+  it is always available, always agreed, and costs at most half a comms
+  range to reach, so when no tour cell is worth its detour the behaviour
+  degrades exactly to today's. Hybrid can therefore not come out worse than
+  the current implementation on fallback cost.
+- **`rendezvous` alone stops meaning "drive to the midpoint on silence".**
+  It becomes the pure scheduled strategy: ignore the silence entirely, keep
+  exploring, and leave only when the countdown demands it. This is what
+  makes the four arms a factorial rather than a menu.
+
+**Why the factorial matters.** mh1 (off vs hybrid, 30/30, one binary
+`8121506`) can only support a hybrid-vs-off claim; which half of hybrid does
+the work is undetermined by that design. `pursuit` and `rendezvous` alone
+are exactly the two missing cells. They must be run **in one campaign
+invocation** — `run_campaign.sh` is seed-major, and separate invocations
+confound arm with session on a box that drifts ~8%.
+
+**What mh1 says the mechanism should be.** The info gate declined 100 of 110
+evaluations, every one on cost (`c_re_mm > c_no_mm`) and none for lack of
+knowledge. That is the predicted signature of a worthless destination: the
+midpoint is behind both robots, on ground already covered, so reconnecting
+can only ever cost more than not reconnecting. Giving the fallback a
+tour-side destination lowers `C_re` directly, and the decline rate is the
+falsifiable prediction — if it does not move, the tour-relative objective is
+wrong and the section should be reverted, not tuned. Completion times for
+reference: `off` median 600.0 s / mean 642.4 s / sd 152.5; `mtare_hybrid`
+median 676.5 / mean 663.8 / sd 108.3 (n = 30 per arm, all `rc=0`,
+all `all_done`). Note hybrid is *tighter* (sd 108 vs 152, better worst case
+943 vs 1001) while being slower at the median — the arms differ in
+distribution shape, not by a location shift, so a single-number summary of
+this pair is misleading whichever statistic is chosen.
 
 ### 3.7 `pursuit_predictor` — MDP interception
 
@@ -486,10 +699,14 @@ pursuit state machine a better waypoint:
   P(peer at c at now + my_travel_time(c)) — intercept where they will be,
   not where they were. Re-evaluated each cycle; TOPwTVR is not ported.
 - Everything downstream is unchanged: staleness-scaled budget, budget cap,
-  link vetoes, and the fallback ladder — hybrid's fallback destination
-  remains the last-contact midpoint (an agreed-rendezvous-cell fallback
-  only makes sense if modes composed, which §3.5 forbids; noted as a
-  possible future variant, not in scope).
+  and the link vetoes at both dispatch sites. **The fallback ladder gains a
+  third terminator** (v4): alongside `pursuit-budget`
+  (`explo_planner_node.cpp:7665`) and `trail-exhausted` (`:7704`), a chase
+  in `hybrid` also ends at the §3.5 departure deadline, which fires before
+  either by construction. Superseding v2/v3: hybrid's fallback destination
+  is now the agreed cell, not the last-contact midpoint — see §3.6.1. The
+  midpoint remains as the floor of the §3.5 argmin, so a hybrid run with no
+  worthwhile tour cell degrades exactly to today's behaviour.
 - Degradation: with no tour on record, the trail is today's
   `[peer_goal, peer_pos]` — pursuit never gets *worse* than the current
   implementation.
@@ -583,14 +800,34 @@ direction: (a) peer provably knows everything → zero info-gated dispatches;
 → the knowledge gate must fire. (b) is what catches OR-forever-style
 over-suppression bugs that (a) silently passes.
 
-**P5 — scheduled rendezvous.**
-`rendezvous_scheduler` + `reconnect_mode: scheduled`; proposals in
-TeamWorld; execution through existing RETURN_NAV/RETURN_SYNC; mid-run
-dispatch disabled in this mode (arbitration table §3.6). Gate: unit tests
-(minimax cell choice, lowest-id adoption, freeze/invalidation chatter
-control with a simulated 0.5 Hz echo lag, countdown arithmetic on
-mission-elapsed time, no-show degradation); smoke: two robots agree
-(identical (cell,time) in both NDJSON logs), meet, and re-separate.
+**P5 — pre-planned rendezvous from the grid world.**
+`rendezvous_scheduler` deriving `(cell, t_meet)` from the allocation output
+(§3.5); `reconnect_mode: rendezvous` as a standalone arm; `hybrid`'s
+fallback destination repointed from the midpoint to the agreed cell; the
+departure deadline added as the third pursuit terminator (§3.7).
+**Substantially smaller than the v3 spec** — the proposal/echo/adoption
+protocol and its chatter control are deleted, since agreement now follows
+from §3.4's cross-process determinism.
+
+Gate: unit tests on (a) the `penalty` argmin including the midpoint floor
+winning when no tour cell is worth its detour; (b) `t_meet = maxᵢ τᵢ(c)`
+against a hand-computed two-tour case; (c) **cross-perspective identity
+through the wire codec** — serialise A's world, merge into B's and vice
+versa, and assert *bit-identical* `(cell, t_meet)` on both, which is the
+whole agreement argument and must be tested as such, not assumed from
+§3.4's allocator test; (d) departure arithmetic on mission-elapsed time,
+including the staggered-departure/coincident-arrival property; (e)
+admissibility rejecting a cell absent from a peer's `cell_world` or
+unreachable on the roadmap; (f) no-show degrading to "resume with the next
+schedule armed" and never to a standstill — the direct regression test for
+§3.5.1 edge 5.
+
+Smoke: two robots log identical `(cell, t_meet)` in both NDJSON logs before
+separation, chase, break off at their own deadlines, and meet.
+**Non-vacuity rule**: a smoke in which the appointment never comes due, or
+in which the midpoint floor wins every time, is reported as NOT-APPLICABLE,
+not as a pass — the §3.5 objective is only exercised when a tour cell
+actually wins.
 
 **P6 — MDP pursuit.**
 `pursuit_predictor` behind `pursuit_predictor: mdp | trail` (default
@@ -598,22 +835,37 @@ mission-elapsed time, no-show degradation); smoke: two robots agree
 argmax intercept vs a hand-computed case, no-tour degradation); smoke under
 forced dropout: chase dispatched at the predicted cell, not the stale goal.
 
-**P7 — N=3 harness + validation campaign.**
+**P7 — N=3 harness + the four-arm factorial.**
 Extend `run_explo_sim_rviz.sh` to N robots (namespace loops exist; the N=2
-assertions and pairwise link-gate wiring are the work). Then the first real
-campaign on the new binary, **one lever only**: `hybrid + reconnect_gate:
-silence` vs `hybrid + reconnect_gate: info`, with `global_alloc_enabled`
-pinned identically in both arms (on, since the info gate is the novelty
-under test and needs the allocator; the arm difference is the gate alone).
-Off-vs-hybrid is *not* re-run here: it was answered on generation 4 (flat,
-and that null is real) and re-running it on the new binary answers nothing
-about the new mechanisms. ~30 cells/arm minimum per the power floor, exact
-permutation test.
+assertions and pairwise link-gate wiring are the work). Then the validation
+campaign: the **2×2 factorial of §3.6.1** — `off`, `pursuit`, `rendezvous`,
+`hybrid` — with `global_alloc_enabled` and `reconnect_gate` pinned
+identically across all four arms, so the only levers are chase on/off and
+appointment on/off.
+
+This supersedes v2/v3's single-lever silence-vs-info plan. The reason is
+mh1: it establishes hybrid-vs-off on the current binary but **cannot
+attribute the effect to either half**, and `pursuit`/`rendezvous` alone are
+precisely the two cells that can. Testing the gate instead would answer a
+narrower question at the same cost.
+
+Hygiene, all non-negotiable: **one `run_campaign.sh` invocation** (it is
+seed-major; separate invocations confound arm with session on a box that
+drifts ~8%); one frozen binary across all four arms, verified from each
+cell's own `run_manifest.txt` rather than assumed; ~30 cells/arm as the
+**floor** not the target (that floor buys 58–84% power for completion time,
+and redundancy needs ~4451 cells and is dead as a between-arm metric); the
+**exact permutation test**, never a bootstrap — and since C(120,30) cannot
+be enumerated, the sampled permutation must first be validated against a
+known exact result at small n before it is trusted (`[[lcg-low-bits-bias]]`).
 
 Ordering rationale: P1→P2→P3 is a strict data dependency (cells → exchange →
-allocation). P4 needs P3's plan pair. P5 needs P2's plumbing; scheduling it
-after P4 keeps the reconnection subsystem changes serial. P6 needs P2's
-shared tours (and P3 to make tours non-trivial).
+allocation). P4 needs P3's plan pair. **P5 now depends on P3, not merely on
+P2's plumbing** (v4): the rendezvous is derived from the allocator's tours
+and inherits its cross-process determinism, so without P3 there is nothing
+to derive it from and no agreement argument. Scheduling P5 after P4 also
+keeps the reconnection-subsystem changes serial. P6 needs P2's shared tours
+(and P3 to make tours non-trivial).
 
 ## 5. Explicit non-goals
 
@@ -629,8 +881,12 @@ shared tours (and P3 to make tours non-trivial).
   messages are affordable at our scale and strictly simpler.
 - **Tour gossip** — only positions/last-heard relay at N=3; pursuit of a
   never-directly-heard peer degrades to trail chase.
-- **Composing scheduled rendezvous with reactive dispatch** — mutually
-  exclusive modes, like mTARE (§3.5/§3.6).
+- **Porting mTARE's rendezvous *implementation*.** §3.5 keeps the idea — a
+  pre-agreed cell and time — and replaces the mechanism wholesale; §3.5.1
+  records, with file:line, what the reference actually does and why each
+  piece is not ported. The mutual exclusion of scheduled and reactive
+  triggers is the specific thing v4 does **not** inherit: §3.6.1 composes
+  them on a partitioned timeline instead.
 - **Splitting the node monolith.** New logic goes in pure libs + thin
   hooks; a structural node split is a separate effort.
 
@@ -678,8 +934,8 @@ shared tours (and P3 to make tours non-trivial).
 | Knowledge gate goes vacuous (OR-forever) | Every info-gated dispatch decision | known_by reset-on-change semantics (§3.1); P4 smoke (b) exists specifically to catch over-suppression |
 | Allocator nondeterminism across robots (float ties) | Silent solve-same breakage | Integer-quantised costs; tie-break totality unit-tested; cross-perspective determinism tested through the wire codec |
 | Focus filter starves the local planner (centroid straddle, stale status) | Stall = the known EIG-gap failure mode | 8-neighbourhood admission + tour-advance + unrestricted fallback + staleness demotion (§3.4) |
-| Two reconnection triggers fight (countdown vs silence/info) | Any run in scheduled mode | Modes mutually exclusive (arbitration table §3.6), like mTARE's else-if chain |
-| Agreement chatter (proposal moves faster than echoes) | Scheduled mode at 0.5 Hz | Freeze-on-agreed + invalidation-only re-proposal; convergence bound unit-tested |
+| Two reconnection triggers fight (departure deadline vs silence/info) | Every `hybrid` outage | Not mutual exclusion but a timeline partition (§3.6.1): the chase owns the span before the deadline, the appointment owns it after. The deadline is a hard terminator ordered *ahead* of `pursuit-budget` and `trail-exhausted`, so the later two can only fire inside the chase's own span |
+| Robots compute *different* appointments (agreement-by-construction fails on differing inputs) | Contact loss mid-divergence | Freeze at the last **bidirectionally confirmed** snapshot, not the last received one (§3.5); cross-perspective bit-identity tested through the wire codec (P5 gate c). Residual risk is bounded by the release condition: `teamComplete` is checked every tick, so two nearby-but-unequal destinations still close the range gap |
 | N=3 closure declares comms with a data-silent robot | Chain topologies | Closure is status-only; consumers key on gossiped per-robot freshness (§3.3) |
 | TeamWorld flooding the executor | Claim-grace episode precedent | Default-off publishing, copy-only callback, merge in tick, `plan_time_ms` watched |
 | Scheduled rendezvous under clock skew | Field: offsets of hours | Mission-elapsed time only, never absolute stamps |
@@ -705,8 +961,11 @@ shared tours (and P3 to make tours non-trivial).
    doesn't decide; update_id is local-only bookkeeping.
 9. Fleet identity is the ordered `team_robot_names` param (§3.0), hash-
    checked on the wire; mismatch is fatal at startup, not coerced.
-10. `scheduled` mode and the reactive mid-run dispatch are mutually
-    exclusive; the arbitration table in §3.6 is exhaustive.
+10. The appointment and the reactive chase **compose** rather than exclude
+    (reversing v2/v3 and mTARE): they partition one outage's timeline at
+    the departure deadline (§3.6.1). The four arms — `off`, `pursuit`,
+    `rendezvous`, `hybrid` — are the 2×2 factorial of the two mechanisms,
+    which is what makes "which half does the work" answerable.
 11. Finished robots leave the allocator's vehicle set, their cells return
     to the pool, and the knowledge gate ignores them.
 12. Comms closure classifies status; data consumers key on gossiped
@@ -714,6 +973,33 @@ shared tours (and P3 to make tours non-trivial).
 
 ## 9. Revision history
 
+- **v4** — after mh1 (off vs m-tare-hybrid, 30/30, binary `8121506`) and an
+  audit of the vendored mTARE reference. **The rendezvous objective
+  changed**: from a geometric minimax 1-centre over frontier cells to the
+  minimum-makespan-penalty insertion into the allocator's existing tours
+  (§3.5) — the old objective optimised a quantity no robot pays and was
+  blind to robot positions, and the reference's version excludes them by
+  construction. Consequences: the entire proposal/echo/lowest-id-adoption
+  protocol and its chatter control are **deleted**, because agreement now
+  follows from §3.4's cross-process determinism rather than from
+  negotiation; `t_meet` falls out of tour arrival times instead of a tuned
+  formula; P5 shrinks and gains a dependency on P3. **The v2 arbitration
+  rule is reversed** (§3.6.1): composing the countdown with the reactive
+  dispatch is admissible when a computed departure deadline partitions the
+  timeline, which is not the whoever-fires-first race v2 rejected. Modes
+  re-framed as a 2×2 factorial of chase × appointment, making `pursuit` and
+  `rendezvous` alone the two cells that can attribute hybrid's effect —
+  which mh1 by construction cannot. Hybrid's fallback destination repointed
+  from the last-contact midpoint to the agreed cell, with the midpoint
+  retained as the argmin floor so the change cannot make fallback cost
+  worse. §3.5.1 added: a ten-item audit of the reference, recording that
+  rendezvous is mTARE's *baseline* rather than its method (off by default,
+  dead params, zero tests) and cataloguing the specific defects our spec is
+  written against — the commented-out departure test, the robot-0 adoption,
+  the `exit(1)` on an unreachable cell, the permanent no-show deadlock, the
+  self-vs-stale sync failure, and an operator-precedence guard that never
+  fires. P7 re-scoped from the single-lever gate comparison to the
+  four-arm factorial.
 - **v3** — during P1 implementation: §3.1.1 added, recording that the
   mTARE-analogy thresholds were unsatisfiable against this map
   representation (zero cells promoted over a full run), that re-scaling them
