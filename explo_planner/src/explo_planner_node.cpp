@@ -5158,6 +5158,12 @@ void ExploPlannerNode::doPlan() {
   // CENTROIDS, and a cluster straddling a cell boundary parks its centroid in
   // the neighbour. Filtering to the focus cell alone would starve exactly the
   // cells whose clusters span it.
+  // Initialised to 0 = "no restriction in force", which is what every
+  // candidate carries when the allocator is off — that is the pre-P3
+  // comparator, since a single rank value makes the first sort key inert.
+  // When the allocator IS on and produced a tour, the loop below overwrites
+  // every entry: frontiers with their tour rank, the polar ring with the
+  // unrestricted band. Nothing keeps the initialiser in that case.
   std::vector<int> alloc_rank(candidates.size(), 0);
   std::vector<AllocRobot> alloc_robots;
   Allocation alloc;
@@ -5177,8 +5183,28 @@ void ExploPlannerNode::doPlan() {
             std::chrono::steady_clock::now() - t_solve0).count();
 
     // Rank the candidates. Local polar-ring candidates stay unrestricted
-    // (§3.4) and so keep rank 0, competing on utility with the focus
-    // neighbourhood; only frontier candidates are steered.
+    // (§3.4): only frontier candidates are steered, so the ring sorts in the
+    // UNRESTRICTED band alongside the frontiers no tour cell claimed, where
+    // the two compete on utility exactly as they did before P3.
+    //
+    // This band used to be 0, on the reading that "unrestricted" meant
+    // "competing on utility with the focus neighbourhood". Rank 0 is not an
+    // exempt band, it is the WINNING one: the comparator is lexicographic on
+    // rank before utility and the walk takes the first admissible candidate,
+    // so a ring point beat every out-of-focus frontier no matter how much
+    // more that frontier would have revealed. The ring is generated around
+    // the robot and is almost always admissible, so in the p4 smoke the pick
+    // was rank 0 on 29 of 29 allocation rows while `reordered` was true on
+    // 27 — the tour was solved, logged, and never actually steered anything.
+    // The demotion below made it self-sustaining: it reads `picked_rank == 0`
+    // as "came from the focus", so a ring pick reset the staleness counter
+    // that exists to write off a focus cell nothing can reach, and the focus
+    // wandered the grid a cell per tick.
+    //
+    // Sorting the ring last instead would be the other error: it would demote
+    // the ring below every steered frontier and make the allocator able to
+    // starve the local fallback, which is the failure mode the ordering-not-
+    // filtering design exists to prevent.
     // Copied, not referenced: alloc_robots is index-aligned with the fleet, so
     // this is a handful of ints, and a dangling reference into a structure the
     // rest of this function keeps mutating is not worth saving them.
@@ -5202,7 +5228,10 @@ void ExploPlannerNode::doPlan() {
         }
       }
       for (size_t i = 0; i < candidates.size(); ++i) {
-        if (!candidates[i].is_frontier) continue;   // polar ring: unrestricted
+        if (!candidates[i].is_frontier) {
+          alloc_rank[i] = kAllocRankUnrestricted;   // polar ring: unrestricted
+          continue;
+        }
         const int cid = g.idAt(candidates[i].position.x(),
                                candidates[i].position.y());
         alloc_rank[i] = g.valid(cid)

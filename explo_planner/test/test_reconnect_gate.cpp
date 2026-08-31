@@ -51,6 +51,23 @@ std::vector<AllocRobot> pair2(int cell_a, int cell_b) {
   return {AllocRobot{0, cell_a, true, false}, AllocRobot{1, cell_b, true, false}};
 }
 
+/// PRODUCTION SHAPE: the peer the caller reports missing is also flagged
+/// out-of-comms in the vehicle list.
+///
+/// `pair2` marks both vehicles in_comms=true, which is a pairing the node
+/// cannot produce — explo_planner_node builds `missing` by scanning that very
+/// list for `!r.in_comms`, so a missing peer is out-of-comms BY CONSTRUCTION.
+/// Every test in this file used pair2, and the consequence was that
+/// GlobalAllocator's comms mask — which only ever restricts a vehicle whose
+/// `in_comms` is false — was a no-op across the whole suite. The gate's entire
+/// value half turns on that mask (it is what makes C_no "the cost of finishing
+/// without telling them"), so the suite was blind to it: flipping
+/// `re_cfg.comms_mask` in the production path would not have failed a test.
+std::vector<AllocRobot> pair2Apart(int cell_self, int cell_peer) {
+  return {AllocRobot{0, cell_self, true, false},
+          AllocRobot{1, cell_peer, false, false}};
+}
+
 std::vector<MissingPeer> missing1(int id, int cell, bool finished = false) {
   return {MissingPeer{id, cell, finished}};
 }
@@ -349,16 +366,107 @@ TEST(FailOpen, PeerIdOutsideTheMaskWidth) {
   EXPECT_EQ(v.refused, "peer-id-out-of-mask-range");
 }
 
-TEST(FailOpen, NoMissingPeerAtAllIsADecidedNo) {
-  // Distinct from every case above: nobody is missing, so there is nothing to
-  // fail open ABOUT. A trigger that reaches the gate with an empty peer set has
-  // a bug upstream, and answering "go anyway" would hide it behind a manoeuvre.
+TEST(FailOpen, NoMissingPeerIdentifiedIsAnInabilityToEvaluate) {
+  // This test used to assert the opposite — dispatch=false, refused="" — on
+  // the reasoning that "a trigger that reaches the gate with an empty peer set
+  // has a bug upstream", so answering "go anyway" would hide it.
+  //
+  // The premise was wrong twice. It is not a bug: the trigger reads the
+  // coordination beacon and this list is built from TeamModel::inComms, two
+  // different topics with different TTLs that are EXPECTED to disagree, so an
+  // empty set here is a normal outcome. And the old verdict hid it far better
+  // than a dispatch would have — {dispatch=false, refused="", unshared=0} is
+  // byte-identical to the clean "the partner already knows everything"
+  // suppression, so the log could not distinguish "we decided to stay" from
+  // "we never identified anyone to ask about".
   CellWorld w = world5(0);
   w.commitSelf(6, CellStatus::EXPLORING);
   const GateVerdict v = evaluateReconnectGate(w, pair2(0, 24), {}, alloc0());
+  EXPECT_TRUE(v.dispatch);
+  EXPECT_EQ(v.refused, "no-missing-peer-identified");
+}
+
+TEST(KnowledgeGate, EveryMissingPeerFinishedIsStillACleanSuppression) {
+  // The other way the priced set empties, and it must NOT be confused with the
+  // one above: a FINISHED peer will never explore again, so nothing we could
+  // tell it changes any plan. That is a computed no, and it keeps the empty
+  // `refused` that marks a real decision. Asserted here because the fail-open
+  // added for the empty-`missing` case sits directly upstream of this path and
+  // would swallow it if it were written one line too broadly.
+  CellWorld w = world5(0);
+  w.commitSelf(6, CellStatus::EXPLORING);
+  std::vector<MissingPeer> done = missing1(1, 24);
+  done[0].finished = true;
+  const GateVerdict v = evaluateReconnectGate(w, pair2(0, 24), done, alloc0());
   EXPECT_FALSE(v.dispatch);
   EXPECT_EQ(v.refused, "");
   EXPECT_EQ(v.unshared_cells, 0);
+}
+
+// ======================================================================
+// Production shape: the missing peer is out of comms in the vehicle list.
+// ======================================================================
+
+TEST(ProductionShape, DispatchIsReachableWhenThePeerIsOutOfComms) {
+  // THE DIRECTION THE LIVE SMOKE NEVER EXERCISED. A p4 smoke cell produced 11
+  // gate evaluations and suppressed all 11, which is consistent both with a
+  // discriminating gate and with a gate wedged shut — and no test could tell
+  // the two apart, because every fixture in this file was in_comms=true, where
+  // the mask cannot bite and C_no cannot rise. So this asserts the reachability
+  // of "go", on the shape the node actually builds.
+  //
+  // The fixture has to make BOTH terms favourable, and the first draft of this
+  // test got both wrong in an instructive way. Peer at the opposite corner
+  // (cell 24) makes the leg 56.6 m across a 50 m grid, which alone exceeded the
+  // whole coordination benefit — the gate correctly said stay, and the test was
+  // asserting the gate was broken for getting it right. And a backlog packed
+  // into self's own corner is work the distant peer would not have taken even
+  // unmasked, so there was no benefit to buy.
+  //
+  // So: peer ADJACENT (cell 1, one 10 m hop, a cheap leg) and the backlog
+  // spread across the whole grid, where splitting it two ways genuinely halves
+  // the makespan and the peer has a bit for none of it.
+  CellWorld w = world5(0);
+  for (int id = 5; id <= 24; ++id) w.commitSelf(id, CellStatus::EXPLORING);
+  const GateVerdict v = evaluateReconnectGate(
+      w, pair2Apart(0, 1), missing1(1, 1), alloc0());
+  EXPECT_EQ(v.refused, "") << "the gate refused rather than deciding";
+  EXPECT_TRUE(v.knowledge) << "peer holds no bit for any committed cell";
+  EXPECT_GT(v.unshared_cells, 0);
+  // The decision itself, and the arithmetic behind it, so a failure says which.
+  EXPECT_GT(v.c_no_mm, 0);
+  EXPECT_GT(v.c_re_mm, 0);
+  EXPECT_GE(v.leg_mm, 0);
+  EXPECT_LT(v.c_re_mm, v.c_no_mm) << "c_re " << v.c_re_mm << " c_no "
+                                  << v.c_no_mm << " leg " << v.leg_mm;
+  EXPECT_TRUE(v.dispatch);
+}
+
+TEST(ProductionShape, TheCommsMaskIsWhatMakesStayingApartExpensive) {
+  // Pins the mechanism, and the comparison has to be chosen carefully to see
+  // it. The obvious test — same fixture, flip the peer's in_comms, expect C_no
+  // to move — cannot work and its failure is not a defect: the gate copies
+  // `robots` into `apart` and sets in_comms=false on every live missing peer
+  // ITSELF, so the caller's flag never reaches the C_no solve. That is the
+  // right design (the caller cannot accidentally price an unmasked future),
+  // but it means the mask has to be observed against the OTHER solve.
+  //
+  // So compare the two futures the gate actually builds. c_re_mm carries the
+  // leg; net it off and what remains is makespan(re_plan), solved over the same
+  // world and the same vehicles with the mask OFF. Against a backlog the peer
+  // holds no bit for, barring it must make the apart-makespan strictly larger.
+  // If these come out equal, no_cfg.comms_mask is not reaching the solver and
+  // the entire value half is arithmetic over two identical problems — the
+  // mutation this suite previously could not catch.
+  CellWorld w = world5(0);
+  for (int id = 5; id <= 24; ++id) w.commitSelf(id, CellStatus::EXPLORING);
+  const GateVerdict v = evaluateReconnectGate(
+      w, pair2Apart(0, 1), missing1(1, 1), alloc0());
+  ASSERT_EQ(v.refused, "");
+  ASSERT_GT(v.unshared_cells, 0) << "fixture shares nothing to bar";
+  EXPECT_GT(v.c_no_mm, v.c_re_mm - v.leg_mm)
+      << "masked makespan " << v.c_no_mm << " vs unmasked "
+      << (v.c_re_mm - v.leg_mm);
 }
 
 // ======================================================================

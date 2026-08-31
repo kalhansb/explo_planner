@@ -53,6 +53,30 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     return v;
   }
 
+  // NOBODY TO PRICE IS AN INABILITY TO EVALUATE, NOT A DECISION TO STAY.
+  //
+  // The caller reached this gate because the mid-run trigger fired, and the
+  // trigger's notion of "missing" is not this one. The trigger reads the
+  // coordination beacon (livePeerCount / team_last_complete_time_, 1 Hz,
+  // claim-TTL'd); `missing` is built from TeamModel::inComms, a different
+  // topic with its own TTL, a two-way handshake and transitive closure. They
+  // are designed to disagree — 16-21% of mid-run fires in generation 8 fired
+  // with the radio UP — so a peer whose beacons lapsed while its TeamWorld
+  // summaries kept arriving reaches here with an EMPTY missing list.
+  //
+  // Falling through would have counted 0 unshared cells over an empty set,
+  // set knowledge=false, and returned a verdict byte-identical to the clean
+  // "the partner already knows everything" suppression — the same
+  // {false,false,0,-1,-1,-1,0,""} row, with nothing in the log able to tell
+  // the two apart. That is the one path where the gate answered "stay"
+  // about a question it never asked. Everything else it cannot evaluate
+  // fails open; so does this, and it says why.
+  if (missing.empty()) {
+    v.refused  = "no-missing-peer-identified";
+    v.dispatch = true;
+    return v;
+  }
+
   // The set we are actually pricing: unfinished, addressable peers.
   //
   // The two ways a peer leaves this list are NOT the same answer, and
