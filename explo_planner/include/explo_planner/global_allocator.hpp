@@ -133,6 +133,20 @@ public:
   /// unreachable cell that vanished from the problem would be a cell no robot
   /// is ever sent to clear, and it would stay EXPLORING forever.
   static long long costMm(const CellWorld& world, int a, int b);
+
+  /// Open-route cost of `tour` driven from cell `start`, in the quantised unit.
+  /// Open, not closed: the robots are not coming back, so there is no closing
+  /// leg — adding one would inflate every cost by a term depending only on the
+  /// tour's last cell, biasing the makespan balance toward tours that happen to
+  /// end near their origin.
+  ///
+  /// Exposed because §3.5's rendezvous objective is a DIFFERENCE OF MAKESPANS,
+  /// and a difference is only meaningful if both sides come from the same cost
+  /// function. A second, private copy in the scheduler would be free to drift
+  /// from this one — and the symptom of that drift is a penalty that ranks
+  /// cells the allocator would not, which is invisible in every log.
+  static long long routeCostMm(const CellWorld& world, int start,
+                               const std::vector<int>& tour);
 };
 
 /// The staleness rule's decision (§3.4): should a focus cell that keeps

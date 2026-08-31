@@ -21,20 +21,12 @@ inline uint32_t robotBit(int id) {
   return (id >= 0 && id < 32) ? (1u << id) : 0u;
 }
 
-/// Route cost of `tour` starting from `start`, in mm. Open route: the robots
-/// are not coming back, so there is no closing leg. Adding one would inflate
-/// every cost by a term that depends only on the tour's last cell, which biases
-/// the makespan balance toward tours that happen to end near their origin —
-/// a preference nothing in the mission wants.
-long long routeCost(const CellWorld& w, int start,
-                    const std::vector<int>& tour) {
-  long long c = 0;
-  int prev = start;
-  for (int id : tour) {
-    c += GlobalAllocator::costMm(w, prev, id);
-    prev = id;
-  }
-  return c;
+/// Shorthand for the public routeCostMm below, kept so the solve loops read
+/// the way they always did. One implementation, two names — not two
+/// implementations.
+inline long long routeCost(const CellWorld& w, int start,
+                           const std::vector<int>& tour) {
+  return GlobalAllocator::routeCostMm(w, start, tour);
 }
 
 } // namespace
@@ -71,6 +63,17 @@ long long GlobalAllocator::costMm(const CellWorld& world, int a, int b) {
   if (!(d >= 0.0)) d = world.centroidDistance(a, b);
   if (!std::isfinite(d) || d < 0.0) return 0;
   return static_cast<long long>(std::llround(d * kMmPerM));
+}
+
+long long GlobalAllocator::routeCostMm(const CellWorld& world, int start,
+                                       const std::vector<int>& tour) {
+  long long c = 0;
+  int prev = start;
+  for (int id : tour) {
+    c += costMm(world, prev, id);
+    prev = id;
+  }
+  return c;
 }
 
 Allocation GlobalAllocator::solve(const CellWorld& world,
