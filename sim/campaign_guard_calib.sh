@@ -291,12 +291,12 @@ if [ -n "$PRELUDE_END" ]; then
   # knobs as the launcher resolved them. That is what makes an ALLOW case say
   # something: absence of our FATAL text is also true of a prelude that died at
   # the scenario check, and would certify a launcher that refuses everything.
-  printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rm=$RECONNECT_MODE"' >> "$PROBE"
+  printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rs=$RENDEZVOUS_SCHEDULE rm=$RECONNECT_MODE"' >> "$PROBE"
 
   # And the cut has to CONTAIN the guards. A range that stopped short would
   # fail every BLOCK case for the wrong reason and pass every ALLOW one.
   for _need in "FATAL: CELL_WORLD" "FATAL: TEAM_WORLD=" "FATAL: TEAM_WORLD_HZ" \
-               "the arm name and the arm"; do
+               "FATAL: RENDEZVOUS_SCHEDULE" "the arm name and the arm"; do
     cases=$((cases+1))
     if grep -qF "$_need" "$PROBE"; then
       echo "  PASS  the cut carries the guard: $_need"
@@ -336,11 +336,28 @@ if [ -n "$PRELUDE_END" ]; then
   # The two controls that give every refusal below its meaning. If the first
   # ever fails, the launcher is refusing off-arm cells; if the second fails,
   # the mtare_hybrid arm does not exist and the campaign has no treatment.
-  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rm=hybrid' \
+  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 rm=hybrid' \
      "shipped defaults resolve with every M-TARE knob off"
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rm=mtare_hybrid' \
-     "RECONNECT_MODE=mtare_hybrid expands to all four features" \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 rm=mtare_hybrid' \
+     "RECONNECT_MODE=mtare_hybrid expands to the whole P1-P5 stack" \
      RECONNECT_MODE=mtare_hybrid
+
+  # The other three cells of the doc §3.6.1 factorial. Each expands to a
+  # DIFFERENT vector, and the two that differ from mtare_hybrid are the point
+  # of the design: mtare_pursuit is chase without an appointment,
+  # mtare_rendezvous is an appointment without a chase, mtare_off is neither.
+  # Asserted one knob at a time because a token that expanded to the hybrid
+  # stack under a different name would run the campaign as one arm four times
+  # and every gate downstream would agree with it.
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 rm=mtare_off' \
+     "RECONNECT_MODE=mtare_off expands to P1-P3 and NEITHER mechanism" \
+     RECONNECT_MODE=mtare_off
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 rm=mtare_pursuit' \
+     "RECONNECT_MODE=mtare_pursuit expands to the chase WITHOUT an appointment" \
+     RECONNECT_MODE=mtare_pursuit
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 rm=mtare_rendezvous' \
+     "RECONNECT_MODE=mtare_rendezvous expands to the appointment WITHOUT a chase" \
+     RECONNECT_MODE=mtare_rendezvous
 
   # A typo in a 0/1 knob reads as OFF, and an off treatment knob is invisible:
   # the run completes, the manifest records the value it was handed, and the
@@ -364,20 +381,47 @@ if [ -n "$PRELUDE_END" ]; then
   lg BLOCK "FATAL: TEAM_WORLD_HZ='<empty: rejected by flt>'" \
      "flt's empty return for nan is refused, not passed to ros2 as a bare -p" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=nan
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rm=hybrid' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 rm=hybrid' \
      "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2
 
   # The node reconstitutes the arm itself, prefixing `mtare_` when
-  # global_alloc_enable_ || reconnect_gate_info_. Every directory, index row and
-  # analysis keys off the NAME; only run_start carries the stamp. Setting a knob
-  # by hand under the plain name puts a treated cell in the control column.
+  # global_alloc_enable_ || reconnect_gate_info_ || rendezvous_schedule_enable_.
+  # Every directory, index row and analysis keys off the NAME; only run_start
+  # carries the stamp. Setting a knob by hand under the plain name puts a
+  # treated cell in the control column.
+  #
+  # One case per disjunct, and that is the whole reason this block is a list
+  # rather than one case: a guard that tracked only two of the three would keep
+  # printing two PASSes while the third knob walked straight through it.
   lg BLOCK "FATAL: the arm name and the arm" \
      "GLOBAL_ALLOC=1 under the plain hybrid name is refused" \
      CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
   lg BLOCK "FATAL: the arm name and the arm" \
      "RECONNECT_GATE=info under the plain hybrid name is refused" \
      CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_GATE=info RECONNECT_MODE=hybrid
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "RENDEZVOUS_SCHEDULE=1 under the plain hybrid name is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=hybrid
+
+  # The P5 knob's own preconditions, mirroring the node's fatals. Each names a
+  # configuration in which the cell would RECORD the treatment and not carry
+  # it, which is the failure mode the manifest cannot self-diagnose.
+  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 requires TEAM_WORLD=1" \
+     "the appointment without the exchange is refused" \
+     CELL_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=hybrid
+  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=off" \
+     "an appointment with no manoeuvre to schedule is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=off
+  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=pursuit" \
+     "an appointment in the appointment-OFF cell of the 2x2 is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=pursuit
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_pursuit implies RENDEZVOUS_SCHEDULE=0" \
+     "contradicting the mtare_pursuit token's own stack is refused" \
+     RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=mtare_pursuit
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_rendezvous implies RECONNECT_GATE=info" \
+     "contradicting the mtare_rendezvous token's own stack is refused" \
+     RECONNECT_GATE=silence RECONNECT_MODE=mtare_rendezvous
 fi
 
 # A clean launch must be SILENT on stderr. `env_val` took its default from a
@@ -408,7 +452,7 @@ unset _stderr
 # same arm on both sides, and score CLEAN. Read the -u list back out rather than
 # trusting that it was kept in step with the knobs the launcher grew.
 for _u in LINK_GATE MIDRUN_SILENCE CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ \
-          GLOBAL_ALLOC RECONNECT_GATE; do
+          GLOBAL_ALLOC RECONNECT_GATE RENDEZVOUS_SCHEDULE; do
   cases=$((cases+1))
   if sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS" \
      | grep -qE -- "-u $_u( |\\\\|$)"; then

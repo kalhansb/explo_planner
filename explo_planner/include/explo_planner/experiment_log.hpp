@@ -677,6 +677,104 @@ struct ReconnectGateEvent {
   std::string peers;
 };
 
+/// `rendezvous_agreed` payload: one appointment, and everything needed to
+/// check offline that the peer derived the same one (§3.5).
+///
+/// The name is inherited from the v2 design, where agreement was a PROTOCOL
+/// and this event marked the moment it converged. Under v4 there is no
+/// protocol: agreement is a consequence of both robots running identical
+/// arithmetic over a converged world, so this event records a DERIVATION, and
+/// the fields exist to make the claim falsifiable rather than to narrate a
+/// handshake. `shared_hash` is the join key — restrict to outages where both
+/// robots logged the same value and any (cell, t_meet) disagreement that
+/// remains is the scheduler's, not the comms model's.
+///
+/// Emitted on every arming attempt including the refusals, for the same reason
+/// `reconnect_gate` logs its suppressions: an appointment that was never armed
+/// and one that was armed and ignored are the same silence in the log
+/// otherwise.
+struct RendezvousAgreedEvent {
+  /// The world both sides are claimed to have solved over, and the grid it
+  /// sits on. From the FROZEN snapshot, not the live world — the frozen one is
+  /// what the arithmetic ran on, and logging the live hash would make a
+  /// disagreement look like a scheduler fault when it was a staleness one.
+  unsigned int shared_hash = 0;
+  unsigned int grid_hash   = 0;
+  /// Mission-elapsed seconds at which the snapshot was frozen. The gap between
+  /// this and `t_now_sec` is how long the two worlds have had to diverge, which
+  /// is the only quantity that can explain a legitimate disagreement.
+  double snapshot_age_sec = -1.0;
+
+  /// The appointment. cell -1 with a non-empty `refused` is the refusal shape.
+  int    cell        = -1;
+  double t_meet_sec  = -1.0;
+  double t_now_sec   = -1.0;
+  /// Uncapped max-over-robots arrival, in seconds. Differs from
+  /// (t_meet_sec - t_now_sec) exactly when `capped` is true, and the difference
+  /// IS how late the slowest robot will be.
+  double interval_sec = -1.0;
+  bool   capped       = false;
+
+  /// The objective's value at the winner, in the allocator's quantised unit.
+  /// 0 means the meeting cost the team nothing — somebody was already driving
+  /// there. A large value against a small candidate count is the signature of
+  /// a scheduler with nothing good to choose from.
+  long long penalty_mm = -1;
+  /// True when the last-contact midpoint won. Read together with `candidates`:
+  /// the floor winning against ten candidates is a verdict, the floor winning
+  /// against one is the absence of one.
+  bool floor_won = false;
+  int  candidates = 0;
+  int  rejected_unreachable = 0;
+  int  rejected_excluded    = 0;
+
+  /// This robot's own travel estimate to the winner and the departure deadline
+  /// derived from it, both in mission-elapsed seconds. Deliberately per-robot
+  /// and NOT expected to match the peer's: staggered departures with coincident
+  /// arrivals is the design, so two equal deadlines in a pair would be evidence
+  /// the mechanism is not doing what it claims.
+  double travel_sec  = -1.0;
+  double depart_sec  = -1.0;
+
+  /// Non-empty when no appointment could be derived. Distinguishes "no meeting
+  /// was scheduled" from "a meeting was scheduled and nothing came of it".
+  std::string refused;
+  /// Cells already written off by a no-show, comma-separated. Grows within one
+  /// outage; empty on the first attempt.
+  std::string excluded;
+};
+
+/// `rendezvous_outcome` payload: how an armed appointment actually ended.
+///
+/// One per `rendezvous_agreed` that armed, so the two join 1:1 within an
+/// outage and the pair answers the only question that matters about the
+/// mechanism: of the meetings it scheduled, how many produced contact. Without
+/// this event a scheduler that arms perfectly and never reconnects anything
+/// looks identical in the log to one that works.
+struct RendezvousOutcomeEvent {
+  int    cell       = -1;
+  double t_meet_sec = -1.0;
+  /// When this robot actually got there (or gave up), mission-elapsed.
+  double t_end_sec  = -1.0;
+  /// Signed: negative is early, positive is late. The quantity the departure
+  /// rule exists to keep near zero, and the one mTARE's depart-at-zero rule
+  /// cannot control because its lateness differs per robot.
+  double lateness_sec = -1.0;
+
+  /// How it ended. One of:
+  ///   "reconnected"   contact restored (the success case)
+  ///   "no-show"       arrived, waited out the cap, nobody came
+  ///   "unreachable"   the drive to the cell failed or timed out
+  ///   "superseded"    abandoned because the manoeuvre ended another way
+  std::string outcome;
+  /// True when the robot reached the cell at all, whatever the outcome. A
+  /// no-show with `arrived` false is a navigation failure wearing a
+  /// coordination failure's name.
+  bool arrived = false;
+  /// Seconds spent waiting at the cell.
+  double waited_sec = -1.0;
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -1009,6 +1107,16 @@ class ExperimentLog {
   /// Emits one `reconnect_gate` (schema v4). One per evaluation, fired or not.
   void logReconnectGate(const ExperimentContext& ctx,
                         const ReconnectGateEvent& e);
+
+  /// Emits one `rendezvous_agreed` (schema v4). One per arming attempt,
+  /// including the refusals — see the struct for why the refusals matter.
+  void logRendezvousAgreed(const ExperimentContext& ctx,
+                           const RendezvousAgreedEvent& e);
+
+  /// Emits one `rendezvous_outcome` (schema v4). One per appointment that
+  /// armed, so the two kinds join 1:1 within an outage.
+  void logRendezvousOutcome(const ExperimentContext& ctx,
+                            const RendezvousOutcomeEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;

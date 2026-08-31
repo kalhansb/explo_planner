@@ -225,8 +225,9 @@ fi
 # sim is nondeterministic run-to-run ([[sim-run-to-run-nondeterminism]]), so the
 # spread would look like real between-cell variation.
 #
-# GLOBAL_ALLOC and RECONNECT_GATE join them because they are arm-DEFINING: the
-# node's `arm` string is "mtare_" + the mode whenever either is live, so an
+# GLOBAL_ALLOC, RECONNECT_GATE and RENDEZVOUS_SCHEDULE join them because they
+# are arm-DEFINING: the node's `arm` string is "mtare_" + the mode whenever any
+# of the three is live, so an
 # --env passenger turning one on renames every cell's arm from inside the
 # binary while the directory, the index and the manifest's
 # reconnect_mode_requested all still say hybrid and off. analyze_runs.py,
@@ -242,7 +243,8 @@ fi
 # CELL_WORLD and TEAM_WORLD deliberately stay ALLOWED: P1 and P2 change no
 # decision and do not rename the arm, so they are legitimately campaign-wide
 # settings rather than treatments.
-for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE; do
+for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE \
+                RENDEZVOUS_SCHEDULE; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -333,6 +335,13 @@ _veto_live=0
 # to this at all and must not be blocked by it. Naming "off" rather than
 # "hybrid" keeps a future arm inside the guard by default.
 #
+# The `mtare_` prefix is stripped before that comparison, because what decides
+# whether this hazard exists is rendezvous_enabled, and the runner sets that
+# from the arm's SUFFIX alone: mtare_off is rendezvous_enabled=false exactly
+# like off, and dispatches nothing to chase with. Leaving the prefix on would
+# have classed the P7 factorial's own control as treated and blocked a --comms
+# 0 run of it for a trigger that arm never arms.
+#
 # $CELLS is the single source: it is what actually runs, whether it came from
 # --cells or from crossing --arms with --seeds, so there is no second spelling
 # for the guard to go silent on. Cells are "arm:seed", and the trailing _seek is
@@ -343,6 +352,7 @@ _treated=0
 for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
   _a="${_a%%:*}"
   _a="${_a%_seek}"
+  _a="${_a#mtare_}"
   [ "$_a" = "off" ] || _treated=1
 done
 _sil="$(env_val MIDRUN_SILENCE)"
@@ -390,8 +400,9 @@ unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 #
 # The M-TARE knobs are here for a sharper reason than tidiness, and it is the
 # one failure the arm-stamp guard cannot see. The node prefixes the arm with
-# `mtare_` on `global_alloc_enable_ || reconnect_gate_info_` -- so an ambient
-# GLOBAL_ALLOC or RECONNECT_GATE at least renames the arm and trips check 3e.
+# `mtare_` on `global_alloc_enable_ || reconnect_gate_info_ ||
+# rendezvous_schedule_enable_` -- so an ambient GLOBAL_ALLOC, RECONNECT_GATE or
+# RENDEZVOUS_SCHEDULE at least renames the arm and trips check 3e.
 # CELL_WORLD and TEAM_WORLD rename NOTHING. `export CELL_WORLD=1 TEAM_WORLD=1`
 # left over from a P2 debugging session would run the census and the 1 Hz
 # exchange in every cell of a plain hybrid-vs-off campaign, stamp the same arm
@@ -402,7 +413,8 @@ unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 # after unsets, so `--env CELL_WORLD=1` still works and is still the one channel
 # the guards read.
 for _amb in LINK_GATE MIDRUN_SILENCE \
-            CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE; do
+            CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
+            RENDEZVOUS_SCHEDULE; do
   if [ -n "${!_amb+x}" ]; then
     echo "NOTE: $_amb=${!_amb} is exported in this shell and will be IGNORED --" >&2
     echo "      the per-cell launch strips it so the campaign's guards cannot be" >&2
@@ -456,10 +468,11 @@ for cell in "${CELL_LIST[@]}"; do
     *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
   esac
 
-  # What this cell's manifest WILL say for the four M-TARE knobs, so the resume
+  # What this cell's manifest WILL say for the five M-TARE knobs, so the resume
   # guard below can compare rather than assume. Per cell and not per campaign,
-  # because the arm token is what sets them: mtare_hybrid expands to all four
-  # inside run_explo_sim_rviz.sh, every other arm takes the --env value or the
+  # because the arm token is what sets them: each mtare_* token expands to its
+  # own full stack inside run_explo_sim_rviz.sh, every other arm takes the
+  # --env value or the
   # runner's default. Kept in step with that expansion by hand -- if the two
   # ever disagree, the resume guard aborts a correct resume, which is the safe
   # direction to be wrong in.
@@ -467,10 +480,18 @@ for cell in "${CELL_LIST[@]}"; do
   TEAM_WORLD_REQ=$(env_val TEAM_WORLD 0)
   GLOBAL_ALLOC_REQ=$(env_val GLOBAL_ALLOC 0)
   RECONNECT_GATE_REQ=$(env_val RECONNECT_GATE silence)
-  if [ "$cell_mode" = "mtare_hybrid" ]; then
-    CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-    GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info
-  fi
+  RENDEZVOUS_SCHEDULE_REQ=$(env_val RENDEZVOUS_SCHEDULE 0)
+  case "$cell_mode" in
+    mtare_off)
+      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=silence; RENDEZVOUS_SCHEDULE_REQ=0 ;;
+    mtare_pursuit)
+      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0 ;;
+    mtare_rendezvous|mtare_hybrid)
+      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1 ;;
+  esac
 
   # "Complete" means reached an end reason AND passed its run-time gates. A run
   # that dropped relay traffic reaches all_done exactly like a good one, so
@@ -494,7 +515,7 @@ for cell in "${CELL_LIST[@]}"; do
     # key cannot be shown to agree, and "cannot be shown to agree" is exactly
     # what this guard is for.
     #
-    # The four M-TARE knobs are here for the same reason, and one of them is
+    # The five M-TARE knobs are here for the same reason, and one of them is
     # the only member of this list whose absence is COMPLETELY silent. Resume a
     # half-finished campaign with `--env "CELL_WORLD=1 TEAM_WORLD=1"` added and
     # the banked cells satisfy every other key, so seeds 1-15 carry no cell
@@ -514,7 +535,8 @@ for cell in "${CELL_LIST[@]}"; do
       "cell_world=$CELL_WORLD_REQ" \
       "team_world=$TEAM_WORLD_REQ" \
       "global_alloc=$GLOBAL_ALLOC_REQ" \
-      "reconnect_gate=$RECONNECT_GATE_REQ"
+      "reconnect_gate=$RECONNECT_GATE_REQ" \
+      "rendezvous_schedule=$RENDEZVOUS_SCHEDULE_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -598,7 +620,7 @@ for cell in "${CELL_LIST[@]}"; do
   # still the channel the guard reads.
   env -u LINK_GATE -u MIDRUN_SILENCE \
       -u CELL_WORLD -u TEAM_WORLD -u TEAM_WORLD_HZ \
-      -u GLOBAL_ALLOC -u RECONNECT_GATE \
+      -u GLOBAL_ALLOC -u RECONNECT_GATE -u RENDEZVOUS_SCHEDULE \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \

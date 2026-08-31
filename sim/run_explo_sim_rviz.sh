@@ -199,12 +199,32 @@ EXPLOIT="${EXPLOIT:-1}"
 # row and every gate's arm parser. Four independent knobs would let a campaign
 # run cells labelled mtare_hybrid with, say, the allocator off, and nothing
 # downstream could tell.
+#
+# P5/P7 add three MORE arm tokens, and the four `mtare_*` values together are
+# the 2x2 factorial of doc §3.6.1 — chase on/off x appointment on/off:
+#
+#   token              chase   appointment   reconnect_mode  rendezvous_enabled
+#   mtare_off            -          -          (hybrid)          false
+#   mtare_pursuit       yes         -           pursuit           true
+#   mtare_rendezvous     -         yes         rendezvous         true
+#   mtare_hybrid        yes        yes           hybrid           true
+#
+# All four run the SAME P1-P3 decision stack (cell world, TeamWorld exchange,
+# global allocator), so the only levers between them are the two mechanisms.
+# `mtare_off` carries RECONNECT_GATE=silence rather than `info`, because the
+# gate can only suppress a dispatch and that arm makes none: pinning it there
+# would be pinning an inert knob, and the harness refuses the pairing outright
+# a few blocks below. GLOBAL_ALLOC is emphatically NOT inert in that arm, which
+# is why the control is `mtare_off` and not plain `off` — a plain-`off` control
+# would confound the two mechanisms with the allocator.
 RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
 case "$RECONNECT_MODE" in
-  rendezvous|pursuit|hybrid|off|mtare_hybrid) ;;
+  rendezvous|pursuit|hybrid|off) ;;
+  mtare_off|mtare_pursuit|mtare_rendezvous|mtare_hybrid) ;;
   *) echo "FATAL: RECONNECT_MODE='$RECONNECT_MODE' is not one of \
-rendezvous|pursuit|hybrid|off|mtare_hybrid. The planner would silently fall \
-back to rendezvous and the run would be mislabelled." >&2; exit 2 ;;
+rendezvous|pursuit|hybrid|off|mtare_off|mtare_pursuit|mtare_rendezvous|\
+mtare_hybrid. The planner would silently fall back to rendezvous and the run \
+would be mislabelled." >&2; exit 2 ;;
 esac
 # The arm token IS the configuration. Set here, before the CELL_WORLD /
 # TEAM_WORLD / GLOBAL_ALLOC / RECONNECT_GATE default blocks below read their
@@ -216,21 +236,33 @@ esac
 # the index, that is missing a quarter of the treatment — and no gate reads
 # four separate knobs to notice. Refusing costs an operator one re-run; the
 # silent version costs the campaign.
-if [ "$RECONNECT_MODE" = "mtare_hybrid" ]; then
-  for _kv in CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info; do
+_arm_stack=""
+case "$RECONNECT_MODE" in
+  mtare_off)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:silence RENDEZVOUS_SCHEDULE:0" ;;
+  mtare_pursuit)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:0" ;;
+  mtare_rendezvous)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1" ;;
+  mtare_hybrid)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1" ;;
+esac
+if [ -n "$_arm_stack" ]; then
+  for _kv in $_arm_stack; do
     _k="${_kv%%:*}"; _want="${_kv#*:}"
     eval "_got=\${$_k-}"
     if [ -n "$_got" ] && [ "$_got" != "$_want" ]; then
-      echo "FATAL: RECONNECT_MODE=mtare_hybrid implies $_k=$_want, but $_k='$_got'" >&2
+      echo "FATAL: RECONNECT_MODE=$RECONNECT_MODE implies $_k=$_want, but $_k='$_got'" >&2
       echo "       was set explicitly. The arm token names the whole stack; a" >&2
       echo "       cell that contradicts one part of it would still be recorded," >&2
-      echo "       named and analysed as mtare_hybrid." >&2
+      echo "       named and analysed as $RECONNECT_MODE." >&2
       exit 2
     fi
     eval "$_k=\$_want"
   done
   unset _kv _k _want _got
 fi
+unset _arm_stack
 # Barrier cap. The planner's code default is 0 = wait forever, which is the
 # right field behaviour and the wrong experiment: a robot that gives up on the
 # chase raises the barrier at its current pose and never lowers it, so the run
@@ -638,10 +670,69 @@ if [ "$RECONNECT_GATE" = "info" ] && [ "$RECONNECT_MODE" = "off" ]; then
   echo "       carrying the P4 treatment and would not carry it." >&2
   exit 2
 fi
+# --- Scheduled rendezvous (M-TARE evolution, P5) --------------------------
+# RENDEZVOUS_SCHEDULE=1 arms the §3.5 appointment: when a reconnect is
+# dispatched, both robots derive the SAME (cell, t_meet) from the allocator's
+# own tours — the cheapest cell to insert into the tours they are already
+# driving — instead of steering to the geometric midpoint of the last contact.
+# Agreement is by construction, not by protocol: the allocator is bit-identical
+# across processes, so anything derived from its output is too.
+#
+# OFF by default and off means NO PARAMETER IS PASSED, same rule as the three
+# blocks above: the per-phase equivalence gate requires every param new in the
+# child to sit at its compiled default.
+#
+# Requires TEAM_WORLD=1 for the same reason GLOBAL_ALLOC does — without the
+# exchange each robot schedules a meeting with a fleet of one, at a cell the
+# peer has never heard of, and logs a healthy-looking `rendezvous_agreed`
+# event for it. The planner treats the pairing as fatal; refused here too,
+# because a planner that throws at construction takes both robots down several
+# seconds into an otherwise-normal bring-up and the reason scrolls past in two
+# separate log files.
+RENDEZVOUS_SCHEDULE="${RENDEZVOUS_SCHEDULE:-0}"
+case "$RENDEZVOUS_SCHEDULE" in
+  0|1) ;;
+  *) echo "FATAL: RENDEZVOUS_SCHEDULE='$RENDEZVOUS_SCHEDULE' is not 0 or 1." >&2
+     exit 2 ;;
+esac
+if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$TEAM_WORLD" != "1" ]; then
+  echo "FATAL: RENDEZVOUS_SCHEDULE=1 requires TEAM_WORLD=1 (with no exchange" >&2
+  echo "       each robot would schedule a meeting with a fleet of one, at a" >&2
+  echo "       cell the peer has never heard of)." >&2
+  exit 2
+fi
+# The appointment is a DESTINATION for a reconnect manoeuvre. With the
+# manoeuvre disabled there is nothing to redirect, so the knob is inert and
+# asking for it is a mistake in whatever set the arm — the same failure the
+# RECONNECT_GATE=info / RECONNECT_MODE=off pairing above refuses.
+if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$RECONNECT_MODE" = "off" ]; then
+  echo "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=off. There is no" >&2
+  echo "       reconnect manoeuvre to schedule, so the cell would be labelled" >&2
+  echo "       as carrying the P5 treatment and would not carry it." >&2
+  exit 2
+fi
+# PURSUIT is the chase-only cell of the §3.6.1 factorial, and the planner
+# refuses to arm an appointment in it by design — that absence IS the A/B.
+# Setting the knob there is therefore not merely inert, it is a request for
+# the arm the run will not be. Fatal rather than a warning: the planner would
+# stamp `arm=mtare_pursuit` and the run_start param dump would say the P5
+# treatment was on, which is exactly the name/stamp disagreement the check
+# below exists to prevent, one level down.
+_rzv_pursuit=0
+case "$RECONNECT_MODE" in pursuit|mtare_pursuit) _rzv_pursuit=1 ;; esac
+if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$_rzv_pursuit" = "1" ]; then
+  echo "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=$RECONNECT_MODE." >&2
+  echo "       The pursuit arm is the appointment-OFF cell of the 2x2 and the" >&2
+  echo "       planner will not arm one there. The cell would record the P5" >&2
+  echo "       treatment as enabled and would not carry it." >&2
+  exit 2
+fi
+unset _rzv_pursuit
 # THE ARM NAME AND THE ARM STAMP MUST AGREE, IN BOTH DIRECTIONS.
 #
 # The node names the arm itself, and its rule is an OR:
-#   arm = (global_alloc_enable || reconnect_gate==info ? "mtare_" : "") +
+#   arm = (global_alloc_enable || reconnect_gate==info ||
+#          rendezvous_schedule_enable ? "mtare_" : "") +
 #         (rendezvous_enabled ? reconnect_mode : "off")
 # Everything downstream — the cell directory, campaign_index.csv, every
 # analysis script — takes the arm from RECONNECT_MODE instead. So any
@@ -657,9 +748,13 @@ fi
 # the untreated cells.
 #
 # Written as the node's own predicate rather than a list of bad pairs, so a
-# fifth knob that sets the prefix cannot slip past it.
+# fifth knob that sets the prefix cannot slip past it. P5's
+# RENDEZVOUS_SCHEDULE is that fifth knob, and it was added to BOTH sides in
+# the same commit: a predicate that stops tracking the node's is a check that
+# has stopped checking while still printing a pass.
 _mtare_stamped=0
-if [ "$GLOBAL_ALLOC" = "1" ] || [ "$RECONNECT_GATE" = "info" ]; then
+if [ "$GLOBAL_ALLOC" = "1" ] || [ "$RECONNECT_GATE" = "info" ] \
+   || [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
   _mtare_stamped=1
 fi
 _mtare_named=0
@@ -668,7 +763,8 @@ if [ "$_mtare_stamped" != "$_mtare_named" ]; then
   echo "FATAL: the arm name and the arm the node will stamp disagree." >&2
   echo "       RECONNECT_MODE=$RECONNECT_MODE names a$([ "$_mtare_named" = 1 ] \
        && echo "n mtare" || echo " non-mtare") arm, but" >&2
-  echo "       GLOBAL_ALLOC=$GLOBAL_ALLOC RECONNECT_GATE=$RECONNECT_GATE means" >&2
+  echo "       GLOBAL_ALLOC=$GLOBAL_ALLOC RECONNECT_GATE=$RECONNECT_GATE" >&2
+  echo "       RENDEZVOUS_SCHEDULE=$RENDEZVOUS_SCHEDULE means" >&2
   echo "       the node will stamp $([ "$_mtare_stamped" = 1 ] \
        && echo "arm=mtare_*" || echo "a plain arm")." >&2
   echo "       Every directory, index and analysis keys off the name; only" >&2
@@ -1628,14 +1724,21 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # and is inert, since shouldRendezvous() returns false before the mode is
 # consulted.
 #
-# `mtare_hybrid` maps the same way and for the same reason: it is not a
-# reconnect_mode either, it is `hybrid` plus the P1-P4 stack the blocks above
-# have already switched on. The planner reconstitutes the arm label itself from
-# what it was handed (see its addParamStr("arm", ...)), so nothing here has to
-# carry the name forward.
+# The four `mtare_*` tokens map the same way and for the same reason: none of
+# them is a reconnect_mode either, each is one of the four §3.6.1 cells plus
+# the P1-P5 stack the blocks above have already switched on. `mtare_off` is
+# `off` with that stack, so it drops rendezvous_enabled exactly as plain `off`
+# does. The planner reconstitutes the arm label itself from what it was handed
+# (see its addParamStr("arm", ...)), so nothing here has to carry the name
+# forward — the token strips to its suffix and the prefix comes back from the
+# knobs. That round trip is what the name/stamp check above verifies.
 RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
-if [ "$RECONNECT_MODE" = "off" ]; then RDV_ENABLED="false"; MODE_ARG="hybrid"; fi
-if [ "$RECONNECT_MODE" = "mtare_hybrid" ]; then MODE_ARG="hybrid"; fi
+case "$RECONNECT_MODE" in
+  off|mtare_off)              RDV_ENABLED="false"; MODE_ARG="hybrid" ;;
+  mtare_pursuit)              MODE_ARG="pursuit" ;;
+  mtare_rendezvous)           MODE_ARG="rendezvous" ;;
+  mtare_hybrid)               MODE_ARG="hybrid" ;;
+esac
 log "done_seek_enabled=$DONE_SEEK_ARG done_seek_max_sec=$DONE_SEEK_MAX (DONE_SEEK=$DONE_SEEK)"
 log "mission_return_enabled=$MISSION_RETURN_ARG home_tol=${MISSION_HOME_TOL}m max=${MISSION_RETURN_MAX}s (MISSION_RETURN=$MISSION_RETURN)"
 log "candidate_enable_polar=$POLAR_ARG (FRONTIER_ONLY=$FRONTIER_ONLY)"
@@ -1677,6 +1780,11 @@ if [ "$RECONNECT_GATE" = "info" ]; then
   log "reconnect gate = info: the mid-run silence clock is a FLOOR; past it, dispatch only if the peer is missing something we hold AND the leg pays for itself (C_re < C_no). Every evaluation is logged, suppressed or not."
 else
   log "reconnect gate = silence (planner default) — the mid-run clock decides alone; no reconnect_gate param passed"
+fi
+if [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
+  log "scheduled rendezvous ON: on dispatch both robots derive the same (cell, t_meet) from the allocator's own tours and each departs at its own travel-time deadline; the midpoint is the floor, not the default"
+else
+  log "scheduled rendezvous OFF (RENDEZVOUS_SCHEDULE=0) — no rendezvous_schedule_enable param passed; the reconnect destination is the last-contact midpoint"
 fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
@@ -1798,6 +1906,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # that never had it.
   echo "global_alloc=$GLOBAL_ALLOC"
   echo "reconnect_gate=$RECONNECT_GATE"
+  echo "rendezvous_schedule=$RENDEZVOUS_SCHEDULE"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -2011,6 +2120,9 @@ for r in $ROBOTS; do
   fi
   if [ "$RECONNECT_GATE" = "info" ]; then
     EXTRA+=( -p reconnect_gate:=info )
+  fi
+  if [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
+    EXTRA+=( -p rendezvous_schedule_enable:=true )
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \

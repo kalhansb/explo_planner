@@ -174,6 +174,13 @@ GATED_MANIFEST_GROUPS = {
     # the same commit that adds the key.
     "global_alloc": ("0", set()),
     "reconnect_gate": ("silence", set()),
+    # P5. Same shape and same reasoning: one gate key, no dependents, because
+    # the runner passes rendezvous_schedule_enable alone and leaves every
+    # tuning knob of the scheduler (speed, safety factor, margin) at its
+    # compiled default. Registered in the SAME commit that added the manifest
+    # line, which is the habit the P3/P4 note above was written to enforce
+    # after that habit was skipped once.
+    "rendezvous_schedule": ("0", set()),
 }
 
 

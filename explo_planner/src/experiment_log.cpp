@@ -842,6 +842,47 @@ void ExperimentLog::logReconnectGate(const ExperimentContext& ctx,
   end();
 }
 
+void ExperimentLog::logRendezvousAgreed(const ExperimentContext& ctx,
+                                        const RendezvousAgreedEvent& e) {
+  if (!open_ || !started_) return;
+  begin("rendezvous_agreed", ctx);
+  // Decimal, like every other hash in this file: JSON has no hex literal.
+  integer("shared_hash", static_cast<long long>(e.shared_hash));
+  integer("grid_hash", static_cast<long long>(e.grid_hash));
+  num("snapshot_age_sec", e.snapshot_age_sec);
+  integer("cell", e.cell);
+  num("t_meet_sec", e.t_meet_sec);
+  num("t_now_sec", e.t_now_sec);
+  num("interval_sec", e.interval_sec);
+  boolean("capped", e.capped);
+  integer("penalty_mm", e.penalty_mm);
+  boolean("floor_won", e.floor_won);
+  integer("candidates", e.candidates);
+  integer("rejected_unreachable", e.rejected_unreachable);
+  integer("rejected_excluded", e.rejected_excluded);
+  num("travel_sec", e.travel_sec);
+  num("depart_sec", e.depart_sec);
+  // Always written, including as "": a reader counting refusals must not have
+  // to treat an absent key and an empty one as the same thing.
+  text("refused", e.refused);
+  text("excluded", e.excluded);
+  end();
+}
+
+void ExperimentLog::logRendezvousOutcome(const ExperimentContext& ctx,
+                                         const RendezvousOutcomeEvent& e) {
+  if (!open_ || !started_) return;
+  begin("rendezvous_outcome", ctx);
+  integer("cell", e.cell);
+  num("t_meet_sec", e.t_meet_sec);
+  num("t_end_sec", e.t_end_sec);
+  num("lateness_sec", e.lateness_sec);
+  text("outcome", e.outcome);
+  boolean("arrived", e.arrived);
+  num("waited_sec", e.waited_sec);
+  end();
+}
+
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));

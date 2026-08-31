@@ -190,8 +190,8 @@ EXPECT_ARMS = tuple(
     if a)
 
 # The control arm, and the ONLY arm that runs with rendezvous_enabled=false.
-# Everything else — hybrid, pursuit, rendezvous, mtare_hybrid — reaches the
-# manoeuvre and must have it enabled. Check 3e used to spell this as
+# Everything else — hybrid, pursuit, rendezvous and the three treated
+# `mtare_*` tokens — reaches the manoeuvre and must have it enabled. Check 3e used to spell this as
 # `arm == "hybrid"`, which asserted rendezvous_enabled=False for a pursuit or
 # rendezvous cell and would have hard-failed a correct run of either.
 #
@@ -204,6 +204,13 @@ EXPECT_ARMS = tuple(
 # check 3f skipped and 3e satisfied — every assertion about its treatment
 # exempted in advance, by a default nobody had to type. An arm earns the
 # exemption by being declared at scoring time, not by being guessed at here.
+#
+# THAT DAY HAS ARRIVED and the default has deliberately not moved. `mtare_off`
+# is now a real runner token — the control cell of the §3.6.1 factorial, which
+# carries P1-P3 and neither reconnect mechanism. Scoring that campaign
+# therefore requires GATE_CONTROL_ARMS="mtare_off" to be typed out, and the
+# check below refuses a control arm that no cell is running, so the typing
+# cannot be wrong in the quiet direction.
 CONTROL_ARMS = frozenset(
     a for a in (s.strip()
                 for s in os.environ.get("GATE_CONTROL_ARMS", "off").split(","))
@@ -400,6 +407,80 @@ if not cells:
     print(f"no cells for tag {TAG}")
     sys.exit(1)
 
+# ==================================================================
+# The M-TARE feature vector each arm token is DEFINED to carry (check 3g).
+# ==================================================================
+# Until P5 this was a single boolean — every feature ON for an `mtare_*` arm,
+# every feature OFF otherwise — because there was exactly one m-tare arm and it
+# carried the whole stack. The doc §3.6.1 factorial ends that: its four arms
+# share the P1-P3 stack (cell world, exchange, allocator) and differ precisely
+# in the two reconnect MECHANISMS, so "all features on" would reject three of
+# the four cells of the design this check exists to certify.
+#
+# `mtare_off` carries reconnect_gate=silence on purpose and not as an
+# oversight: the gate can only suppress a dispatch, and that arm makes none, so
+# `info` there would pin an inert knob. What is emphatically NOT inert in it is
+# the allocator, which is why the factorial's control is `mtare_off` and not
+# plain `off` — a plain-`off` control would confound the two mechanisms under
+# test with P3.
+#
+# `mtare_rendezvous` and `mtare_hybrid` have identical vectors. They are
+# separated by reconnect_mode / rendezvous_enabled, which check 3e already
+# compares against the directory name; this table is about the stack, not the
+# mode.
+MTARE_ARM_STACK = {
+    "mtare_off": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": False,
+        "rendezvous_schedule_enable": False},
+    "mtare_pursuit": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": True,
+        "rendezvous_schedule_enable": False},
+    "mtare_rendezvous": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": True,
+        "rendezvous_schedule_enable": True},
+    "mtare_hybrid": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": True,
+        "rendezvous_schedule_enable": True},
+}
+# Which m-tare arm tokens a PRE-P5 binary could have stamped. Only one: the
+# three factorial names did not exist, and the runner refused every route to
+# `mtare_off` (the arm-name/arm-stamp check rejected a plain token with the
+# allocator on, and RECONNECT_GATE=info with RECONNECT_MODE=off was fatal). So
+# seeing one of them on a pre-P5 cell means the directory was renamed after the
+# fact, not that the binary ran that arm.
+MTARE_ARMS_PRE_P5 = {"mtare_hybrid"}
+
+
+def mtare_expect(arm, gen_p5):
+    """The feature vector `arm` is defined to carry, or None if a binary of
+    this generation cannot stamp that arm at all.
+
+    `gen_p5` selects the vocabulary AND the vector width: a pre-P5 binary emits
+    no rendezvous_schedule_enable, so asking about it would compare against a
+    key the observed vector does not have."""
+    if arm.startswith("mtare_"):
+        if not gen_p5 and arm not in MTARE_ARMS_PRE_P5:
+            return None
+        want = MTARE_ARM_STACK.get(arm)
+        if want is None:
+            return None
+        want = dict(want)
+    else:
+        # An untreated arm carries none of it, in either generation. Checked in
+        # this direction too, and this is the direction that decides the
+        # comparison: a control cell that somehow ran the allocator is a
+        # treated cell sitting in the control column, and no amount of care in
+        # the treated arm compensates for that.
+        want = {k: False for k in MTARE_ARM_STACK["mtare_hybrid"]}
+    if not gen_p5:
+        want.pop("rendezvous_schedule_enable", None)
+    return want
+
+
 hard_fail, soft, unresolved = [], [], []
 agg_recovery_entries = 0
 rows = []
@@ -422,6 +503,11 @@ n_3f_runs = n_3f_live_checked = 0
 # ever certified as untreated, and either alone would let the check read as a
 # pass over the arm it never looked at.
 n_3g_treated = n_3g_control = 0
+# Check 3h's populations: how many robot-runs came from each binary generation,
+# and which cells they were, so a mixed campaign can name the cells rather than
+# just the counts.
+n_3g_gen_p5 = n_3g_gen_pre = 0
+_gen_cells_p5, _gen_cells_pre = set(), set()
 _live_reported = {}
 
 for c in cells:
@@ -544,15 +630,16 @@ for c in cells:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — arm={arm} but rendezvous_enabled="
                     f"{pr.get('rendezvous_enabled')!r}")
-            # 3g. THE M-TARE ARM MUST WITNESS ALL FOUR FEATURES, NOT ONE.
+            # 3g. THE M-TARE ARM MUST WITNESS ITS WHOLE STACK, NOT ONE BIT.
             #
             # The node reconstitutes the arm itself and prefixes `mtare_` when
-            # `global_alloc_enable_ || reconnect_gate_info_` — an OR. So the
-            # name `mtare_hybrid` proves at least one of P3 and P4 was live and
-            # never both, and check 3e, which compares that name against the
-            # stamp it came from, is satisfied by a cell running half the
-            # treatment. The arm's definition is four features; nothing above
-            # asks about four.
+            # `global_alloc_enable_ || reconnect_gate_info_ ||
+            # rendezvous_schedule_enable_` — an OR. So the name `mtare_hybrid`
+            # proves at least ONE of P3, P4 and P5 was live and never all
+            # three, and check 3e, which compares that name against the stamp
+            # it came from, is satisfied by a cell running a third of the
+            # treatment. The arm's definition is a feature VECTOR; nothing
+            # above asks about the vector.
             #
             # Two of them are worse than ambiguous, they are invisible.
             # cell_world_enable and team_world_hz rename NOTHING, so a cell
@@ -571,6 +658,34 @@ for c in cells:
                        ("cell_world_enable", "team_world_hz",
                         "global_alloc_enable", "reconnect_gate")}
             _mt_absent = sorted(k for k, v in _mt_raw.items() if v is None)
+            # P5 added a FIFTH feature, and its param's absence does not mean
+            # what the other four's does. Those four have been emitted
+            # unconditionally since P4, so a cell missing one predates the
+            # whole stack and cannot be certified at all. rendezvous_schedule_
+            # enable instead DATES the cell: absent means a pre-P5 binary,
+            # which is a perfectly legitimate thing to score — campaign mh1 is
+            # one — but a different generation, in which the token
+            # `mtare_hybrid` does not name the same arm it names after P5
+            # (there was no appointment to switch on, so hybrid's fallback
+            # destination was the midpoint).
+            #
+            # Handled by GENERATION rather than by exemption, because the two
+            # loosenings on offer are both the failure this file exists to
+            # prevent: dropping the fifth key from the vector would certify a
+            # P7 mtare_hybrid cell that never armed an appointment, and
+            # hard-failing its absence would make the gate unable to score any
+            # campaign banked before today. So each cell is dated, a pre-P5
+            # cell is held to the pre-P5 arm vocabulary, and a campaign that
+            # mixes the two generations is rejected outright below (3h) — that
+            # is pooling across binary generations, which is already forbidden.
+            _p5_raw = pr.get("rendezvous_schedule_enable")
+            _gen_p5 = _p5_raw is not None
+            if _gen_p5:
+                n_3g_gen_p5 += 1
+                _gen_cells_p5.add(c)
+            else:
+                n_3g_gen_pre += 1
+                _gen_cells_pre.add(c)
             if _mt_absent:
                 # The node emits all four unconditionally, so absence is not a
                 # default — it is a cell written by a binary predating the
@@ -602,13 +717,26 @@ for c in cells:
                         "reconnect_gate=info":
                             _mt_raw["reconnect_gate"] == "info",
                     }
-                    _wrong = [k for k, v in _feat.items() if v != _mt_want]
-                    if _wrong:
+                    if _gen_p5:
+                        _feat["rendezvous_schedule_enable"] = bool(_p5_raw)
+                    _want = mtare_expect(arm, _gen_p5)
+                    if _want is None:
                         hard_fail.append(
-                            f"{c}/{r}: check 3g — arm={arm} but "
-                            + ", ".join(f"{k}={_feat[k]}" for k in _wrong)
-                            + f"; every M-TARE feature must be "
-                            f"{'ON' if _mt_want else 'OFF'} for this arm")
+                            f"{c}/{r}: check 3g — arm={arm} is not an arm a "
+                            f"{'P5-or-later' if _gen_p5 else 'pre-P5'} binary "
+                            f"can stamp (known: "
+                            f"{sorted(MTARE_ARM_STACK if _gen_p5 else MTARE_ARMS_PRE_P5)}"
+                            f"). The directory name and the binary disagree "
+                            f"about which experiment this is")
+                    else:
+                        _wrong = [k for k, v in _feat.items() if v != _want[k]]
+                        if _wrong:
+                            hard_fail.append(
+                                f"{c}/{r}: check 3g — arm={arm} but "
+                                + ", ".join(f"{k}={_feat[k]} "
+                                            f"(want {_want[k]})"
+                                            for k in _wrong)
+                                + "; the arm token names the whole stack")
                     if _mt_want:
                         n_3g_treated += 1
                     else:
@@ -994,6 +1122,37 @@ print("\narm identity: " + ", ".join(
     sorted({f"{r['arm']}: mode_req={r.get('mode_req')} rdv={r.get('rdv')}" for r in rows})))
 print(f"nav_goal_failed by arm: {dict(nav_fail_by_arm)}")
 
+# ==================================================================
+# 3h. ONE BINARY GENERATION PER CAMPAIGN.
+# ==================================================================
+# Check 3b already pins one git_rev across the campaign, which catches this
+# whenever the revision is recorded and readable. This is the same claim read
+# off the BEHAVIOUR instead of off the provenance string, and it is worth
+# having twice because the two fail differently: 3b compares a label, 3h
+# compares what the binary actually emitted.
+#
+# The P5 param is the discriminator. A binary that has the scheduled
+# rendezvous emits `rendezvous_schedule_enable` in every run_start, on or off;
+# one that predates it emits nothing. So a campaign holding both kinds of cell
+# pooled two generations under one set of arm names — and the arm names are
+# exactly what does not survive that: `mtare_hybrid` means "chase, falling back
+# to the midpoint" on one side of P5 and "chase, falling back to the agreed
+# cell" on the other. Analysed together they are one arm run twice with two
+# different treatments in it.
+if n_3g_gen_p5 and n_3g_gen_pre:
+    hard_fail.append(
+        f"check 3h — this campaign mixes binary generations: "
+        f"{n_3g_gen_p5} robot-run(s) in {len(_gen_cells_p5)} cell(s) emit "
+        f"rendezvous_schedule_enable (P5 or later) and {n_3g_gen_pre} in "
+        f"{len(_gen_cells_pre)} cell(s) do not (pre-P5). The arm tokens do not "
+        f"mean the same thing across that boundary. "
+        f"pre-P5 e.g. {sorted(_gen_cells_pre)[:3]}, "
+        f"P5+ e.g. {sorted(_gen_cells_p5)[:3]}")
+elif n_3g_gen_p5 or n_3g_gen_pre:
+    print(f"binary generation: "
+          f"{'P5+' if n_3g_gen_p5 else 'pre-P5'} "
+          f"({n_3g_gen_p5 or n_3g_gen_pre} robot-runs, uniform)")
+
 # Populations examined — printed so a pass can be read as "N rows were checked",
 # never as "nothing objected".
 print("\npopulations examined by the generation-8 checks:")
@@ -1011,6 +1170,7 @@ for label, n, check in (
         ("link-gate live witnesses",    n_3f_live_checked, "3f"),
         ("m-tare features certified ON", n_3g_treated,   "3g"),
         ("m-tare features certified OFF", n_3g_control,  "3g"),
+        ("binary-generation witnesses", n_3g_gen_p5 + n_3g_gen_pre, "3h"),
         ("console logs present",        n_console_logs,   "9"),
         ("mid-run reconnect lines",     n_midrun,        "20")):
     mark = "" if n else "   <- EMPTY: check is UNRESOLVED, not passed"

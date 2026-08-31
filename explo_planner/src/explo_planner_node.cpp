@@ -80,6 +80,7 @@
 #include "explo_planner/team_model.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
+#include "explo_planner/rendezvous_scheduler.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
@@ -312,6 +313,37 @@ private:
   /// transitions into a manoeuvre state and returns true (kept boolean for
   /// call-site symmetry with startPursuit).
   bool dispatchReconnect(const char* reason);
+
+  // ---- Scheduled rendezvous (P5, §3.5) --------------------------------
+  /// Freeze the world the next appointment will be derived from.
+  ///
+  /// Called on the heartbeat while the team reads COMPLETE, so what it holds
+  /// is always the last bidirectionally confirmed state. That is the whole
+  /// mechanism: agreement is by construction only if both robots solve the
+  /// same problem, and the live world at DISPATCH is not that problem — the
+  /// dispatch happens a gate's worth of silence AFTER contact was lost, by
+  /// which time the two worlds have diverged by exactly the backlog the
+  /// meeting exists to exchange. No-op unless the schedule is enabled.
+  void refreshRendezvousSnapshot();
+  /// Derive the appointment from the frozen snapshot and arm it. Emits one
+  /// `rendezvous_agreed` per call, refusals included. Returns true when an
+  /// appointment now stands.
+  bool armAppointment(const char* reason);
+  /// This robot's own travel time to the standing appointment, recomputed
+  /// LIVE from where it is now (a chase moves it). -1 when there is no
+  /// appointment or no usable cell for the current position.
+  long long appointmentTravelMs() const;
+  /// Departure test: is it time to break off and drive to the appointment?
+  /// Per-robot by construction, so the far robot leaves first and the two
+  /// arrive together — see §3.5's departure rule.
+  bool appointmentDue();
+  /// Centre of the appointment cell, as a drive destination.
+  Eigen::Vector3f appointmentPoint() const;
+  /// Close a standing appointment and emit its `rendezvous_outcome`. A
+  /// "no-show" also writes the cell off, so the next arming inside the same
+  /// outage cannot pick it again. No-op when nothing is armed.
+  void closeAppointment(const char* outcome, bool arrived, double waited_sec);
+
   /// Flicker guard for manoeuvre release: true once `eligible` has held
   /// continuously for reconnect_release_confirm_sec (immediately when the
   /// window is 0). Resets whenever eligible drops or the state changes.
@@ -595,6 +627,65 @@ private:
   // forward — so the silence floor of §3.6.3 is kept structurally rather than
   // by a second comparison someone could later drop.
   bool       reconnect_gate_info_ = false;
+
+  // ---- Scheduled rendezvous (P5, §3.5) --------------------------------
+  //
+  // OFF by default, and off means dispatchReconnect is byte-identical to the
+  // pre-P5 node: no snapshot is taken, no appointment is derived, no
+  // rendezvous_* event is emitted, and every mode falls through the branches
+  // it always did. That is the P5 equivalence claim.
+  //
+  // ON, the mechanism replaces ONE thing: the destination a RENDEZVOUS or
+  // HYBRID manoeuvre drives to, and the moment it departs. It replaces
+  // nothing under PURSUIT — pure pursuit has no agreed fallback point BY
+  // DESIGN, and that absence is the A/B this campaign measures (see
+  // dispatchReconnect and pursuitFallback, which both say so). So the four
+  // arms are a clean 2x2 of chase x appointment: off / pursuit (chase only) /
+  // rendezvous (appointment only) / hybrid (both).
+  bool       rendezvous_schedule_enable_ = false;
+  RendezvousScheduler::Config rzv_cfg_;
+
+  // The frozen problem. Copied wholesale rather than referenced: the live
+  // cell_world_ keeps merging peer voxels and re-solving, and an appointment
+  // derived from a world that moved under it is an appointment the peer never
+  // computed. Refreshed only while the team reads complete, so its age is
+  // exactly the outage's age — logged as snapshot_age_sec so a disagreement
+  // between the pair can be attributed to staleness rather than to the
+  // scheduler.
+  //
+  // WHAT AGREEMENT ACTUALLY RESTS ON, stated plainly because the code cannot
+  // enforce it: RendezvousScheduler::solve is deterministic given identical
+  // inputs, so both robots derive the same appointment IF their snapshots
+  // agree. Mine holds my own position first-hand and the peer's from its last
+  // beacon; the peer's holds the mirror image. The two therefore differ by up
+  // to one beacon period of motion — which is invisible at cell granularity
+  // unless the motion crossed a boundary. This is the same residual the
+  // shipped midpoint construction already carries ("both midpoints agree to
+  // whatever the robots moved between the two receipt instants"), not a new
+  // one; what P5 adds is the shared_hash + cell + t_meet fields that make it
+  // MEASURABLE offline instead of assumed.
+  CellWorld               rendezvous_world_;
+  std::vector<AllocRobot> rendezvous_vehicles_;
+  bool                    have_rendezvous_snapshot_ = false;
+  double                  rendezvous_snapshot_at_sec_ = -1.0;
+
+  // The standing appointment. Armed by armAppointment, cleared by
+  // closeAppointment, and while armed it SUPPRESSES the mid-run trigger: the
+  // decision was taken when it armed and what remains is a clock. Without
+  // that suppression every PLAN tick of the outage would re-enter the trigger,
+  // burn an attempt and re-derive the same appointment, exhausting the budget
+  // in seconds while nothing moved.
+  RendezvousPlan appointment_;
+  bool           appointment_armed_    = false;
+  bool           appointment_departed_ = false;
+  bool           appointment_arrived_  = false;
+  double         appointment_armed_at_sec_   = -1.0;
+  double         appointment_arrived_at_sec_ = -1.0;
+  // Cells a no-show has written off, within the current outage. Cleared when
+  // the team reconnects. The floor is exempt from it by construction (see
+  // RendezvousScheduler::solve) so this list can never empty the candidate
+  // set, which is the deadlock the rule exists to prevent.
+  std::vector<int> rendezvous_noshow_;
 
   bool       team_merge_local_priority_ = true;
   std::string team_world_pub_topic_;
@@ -3423,6 +3514,120 @@ ExploPlannerNode::ExploPlannerNode()
                           reconnect_gate_info_ ? "info" : "silence");
   }
 
+  // ---- Scheduled rendezvous (P5) --------------------------------------
+  //
+  // §3.5. The meeting stops being a landmark and becomes a CONSTRAINT on the
+  // tours already being driven: pick the cell whose forced insertion costs the
+  // team's makespan the least, and meet when the slower robot gets there under
+  // its own tour. The last-contact midpoint stays in the candidate set as a
+  // guaranteed floor, so the worst case is exactly the shipped behaviour.
+  //
+  // WHY, in one measurement. Campaign mh1 ran the midpoint destination under
+  // the §3.6 value gate: 100 of 110 evaluations declined, every single one on
+  // COST (c_re > c_no), never on knowledge. That is not a gate being cautious,
+  // it is the gate correctly reporting that the destination is worthless — the
+  // midpoint of two poses that were in contact sits BEHIND both robots on
+  // ground they have already covered, so meeting there always costs more than
+  // it returns. Nothing about the gate can fix a bad destination; the
+  // destination had to change.
+  rendezvous_schedule_enable_ = dp("rendezvous_schedule_enable", false);
+  if (rendezvous_schedule_enable_) {
+    // The problem IS the cell world, same as P3/P4, and for the same reason
+    // those two are fatal rather than degrading: a scheduler with no world
+    // would refuse on every arming and log a perfectly healthy stream of
+    // refusals that reads like a mechanism deciding not to fire.
+    if (!cell_world_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_schedule_enable=true but cell_world_enable=false: the "
+          "meeting is chosen by inserting a cell into the solved tours, and "
+          "neither the cells nor the tours exist without the cell world.");
+      throw std::runtime_error(
+          "rendezvous_schedule_enable requires cell_world_enable");
+    }
+    const std::string idw =
+        requireFleetIdentity(fleet_, "rendezvous_schedule_enable=true");
+    if (!idw.empty()) {
+      RCLCPP_FATAL(get_logger(), "%s", idw.c_str());
+      throw std::runtime_error(idw);
+    }
+    // Without the exchange the two robots never converge on a world, so
+    // "agreement by construction" has no construction to rest on: each would
+    // solve its own private allocation, derive its own appointment, and drive
+    // to a different cell — while logging an entirely well-formed
+    // rendezvous_agreed event at each end. Exactly the failure that cannot be
+    // caught downstream, so it is fatal here.
+    if (team_world_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_schedule_enable=true but team_world_hz=0: with no world "
+          "exchange each robot would solve a private allocation and derive a "
+          "private appointment, and the two ends would meet nowhere.");
+      throw std::runtime_error(
+          "rendezvous_schedule_enable requires team_world_hz>0");
+    }
+    // Not fatal: a control run with reconnection off is legitimate and the
+    // scheduler simply never arms. Warned because asking for it there is
+    // almost certainly a harness mistake.
+    if (!rendezvous_enabled_) {
+      RCLCPP_WARN(get_logger(),
+          "rendezvous_schedule_enable=true with rendezvous_enabled=false: "
+          "there is no reconnect manoeuvre to schedule, so no appointment "
+          "will ever be armed.");
+    }
+    // Pure pursuit is deliberately untouched — see rendezvous_schedule_enable_.
+    if (reconnect_mode_ == ReconnectMode::PURSUIT) {
+      RCLCPP_WARN(get_logger(),
+          "rendezvous_schedule_enable=true under reconnect_mode=pursuit: pure "
+          "pursuit has no agreed meeting point by design (that absence is the "
+          "A/B against hybrid), so the scheduler will not arm in this arm.");
+    }
+    // The scheduler solves the allocation problem itself, so it needs a
+    // Config even when the allocator and the §3.6 gate are both off.
+    // Declaring a ROS parameter twice throws, so read them only where neither
+    // of the two blocks above already did.
+    if (!global_alloc_enable_ && !reconnect_gate_info_) {
+      alloc_cfg_.polish_passes  = dp("global_alloc_polish_passes", 2);
+      alloc_cfg_.max_candidates = dp("global_alloc_max_candidates", 256);
+    }
+
+    // The speed the SCHEDULE assumes, deliberately not nav_speed_est_mps_.
+    // That one is the nav watchdog's model and is ~3x conservative on purpose
+    // (a leg failing slowly must still time out); reusing it here would push
+    // every t_meet three times too far into the future and the appointment
+    // would always be beaten by the outage ending on its own. This one wants
+    // the honest cruise speed, and it must be identical on both robots — it
+    // is an input to a value both ends derive independently — which is why it
+    // is a shared param and not a per-robot estimate.
+    rzv_cfg_.speed_mm_s =
+        static_cast<long long>(dp("rendezvous_speed_mm_s", 500));
+    // Departure safety and margin. These do NOT have to match across the
+    // pair: each robot departs on its own travel estimate so that the two
+    // ARRIVE together, and identical deadlines in a pair would be evidence
+    // the mechanism is not doing what it claims. They are shared anyway
+    // because there is no reason for them to differ.
+    rzv_cfg_.depart_safety_milli = static_cast<int>(
+        std::lround(dp("rendezvous_depart_safety", 1.2) * 1000.0));
+    rzv_cfg_.depart_margin_ms = static_cast<long long>(
+        std::lround(dp("rendezvous_depart_margin_sec", 0.0) * 1000.0));
+    if (rzv_cfg_.speed_mm_s <= 0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_speed_mm_s=%lld: every arrival time would be infinite "
+          "and there is no safe value to substitute.", rzv_cfg_.speed_mm_s);
+      throw std::runtime_error("rendezvous_speed_mm_s must be positive");
+    }
+  }
+  if (exp_log_) {
+    exp_log_->addParamBool("rendezvous_schedule_enable",
+                           rendezvous_schedule_enable_);
+    if (rendezvous_schedule_enable_) {
+      exp_log_->addParamNum("rendezvous_speed_mm_s",
+                            static_cast<double>(rzv_cfg_.speed_mm_s));
+      exp_log_->addParamNum("rendezvous_depart_safety",
+                            rzv_cfg_.depart_safety_milli / 1000.0);
+      exp_log_->addParamNum("rendezvous_depart_margin_sec",
+                            rzv_cfg_.depart_margin_ms / 1000.0);
+    }
+  }
+
   // THE arm this run belongs to, and the field an analysis must group by.
   //
   // Stamped HERE, not up with reconnect_mode among the other param lines,
@@ -3449,8 +3654,15 @@ ExploPlannerNode::ExploPlannerNode()
   // A run with either engaged is not the hybrid arm, and pooling it into the
   // hybrid cell would do to that comparison exactly what grouping on
   // reconnect_mode does to the control.
+  //
+  // P5 joins them for the same reason and not by analogy: the scheduler
+  // changes WHERE a manoeuvre goes and WHEN it leaves, which is a decision
+  // change of exactly the kind P3 and P4 make. A scheduled hybrid pooled into
+  // the hybrid cell would average the new destination against the midpoint
+  // the whole phase exists to replace.
   if (exp_log_) {
-    const bool mtare = global_alloc_enable_ || reconnect_gate_info_;
+    const bool mtare = global_alloc_enable_ || reconnect_gate_info_ ||
+                       rendezvous_schedule_enable_;
     std::string arm = rendezvous_enabled_
                           ? std::string(reconnectModeName(reconnect_mode_))
                           : std::string("off");
@@ -4457,6 +4669,59 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
       reconnect_terminal_ = true;
     }
   }
+
+  // ---- P5: appointment bookkeeping -------------------------------------
+  //
+  // Its own block, deliberately NOT folded into the manoeuvre-end block
+  // above, because the two do not share a lifetime. A DEFERRED appointment
+  // stands while the robot is still EXPLORING — that deferral is the whole
+  // mechanism — so reconnect_active_ is false and the block above never runs
+  // for it.
+  //
+  // Every armed appointment must produce exactly one outcome event, or the
+  // 1:1 join the two kinds exist to support silently stops holding. The three
+  // ways one can end are all handled here: the team came back, this robot
+  // kept it (departed, then either met somebody or did not), or the run ended
+  // underneath it.
+  if (appointment_armed_) {
+    const int appt_live =
+        coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+    const bool team_back = teamComplete(appt_live, rendezvous_expected_peers_);
+    const bool run_over  = (s == State::DONE || s == State::RETURN_HOME);
+    // A DEPARTED appointment is resolved the moment the manoeuvre keeping it
+    // ends. An UNDEPARTED one must survive leaving the manoeuvre states,
+    // because going back to exploring before the deadline is precisely what
+    // the mechanism does — closing it here would delete the appointment on
+    // the first declined chase.
+    const bool kept_and_done = appointment_departed_ && !manoeuvre;
+    if (team_back || run_over || kept_and_done) {
+      const double t_close = missionElapsed();
+      const double waited =
+          (appointment_arrived_ && appointment_arrived_at_sec_ >= 0.0 &&
+           t_close >= 0.0)
+              ? std::max(0.0, t_close - appointment_arrived_at_sec_)
+              : 0.0;
+      // Derived from what happened, not re-decided. Whether the team is back
+      // IS the outcome; whether this robot reached the cell is the only other
+      // fact the classification needs. The two are kept apart on purpose: a
+      // "no-show" with arrived=false would be a navigation failure wearing a
+      // coordination failure's name, and counting those together is how a
+      // mechanism that never arrives anywhere looks like one whose partner
+      // never turns up.
+      const char* appt_outcome = team_back              ? "reconnected"
+                                 : !appointment_departed_ ? "superseded"
+                                 : appointment_arrived_   ? "no-show"
+                                                          : "unreachable";
+      closeAppointment(appt_outcome, appointment_arrived_, waited);
+      // The no-show write-offs are scoped to ONE outage: they encode "we both
+      // waited there and nobody came", which says nothing about the next
+      // separation. Cleared on the reconnection rather than on the
+      // appointment, so a SECOND appointment inside the same outage still
+      // avoids the cell the first one failed at.
+      if (team_back) rendezvous_noshow_.clear();
+    }
+  }
+
   // The release-confirm dwell never survives a state change: a flicker that
   // straddles e.g. a PROXIMITY_HOLD must restart its window.
   release_ok_armed_ = false;
@@ -4705,6 +4970,39 @@ void ExploPlannerNode::doPlan() {
     }
   }
 
+  // P5: a standing appointment is a CLOCK, not a decision.
+  //
+  // The decision was taken when it armed, so the mid-run trigger below is
+  // suppressed for as long as one stands — re-entering it would re-derive the
+  // same appointment from the same frozen snapshot and consume one of the
+  // manoeuvre attempts on every PLAN tick of the outage, exhausting the budget
+  // in seconds while the robot had not moved. What remains is this block: keep
+  // exploring, and break off exactly when the departure rule says the robot
+  // can still just make it.
+  if (appointment_armed_ && !appointment_departed_) {
+    const auto appt_now = this->now();
+    const int appt_live =
+        coord_ ? static_cast<int>(coord_->livePeerCount(appt_now)) : 0;
+    if (teamComplete(appt_live, rendezvous_expected_peers_)) {
+      // The outage ended on its own before the deadline. The appointment did
+      // not cause that and must not claim it — but it DID stand for the whole
+      // outage, and an appointment that simply vanishes leaves a
+      // rendezvous_agreed with no rendezvous_outcome, which reads offline as
+      // one that is still open at the end of the run. Closed as superseded.
+      closeAppointment("superseded", /*arrived=*/false, /*waited_sec=*/0.0);
+      rendezvous_noshow_.clear();
+    } else if (appointmentDue()) {
+      RCLCPP_INFO(get_logger(),
+          "Rendezvous: departure deadline for cell %d reached (t_meet t+%.0fs, "
+          "my travel %.0fs) -> breaking off exploration for the appointment.",
+          appointment_.cell, appointment_.t_meet_ms / 1000.0,
+          appointmentTravelMs() / 1000.0);
+      appointment_departed_ = true;
+      startReturnTo(appointmentPoint(), "appointment", "appointment-due");
+      return;
+    }
+  }
+
   // Mid-exploration reconnect trigger (off unless reconnect_midrun_silence_sec
   // > 0). Sits AFTER the exploit branch (targets are the mission deliverable
   // and defer the trigger — remember that when reading firing times) and AFTER
@@ -4717,7 +5015,7 @@ void ExploPlannerNode::doPlan() {
   // period still reads missing and we brake for a manoeuvre that dissolves on
   // its first tick.
   if (reconnect_midrun_silence_sec_ > 0.0 && rendezvous_enabled_ &&
-      have_anchor_ && team_seen_complete_) {
+      have_anchor_ && team_seen_complete_ && !appointment_armed_) {
     if (midrun_attempts_ < reconnect_midrun_max_attempts_) {
       const auto trig_now = this->now();
       const int live =
@@ -6340,6 +6638,217 @@ double ExploPlannerNode::midrunGateSec(double missing_for,
                   std::max(reconnect_midrun_min_silence_sec_, t));
 }
 
+// ==================================================================
+// Scheduled rendezvous (P5, §3.5)
+// ==================================================================
+
+void ExploPlannerNode::refreshRendezvousSnapshot() {
+  if (!rendezvous_schedule_enable_) return;
+  if (!cell_world_.configured()) return;
+  // The copy is the point (see rendezvous_world_). It is a grid of cells and
+  // a distance matrix, taken at most once per heartbeat and only while the
+  // team is complete, so its cost is bounded and it is off the PLAN path.
+  rendezvous_world_    = cell_world_;
+  rendezvous_vehicles_ = allocVehicles(latest_pos_.x(), latest_pos_.y(),
+                                       nullptr);
+  have_rendezvous_snapshot_   = true;
+  rendezvous_snapshot_at_sec_ = missionElapsed();
+}
+
+bool ExploPlannerNode::armAppointment(const char* reason) {
+  if (!rendezvous_schedule_enable_) return false;
+  // Pure pursuit has no agreed meeting point BY DESIGN — see
+  // rendezvous_schedule_enable_. Silent rather than a refusal event: the arm
+  // is not choosing not to meet, the mechanism is not part of that arm at all,
+  // and a stream of "refused: wrong mode" lines would make it look like one.
+  if (reconnect_mode_ == ReconnectMode::PURSUIT) return false;
+
+  RendezvousAgreedEvent ev;
+  for (int c : rendezvous_noshow_) {
+    ev.excluded += (ev.excluded.empty() ? "" : ",") + std::to_string(c);
+  }
+
+  const double t_now = missionElapsed();
+  ev.t_now_sec = t_now;
+  if (t_now < 0.0) {
+    // Every quantity here is mission-elapsed. Before the clock is live there
+    // is no origin to measure a deadline from, and an absolute stamp would
+    // not survive the pair (the two nodes start seconds apart).
+    ev.refused = "mission clock is not live yet";
+  } else if (!have_rendezvous_snapshot_) {
+    ev.refused = "no frozen snapshot: the team has never read complete, so "
+                 "there is no world both robots are known to share";
+  }
+
+  Allocation alloc;
+  if (ev.refused.empty()) {
+    ev.shared_hash      = rendezvous_world_.sharedHash();
+    ev.grid_hash        = rendezvous_world_.grid().configHash();
+    ev.snapshot_age_sec = t_now - rendezvous_snapshot_at_sec_;
+
+    // Solved HERE, over the frozen snapshot, and deliberately not reused from
+    // doPlan's live solve: doPlan solves the world as it is now, which is the
+    // right problem for choosing this robot's next hop and the wrong one for
+    // a value the peer has to reproduce.
+    alloc = GlobalAllocator::solve(rendezvous_world_, rendezvous_vehicles_,
+                                   alloc_cfg_);
+
+    RendezvousScheduler::Config cfg = rzv_cfg_;
+    cfg.exclude = rendezvous_noshow_;
+    // The divergence cap, from the same dead-reckoning model midrunGateSec
+    // uses for the trigger. Both robots hold the mirror image of the same two
+    // rates, so the sum is symmetric and both ends cap to the same value —
+    // which is the only reason a cap can be applied at all without breaking
+    // agreement. rate 0 (unknown) leaves it uncapped, matching the trigger's
+    // reading of "nothing known to share".
+    if (have_reconnect_rec_ && reconnect_min_share_voxels_ > 0.0) {
+      const double rate_sum = std::max(0.0, reconnect_rec_.self_rate) +
+                              std::max(0.0, reconnect_rec_.peer_rate);
+      if (rate_sum > 1e-9) {
+        cfg.max_interval_ms = static_cast<long long>(
+            (reconnect_min_share_voxels_ / rate_sum) * 1000.0);
+      }
+    }
+
+    // The floor: the midpoint of the last-contact pair, the destination the
+    // pre-P5 node drives to. Admitted unconditionally by the scheduler, so
+    // the worst case of this whole phase is the behaviour it replaces.
+    int floor_cell = -1;
+    if (have_reconnect_rec_) {
+      const Eigen::Vector3f mp = meetingPoint(reconnect_rec_.self_pose,
+                                              reconnect_rec_.peer_pose);
+      floor_cell = rendezvous_world_.grid().idAt(mp.x(), mp.y());
+    }
+
+    appointment_ = RendezvousScheduler::solve(
+        rendezvous_world_, rendezvous_vehicles_, alloc, floor_cell,
+        static_cast<long long>(t_now * 1000.0), cfg);
+
+    ev.cell                 = appointment_.cell;
+    ev.penalty_mm           = appointment_.penalty_mm;
+    ev.floor_won            = appointment_.floor_won;
+    ev.candidates           = appointment_.candidates;
+    ev.rejected_unreachable = appointment_.rejected_unreachable;
+    ev.rejected_excluded    = appointment_.rejected_excluded;
+    ev.capped               = appointment_.capped;
+    ev.refused              = appointment_.refused;
+    if (appointment_.interval_ms >= 0)
+      ev.interval_sec = appointment_.interval_ms / 1000.0;
+    if (appointment_.t_meet_ms >= 0)
+      ev.t_meet_sec = appointment_.t_meet_ms / 1000.0;
+  }
+
+  const bool armed = ev.refused.empty() && appointment_.valid();
+  if (armed) {
+    appointment_armed_          = true;
+    appointment_departed_       = false;
+    appointment_arrived_        = false;
+    appointment_armed_at_sec_   = t_now;
+    appointment_arrived_at_sec_ = -1.0;
+    const long long travel = appointmentTravelMs();
+    if (travel >= 0) {
+      ev.travel_sec = travel / 1000.0;
+      // The departure deadline, reported as the mission-elapsed instant it
+      // falls at. Per-robot on purpose: the far robot's is EARLIER, which is
+      // what staggers the departures so the arrivals coincide.
+      ev.depart_sec = appointment_.t_meet_ms / 1000.0 -
+                      (travel * std::max(0, rzv_cfg_.depart_safety_milli)) /
+                          1000.0 / 1000.0 -
+                      rzv_cfg_.depart_margin_ms / 1000.0;
+    }
+  } else {
+    appointment_ = RendezvousPlan{};
+  }
+
+  if (exp_log_) exp_log_->logRendezvousAgreed(expCtx(), ev);
+
+  if (armed) {
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous schedule [%s]: cell %d at t+%.0fs (in %.0fs%s), penalty "
+        "%lld mm over %d candidate(s)%s; my travel %.0fs, depart at t+%.0fs.",
+        reason, appointment_.cell, ev.t_meet_sec, ev.interval_sec,
+        appointment_.capped ? ", CAPPED by map divergence" : "",
+        appointment_.penalty_mm, appointment_.candidates,
+        appointment_.floor_won ? " (last-contact midpoint won)" : "",
+        ev.travel_sec, ev.depart_sec);
+  } else {
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous schedule [%s]: no appointment — %s. Falling back to the "
+        "unscheduled manoeuvre.", reason, ev.refused.c_str());
+  }
+  return armed;
+}
+
+long long ExploPlannerNode::appointmentTravelMs() const {
+  if (!appointment_armed_ && !appointment_.valid()) return -1;
+  if (!rendezvous_world_.configured()) return -1;
+  // From where this robot is NOW, not from where it was when the appointment
+  // armed: under hybrid it has been chasing since, and a deadline computed
+  // from the arming position would fire from the wrong side of the chase.
+  const int here = rendezvous_world_.grid().idAt(latest_pos_.x(),
+                                                 latest_pos_.y());
+  if (!rendezvous_world_.grid().valid(here)) return -1;
+  return RendezvousScheduler::travelMs(
+      GlobalAllocator::costMm(rendezvous_world_, here, appointment_.cell),
+      rzv_cfg_.speed_mm_s);
+}
+
+bool ExploPlannerNode::appointmentDue() {
+  if (!appointment_armed_) return false;
+  const double t = missionElapsed();
+  if (t < 0.0) return false;
+  return RendezvousScheduler::shouldDepart(
+      appointment_.t_meet_ms, static_cast<long long>(t * 1000.0),
+      appointmentTravelMs(), rzv_cfg_);
+}
+
+Eigen::Vector3f ExploPlannerNode::appointmentPoint() const {
+  float x = 0.0f, y = 0.0f;
+  rendezvous_world_.grid().centre(appointment_.cell, x, y);
+  // z from the robot's own frame: the drive and its arrival test are planar
+  // (goal_xy_tol_), and the cell grid carries no height.
+  return Eigen::Vector3f(x, y, latest_pos_.z());
+}
+
+void ExploPlannerNode::closeAppointment(const char* outcome, bool arrived,
+                                        double waited_sec) {
+  if (!appointment_armed_) return;
+  const double t_end = missionElapsed();
+
+  RendezvousOutcomeEvent ev;
+  ev.cell         = appointment_.cell;
+  ev.t_meet_sec   = appointment_.t_meet_ms / 1000.0;
+  ev.t_end_sec    = t_end;
+  ev.lateness_sec = (t_end >= 0.0) ? (t_end - ev.t_meet_sec) : 0.0;
+  ev.outcome      = outcome;
+  ev.arrived      = arrived;
+  ev.waited_sec   = waited_sec;
+  if (exp_log_) exp_log_->logRendezvousOutcome(expCtx(), ev);
+
+  RCLCPP_INFO(get_logger(),
+      "Rendezvous appointment at cell %d closed: %s (%s, %.0fs %s, waited "
+      "%.0fs).", appointment_.cell, outcome,
+      arrived ? "arrived" : "never arrived", std::fabs(ev.lateness_sec),
+      ev.lateness_sec >= 0.0 ? "late" : "early", waited_sec);
+
+  // A no-show writes the cell off for the REST OF THIS OUTAGE. Both robots
+  // reach the same verdict from the same evidence (each waited out the cap
+  // alone), so the exclusion is symmetric and the next arming moves both to
+  // the same next-best cell. It can never empty the candidate set: the floor
+  // is exempt from cfg.exclude by construction.
+  if (std::strcmp(outcome, "no-show") == 0 &&
+      rendezvous_world_.grid().valid(appointment_.cell) &&
+      std::find(rendezvous_noshow_.begin(), rendezvous_noshow_.end(),
+                appointment_.cell) == rendezvous_noshow_.end()) {
+    rendezvous_noshow_.push_back(appointment_.cell);
+  }
+
+  appointment_armed_    = false;
+  appointment_departed_ = false;
+  appointment_arrived_  = false;
+  appointment_          = RendezvousPlan{};
+}
+
 bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   std::string peer_id;
   const LastContact* rec = missingPeerRecord(&peer_id);
@@ -6363,11 +6872,48 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
     // different peer), so there is nothing to chase and no pair to midpoint.
     reconnect_decline_reason_ = "no-peer-record";
   }
+
+  // ---- P5: the appointment, and the timeline it partitions -------------
+  //
+  // Arm it FIRST, because it is what the branches below are arbitrated
+  // against. §3.6.1: chase and appointment do not compete for the manoeuvre,
+  // they compose on a partitioned timeline —
+  //
+  //     [ contact lost .... departure deadline .... t_meet + wait ]
+  //       ^--- CHASE owns this ---^--- APPOINTMENT owns this ---^
+  //
+  // Exactly one is armed at any instant, so there is no arbitration to get
+  // wrong: the chase runs while the deadline is in the future and is
+  // terminated BY the deadline (doPursue), and the appointment owns
+  // everything after it.
+  //
+  // A terminal dispatch (finishOrRendezvous) is exempt from the deferral:
+  // "keep exploring until the deadline" is not an option for a robot whose
+  // exploration is already over, so a terminal manoeuvre departs at once and
+  // the appointment only supplies the DESTINATION.
+  const bool have_appointment = armAppointment(reason);
+  const bool may_defer = have_appointment && !reconnect_terminal_;
+  if (have_appointment && (reconnect_terminal_ || appointmentDue())) {
+    // Either exploration is over, or the deadline has already passed while
+    // the silence clock was still counting — a long outage against a nearby
+    // meeting. Go now.
+    startReturnTo(appointmentPoint(), "appointment", reason);
+    appointment_departed_ = true;
+    return true;
+  }
+
   if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
       startPursuit(peer_id, *rec, reason)) {
     return true;
   }
   if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
+    // The chase declined (record too stale, trail uncoverable) and the
+    // deadline is still ahead. Pre-P5 this parked the robot at the midpoint
+    // for the whole outage; with an appointment standing it goes back to
+    // exploring instead and departs when the clock says so. Strictly better:
+    // the ground covered in between is mission progress the parked robot
+    // never earned, and the meeting still happens.
+    if (may_defer) return false;
     startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
                   "meeting point", reason);
     return true;
@@ -6401,6 +6947,14 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   // The midpoint is the same construction HYBRID's fallback already uses
   // above; sharing it is deliberate, so the arms differ in WHEN they go to a
   // meeting point and not in where the meeting point is.
+  //
+  // P5 changes WHEN this leaves, not where it goes when it must go now: with
+  // an appointment standing, plain rendezvous keeps exploring until its own
+  // departure deadline instead of braking the instant the silence clock
+  // expires. That deferral IS the rendezvous arm of the 2x2 (appointment
+  // without chase); the destination it eventually drives to is the scheduled
+  // cell, which the pre-P5 midpoint is the floor of.
+  if (may_defer) return false;
   if (rec != nullptr) {
     startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
                   "meeting point", reason);
@@ -6587,6 +7141,14 @@ void ExploPlannerNode::doReturnNav() {
     // controller keeps driving to the exact goal pose underneath the barrier
     // — and underneath whatever state the release transitions into next.
     // Same rationale as the release path above.
+    // P5: stamp the arrival so the outcome event can say whether a failed
+    // meeting was a coordination failure (both arrived, nobody was there) or
+    // a navigation one (this robot never got there). Without the distinction
+    // a no-show count is uninterpretable — see RendezvousOutcomeEvent.
+    if (appointment_armed_ && appointment_departed_ && !appointment_arrived_) {
+      appointment_arrived_        = true;
+      appointment_arrived_at_sec_ = missionElapsed();
+    }
     abandonNavGoal("return-arrived");
     transitionTo(State::RETURN_SYNC, "return-arrived");
     return;
@@ -6693,7 +7255,16 @@ void ExploPlannerNode::doReturnSync() {
           reconnect_mode_ != ReconnectMode::PURSUIT && have_reconnect_rec_;
       Eigen::Vector3f esc_target = Eigen::Vector3f::Zero();
       const char* esc_what = nullptr;
-      if (use_meeting) {
+      // P5: an appointment that was departed already HAS an agreed point, and
+      // it is not the midpoint — escalating to the midpoint would walk away
+      // from the one place the peer has a reason to be. A robot that reached
+      // the cell is already there, so the tolerance test below falls through
+      // and it gives up on the spot, which is correct: there is nowhere
+      // better to go. One that never reached it re-attempts the same drive.
+      if (appointment_armed_ && appointment_departed_) {
+        esc_target = appointmentPoint();
+        esc_what   = "appointment";
+      } else if (use_meeting) {
         esc_target = meetingPoint(reconnect_rec_.self_pose,
                                   reconnect_rec_.peer_pose);
         esc_what = "meeting point";
@@ -7657,6 +8228,34 @@ void ExploPlannerNode::doPursue() {
     transitionTo(State::PLAN, "pursuit-released");
     return;
   }
+  // P5: the departure deadline terminates the chase, and it is tested BEFORE
+  // the budget and before the trail.
+  //
+  // Ordering is the whole content of this block. §3.6.1 partitions the outage
+  // into a chase span and an appointment span, and the deadline is the
+  // boundary; if the budget or an exhausted trail could fire first, the chase
+  // would hand off to pursuitFallback and the appointment would be kept — or
+  // missed — as a side effect of whichever timer happened to expire, which is
+  // exactly the arbitration this design removed. The deadline is recomputed
+  // from the robot's CURRENT position each tick (appointmentTravelMs), so a
+  // chase that has driven AWAY from the meeting cell is cut off earlier, and
+  // one that happened to drive toward it is allowed to run longer.
+  if (appointment_armed_ && !appointment_departed_ && appointmentDue()) {
+    RCLCPP_INFO(get_logger(),
+        "Pursuit: departure deadline for cell %d reached after %.0fs of chase "
+        "(t_meet t+%.0fs, my travel %.0fs) -> breaking off for the "
+        "appointment.",
+        appointment_.cell, (now - pursue_start_time_).seconds(),
+        appointment_.t_meet_ms / 1000.0, appointmentTravelMs() / 1000.0);
+    appointment_departed_ = true;
+    // PURSUE is a driving state and startReturnTo publishes a new goal on top
+    // of the chase waypoint; abandon the old one first, same reason the
+    // release path above does.
+    abandonNavGoal("appointment-due");
+    startReturnTo(appointmentPoint(), "appointment", "appointment-due");
+    return;
+  }
+
   const double chased = (now - pursue_start_time_).seconds();
   if (chased >= pursue_budget_sec_) {
     RCLCPP_WARN(get_logger(),
@@ -7759,6 +8358,27 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
       resumeExploring(why);
       return;
     }
+  }
+  // P5: with an appointment standing, a chase that died EARLY has not reached
+  // the boundary between the two spans — the deadline is still ahead, and
+  // doPursue tests it first, so arriving here means the budget or the trail
+  // ran out before it. Going back to exploring is then strictly better than
+  // parking at the meeting point for the remainder: the appointment is kept
+  // either way, and the ground covered in between is mission progress the
+  // parked robot never earns. This is the same deferral dispatchReconnect
+  // applies when the chase declines at the outset.
+  //
+  // The undeparted case is the only one that can reach here (a departed
+  // appointment is in RETURN_NAV, not PURSUE), so no ordering with the
+  // deadline is needed — resumeExploring hands the outage back to doPlan's
+  // departure block, which owns it from here.
+  if (appointment_armed_ && !appointment_departed_) {
+    RCLCPP_INFO(get_logger(),
+        "Pursuit fallback (%s): appointment at cell %d still stands (t_meet "
+        "t+%.0fs) -> resuming exploration until the departure deadline.",
+        why, appointment_.cell, appointment_.t_meet_ms / 1000.0);
+    resumeExploring(why);
+    return;
   }
   if (reconnect_mode_ == ReconnectMode::HYBRID) {
     // pursue_rec_ is the pair the chase was armed from (snapshotted in
@@ -7935,6 +8555,12 @@ void ExploPlannerNode::heartbeatTick() {
                      rendezvous_expected_peers_)) {
       team_last_complete_time_ = pres_now;
       team_seen_complete_ = true;
+      // P5: freeze the problem while the team is confirmed complete. HERE and
+      // nowhere else, for the same reason the clock above lives here — this is
+      // the last instant at which both robots are known to be looking at the
+      // same world, and an appointment derived from anything later is one the
+      // peer never computed. No-op unless the schedule is enabled.
+      refreshRendezvousSnapshot();
     }
   }
   // Suppression accounting (comms experiments). The beacon is STATE-GATED, so
