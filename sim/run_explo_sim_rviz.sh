@@ -96,20 +96,44 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # <repo>/sim
 # The repo is expected checked out at …/hmr_explo/ws/src/explo_planner, so the
 # ws overlay root is three levels up from this sim/ directory.
 WS="$(cd "$HERE/../../.." && pwd)"           # …/hmr_explo/ws
-ROBOTS="atlas bestla"
 # Overridable so a denser stand can be run without editing the harness. The
 # scenario picks the WORLD, and the world sets both the link budget (stems in
 # the Fresnel corridor) and the coverage floor — so a scenario change
 # invalidates the calibrated done_unknown_fraction and is recorded in the
-# manifest for exactly that reason. Any replacement must keep two robots named
-# atlas and bestla, since ROBOTS above and the topic wiring below assume them.
+# manifest for exactly that reason.
 SCENARIO="${SCENARIO:-flatforest_2robot_lidar.yaml}"
-if [ ! -f "$WS/install/hmr_sim/share/hmr_sim/config/scenarios/$SCENARIO" ]; then
+SCENARIO_PATH="$WS/install/hmr_sim/share/hmr_sim/config/scenarios/$SCENARIO"
+if [ ! -f "$SCENARIO_PATH" ]; then
   echo "FATAL: scenario '$SCENARIO' is not installed. Rebuild hmr_sim, or pick"\
        "one of:" >&2
   ls "$WS/install/hmr_sim/share/hmr_sim/config/scenarios/" 2>/dev/null >&2
   exit 2
 fi
+# The roster comes from the SCENARIO, not from a literal here (P7). It used to
+# be `ROBOTS="atlas bestla"` with a comment telling the reader not to change the
+# scenario without changing this line, which is a consistency requirement kept
+# by hand — and the failure mode is bad: comms_sim.launch.py already reads its
+# own robot list from this same file, so a mismatch produces a run in which the
+# emulator models three radios while the harness starts two planners and the
+# third robot sits in the world as an unexplained obstacle. Reading the one
+# file makes that disagreement unrepresentable.
+#
+# NOT overridable from the environment, for the same reason: an override could
+# only ever disagree with the emulator. To change the roster, change (or add) a
+# scenario.
+ROBOTS="$(python3 - "$SCENARIO_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f) or {}
+names = [r["name"] for r in (doc.get("robots") or [])]
+if len(names) < 2:
+    sys.exit("FATAL: scenario names %d robot(s); this harness needs >= 2" % len(names))
+if len(set(names)) != len(names):
+    sys.exit("FATAL: scenario has duplicate robot names: %s" % names)
+print(" ".join(names))
+PY
+)" || exit 2
+N_ROBOTS=$(echo $ROBOTS | wc -w)
 DURATION_S="${DURATION_S:-0}"                # 0 = until Ctrl-C
 RVIZ="${RVIZ:-1}"
 GZ_GUI="${GZ_GUI:-0}"                        # 1 => ignition GUI as well
@@ -167,11 +191,11 @@ EXPLOIT="${EXPLOIT:-1}"
 # robot-carried-radio reconnection methods runs when a planner exhausts its
 # goals with its teammate out of comms. The pursuit budgets ride along from
 # shared_params.yaml (240 s cap / 180 s staleness gate, flatforest-sized).
-# The planner invocation below also passes rendezvous_expected_peers:=1
-# (this is a 2-robot stack): shared_params.yaml ships 0 — the field value,
-# where the launch file computes team-size-1 — and the planner hard-disables
-# the whole reconnect feature at startup on expected_peers=0, which would
-# leave this knob silently inert.
+# The planner invocation below also passes rendezvous_expected_peers:=N-1,
+# computed from the scenario roster: shared_params.yaml ships 0 — the field
+# value, where the launch file computes team-size-1 — and the planner
+# hard-disables the whole reconnect feature at startup on expected_peers=0,
+# which would leave this knob silently inert.
 # NOTE: stock sim DDS is one broadcast domain, so with both planners healthy
 # no manoeuvre ever runs: the first finisher parks DONE-idle and keeps
 # beaconing, the second finisher counts it and goes DONE in place. The A/B
@@ -200,8 +224,9 @@ EXPLOIT="${EXPLOIT:-1}"
 # run cells labelled mtare_hybrid with, say, the allocator off, and nothing
 # downstream could tell.
 #
-# P5/P7 add three MORE arm tokens, and the four `mtare_*` values together are
-# the 2x2 factorial of doc §3.6.1 — chase on/off x appointment on/off:
+# P5/P7 add five MORE arm tokens. Four of them — the ones without an `_mdp`
+# suffix — are together the 2x2 factorial of doc §3.6.1, chase on/off x
+# appointment on/off:
 #
 #   token              chase   appointment   reconnect_mode  rendezvous_enabled
 #   mtare_off            -          -          (hybrid)          false
@@ -217,14 +242,41 @@ EXPLOIT="${EXPLOIT:-1}"
 # a few blocks below. GLOBAL_ALLOC is emphatically NOT inert in that arm, which
 # is why the control is `mtare_off` and not plain `off` — a plain-`off` control
 # would confound the two mechanisms with the allocator.
+#
+# All four of those pin PURSUIT_PREDICTOR=trail. P6's MDP interception is a THIRD
+# mechanism, not a third level of either lever, and the factorial has no cell
+# for it: an mdp run of `mtare_hybrid` would land in a directory named
+# mtare_hybrid, be indexed as that arm, and be pooled with the trail cells by
+# every analysis script.
+#
+# So it gets NAMES instead of an override — `mtare_pursuit_mdp` and
+# `mtare_hybrid_mdp`, the two arms that actually chase, each the exact stack of
+# its trail-named counterpart with the predictor swapped:
+#
+#   token                chase   appointment   predictor
+#   mtare_pursuit         yes         -          trail
+#   mtare_pursuit_mdp     yes         -          mdp
+#   mtare_hybrid          yes        yes         trail
+#   mtare_hybrid_mdp      yes        yes         mdp
+#
+# There is deliberately no mdp counterpart for mtare_off or mtare_rendezvous:
+# neither arms a chase, so the predictor has nothing to aim and the cell would
+# record a treatment it cannot carry. A P6 comparison is therefore one of two
+# paired arms against its own trail control, in one invocation, and never a
+# third level inside the 2x2 — the factorial and the predictor are separate
+# questions and this keeps them in separate directories.
+#
+# Six tokens, not eight, and NOT a 2x2x2: chase-on is a precondition of the
+# predictor, so the third factor is only defined on half the design.
 RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
 case "$RECONNECT_MODE" in
   rendezvous|pursuit|hybrid|off) ;;
   mtare_off|mtare_pursuit|mtare_rendezvous|mtare_hybrid) ;;
+  mtare_pursuit_mdp|mtare_hybrid_mdp) ;;
   *) echo "FATAL: RECONNECT_MODE='$RECONNECT_MODE' is not one of \
 rendezvous|pursuit|hybrid|off|mtare_off|mtare_pursuit|mtare_rendezvous|\
-mtare_hybrid. The planner would silently fall back to rendezvous and the run \
-would be mislabelled." >&2; exit 2 ;;
+mtare_hybrid|mtare_pursuit_mdp|mtare_hybrid_mdp. The planner would silently \
+fall back to rendezvous and the run would be mislabelled." >&2; exit 2 ;;
 esac
 # The arm token IS the configuration. Set here, before the CELL_WORLD /
 # TEAM_WORLD / GLOBAL_ALLOC / RECONNECT_GATE default blocks below read their
@@ -239,13 +291,21 @@ esac
 _arm_stack=""
 case "$RECONNECT_MODE" in
   mtare_off)
-    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:silence RENDEZVOUS_SCHEDULE:0" ;;
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:silence RENDEZVOUS_SCHEDULE:0 PURSUIT_PREDICTOR:trail" ;;
   mtare_pursuit)
-    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:0" ;;
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:0 PURSUIT_PREDICTOR:trail" ;;
   mtare_rendezvous)
-    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1" ;;
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1 PURSUIT_PREDICTOR:trail" ;;
   mtare_hybrid)
-    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1" ;;
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1 PURSUIT_PREDICTOR:trail" ;;
+  # The predictor pair: byte-identical to the two chasing tokens above except
+  # for the last field. Written out in full rather than derived from them so
+  # that a future edit to one stack cannot silently desynchronise the other --
+  # the diff between a treated arm and its control has to be readable here.
+  mtare_pursuit_mdp)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:0 PURSUIT_PREDICTOR:mdp" ;;
+  mtare_hybrid_mdp)
+    _arm_stack="CELL_WORLD:1 TEAM_WORLD:1 GLOBAL_ALLOC:1 RECONNECT_GATE:info RENDEZVOUS_SCHEDULE:1 PURSUIT_PREDICTOR:mdp" ;;
 esac
 if [ -n "$_arm_stack" ]; then
   for _kv in $_arm_stack; do
@@ -719,7 +779,9 @@ fi
 # treatment was on, which is exactly the name/stamp disagreement the check
 # below exists to prevent, one level down.
 _rzv_pursuit=0
-case "$RECONNECT_MODE" in pursuit|mtare_pursuit) _rzv_pursuit=1 ;; esac
+case "$RECONNECT_MODE" in
+  pursuit|mtare_pursuit|mtare_pursuit_mdp) _rzv_pursuit=1 ;;
+esac
 if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$_rzv_pursuit" = "1" ]; then
   echo "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=$RECONNECT_MODE." >&2
   echo "       The pursuit arm is the appointment-OFF cell of the 2x2 and the" >&2
@@ -728,12 +790,66 @@ if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$_rzv_pursuit" = "1" ]; then
   exit 2
 fi
 unset _rzv_pursuit
+# --- MDP interception (M-TARE evolution, P6) --------------------------------
+# PURSUIT_PREDICTOR=mdp aims the chase at where the peer is PREDICTED to be
+# when this robot can get there — the argmax over the peer's last directly
+# received tour of P(peer at cell c at now + travel_time(c)) — instead of at
+# the stale last-known goal. `trail` is today's behaviour and the default.
+#
+# It changes the chase WAYPOINT only. The dispatch trigger, the chase budget
+# and every terminator are computed from the legacy trail on both settings, so
+# the mdp arm cannot buy itself more chase time than the control gets, and an
+# intercept that does not fit the budget downgrades to the trail rather than
+# suppressing a chase the control would have performed.
+#
+# OFF means NO PARAMETER IS PASSED, same rule as the four blocks above.
+PURSUIT_PREDICTOR="${PURSUIT_PREDICTOR:-trail}"
+case "$PURSUIT_PREDICTOR" in
+  trail|mdp) ;;
+  *) echo "FATAL: PURSUIT_PREDICTOR='$PURSUIT_PREDICTOR' is not trail or mdp." >&2
+     exit 2 ;;
+esac
+# Needs the allocator, which in turn needs the exchange. The prediction runs on
+# the peer's last directly received TOUR, and a tour only exists because the
+# global allocator produced one; without it predictIntercept has nothing to
+# expand, returns invalid on every dispatch, and the cell records the P6
+# treatment as enabled while behaving exactly like the control.
+#
+# The node refuses this pairing at construction (mdp without global_alloc). It
+# is caught here as well because a planner that throws at construction takes
+# every robot down several seconds into an otherwise-normal bring-up, and the
+# reason scrolls past in N separate log files.
+if [ "$PURSUIT_PREDICTOR" = "mdp" ] && [ "$GLOBAL_ALLOC" != "1" ]; then
+  echo "FATAL: PURSUIT_PREDICTOR=mdp requires GLOBAL_ALLOC=1 (the prediction" >&2
+  echo "       expands the peer's TOUR, and without the allocator there is no" >&2
+  echo "       tour to expand, so every prediction degrades to the trail and" >&2
+  echo "       the cell is mislabelled as treated)." >&2
+  exit 2
+fi
+# And a chase to aim. RECONNECT_MODE=off has no manoeuvre; the rendezvous-only
+# cell of the 2x2 has an appointment but no chase. In both the knob is inert
+# and asking for it is the same name/stamp mistake the RENDEZVOUS_SCHEDULE
+# pairings above refuse.
+_pp_nochase=0
+case "$RECONNECT_MODE" in
+  off|mtare_off|rendezvous|mtare_rendezvous) _pp_nochase=1 ;;
+esac
+if [ "$PURSUIT_PREDICTOR" = "mdp" ] && [ "$_pp_nochase" = "1" ]; then
+  echo "FATAL: PURSUIT_PREDICTOR=mdp with RECONNECT_MODE=$RECONNECT_MODE." >&2
+  echo "       That arm never arms a chase, so there is no waypoint to aim." >&2
+  echo "       The cell would record the P6 treatment as enabled and would not" >&2
+  echo "       carry it." >&2
+  exit 2
+fi
+unset _pp_nochase
 # THE ARM NAME AND THE ARM STAMP MUST AGREE, IN BOTH DIRECTIONS.
 #
-# The node names the arm itself, and its rule is an OR:
+# The node names the arm itself, and its rule is an OR plus a suffix:
 #   arm = (global_alloc_enable || reconnect_gate==info ||
-#          rendezvous_schedule_enable ? "mtare_" : "") +
-#         (rendezvous_enabled ? reconnect_mode : "off")
+#          rendezvous_schedule_enable || pursuit_predictor==mdp
+#            ? "mtare_" : "") +
+#         (rendezvous_enabled ? reconnect_mode : "off") +
+#         (pursuit_predictor==mdp ? "_mdp" : "")
 # Everything downstream — the cell directory, campaign_index.csv, every
 # analysis script — takes the arm from RECONNECT_MODE instead. So any
 # configuration where those two disagree produces a cell whose directory says
@@ -748,31 +864,42 @@ unset _rzv_pursuit
 # the untreated cells.
 #
 # Written as the node's own predicate rather than a list of bad pairs, so a
-# fifth knob that sets the prefix cannot slip past it. P5's
-# RENDEZVOUS_SCHEDULE is that fifth knob, and it was added to BOTH sides in
-# the same commit: a predicate that stops tracking the node's is a check that
-# has stopped checking while still printing a pass.
+# further knob that sets the prefix cannot slip past it. P5's
+# RENDEZVOUS_SCHEDULE and P6's PURSUIT_PREDICTOR are the fifth and sixth, and
+# each was added to BOTH sides in the same commit: a predicate that stops
+# tracking the node's is a check that has stopped checking while still
+# printing a pass. Keep this list in lockstep with the `mtare` OR in
+# explo_planner_node.cpp's arm stamp — grep `mtare_` there.
 _mtare_stamped=0
 if [ "$GLOBAL_ALLOC" = "1" ] || [ "$RECONNECT_GATE" = "info" ] \
-   || [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
+   || [ "$RENDEZVOUS_SCHEDULE" = "1" ] || [ "$PURSUIT_PREDICTOR" = "mdp" ]; then
   _mtare_stamped=1
 fi
-_mtare_named=0
-case "$RECONNECT_MODE" in mtare_*) _mtare_named=1 ;; esac
-if [ "$_mtare_stamped" != "$_mtare_named" ]; then
+# Reconstructed as the WHOLE STRING rather than as a prefix-present flag. The
+# core is whatever the token is once its decorations are stripped, and each
+# decoration is then put back from the knob that actually drives it in the node
+# — so the comparison is the full name the run_start dump will carry against
+# the full name every directory and index will carry. A prefix-only check would
+# pass `mtare_hybrid` with the predictor on, which is a different treatment
+# under the same name and precisely the pooling this exists to stop.
+_arm_core="${RECONNECT_MODE#mtare_}"
+_arm_core="${_arm_core%_mdp}"
+_arm_expect="$_arm_core"
+if [ "$_mtare_stamped" = "1" ]; then _arm_expect="mtare_$_arm_expect"; fi
+if [ "$PURSUIT_PREDICTOR" = "mdp" ]; then _arm_expect="${_arm_expect}_mdp"; fi
+if [ "$_arm_expect" != "$RECONNECT_MODE" ]; then
   echo "FATAL: the arm name and the arm the node will stamp disagree." >&2
-  echo "       RECONNECT_MODE=$RECONNECT_MODE names a$([ "$_mtare_named" = 1 ] \
-       && echo "n mtare" || echo " non-mtare") arm, but" >&2
+  echo "       RECONNECT_MODE=$RECONNECT_MODE names the arm, but" >&2
   echo "       GLOBAL_ALLOC=$GLOBAL_ALLOC RECONNECT_GATE=$RECONNECT_GATE" >&2
-  echo "       RENDEZVOUS_SCHEDULE=$RENDEZVOUS_SCHEDULE means" >&2
-  echo "       the node will stamp $([ "$_mtare_stamped" = 1 ] \
-       && echo "arm=mtare_*" || echo "a plain arm")." >&2
+  echo "       RENDEZVOUS_SCHEDULE=$RENDEZVOUS_SCHEDULE" >&2
+  echo "       PURSUIT_PREDICTOR=$PURSUIT_PREDICTOR means" >&2
+  echo "       the node will stamp arm=$_arm_expect." >&2
   echo "       Every directory, index and analysis keys off the name; only" >&2
-  echo "       run_start carries the stamp. Use RECONNECT_MODE=mtare_hybrid to" >&2
-  echo "       request the treatment, and do not set these knobs by hand." >&2
+  echo "       run_start carries the stamp. Use RECONNECT_MODE=$_arm_expect to" >&2
+  echo "       request that treatment, and do not set these knobs by hand." >&2
   exit 2
 fi
-unset _mtare_stamped _mtare_named
+unset _mtare_stamped _arm_core _arm_expect
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.
@@ -1225,21 +1352,46 @@ OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # export the same value first:  export ROS_DOMAIN_ID=42
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 
-# Per-robot viz mesh set. Both robots spawn as COSTAR_HUSKY_SENSOR_CONFIG_LIDAR
-# in the scenario, but that model is one colour — RViz uses the yellow/green
-# variants' meshes (same geometry, painted differently) so the two robots are
-# telling apart at a glance.
-declare -A VIZ_MODEL=(
-  [atlas]=COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_YELLOW
-  [bestla]=COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_GREEN
-)
+# Per-robot viz mesh set. Every robot spawns as COSTAR_HUSKY_SENSOR_CONFIG_LIDAR
+# in the scenario, but that model is one colour — RViz uses the painted variants'
+# meshes (same geometry, different texture) so the robots can be told apart at a
+# glance. Assigned by ROSTER POSITION rather than by name (P7): a scenario is
+# free to name its robots anything, and a name-keyed table would hand the third
+# robot an empty model string and a URDF that fails to parse. Only three painted
+# variants exist, so beyond N=3 the palette repeats — cosmetic only, and the
+# banner says so rather than letting the reader wonder why two robots match.
+VIZ_PALETTE=(COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_YELLOW
+             COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_GREEN
+             COSTAR_HUSKY_SENSOR_CONFIG_REDUCED)
+declare -A VIZ_MODEL=()
+_vi=0
+for _r in $ROBOTS; do
+  VIZ_MODEL[$_r]=${VIZ_PALETTE[$((_vi % ${#VIZ_PALETTE[@]}))]}
+  _vi=$((_vi + 1))
+done
+unset _vi _r
 
 mkdir -p "$OUTDIR"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
-# The other robot in a 2-robot stack. Everything COMMS=1 rewires is per-link, so
-# the wiring needs to name the far end; this is deliberately only correct for
-# |ROBOTS| == 2, which is what this harness is.
-peer_of() { local s=$1 p; for p in $ROBOTS; do [ "$p" = "$s" ] || { echo "$p"; return; }; done; }
+# Everything COMMS=1 rewires is per-link, so the wiring has to name each far
+# end. peers_of returns ALL of them (P7): at |ROBOTS| == 2 it emits the single
+# name its predecessor peer_of did, so every pairwise call site is unchanged,
+# and at N >= 3 the callers that build subscription LISTS get the whole set
+# instead of one arbitrary member of it.
+peers_of()  { local s=$1 p; for p in $ROBOTS; do [ "$p" = "$s" ] || echo "$p"; done; }
+peers_csv() { peers_of "$1" | paste -sd, -; }
+# A ROS string-array literal — ["a","b"] — for -p name:=... Empty input yields
+# [], which is a valid empty array and the right answer for a lone robot; the
+# roster check above makes that unreachable, but a helper that silently emitted
+# [""] would be a subscription to the empty topic name.
+peers_ros_array() {
+  local self=$1 out="" p
+  for p in $(peers_of "$self"); do
+    [ -z "$out" ] || out="$out,"
+    out="$out\"$2$p$3\""
+  done
+  echo "[$out]"
+}
 
 # --- environment: humble + ws overlay, miniconda stripped -------------------
 # (miniconda on PATH shadows /usr/bin/python3 and breaks catkin_pkg/ament)
@@ -1571,20 +1723,20 @@ fi
 PEER_BIN_PATTERN="/{peer}/scovox_node/scovox_bin"
 [ "$COMMS" = "1" ] && PEER_BIN_PATTERN="/{self}/rx/{peer}/scovox_node/scovox_bin"
 log "peer_bin_topic_pattern=$PEER_BIN_PATTERN (COMMS=$COMMS)"
-start nav_atlas "$OUTDIR/nav_atlas.log" \
-  ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=atlas mode:=ugv \
-    mapping:=dscovox_lidar peers:=bestla \
-    peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
-    voxel_resolution_m:=$VOXEL_RES \
-    global_planning_map_size_m:=$PLAN_MAP_SIZE \
-    global_planning_map_resolution:=$PLAN_MAP_RES
-start nav_bestla "$OUTDIR/nav_bestla.log" \
-  ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=bestla mode:=ugv \
-    mapping:=dscovox_lidar peers:=atlas \
-    peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
-    voxel_resolution_m:=$VOXEL_RES \
-    global_planning_map_size_m:=$PLAN_MAP_SIZE \
-    global_planning_map_resolution:=$PLAN_MAP_RES
+# One launch per robot, over the roster (P7). This was two hand-written blocks
+# naming atlas and bestla; `peers:` is a comma-separated list on the simple_nav
+# side, so an N-robot merger is the same call with a longer list — each robot's
+# dscovox_node fuses every OTHER robot's binary, which is what makes each
+# planner read a team map rather than a pairwise one.
+for r in $ROBOTS; do
+  start nav_$r "$OUTDIR/nav_$r.log" \
+    ros2 launch simple_nav_3d simple_nav_3d.launch.py robot:=$r mode:=ugv \
+      mapping:=dscovox_lidar peers:="$(peers_csv "$r")" \
+      peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
+      voxel_resolution_m:=$VOXEL_RES \
+      global_planning_map_size_m:=$PLAN_MAP_SIZE \
+      global_planning_map_resolution:=$PLAN_MAP_RES
+done
 for r in $ROBOTS; do
   wait_for 180 "$r planning_map" -- \
     timeout 8 ros2 topic echo /$r/scovox_node/planning_map --once \
@@ -1643,19 +1795,25 @@ start targetviz "$OUTDIR/targetviz.log" python3 "$HERE/sim_target_markers.py"
 COMMS_BAG_TOPICS=()
 if [ "$COMMS" = "1" ]; then
   for r in $ROBOTS; do
-    p=$(peer_of "$r")
-    COMMS_BAG_TOPICS+=( "/$r/exploration/intents"
-                        "/$r/rx/$p/exploration/intents"
-                        "/$r/rx/$p/scovox_node/scovox_bin" )
-    # Both ends of the exchange: what this robot SENT and what actually
-    # arrived. The pair is what makes the P2 convergence claim checkable
-    # offline — a bag of only the sent copies shows two robots that both
-    # published diligently through a blackout neither of them received across.
-    # Only when the stream exists; a topic nobody publishes just makes
-    # `ros2 bag record` warn once per run about a name it cannot find.
+    COMMS_BAG_TOPICS+=( "/$r/exploration/intents" )
+    # Both ends of the exchange: what this robot SENT (once, above) and what
+    # actually arrived from each peer. The pair is what makes the P2
+    # convergence claim checkable offline — a bag of only the sent copies shows
+    # robots that all published diligently through a blackout none of them
+    # received across. Only when the stream exists; a topic nobody publishes
+    # just makes `ros2 bag record` warn once per run about a name it cannot
+    # find. At N robots the received side is N-1 topics per robot, so this list
+    # grows quadratically — it is names only, and the BYTES are unchanged
+    # (every relayed copy exists whether or not it is recorded).
+    for p in $(peers_of "$r"); do
+      COMMS_BAG_TOPICS+=( "/$r/rx/$p/exploration/intents"
+                          "/$r/rx/$p/scovox_node/scovox_bin" )
+      if [ "$TEAM_WORLD" = "1" ]; then
+        COMMS_BAG_TOPICS+=( "/$r/rx/$p/exploration/team_world" )
+      fi
+    done
     if [ "$TEAM_WORLD" = "1" ]; then
-      COMMS_BAG_TOPICS+=( "/$r/exploration/team_world"
-                          "/$r/rx/$p/exploration/team_world" )
+      COMMS_BAG_TOPICS+=( "/$r/exploration/team_world" )
     fi
   done
   # /hmr_comms_sim/stats carries backlog_bytes and the drop_* counters
@@ -1683,21 +1841,23 @@ if [ "$RECORD" != "0" ]; then
   # mode records the RELAYED /rx/ copies: the oracle merge is defined on what
   # each robot SENT, and what arrived is already reconstructable from
   # link_states plus the receivers' own CSVs.
-  BAG_TOPICS=( /clock /tf_static
-               /atlas/odom_ground_truth /atlas/scovox_node/scovox_bin
-               /bestla/odom_ground_truth /bestla/scovox_node/scovox_bin
-               /exploration/intents )
+  #
+  # Built by looping the roster rather than naming atlas/bestla (P7). At N == 2
+  # this emits the same topics in the same order the literal lists did.
+  BAG_TOPICS=( /clock /tf_static )
+  for r in $ROBOTS; do
+    BAG_TOPICS+=( /$r/odom_ground_truth /$r/scovox_node/scovox_bin )
+  done
+  BAG_TOPICS+=( /exploration/intents )
   if [ "$RECORD" = "1" ]; then
-    BAG_TOPICS+=( /tf
-                  /atlas/imu/data /atlas/cmd_vel
-                  /atlas/scovox_node/planning_map
-                  /atlas/scovox_node/global_planning_map
-                  /atlas/goal_pose /atlas/explo_planner/candidates
-                  /bestla/imu/data /bestla/cmd_vel
-                  /bestla/scovox_node/planning_map
-                  /bestla/scovox_node/global_planning_map
-                  /bestla/goal_pose /bestla/explo_planner/candidates
-                  /exploration/targets )
+    BAG_TOPICS+=( /tf )
+    for r in $ROBOTS; do
+      BAG_TOPICS+=( /$r/imu/data /$r/cmd_vel
+                    /$r/scovox_node/planning_map
+                    /$r/scovox_node/global_planning_map
+                    /$r/goal_pose /$r/explo_planner/candidates )
+    done
+    BAG_TOPICS+=( /exploration/targets )
   fi
   log "recording rosbag (RECORD=$RECORD, ${#BAG_TOPICS[@]} base topics + comms)"
   start bag "$OUTDIR/bag.log" \
@@ -1724,9 +1884,10 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # and is inert, since shouldRendezvous() returns false before the mode is
 # consulted.
 #
-# The four `mtare_*` tokens map the same way and for the same reason: none of
-# them is a reconnect_mode either, each is one of the four §3.6.1 cells plus
-# the P1-P5 stack the blocks above have already switched on. `mtare_off` is
+# The six `mtare_*` tokens map the same way and for the same reason: none of
+# them is a reconnect_mode either, each is one of the four §3.6.1 cells (or, for
+# the two `_mdp` names, a chasing cell with the P6 predictor) plus the P1-P6
+# stack the blocks above have already switched on. `mtare_off` is
 # `off` with that stack, so it drops rendezvous_enabled exactly as plain `off`
 # does. The planner reconstitutes the arm label itself from what it was handed
 # (see its addParamStr("arm", ...)), so nothing here has to carry the name
@@ -1735,9 +1896,9 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
 case "$RECONNECT_MODE" in
   off|mtare_off)              RDV_ENABLED="false"; MODE_ARG="hybrid" ;;
-  mtare_pursuit)              MODE_ARG="pursuit" ;;
+  mtare_pursuit|mtare_pursuit_mdp) MODE_ARG="pursuit" ;;
   mtare_rendezvous)           MODE_ARG="rendezvous" ;;
-  mtare_hybrid)               MODE_ARG="hybrid" ;;
+  mtare_hybrid|mtare_hybrid_mdp)   MODE_ARG="hybrid" ;;
 esac
 log "done_seek_enabled=$DONE_SEEK_ARG done_seek_max_sec=$DONE_SEEK_MAX (DONE_SEEK=$DONE_SEEK)"
 log "mission_return_enabled=$MISSION_RETURN_ARG home_tol=${MISSION_HOME_TOL}m max=${MISSION_RETURN_MAX}s (MISSION_RETURN=$MISSION_RETURN)"
@@ -1785,6 +1946,11 @@ if [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
   log "scheduled rendezvous ON: on dispatch both robots derive the same (cell, t_meet) from the allocator's own tours and each departs at its own travel-time deadline; the midpoint is the floor, not the default"
 else
   log "scheduled rendezvous OFF (RENDEZVOUS_SCHEDULE=0) — no rendezvous_schedule_enable param passed; the reconnect destination is the last-contact midpoint"
+fi
+if [ "$PURSUIT_PREDICTOR" = "mdp" ]; then
+  log "pursuit predictor = mdp: the chase aims at the argmax over the peer's last received tour of P(peer there when we arrive); the budget and every terminator still come from the trail, and an unaffordable intercept downgrades to it"
+else
+  log "pursuit predictor = trail (planner default) — no pursuit_predictor param passed; the chase drives the peer's last known goal then its last known pose"
 fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
@@ -1907,10 +2073,18 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "global_alloc=$GLOBAL_ALLOC"
   echo "reconnect_gate=$RECONNECT_GATE"
   echo "rendezvous_schedule=$RENDEZVOUS_SCHEDULE"
+  echo "pursuit_predictor=$PURSUIT_PREDICTOR"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
   echo "scenario=$SCENARIO"
+  # The roster is DERIVED from the scenario (P7), so recording the scenario
+  # name alone leaves a reader to go and look it up in an install tree that may
+  # have been rebuilt since. Written out so team size and robot identity can be
+  # read off the cell itself — every analysis script currently hardcodes
+  # ("atlas","bestla") and this is what lets them stop.
+  echo "robots=$(echo $ROBOTS | tr ' ' ',')"
+  echo "n_robots=$N_ROBOTS"
   echo "exploitation_enabled=$EXPLOIT_ARG"
   echo "dwell_sync=$DWELL_SYNC_ARG"
   echo "candidate_enable_polar=$POLAR_ARG"
@@ -2064,10 +2238,11 @@ for r in $ROBOTS; do
   # shared /exploration/intents bus exactly as before.
   EXTRA=()
   if [ "$COMMS" = "1" ]; then
-    peer=$(peer_of "$r")
+    # One subscription per peer. The param is a string ARRAY on the node side
+    # and always has been, so N=2 passes the same single-element list it did.
     EXTRA=( -p coord_intent_pub_topic:=exploration/intents
-            -p coord_intent_sub_topics:="[\"rx/$peer/exploration/intents\"]" )
-    log "$r intents: pub /$r/exploration/intents  sub /$r/rx/$peer/exploration/intents"
+            -p coord_intent_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/intents')" )
+    log "$r intents: pub /$r/exploration/intents  sub $(peers_ros_array "$r" "/$r/rx/" '/exploration/intents')"
   fi
   # Link-state gate. Appended to the same array rather than passed as bare -p
   # flags because the "off" value is the empty string, and `-p name:=` with
@@ -2103,10 +2278,9 @@ for r in $ROBOTS; do
   if [ "$TEAM_WORLD" = "1" ]; then
     EXTRA+=( -p team_world_hz:="$TEAM_WORLD_HZ" )
     if [ "$COMMS" = "1" ]; then
-      peer=$(peer_of "$r")
       EXTRA+=( -p team_world_pub_topic:=exploration/team_world
-               -p team_world_sub_topics:="[\"rx/$peer/exploration/team_world\"]" )
-      log "$r team_world: pub /$r/exploration/team_world  sub /$r/rx/$peer/exploration/team_world"
+               -p team_world_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/team_world')" )
+      log "$r team_world: pub /$r/exploration/team_world  sub $(peers_ros_array "$r" "/$r/rx/" '/exploration/team_world')"
     else
       log "$r team_world: ${TEAM_WORLD_HZ} Hz on the shared /exploration/team_world bus (COMMS=0)"
     fi
@@ -2123,6 +2297,9 @@ for r in $ROBOTS; do
   fi
   if [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
     EXTRA+=( -p rendezvous_schedule_enable:=true )
+  fi
+  if [ "$PURSUIT_PREDICTOR" = "mdp" ]; then
+    EXTRA+=( -p pursuit_predictor:=mdp )
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
     ros2 run explo_planner explo_planner_node --ros-args \
@@ -2162,7 +2339,7 @@ for r in $ROBOTS; do
       -p hold_escalate:=$HOLD_ESCALATE_ARG \
       -p hold_escalate_wait_sec:=$HOLD_ESCALATE_WAIT \
       -p exploitation_enabled:=$EXPLOIT_ARG \
-      -p rendezvous_expected_peers:=1 \
+      -p rendezvous_expected_peers:=$((N_ROBOTS - 1)) \
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
       -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
       -p use_planning_map:=true \
@@ -2412,7 +2589,7 @@ planner_state() {
 # resolution is the thing being bought.
 POLL_S="${POLL_S:-2}"
 CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
-LAST_SA=-1; LAST_SB=-1; STALL=0
+LAST_STEPS=-1; STALL=0
 LAST_CLOCK_WALL=0
 # Wall-clock deadman on the sim clock itself.
 #
@@ -2485,11 +2662,23 @@ while true; do
   fi
   if [ $((T - LAST_HB)) -ge 60 ]; then
     LAST_HB=$T
-    SA=$(grep -c "selected goal" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
-    SB=$(grep -c "selected goal" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
-    CA=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
-    CB=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
-    log "HB t_sim=$T steps(atlas/bestla)=$SA/$SB complete=$CA/$CB"
+    # One slash-joined field per robot in roster order, instead of the SA/SB
+    # pair this used to keep (P7). The counts are normalised to 0 here rather
+    # than compared raw, which closes the same empty-vs-zero disarm the DONE
+    # block below documents: `grep -c` prints NOTHING for a missing log, so a
+    # planner that died before creating its log used to alternate ""/"0" against
+    # whatever the other robot reported and reset STALL every heartbeat — on the
+    # path the gate is most needed. Normalising cannot cause a false HUNG,
+    # because a missing log also reports no DONE prefix, which is exactly the
+    # broken run this is supposed to kill.
+    STEPS_NOW=""; COMPLETE_NOW=""
+    for r in $ROBOTS; do
+      s=$(grep -c "selected goal" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
+      c=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
+      STEPS_NOW="$STEPS_NOW${STEPS_NOW:+/}${s:-0}"
+      COMPLETE_NOW="$COMPLETE_NOW${COMPLETE_NOW:+/}${c:-0}"
+    done
+    log "HB t_sim=$T steps($(echo $ROBOTS | tr ' ' '/'))=$STEPS_NOW complete=$COMPLETE_NOW"
     # Hang gate. A planner that cannot find an acceptable candidate returns from
     # doPlan and re-enters PLAN forever: no crash, no error, every process
     # alive, and the CSV keeps growing because the metrics timer samples every
@@ -2501,7 +2690,7 @@ while true; do
     #
     # Not fatal if a robot has legitimately finished: DONE-idle is a terminal
     # state by design and its step count is supposed to stop.
-    if [ "$SA" = "$LAST_SA" ] && [ "$SB" = "$LAST_SB" ]; then
+    if [ "$STEPS_NOW" = "$LAST_STEPS" ]; then
       STALL=$((STALL + 1))
       # The pattern must match ONLY genuine completion. Through generation 7 the
       # alternate was a bare `DONE`, and every planner log's line 2 reads
@@ -2532,9 +2721,17 @@ while true; do
       # the no-match-but-file-exists case grep's own "0" and the echoed "0" both
       # land, giving "0\n0", and `[ "0 0" = 0 ]` is false too — which disarms it
       # on the PRIMARY hung-run case. Calibrated against all three inputs.
+      #
+      # ANY robot reporting DONE disarms the gate, which is what the two-term
+      # `DONE_A = 0 && DONE_B = 0` said and is the conservative direction: with
+      # one robot legitimately finished the team's step counter can sit still
+      # for reasons that are not a hang.
       DONE_PAT="Exploration complete\|Exploration finished"
-      DONE_A=$(grep -c "$DONE_PAT" "$OUTDIR/planner_atlas.log" 2>/dev/null || true)
-      DONE_B=$(grep -c "$DONE_PAT" "$OUTDIR/planner_bestla.log" 2>/dev/null || true)
+      ANY_DONE=0
+      for r in $ROBOTS; do
+        d=$(grep -c "$DONE_PAT" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
+        [ "${d:-0}" = 0 ] || { ANY_DONE=1; break; }
+      done
       # A gate that aborts valid cells is worse than one that never fires, and
       # the calibration that used to justify 600 s here was WRONG in a way worth
       # recording, because it is the reason a one-arm dropout mechanism shipped:
@@ -2565,16 +2762,16 @@ while true; do
       # starts. Half the corpus this line used to claim. That bound is
       # structural instead, which is why halving it changes nothing — the
       # funnel line is printed on every ending, before startReturnHome.
-      if [ "$STALL" -ge "$HANG_HB" ] && [ "${DONE_A:-0}" = 0 ] && [ "${DONE_B:-0}" = 0 ]; then
-        die "HUNG: neither planner advanced a step in $((STALL * 60)) sim-s \
-(steps still $SA/$SB) and neither reports DONE. Run is invalid — check \
+      if [ "$STALL" -ge "$HANG_HB" ] && [ "$ANY_DONE" = 0 ]; then
+        die "HUNG: no planner advanced a step in $((STALL * 60)) sim-s \
+(steps still $STEPS_NOW) and none reports DONE. Run is invalid — check \
 'rejected' counts in $OUTDIR/planner_*.log (cost_grid_radius_cap_m=$COST_CAP)."
       fi
       [ "$STALL" -ge 2 ] && log "WARNING no step progress for $((STALL * 60)) sim-s"
     else
       STALL=0
     fi
-    LAST_SA=$SA; LAST_SB=$SB
+    LAST_STEPS=$STEPS_NOW
   fi
   if [ "$STOP_ON_DONE" = "1" ]; then
     # all_done was computed above, before the clock read, so that a fast poll

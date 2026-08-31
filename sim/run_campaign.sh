@@ -244,7 +244,7 @@ fi
 # decision and do not rename the arm, so they are legitimately campaign-wide
 # settings rather than treatments.
 for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE \
-                RENDEZVOUS_SCHEDULE; do
+                RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -401,8 +401,9 @@ unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 # The M-TARE knobs are here for a sharper reason than tidiness, and it is the
 # one failure the arm-stamp guard cannot see. The node prefixes the arm with
 # `mtare_` on `global_alloc_enable_ || reconnect_gate_info_ ||
-# rendezvous_schedule_enable_` -- so an ambient GLOBAL_ALLOC, RECONNECT_GATE or
-# RENDEZVOUS_SCHEDULE at least renames the arm and trips check 3e.
+# rendezvous_schedule_enable_ || pursuit_predictor_mdp_` -- so an ambient
+# GLOBAL_ALLOC, RECONNECT_GATE, RENDEZVOUS_SCHEDULE or PURSUIT_PREDICTOR at
+# least renames the arm and trips check 3e.
 # CELL_WORLD and TEAM_WORLD rename NOTHING. `export CELL_WORLD=1 TEAM_WORLD=1`
 # left over from a P2 debugging session would run the census and the 1 Hz
 # exchange in every cell of a plain hybrid-vs-off campaign, stamp the same arm
@@ -414,7 +415,7 @@ unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 # the guards read.
 for _amb in LINK_GATE MIDRUN_SILENCE \
             CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
-            RENDEZVOUS_SCHEDULE; do
+            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
   if [ -n "${!_amb+x}" ]; then
     echo "NOTE: $_amb=${!_amb} is exported in this shell and will be IGNORED --" >&2
     echo "      the per-cell launch strips it so the campaign's guards cannot be" >&2
@@ -468,7 +469,7 @@ for cell in "${CELL_LIST[@]}"; do
     *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
   esac
 
-  # What this cell's manifest WILL say for the five M-TARE knobs, so the resume
+  # What this cell's manifest WILL say for the six M-TARE knobs, so the resume
   # guard below can compare rather than assume. Per cell and not per campaign,
   # because the arm token is what sets them: each mtare_* token expands to its
   # own full stack inside run_explo_sim_rviz.sh, every other arm takes the
@@ -481,16 +482,31 @@ for cell in "${CELL_LIST[@]}"; do
   GLOBAL_ALLOC_REQ=$(env_val GLOBAL_ALLOC 0)
   RECONNECT_GATE_REQ=$(env_val RECONNECT_GATE silence)
   RENDEZVOUS_SCHEDULE_REQ=$(env_val RENDEZVOUS_SCHEDULE 0)
+  PURSUIT_PREDICTOR_REQ=$(env_val PURSUIT_PREDICTOR trail)
   case "$cell_mode" in
     mtare_off)
       CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=silence; RENDEZVOUS_SCHEDULE_REQ=0 ;;
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=silence; RENDEZVOUS_SCHEDULE_REQ=0
+      PURSUIT_PREDICTOR_REQ=trail ;;
     mtare_pursuit)
       CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0 ;;
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0
+      PURSUIT_PREDICTOR_REQ=trail ;;
     mtare_rendezvous|mtare_hybrid)
       CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1 ;;
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1
+      PURSUIT_PREDICTOR_REQ=trail ;;
+    # The P6 pair: the same stacks as mtare_pursuit / mtare_hybrid with the
+    # predictor swapped. Listed separately rather than folded into those two
+    # branches so the one field that differs is visible at the point of use.
+    mtare_pursuit_mdp)
+      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0
+      PURSUIT_PREDICTOR_REQ=mdp ;;
+    mtare_hybrid_mdp)
+      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1
+      PURSUIT_PREDICTOR_REQ=mdp ;;
   esac
 
   # "Complete" means reached an end reason AND passed its run-time gates. A run
@@ -515,7 +531,15 @@ for cell in "${CELL_LIST[@]}"; do
     # key cannot be shown to agree, and "cannot be shown to agree" is exactly
     # what this guard is for.
     #
-    # The five M-TARE knobs are here for the same reason, and one of them is
+    # pursuit_predictor is the newest key and the one where that rule bites a
+    # reader who knows better: a manifest without it was written by a binary
+    # that had no such parameter, so the cell provably ran `trail` and the
+    # abort looks pedantic. It is kept strict anyway, because resuming across
+    # that boundary means resuming with a DIFFERENT BINARY, which check 3b
+    # hard-fails downstream regardless -- aborting here just says so before
+    # another cell's worth of wall time is spent.
+    #
+    # The six M-TARE knobs are here for the same reason, and one of them is
     # the only member of this list whose absence is COMPLETELY silent. Resume a
     # half-finished campaign with `--env "CELL_WORLD=1 TEAM_WORLD=1"` added and
     # the banked cells satisfy every other key, so seeds 1-15 carry no cell
@@ -536,7 +560,8 @@ for cell in "${CELL_LIST[@]}"; do
       "team_world=$TEAM_WORLD_REQ" \
       "global_alloc=$GLOBAL_ALLOC_REQ" \
       "reconnect_gate=$RECONNECT_GATE_REQ" \
-      "rendezvous_schedule=$RENDEZVOUS_SCHEDULE_REQ"
+      "rendezvous_schedule=$RENDEZVOUS_SCHEDULE_REQ" \
+      "pursuit_predictor=$PURSUIT_PREDICTOR_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -621,6 +646,7 @@ for cell in "${CELL_LIST[@]}"; do
   env -u LINK_GATE -u MIDRUN_SILENCE \
       -u CELL_WORLD -u TEAM_WORLD -u TEAM_WORLD_HZ \
       -u GLOBAL_ALLOC -u RECONNECT_GATE -u RENDEZVOUS_SCHEDULE \
+      -u PURSUIT_PREDICTOR \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \

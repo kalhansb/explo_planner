@@ -271,7 +271,7 @@ echo "=== the launcher's own validation blocks (the M-TARE knobs) ==="
 # anywhere else dies at the scenario-installed check for a reason that has
 # nothing to do with the guard under test. Every BLOCK case would still see a
 # non-zero exit, and this whole section would pass while testing nothing.
-PRELUDE_ANCHOR='^unset _mtare_stamped _mtare_named$'
+PRELUDE_ANCHOR='^unset _mtare_stamped _arm_core _arm_expect$'
 PRELUDE_END=$(grep -n "$PRELUDE_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
 PROBE="$(dirname "$LAUNCHER")/.prelude_probe.$$.sh"
 trap 'rm -rf "$TMP"; rm -f "$PROBE"' EXIT
@@ -291,12 +291,13 @@ if [ -n "$PRELUDE_END" ]; then
   # knobs as the launcher resolved them. That is what makes an ALLOW case say
   # something: absence of our FATAL text is also true of a prelude that died at
   # the scenario check, and would certify a launcher that refuses everything.
-  printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rs=$RENDEZVOUS_SCHEDULE rm=$RECONNECT_MODE"' >> "$PROBE"
+  printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rs=$RENDEZVOUS_SCHEDULE pp=$PURSUIT_PREDICTOR rm=$RECONNECT_MODE"' >> "$PROBE"
 
   # And the cut has to CONTAIN the guards. A range that stopped short would
   # fail every BLOCK case for the wrong reason and pass every ALLOW one.
   for _need in "FATAL: CELL_WORLD" "FATAL: TEAM_WORLD=" "FATAL: TEAM_WORLD_HZ" \
-               "FATAL: RENDEZVOUS_SCHEDULE" "the arm name and the arm"; do
+               "FATAL: RENDEZVOUS_SCHEDULE" "FATAL: PURSUIT_PREDICTOR" \
+               "the arm name and the arm"; do
     cases=$((cases+1))
     if grep -qF "$_need" "$PROBE"; then
       echo "  PASS  the cut carries the guard: $_need"
@@ -336,9 +337,9 @@ if [ -n "$PRELUDE_END" ]; then
   # The two controls that give every refusal below its meaning. If the first
   # ever fails, the launcher is refusing off-arm cells; if the second fails,
   # the mtare_hybrid arm does not exist and the campaign has no treatment.
-  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 rm=hybrid' \
+  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 pp=trail rm=hybrid' \
      "shipped defaults resolve with every M-TARE knob off"
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 rm=mtare_hybrid' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
      "RECONNECT_MODE=mtare_hybrid expands to the whole P1-P5 stack" \
      RECONNECT_MODE=mtare_hybrid
 
@@ -349,13 +350,13 @@ if [ -n "$PRELUDE_END" ]; then
   # Asserted one knob at a time because a token that expanded to the hybrid
   # stack under a different name would run the campaign as one arm four times
   # and every gate downstream would agree with it.
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 rm=mtare_off' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 pp=trail rm=mtare_off' \
      "RECONNECT_MODE=mtare_off expands to P1-P3 and NEITHER mechanism" \
      RECONNECT_MODE=mtare_off
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 rm=mtare_pursuit' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 pp=trail rm=mtare_pursuit' \
      "RECONNECT_MODE=mtare_pursuit expands to the chase WITHOUT an appointment" \
      RECONNECT_MODE=mtare_pursuit
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 rm=mtare_rendezvous' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_rendezvous' \
      "RECONNECT_MODE=mtare_rendezvous expands to the appointment WITHOUT a chase" \
      RECONNECT_MODE=mtare_rendezvous
 
@@ -381,7 +382,7 @@ if [ -n "$PRELUDE_END" ]; then
   lg BLOCK "FATAL: TEAM_WORLD_HZ='<empty: rejected by flt>'" \
      "flt's empty return for nan is refused, not passed to ros2 as a bare -p" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=nan
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 rm=hybrid' \
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 pp=trail rm=hybrid' \
      "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2
 
@@ -422,6 +423,60 @@ if [ -n "$PRELUDE_END" ]; then
   lg BLOCK "FATAL: RECONNECT_MODE=mtare_rendezvous implies RECONNECT_GATE=info" \
      "contradicting the mtare_rendezvous token's own stack is refused" \
      RECONNECT_GATE=silence RECONNECT_MODE=mtare_rendezvous
+
+  # The P6 knob. It is the SIXTH thing that flips the node's `mtare_` prefix, so
+  # it needs the same three-way coverage the fifth got: the typo, the arm-stamp
+  # direction, and the preconditions.
+  lg BLOCK "FATAL: PURSUIT_PREDICTOR='MDP'" \
+     "a mis-cased PURSUIT_PREDICTOR is refused, not read as trail" \
+     PURSUIT_PREDICTOR=MDP
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "PURSUIT_PREDICTOR=mdp under the plain hybrid name is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 PURSUIT_PREDICTOR=mdp \
+     RECONNECT_MODE=hybrid
+  # Under a plain arm, because the mtare_* tokens all set GLOBAL_ALLOC=1
+  # themselves and this precondition is unreachable beneath any of them. The
+  # PURSUIT_PREDICTOR block runs BEFORE the arm-stamp guard, so a plain token
+  # reaches this refusal rather than the name/stamp one.
+  lg BLOCK "FATAL: PURSUIT_PREDICTOR=mdp requires GLOBAL_ALLOC=1" \
+     "the predictor without the allocator that makes tours is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 PURSUIT_PREDICTOR=mdp RECONNECT_MODE=hybrid
+  lg BLOCK "FATAL: PURSUIT_PREDICTOR=mdp with RECONNECT_MODE=rendezvous" \
+     "aiming a chase in the chase-OFF cell of the 2x2 is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 PURSUIT_PREDICTOR=mdp \
+     RECONNECT_MODE=rendezvous
+  # The pin, in both directions. The four factorial tokens fix the predictor at
+  # `trail` (an mdp cell would be indexed as the arm it is not), and the ALLOW
+  # cases above already assert pp=trail comes out of each; this asserts the
+  # token REFUSES the override rather than quietly winning over it.
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_hybrid implies PURSUIT_PREDICTOR=trail" \
+     "contradicting the mtare_hybrid token's predictor pin is refused" \
+     PURSUIT_PREDICTOR=mdp RECONNECT_MODE=mtare_hybrid
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_pursuit implies PURSUIT_PREDICTOR=trail" \
+     "contradicting the mtare_pursuit token's predictor pin is refused" \
+     PURSUIT_PREDICTOR=mdp RECONNECT_MODE=mtare_pursuit
+
+  # The two _mdp tokens are the only way to REQUEST the predictor, and they are
+  # ordinary arm tokens: the whole stack comes from the name, and the name is
+  # what the node will stamp back (its arm rule gained the matching `_mdp`
+  # suffix in the same commit). These four assert both halves -- the stack the
+  # token expands to, and the refusal of an override that would make the
+  # directory name and the run_start stamp disagree.
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 pp=mdp rm=mtare_pursuit_mdp' \
+     "mtare_pursuit_mdp expands to the mtare_pursuit stack with the predictor on" \
+     RECONNECT_MODE=mtare_pursuit_mdp
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=mdp rm=mtare_hybrid_mdp' \
+     "mtare_hybrid_mdp expands to the mtare_hybrid stack with the predictor on" \
+     RECONNECT_MODE=mtare_hybrid_mdp
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_hybrid_mdp implies PURSUIT_PREDICTOR=mdp" \
+     "turning the predictor back off under an _mdp token is refused" \
+     PURSUIT_PREDICTOR=trail RECONNECT_MODE=mtare_hybrid_mdp
+  # There is no _mdp counterpart for the two arms that never chase, and the
+  # name has to be refused as unknown rather than mapped to the nearest thing
+  # that parses -- a token that silently degrades is a mislabelled cell.
+  lg BLOCK "FATAL: RECONNECT_MODE='mtare_rendezvous_mdp' is not one of" \
+     "an _mdp name for a chase-OFF arm is not a token" \
+     RECONNECT_MODE=mtare_rendezvous_mdp
 fi
 
 # A clean launch must be SILENT on stderr. `env_val` took its default from a
@@ -452,7 +507,7 @@ unset _stderr
 # same arm on both sides, and score CLEAN. Read the -u list back out rather than
 # trusting that it was kept in step with the knobs the launcher grew.
 for _u in LINK_GATE MIDRUN_SILENCE CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ \
-          GLOBAL_ALLOC RECONNECT_GATE RENDEZVOUS_SCHEDULE; do
+          GLOBAL_ALLOC RECONNECT_GATE RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
   cases=$((cases+1))
   if sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS" \
      | grep -qE -- "-u $_u( |\\\\|$)"; then

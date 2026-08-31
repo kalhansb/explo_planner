@@ -1232,9 +1232,20 @@ private:
       link_states_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr link_index_sub_;
   int  link_self_idx_      = -1;     ///< own row index in the emulator's table
-  bool link_index_usable_  = false;  ///< a 2-robot index naming us has arrived
-  bool link_index_warned_  = false;  ///< N != 2 complaint is emitted once
-  bool link_connected_     = false;  ///< newest own-pair connected bit
+  int  link_robot_count_   = 0;      ///< robots in that table, self included
+  bool link_index_usable_  = false;  ///< an index naming us has arrived
+  bool link_index_warned_  = false;  ///< unusable-index complaint is emitted once
+  /// Newest reading of MY links: true only when every peer in the index has a
+  /// usable row and all of them are up.
+  ///
+  /// "All", not "any", and P7 (N=3) is where the two part company. The veto
+  /// this feeds exists to stop a mid-run fire aimed at a team that is already
+  /// reachable, and the trigger it vetoes is written against team COMPLETENESS
+  /// — so at N>=3 "any" would suppress a dispatch the run needs while one peer
+  /// is still out of contact. At N=2 there is exactly one peer and the two
+  /// readings are the same bit, which is why this generalisation leaves every
+  /// pairwise campaign byte-identical.
+  bool link_connected_     = false;
   bool link_have_sample_   = false;
   bool link_clock_anchored_ = false;
   /// One-shot latch for the "gate went live" console line. The run_start param
@@ -3890,6 +3901,18 @@ ExploPlannerNode::ExploPlannerNode()
   // which is already in the OR — but it is listed anyway, because a term left
   // out on the grounds that another term implies it is a term that silently
   // stops being true the day the implication is relaxed.
+  // The predictor also needs its own SUFFIX, not just membership in the OR
+  // above. Without one, a chase aimed by the MDP and a chase aimed by the trail
+  // both stamp "mtare_hybrid": two different treatments under one name, pooled
+  // by anything that groups on this column — the identical failure the prefix
+  // and the reconnect_mode collapse were each introduced to prevent, one level
+  // further out. With it the stamp reproduces the harness's arm token exactly
+  // for all six (mtare_off, mtare_pursuit, mtare_rendezvous, mtare_hybrid, and
+  // the _mdp counterparts of the two that chase), so the directory name and the
+  // param dump cannot disagree about which arm a cell is.
+  //
+  // trail appends nothing, so every pre-P6 run stamps the byte-identical
+  // string it stamped before.
   if (exp_log_) {
     const bool mtare = global_alloc_enable_ || reconnect_gate_info_ ||
                        rendezvous_schedule_enable_ || pursuit_predictor_mdp_;
@@ -3897,6 +3920,7 @@ ExploPlannerNode::ExploPlannerNode()
                           ? std::string(reconnectModeName(reconnect_mode_))
                           : std::string("off");
     if (mtare) arm = "mtare_" + arm;
+    if (pursuit_predictor_mdp_) arm += "_mdp";
     exp_log_->addParamStr("arm", arm);
   }
 
@@ -4139,20 +4163,30 @@ ExploPlannerNode::ExploPlannerNode()
               names.push_back(s.substr(q1 + 1, q2 - q1 - 1));
               p = q2 + 1;
             }
-            // Deliberately restricted to two robots. With three or more,
-            // "connected to at least one peer" and "the team is complete" stop
-            // being the same statement, and the mid-run trigger is written
-            // against the latter. Guessing a meaning here would be a silent
-            // wrong answer in the heterogeneous campaign that is already
-            // planned, so refuse loudly and keep the legacy clock instead.
-            if (names.size() != 2) {
+            // Any team of two or more (P7, §P7). This was restricted to
+            // exactly two while "connected to at least one peer" and "the team
+            // is complete" were the same statement and there was no reading of
+            // the gate that was defined for three; the row scan below now
+            // requires ALL of this robot's links to be up, which IS the
+            // completeness the mid-run trigger is written against, so the
+            // restriction has been replaced by the meaning it was standing in
+            // for. A team of one has no link to read and is still refused.
+            const std::string joined = [&names] {
+              std::string s;
+              for (size_t k = 0; k < names.size(); ++k) {
+                if (k) s += ", ";
+                s += names[k];
+              }
+              return s;
+            }();
+            if (names.size() < 2) {
               if (!link_index_warned_) {
                 link_index_warned_ = true;
                 RCLCPP_WARN(get_logger(),
-                    "Link gate: robot index lists %zu robots; the gate is only "
-                    "defined for a pair, so the mid-run trigger keeps the "
+                    "Link gate: robot index lists %zu robot(s) [%s]; there is "
+                    "no link to read, so the mid-run trigger keeps the "
                     "record-age clock for this run.",
-                    names.size());
+                    names.size(), joined.c_str());
               }
               link_index_usable_ = false;
               return;
@@ -4162,9 +4196,9 @@ ExploPlannerNode::ExploPlannerNode()
               if (!link_index_warned_) {
                 link_index_warned_ = true;
                 RCLCPP_WARN(get_logger(),
-                    "Link gate: robot index does not name '%s' (it lists '%s', "
-                    "'%s'); keeping the record-age clock.",
-                    robot_name_.c_str(), names[0].c_str(), names[1].c_str());
+                    "Link gate: robot index does not name '%s' (it lists [%s]); "
+                    "keeping the record-age clock.",
+                    robot_name_.c_str(), joined.c_str());
               }
               link_index_usable_ = false;
               return;
@@ -4172,13 +4206,14 @@ ExploPlannerNode::ExploPlannerNode()
             const int idx = static_cast<int>(it - names.begin());
             if (!link_index_usable_ || link_self_idx_ != idx) {
               RCLCPP_INFO(get_logger(),
-                  "Link gate: armed as robot index %d of [%s, %s]; the mid-run "
+                  "Link gate: armed as robot index %d of [%s]; the mid-run "
                   "trigger still fires on record age, but a fire is vetoed "
-                  "while the radio is up — at BOTH the trigger and the "
-                  "exhausted-chase escalation.",
-                  idx, names[0].c_str(), names[1].c_str());
+                  "while EVERY one of this robot's %zu link(s) is up — at BOTH "
+                  "the trigger and the exhausted-chase escalation.",
+                  idx, joined.c_str(), names.size() - 1);
             }
             link_self_idx_     = idx;
+            link_robot_count_  = static_cast<int>(names.size());
             link_index_usable_ = true;
           });
     }
@@ -4192,7 +4227,12 @@ ExploPlannerNode::ExploPlannerNode()
           if (!link_index_usable_) return;
           constexpr size_t kCols = 9;   // emulator's kLinkStateCols
           const auto& d = msg->data;
-          bool found = false, connected = false;
+          // Per-PEER, not a running OR over the rows: see link_connected_. The
+          // vectors are indexed by the peer's own row index so a table that
+          // repeats or omits a pair cannot be miscounted by an accumulator.
+          const size_t n = static_cast<size_t>(link_robot_count_);
+          std::vector<char> seen(n, 0), up(n, 0);
+          bool found = false;
           for (size_t k = 0; k + kCols <= d.size(); k += kCols) {
             const int i = static_cast<int>(d[k]);
             const int j = static_cast<int>(d[k + 1]);
@@ -4202,10 +4242,27 @@ ExploPlannerNode::ExploPlannerNode()
             // emulator never computed. Treating it as a disconnection would
             // manufacture a reconnection the instant poses arrive.
             if (d[k + 4] <= 0.0) continue;
+            const int other = (i == link_self_idx_) ? j : i;
+            if (other < 0 || other >= static_cast<int>(n) ||
+                other == link_self_idx_) {
+              continue;   // a row that does not name a peer we know about
+            }
             found = true;
-            if (d[k + 8] != 0.0) connected = true;   // `connected` column
+            seen[static_cast<size_t>(other)] = 1;
+            if (d[k + 8] != 0.0)              // `connected` column
+              up[static_cast<size_t>(other)] = 1;
           }
           if (!found) return;
+          // A peer with no usable row yet is UNKNOWN, and unknown counts as not
+          // connected. That direction is the safe one: it clears the veto, so
+          // the trigger falls back to the record-age clock it would have used
+          // with no gate at all. The opposite default would let a table that
+          // has not warmed up suppress dispatches.
+          bool connected = true;
+          for (size_t q = 0; q < n; ++q) {
+            if (static_cast<int>(q) == link_self_idx_) continue;
+            if (!seen[q] || !up[q]) { connected = false; break; }
+          }
           const auto now = this->now();
           link_have_sample_      = true;
           link_last_sample_time_ = now;
