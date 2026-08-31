@@ -25,6 +25,29 @@ REV = "3d4306c"
 SHA = "aaaaaaaaaaaaaaaa"
 ROBOTS = ["atlas", "bestla"]
 
+# WHICH ARMS ARE CONTROLS, read out of the gate rather than restated here.
+#
+# The fixture writes rendezvous_enabled=False and omits the reconnect_dispatch
+# row for a control arm, and gate check 3e compares exactly that against the arm
+# name. So if the two files ever disagree about what "control" means, every case
+# in this file exercises a cell the gate refuses for a reason no case mentions:
+# the expect_clean cases go red and the planted-defect cases still "pass",
+# having caught the disagreement instead of their defect.
+#
+# That drift had already happened. This file said ("off", "mtare_off") while the
+# gate's default had become "off" alone, so an mtare_off fixture would have been
+# built manoeuvre-less and then scored as a treated arm with its dispatch
+# missing. Reading the literal back out is the same move campaign_guard_calib.sh
+# makes for the launcher's LINK_GATE default, and for the same reason: nothing
+# else links the two files.
+_m = re.search(r'os\.environ\.get\(\s*"GATE_CONTROL_ARMS"\s*,\s*"([^"]*)"\s*\)',
+               open(GATE).read())
+if not _m:
+    sys.exit("FATAL: gate_g8.py's GATE_CONTROL_ARMS default is no longer "
+             "readable, so the fixture's notion of a control arm is unpinned. "
+             "Fix the pattern above rather than hardcoding the set.")
+CONTROL_ARMS = frozenset(s.strip() for s in _m.group(1).split(",") if s.strip())
+
 MANIFEST = f"""run_end_reason=all_done
 run_gates_verdict=CLEAN
 run_end_t_sim=812.4
@@ -94,6 +117,17 @@ PARAMS = {
     "reconnect_midrun_silence_sec": 90.0,
     "link_gate_configured": True,
     "reconnect_link_down_confirm_sec": 0.0,
+    # Check 3g. The node emits all four UNCONDITIONALLY, which is what lets the
+    # gate treat their absence as "this cell predates the stack" rather than as
+    # a default — so the fixture has to emit them unconditionally too, at the
+    # off values, and let build_events flip them for an m-tare arm. A fixture
+    # that carried them only on the treated cells would have made 3g's control
+    # direction untestable, and the control direction is the one that decides
+    # whether the comparison holds.
+    "cell_world_enable": False,
+    "team_world_hz": 0.0,
+    "global_alloc_enable": False,
+    "reconnect_gate": "silence",
 }
 
 
@@ -123,7 +157,16 @@ def base_events(arm="hybrid", robot="atlas"):
     # which made the fixture unable to express any OTHER treated arm: an
     # mtare_hybrid cell would have been written with rendezvous_enabled=False
     # and check 3e would have "caught" a defect the fixture invented.
-    params["rendezvous_enabled"] = arm not in ("off", "mtare_off")
+    params["rendezvous_enabled"] = arm not in CONTROL_ARMS
+    # An m-tare arm ran all four features; anything else ran none. This mirrors
+    # the launcher's own expansion of RECONNECT_MODE=mtare_hybrid rather than
+    # the node's OR, deliberately: the OR is what check 3g exists to close, so a
+    # fixture built from it could never express the half-treated cell.
+    if arm.startswith("mtare_"):
+        params["cell_world_enable"] = True
+        params["team_world_hz"] = 1.0
+        params["global_alloc_enable"] = True
+        params["reconnect_gate"] = "info"
     ev = [
         _row("run_start", 0, state="IDLE", step=0, t0_sim_sec=0.0,
              schema_version=SCHEMA_VERSION, coverage_milestones=[],
@@ -158,7 +201,7 @@ def base_events(arm="hybrid", robot="atlas"):
         _row("mission_complete", 9, result="arrived"),
         _row("run_end", 10, metrics_timer_rows=163),
     ]
-    if arm not in ("off", "mtare_off"):
+    if arm not in CONTROL_ARMS:
         # logReconnectDispatch, experiment_log.cpp:401-437 -- the only writer of
         # team_incomplete_sec, and therefore the only event on which check 19
         # can legitimately demand it. A real generation-6 dispatch row carries
@@ -272,10 +315,23 @@ def run_gate(root, tag, cells_per_arm="1", env_extra=None):
     # a gate expecting a different schema from the one the fixture writes, and
     # every case would fail on check 3d — a red harness that says nothing about
     # the check it claims to be calibrating.
+    #
+    # GATE_ARMS and GATE_CONTROL_ARMS are pinned for exactly the same reason,
+    # and the reason is not hypothetical for them: scoring the live campaign
+    # requires `export GATE_ARMS=mtare_hybrid,off`, and running this
+    # calibration afterwards in that same shell would hand every one of the
+    # hybrid/off fixtures below an expectation naming an arm they do not
+    # build. Check 21 would then hard-fail all of them — every expect_clean
+    # case reporting FAIL, and every planted-defect case still "passing" while
+    # the gate failed for a reason having nothing to do with its defect. The
+    # harness would go red across the board and be unable to say why.
+    # env_extra still overrides, which is how the mtare cases declare theirs.
     env = dict(os.environ, GATE_ROOT=root,
                GATE_EXPECT_git_explo_planner=REV,
                GATE_EXPECT_sha256_explo_planner_node=SHA,
                GATE_SCHEMA_VERSION=str(SCHEMA_VERSION),
+               GATE_ARMS="hybrid,off",
+               GATE_CONTROL_ARMS=",".join(sorted(CONTROL_ARMS)),
                GATE_CELLS_PER_ARM=cells_per_arm)
     env.update(env_extra or {})
     p = subprocess.run([sys.executable, GATE, tag], capture_output=True,
@@ -791,6 +847,124 @@ try:
                                out)
     print(f"  {'PASS' if ok else 'FAIL'}  an mtare campaign scored against the "
           f"default hybrid,off pre-registration: caught")
+    if not ok:
+        fails += 1
+        print(out[-1500:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("\n=== check 3g: the m-tare arm must witness all four features ===")
+# The node stamps `mtare_` when `global_alloc_enable_ || reconnect_gate_info_`.
+# That is an OR, so the arm NAME proves at most one of P3 and P4 was live, and
+# check 3e — which compares the name against the stamp it was derived from — is
+# satisfied by a cell running half the treatment. Worse, cell_world_enable and
+# team_world_hz rename NOTHING, so a cell that ran no census or no exchange
+# keeps the mtare_hybrid name, the mtare_hybrid stamp, and every other check.
+#
+# Below: the four ways a treated cell can be less than treated, the one way a
+# control cell can be treated, and the pre-stack binary whose arm cannot be
+# certified in either direction. Each planted defect leaves every OTHER check
+# passing, which is what makes 3g the only thing standing between the campaign
+# and a contrast that is not the contrast it reports.
+
+
+def _mtare_campaign_patched(root, tag, treated=None, control=None):
+    """off vs mtare_hybrid with run_start params overridden per arm."""
+    def _patch(rows, overrides):
+        if overrides:
+            for row in rows:
+                if row["event"] == "run_start":
+                    row["params"].update(overrides)
+        return rows
+    ev = {r: _patch(base_events("mtare_hybrid", r), treated) for r in ROBOTS}
+    off = {r: _patch(base_events("off", r), control) for r in ROBOTS}
+    build(root, tag, ev, treated_arm="mtare_hybrid", off_events=off)
+
+
+def _g3(label, want_re, treated=None, control=None):
+    global fails
+    root = tempfile.mkdtemp(prefix="gatecal_")
+    try:
+        _mtare_campaign_patched(root, "cal", treated=treated, control=control)
+        rc, out = run_gate(root, "cal",
+                           env_extra={"GATE_ARMS": "mtare_hybrid,off"})
+        ok = rc == 1 and re.search(want_re, out)
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        if not ok:
+            fails += 1
+            print(f"        rc={rc}, wanted /{want_re}/")
+            print(out[-1200:])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# Each of the four, alone. Half a treatment is not a weaker treatment, it is a
+# different arm, and pooling it into mtare_hybrid does to that comparison what
+# grouping on reconnect_mode did to the control.
+_g3("an mtare_hybrid cell that ran no cell census: caught",
+    r"check 3g — arm=mtare_hybrid but cell_world_enable=False",
+    treated={"cell_world_enable": False})
+_g3("an mtare_hybrid cell whose exchange was switched off by rate: caught",
+    r"check 3g — arm=mtare_hybrid but team_world_hz>0=False",
+    treated={"team_world_hz": 0.0})
+_g3("an mtare_hybrid cell with the allocator off: caught",
+    r"check 3g — arm=mtare_hybrid but global_alloc_enable=False",
+    treated={"global_alloc_enable": False})
+# THE ONE THE ARM NAME CANNOT SEE. reconnect_gate=silence with the allocator on
+# still stamps `mtare_`, so this cell passes 3e and is P3-only — exactly the
+# half-treatment the OR admits.
+_g3("an mtare_hybrid cell with the knowledge gate off: caught by 3g alone",
+    r"check 3g — arm=mtare_hybrid but reconnect_gate=info=False",
+    treated={"reconnect_gate": "silence"})
+
+# The control direction, which is the one that decides the comparison: a
+# treated cell sitting in the control column cannot be compensated for by any
+# amount of care in the treated arm.
+_g3("an off cell that ran the allocator: caught",
+    r"check 3g — arm=off but global_alloc_enable=True",
+    control={"global_alloc_enable": True})
+
+# Absence is not a default. The node emits all four unconditionally, so a cell
+# missing them came from a binary predating the stack and its arm cannot be
+# certified either way -- the one honest verdict is a refusal, not a pass.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    def _strip(rows):
+        for row in rows:
+            if row["event"] == "run_start":
+                for k in ("cell_world_enable", "team_world_hz",
+                          "global_alloc_enable", "reconnect_gate"):
+                    row["params"].pop(k, None)
+        return rows
+    ev = {r: _strip(base_events("mtare_hybrid", r)) for r in ROBOTS}
+    build(root, "cal", ev, treated_arm="mtare_hybrid")
+    rc, out = run_gate(root, "cal", env_extra={"GATE_ARMS": "mtare_hybrid,off"})
+    ok = rc == 1 and re.search(
+        r"check 3g — run_start params carry no cell_world_enable, "
+        r"global_alloc_enable, reconnect_gate, team_world_hz", out)
+    print(f"  {'PASS' if ok else 'FAIL'}  a cell from a pre-M-TARE binary is "
+          f"refused, not certified")
+    if not ok:
+        fails += 1
+        print(out[-1200:])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# And the check must not be a blanket no. A hybrid-vs-off campaign has no
+# m-tare arm and must still score CLEAN -- with 3g's ON population reported as
+# legitimately empty rather than left UNRESOLVED, which is the distinction the
+# whole denominator block exists to draw.
+root = tempfile.mkdtemp(prefix="gatecal_")
+try:
+    ev = {r: base_events("hybrid", r) for r in ROBOTS}
+    build(root, "cal", ev)
+    rc, out = run_gate(root, "cal")
+    ok = (rc == 0 and "HARD FAILURES: none" in out
+          and re.search(r"m-tare features certified ON\s+0\s+<- no such arm",
+                        out)
+          and re.search(r"m-tare features certified OFF\s+[1-9]", out))
+    print(f"  {'PASS' if ok else 'FAIL'}  a hybrid-vs-off campaign still scores "
+          f"CLEAN, with 3g's ON population exempt not unresolved")
     if not ok:
         fails += 1
         print(out[-1500:])

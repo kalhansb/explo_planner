@@ -122,9 +122,22 @@ run_side() {
     || { echo "build failed, tail of $OUT/build_$side.log:" >&2
          tail -30 "$OUT/build_$side.log" >&2; exit 2; }
 
-  # No cell-world env vars, and none of the other treatment knobs: the whole
-  # point is the SHIPPED defaults. Unset rather than trust the caller's shell.
-  ( unset CELL_WORLD CELL_SIZE_M CELL_CENSUS_S COMMS LINK_GATE EXPLOIT
+  # None of the treatment knobs: the whole point is the SHIPPED defaults.
+  # Unset rather than trust the caller's shell.
+  #
+  # A LEAK HERE DOES NOT PRODUCE A SPURIOUS FAIL, IT PRODUCES A FALSE
+  # EQUIVALENT, which is why this list has to be kept in step with every phase
+  # rather than only mostly so. equiv_gate.py short-circuits on `if a == b:
+  # continue` and its gated-key branch fires only for keys NEW in the child, so
+  # a knob exported in the calling shell reaches BOTH sides identically and is
+  # never examined at all. An operator with `export RECONNECT_MODE=mtare_hybrid`
+  # live from scoring a campaign would run both sides with all four features on,
+  # every manifest key would compare equal, and the pair would print EQUIVALENT
+  # — certifying "no behaviour change at defaults" from a run in which no
+  # default was in effect on either side. The gate cannot catch it; only this
+  # line can.
+  ( unset CELL_WORLD CELL_SIZE_M CELL_CENSUS_S COMMS LINK_GATE EXPLOIT \
+          RECONNECT_MODE TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE
     export RVIZ=0 DURATION_S="$DURATION_S" OUTDIR="$OUT/$side/cell_001"
     "$HERE/run_explo_sim_rviz.sh"
   ) >"$OUT/run_$side.log" 2>&1 \

@@ -23,7 +23,7 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
         GATE_ARMS                   pre-registered arms, comma-separated
                                     (default "hybrid,off")
         GATE_CONTROL_ARMS           arms that run with the manoeuvre disabled
-                                    (default "off,mtare_off")
+                                    (default "off")
         GATE_SCHEMA_VERSION         event-log schema to require (default 4;
                                     pass 3 to re-gate a banked gen-9 campaign)
 Exit:   0  no hard failures, every population non-empty
@@ -180,17 +180,53 @@ EXPECT_CELLS_PER_ARM = int(os.environ.get("GATE_CELLS_PER_ARM", "30"))
 # inferred from the directories on disk: inferring it would make check 21
 # incapable of noticing the truncation it exists to catch, since a campaign that
 # only ever ran one arm would "expect" exactly that arm.
+# `.strip()`: these arrive as a shell string, and `GATE_ARMS="off, mtare_hybrid"`
+# would otherwise declare an arm named " mtare_hybrid" that no cell can ever
+# match — check 21 then reports the real arm as unexpected AND the phantom as
+# missing, and the campaign fails for a space.
 EXPECT_ARMS = tuple(
-    a for a in os.environ.get("GATE_ARMS", "hybrid,off").split(",") if a)
+    a for a in (s.strip()
+                for s in os.environ.get("GATE_ARMS", "hybrid,off").split(","))
+    if a)
 
 # The control arm, and the ONLY arm that runs with rendezvous_enabled=false.
 # Everything else — hybrid, pursuit, rendezvous, mtare_hybrid — reaches the
 # manoeuvre and must have it enabled. Check 3e used to spell this as
 # `arm == "hybrid"`, which asserted rendezvous_enabled=False for a pursuit or
 # rendezvous cell and would have hard-failed a correct run of either.
+#
+# The default is `off` ALONE. It briefly shipped as "off,mtare_off" on the
+# theory that a future allocator-on/reconnect-off control would want the same
+# exemption, and that was a pre-authorised hole: `mtare_off` is a name the node
+# can already stamp (its arm string is "mtare_" + "off" whenever the allocator
+# is on and rendezvous is not), so the day that token is added to the runner's
+# case list, a cell carrying a decision-changing treatment would arrive with
+# check 3f skipped and 3e satisfied — every assertion about its treatment
+# exempted in advance, by a default nobody had to type. An arm earns the
+# exemption by being declared at scoring time, not by being guessed at here.
 CONTROL_ARMS = frozenset(
-    a for a in os.environ.get("GATE_CONTROL_ARMS", "off,mtare_off").split(",")
+    a for a in (s.strip()
+                for s in os.environ.get("GATE_CONTROL_ARMS", "off").split(","))
     if a)
+
+# A control arm nobody is running is a control arm that exempts nothing, and it
+# is the exact shape a typo takes: GATE_CONTROL_ARMS=of leaves check 3f demanding
+# reconnect config from the `off` cells, which fails loudly, but
+# GATE_CONTROL_ARMS=off with GATE_ARMS naming no `off` arm fails silently — the
+# exemption sits there unused while the campaign has no control at all.
+_orphan_controls = CONTROL_ARMS - set(EXPECT_ARMS)
+if _orphan_controls:
+    sys.stderr.write(
+        f"FATAL: GATE_CONTROL_ARMS names {sorted(_orphan_controls)}, which "
+        f"is not in GATE_ARMS {list(EXPECT_ARMS)}. A control arm that is not "
+        f"an expected arm exempts nothing.\n")
+    sys.exit(2)
+if not (CONTROL_ARMS & set(EXPECT_ARMS)):
+    sys.stderr.write(
+        f"FATAL: none of the expected arms {list(EXPECT_ARMS)} is a control "
+        f"arm. Every arm would be scored as treated and the campaign has no "
+        f"baseline.\n")
+    sys.exit(2)
 
 LATCH_RE = re.compile(
     r"Exploration complete \[latch\]: ROI unknown fraction ([0-9.]+) <= ([0-9.]+)")
@@ -216,6 +252,7 @@ MIDRUN_KNOWN = (
     "attempt budget exhausted",
     "gave up after",
     "standing down",
+    "gate says stay",             # P4 §3.6 value gate suppressed the dispatch
 )
 
 # Check 18. Which way the inequality that fired points, keyed on the test name
@@ -333,10 +370,32 @@ if "FILL_ME" in EXPECT.values():
           "  key=value lines, or set GATE_EXPECT_<key> in the environment.")
     sys.exit(2)
 
-cells = sorted(
+# Anchored on a trailing _seed<N>, the way event_log.py and modes_compare.py
+# already spell it. `startswith(TAG + "_")` alone also swept up the
+# `<cell>.attempts/` directories run_campaign.sh creates beside a cell it is
+# redoing (it keeps the failed attempt's evidence rather than deleting it).
+# Those parse to a perfectly good arm name — "mtare_hybrid_seed7.attempts"
+# rsplits to "mtare_hybrid" — so every redone cell was counted TWICE in
+# check 21 and then hard-failed a second time for having no manifest and no
+# event log. A redo is not a defect and REDOs correlate with arm, so this
+# inflated one arm's count on exactly the campaigns that needed scoring most,
+# and the operator's only escapes were to raise GATE_CELLS_PER_ARM or delete
+# the evidence — each of which disables a check.
+#
+# Excluded by NAME, not by shape: dropping everything that fails to match
+# `_seed<N>$` would also drop a genuinely malformed cell directory, and a
+# malformed cell is something this gate must shout about, not skip. So
+# `.attempts` — the one sibling the harness is known to create — is removed
+# explicitly, and anything else that does not parse is still enumerated and
+# still hard-fails below on its missing manifest.
+CELL_RE = re.compile(r"^" + re.escape(TAG) + r"_.+_seed\d+$")
+_all_dirs = sorted(
     d for d in os.listdir(ROOT)
     if d.startswith(TAG + "_") and os.path.isdir(os.path.join(ROOT, d))
 )
+cells = [d for d in _all_dirs if not d.endswith(".attempts")]
+_attempts = [d for d in _all_dirs if d.endswith(".attempts")]
+_malformed = [d for d in cells if not CELL_RE.match(d)]
 if not cells:
     print(f"no cells for tag {TAG}")
     sys.exit(1)
@@ -357,6 +416,12 @@ n_disp_rows = n_runstart_rows = n_console_logs = 0
 # Counted in ROBOT-RUNS, like the other run_start populations, because that is
 # the loop it lives in.
 n_3f_runs = n_3f_live_checked = 0
+# Check 3g's two populations, counted separately and reported separately. An
+# off-vs-mtare_hybrid campaign must produce BOTH: a zero in the first means no
+# cell was ever certified as treated, a zero in the second means no cell was
+# ever certified as untreated, and either alone would let the check read as a
+# pass over the arm it never looked at.
+n_3g_treated = n_3g_control = 0
 _live_reported = {}
 
 for c in cells:
@@ -479,6 +544,76 @@ for c in cells:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — arm={arm} but rendezvous_enabled="
                     f"{pr.get('rendezvous_enabled')!r}")
+            # 3g. THE M-TARE ARM MUST WITNESS ALL FOUR FEATURES, NOT ONE.
+            #
+            # The node reconstitutes the arm itself and prefixes `mtare_` when
+            # `global_alloc_enable_ || reconnect_gate_info_` — an OR. So the
+            # name `mtare_hybrid` proves at least one of P3 and P4 was live and
+            # never both, and check 3e, which compares that name against the
+            # stamp it came from, is satisfied by a cell running half the
+            # treatment. The arm's definition is four features; nothing above
+            # asks about four.
+            #
+            # Two of them are worse than ambiguous, they are invisible.
+            # cell_world_enable and team_world_hz rename NOTHING, so a cell
+            # that ran no census or no exchange still carries an mtare_hybrid
+            # directory name, an mtare_hybrid stamp, and passes 3e — and the
+            # launcher guard that would have caught it cannot see an ambient
+            # export either. These params are what the node was actually
+            # handed, and they are the only record that says so.
+            #
+            # Checked in BOTH directions, and the control direction is the one
+            # that decides the comparison. An `off` cell that somehow ran the
+            # allocator is a treated cell sitting in the control column, and no
+            # amount of care in the treated arm compensates for that.
+            _mt_want = arm.startswith("mtare_")
+            _mt_raw = {k: pr.get(k) for k in
+                       ("cell_world_enable", "team_world_hz",
+                        "global_alloc_enable", "reconnect_gate")}
+            _mt_absent = sorted(k for k, v in _mt_raw.items() if v is None)
+            if _mt_absent:
+                # The node emits all four unconditionally, so absence is not a
+                # default — it is a cell written by a binary predating the
+                # stack, whose arm cannot be certified in either direction.
+                hard_fail.append(
+                    f"{c}/{r}: check 3g — run_start params carry no "
+                    f"{', '.join(_mt_absent)}. The node emits every one of "
+                    f"them unconditionally, so this cell came from a binary "
+                    f"predating the M-TARE stack and arm={arm} cannot be "
+                    f"certified either way")
+            else:
+                try:
+                    _hz_on = float(_mt_raw["team_world_hz"]) > 0.0
+                except (TypeError, ValueError):
+                    _hz_on = None
+                if _hz_on is None:
+                    hard_fail.append(
+                        f"{c}/{r}: check 3g — team_world_hz="
+                        f"{_mt_raw['team_world_hz']!r} is not a number, so "
+                        f"whether the exchange ran is unknown")
+                else:
+                    # team_world_hz IS the switch (0 = off), not merely a rate,
+                    # which is why it is compared against 0 and not recorded.
+                    _feat = {
+                        "cell_world_enable": bool(_mt_raw["cell_world_enable"]),
+                        "team_world_hz>0": _hz_on,
+                        "global_alloc_enable":
+                            bool(_mt_raw["global_alloc_enable"]),
+                        "reconnect_gate=info":
+                            _mt_raw["reconnect_gate"] == "info",
+                    }
+                    _wrong = [k for k, v in _feat.items() if v != _mt_want]
+                    if _wrong:
+                        hard_fail.append(
+                            f"{c}/{r}: check 3g — arm={arm} but "
+                            + ", ".join(f"{k}={_feat[k]}" for k in _wrong)
+                            + f"; every M-TARE feature must be "
+                            f"{'ON' if _mt_want else 'OFF'} for this arm")
+                    if _mt_want:
+                        n_3g_treated += 1
+                    else:
+                        n_3g_control += 1
+
             # 3f. THE TREATMENT MUST HAVE BEEN ABLE TO HAPPEN. This is the
             # check g8r1 needed and did not have. That campaign was launched,
             # ran to completion, and passed every gate here — while the mid-run
@@ -874,6 +1009,8 @@ for label, n, check in (
         ("run_start rows",              n_runstart_rows, "3b"),
         ("treated-arm run_start rows",  n_3f_runs,       "3f"),
         ("link-gate live witnesses",    n_3f_live_checked, "3f"),
+        ("m-tare features certified ON", n_3g_treated,   "3g"),
+        ("m-tare features certified OFF", n_3g_control,  "3g"),
         ("console logs present",        n_console_logs,   "9"),
         ("mid-run reconnect lines",     n_midrun,        "20")):
     mark = "" if n else "   <- EMPTY: check is UNRESOLVED, not passed"
@@ -886,6 +1023,20 @@ for label, n, check in (
                 "/GATE_LINK_GATE_LIVE")
         print(f"  check {check:>2}  {label:28} {n:6d}{mark}")
         continue
+    # 3g's two populations are exempt only when the PRE-REGISTRATION says the
+    # arm does not exist. A hybrid-vs-off campaign has no m-tare arm and must
+    # not be marked unresolved for the absence of one; an all-m-tare campaign
+    # has no untreated arm and likewise. What is never exempt is a campaign
+    # that declared both and produced only one — that is the check failing to
+    # look at half the design, and it must stay UNRESOLVED.
+    if not n and check == "3g":
+        _any_mtare = any(a.startswith("mtare_") for a in EXPECT_ARMS)
+        _all_mtare = all(a.startswith("mtare_") for a in EXPECT_ARMS)
+        _exempt = (not _any_mtare) if label.endswith("ON") else _all_mtare
+        if _exempt:
+            print(f"  check {check:>2}  {label:28} {n:6d}"
+                  f"   <- no such arm in GATE_ARMS {list(EXPECT_ARMS)}")
+            continue
     print(f"  check {check:>2}  {label:28} {n:6d}{mark}")
     if not n:
         unresolved.append(f"check {check}: {label} — zero rows, nothing was tested")
@@ -901,7 +1052,26 @@ else:
 # cells, so a campaign that died after three of them scored CLEAN and invited
 # analysis of a truncated, arm-unbalanced dataset. Seed-major ordering makes an
 # early abort systematically unbalanced, so "small" here also means "biased".
-print(f"\ncampaign shape: {dict(cells_by_arm)} "
+# Both lists are printed because both are overridable from the environment, and
+# an override is invisible in the output it changes: a reader seeing "campaign
+# shape: {...} CLEAN" cannot tell whether check 21 compared against the
+# pre-registered pair or against whatever GATE_ARMS happened to be exported in
+# that shell.
+# Reported, not silent: a redo is legitimate, but the number of them is a
+# property of the campaign an operator should see next to the cell counts —
+# REDOs correlate with arm, and an arm that needed five of them is not the
+# same evidence as one that needed none.
+if _attempts:
+    print(f"\nretained failed attempts (excluded from the cell count): "
+          f"{len(_attempts)} — {sorted(_attempts)}")
+if _malformed:
+    hard_fail.append(
+        f"check 21 — {len(_malformed)} director(y/ies) under {TAG}_ do not "
+        f"parse as <TAG>_<arm>_seed<N>: {sorted(_malformed)}")
+print(f"\narms expected: {list(EXPECT_ARMS)} "
+      f"(control: {sorted(CONTROL_ARMS)}, treated: "
+      f"{[a for a in EXPECT_ARMS if a not in CONTROL_ARMS]})")
+print(f"campaign shape: {dict(cells_by_arm)} "
       f"(pre-registered {EXPECT_CELLS_PER_ARM} per arm)")
 for a in EXPECT_ARMS:
     if cells_by_arm.get(a, 0) != EXPECT_CELLS_PER_ARM:

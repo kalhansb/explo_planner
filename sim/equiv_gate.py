@@ -157,6 +157,23 @@ GATED_MANIFEST_GROUPS = {
         # values may legitimately disagree here.
         "team_world_hz",
     }),
+    # P3 and P4. Both are gate keys with no dependents: the runner passes no
+    # other knob for either subsystem, deliberately, so that the arm under test
+    # is the mechanism rather than a tuning of it. If that ever changes, the
+    # new knobs belong in these sets and this gate will say so.
+    #
+    # These two were added to the manifest by the commit that added the
+    # mtare_hybrid arm and NOT added here, which took the phase gate offline:
+    # equiv_pair.sh checks out the parent, so the parent side writes neither
+    # key, both land in the "new in the child" bucket, and the pair returns NOT
+    # EQUIVALENT on two bookkeeping lines — while certifying a commit whose own
+    # closing claim is "no behaviour change at defaults". That is the exact
+    # failure this registry was created to remove, arriving one commit later
+    # through the registry itself. The lesson is the one already written above:
+    # a hand-maintained registry is only as good as the habit of editing it in
+    # the same commit that adds the key.
+    "global_alloc": ("0", set()),
+    "reconnect_gate": ("silence", set()),
 }
 
 

@@ -256,6 +256,150 @@ else
 fi
 
 echo
+echo "=== the launcher's own validation blocks (the M-TARE knobs) ==="
+# run_explo_sim_rviz.sh has no --dry-run: invoking it launches gazebo for real.
+# Probing it that way once burned two minutes and left processes on the box --
+# the same failure the census section above exists to stop. Every guard tested
+# here lives in the launcher's PRELUDE: the defaults, the validation and the
+# refusals, ending at the arm-stamp check. That region runs no ROS, spawns
+# nothing and writes nothing, so it is cut out of the SHIPPED file by line range
+# and run on its own. It is the real text, not a transcription of it: edit a
+# guard and these cases move with it.
+#
+# THE CUT MUST BE WRITTEN INTO sim/, not a tmpdir. The launcher computes HERE
+# from BASH_SOURCE[0] and the workspace root three levels above it, so a copy
+# anywhere else dies at the scenario-installed check for a reason that has
+# nothing to do with the guard under test. Every BLOCK case would still see a
+# non-zero exit, and this whole section would pass while testing nothing.
+PRELUDE_ANCHOR='^unset _mtare_stamped _mtare_named$'
+PRELUDE_END=$(grep -n "$PRELUDE_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
+PROBE="$(dirname "$LAUNCHER")/.prelude_probe.$$.sh"
+trap 'rm -rf "$TMP"; rm -f "$PROBE"' EXIT
+
+cases=$((cases+1))
+if [ -n "$PRELUDE_END" ]; then
+  echo "  PASS  the prelude anchor is present (launcher line $PRELUDE_END)"
+else
+  echo "  FAIL  '$PRELUDE_ANCHOR' is not in the launcher -- the arm-stamp guard"
+  echo "        was renamed or removed, and every case below would be vacuous"
+  fails=$((fails+1))
+fi
+
+if [ -n "$PRELUDE_END" ]; then
+  sed -n "1,${PRELUDE_END}p" "$LAUNCHER" > "$PROBE"
+  # The sentinel is only reachable at the END of the cut, and it carries the
+  # knobs as the launcher resolved them. That is what makes an ALLOW case say
+  # something: absence of our FATAL text is also true of a prelude that died at
+  # the scenario check, and would certify a launcher that refuses everything.
+  printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rm=$RECONNECT_MODE"' >> "$PROBE"
+
+  # And the cut has to CONTAIN the guards. A range that stopped short would
+  # fail every BLOCK case for the wrong reason and pass every ALLOW one.
+  for _need in "FATAL: CELL_WORLD" "FATAL: TEAM_WORLD=" "FATAL: TEAM_WORLD_HZ" \
+               "the arm name and the arm"; do
+    cases=$((cases+1))
+    if grep -qF "$_need" "$PROBE"; then
+      echo "  PASS  the cut carries the guard: $_need"
+    else
+      echo "  FAIL  the cut does NOT carry: $_need -- the line range is wrong"
+      fails=$((fails+1))
+    fi
+  done
+
+  # env -i: the point of several of these guards is that an AMBIENT export must
+  # not reach a cell, so the probe must not inherit one either.
+  lg() {
+    local want="$1" expect="$2" label="$3"; shift 3
+    local out rc
+    cases=$((cases+1))
+    out=$(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-nobody}" \
+              SCENARIO=flatforest_dense_2robot_lidar.yaml "$@" \
+              timeout 30 bash -c \
+              "source /opt/ros/humble/setup.bash >/dev/null 2>&1; bash '$PROBE'" 2>&1)
+    rc=$?
+    local ok=0
+    if [ "$want" = BLOCK ]; then
+      [ "$rc" != 0 ] && printf '%s' "$out" | grep -qF "$expect" && ok=1
+    else
+      [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF "$expect" && ok=1
+    fi
+    if [ "$ok" = 1 ]; then
+      echo "  PASS  $label"
+    else
+      echo "  FAIL  $label"
+      echo "          rc=$rc, wanted $want with '$expect'"
+      printf '%s\n' "$out" | tail -3 | sed 's/^/          | /'
+      fails=$((fails+1))
+    fi
+  }
+
+  # The two controls that give every refusal below its meaning. If the first
+  # ever fails, the launcher is refusing off-arm cells; if the second fails,
+  # the mtare_hybrid arm does not exist and the campaign has no treatment.
+  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rm=hybrid' \
+     "shipped defaults resolve with every M-TARE knob off"
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rm=mtare_hybrid' \
+     "RECONNECT_MODE=mtare_hybrid expands to all four features" \
+     RECONNECT_MODE=mtare_hybrid
+
+  # A typo in a 0/1 knob reads as OFF, and an off treatment knob is invisible:
+  # the run completes, the manifest records the value it was handed, and the
+  # cell is analysed as treated. Only the launcher can catch this.
+  lg BLOCK "FATAL: CELL_WORLD='true'" \
+     "CELL_WORLD=true is refused, not silently read as off" \
+     CELL_WORLD=true
+  lg BLOCK "FATAL: TEAM_WORLD='yes'" \
+     "TEAM_WORLD=yes is refused, not silently read as off" \
+     CELL_WORLD=1 TEAM_WORLD=yes
+
+  # TEAM_WORLD_HZ is the exchange's on/off switch as well as its rate: the node
+  # builds no publisher and no timer at <=0, so these three would each have
+  # recorded team_world=1 on a cell that exchanged nothing.
+  lg BLOCK "FATAL: TEAM_WORLD_HZ='0.0'" \
+     "TEAM_WORLD_HZ=0 is refused (it disables the exchange it records)" \
+     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=0
+  lg BLOCK "FATAL: TEAM_WORLD_HZ='-1.0'" \
+     "a negative TEAM_WORLD_HZ is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=-1
+  lg BLOCK "FATAL: TEAM_WORLD_HZ='<empty: rejected by flt>'" \
+     "flt's empty return for nan is refused, not passed to ros2 as a bare -p" \
+     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=nan
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rm=hybrid' \
+     "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
+     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2
+
+  # The node reconstitutes the arm itself, prefixing `mtare_` when
+  # global_alloc_enable_ || reconnect_gate_info_. Every directory, index row and
+  # analysis keys off the NAME; only run_start carries the stamp. Setting a knob
+  # by hand under the plain name puts a treated cell in the control column.
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "GLOBAL_ALLOC=1 under the plain hybrid name is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "RECONNECT_GATE=info under the plain hybrid name is refused" \
+     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_GATE=info RECONNECT_MODE=hybrid
+fi
+
+# The ambient-export strip on the launch line. This is the one leak the
+# arm-stamp guard above CANNOT see: CELL_WORLD and TEAM_WORLD rename nothing, so
+# `export CELL_WORLD=1 TEAM_WORLD=1` in the launching shell would run the census
+# and the exchange in every cell of a plain hybrid-vs-off campaign, stamp the
+# same arm on both sides, and score CLEAN. Read the -u list back out rather than
+# trusting that it was kept in step with the knobs the launcher grew.
+for _u in LINK_GATE MIDRUN_SILENCE CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ \
+          GLOBAL_ALLOC RECONNECT_GATE; do
+  cases=$((cases+1))
+  if sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS" \
+     | grep -qE -- "-u $_u( |\\\\|$)"; then
+    echo "  PASS  the launch line strips ambient $_u"
+  else
+    echo "  FAIL  ambient $_u reaches every cell -- it is not in the -u list"
+    fails=$((fails+1))
+  fi
+done
+unset _u
+
+echo
 [ "$fails" = 0 ] && echo "ALL PASS ($cases known-answer cases)" \
                  || echo "$fails FAILURE(S) of $cases known-answer cases"
 exit $((fails > 0))

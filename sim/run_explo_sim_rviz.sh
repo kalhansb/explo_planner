@@ -468,6 +468,15 @@ COMMS="${COMMS:-0}"
 # voxel grid per census tick and one JSONL row; what it buys is the P1 gate,
 # which reads `covered_fraction` against `roi_unknown_fraction` on those rows.
 CELL_WORLD="${CELL_WORLD:-0}"
+# Validated like COMMS and RECONNECT_MODE. An unvalidated flag is worse here
+# than elsewhere: every downstream test is `= "1"`, so CELL_WORLD=true or
+# CELL_WORLD=yes reads as OFF, the run completes, and the manifest records the
+# typo rather than the intent. The only way that surfaces is as a missing arm
+# in the gate's check 21, a whole campaign later.
+case "$CELL_WORLD" in
+  0|1) ;;
+  *) echo "FATAL: CELL_WORLD='$CELL_WORLD' is not 0 or 1." >&2; exit 2 ;;
+esac
 CELL_SIZE_M="$(flt "${CELL_SIZE_M:-10.0}")"
 CELL_CENSUS_S="$(flt "${CELL_CENSUS_S:-5.0}")"
 # The cell status thresholds, overridden here for the same reason DONE_UNKNOWN
@@ -519,10 +528,46 @@ CELL_FRONTIER_FRAC="$(flt "${CELL_FRONTIER_FRAC:-0.95}")"
 # staying converged. That is the right control for the merge itself, and it is
 # NOT the P2 gate — the gate needs a dropout to heal, which needs COMMS=1.
 TEAM_WORLD="${TEAM_WORLD:-0}"
+# Validated for the reason given in the CELL_WORLD block: a typo here reads as
+# OFF and is only ever visible after the fact.
+case "$TEAM_WORLD" in
+  0|1) ;;
+  *) echo "FATAL: TEAM_WORLD='$TEAM_WORLD' is not 0 or 1." >&2; exit 2 ;;
+esac
 # 1 Hz: the rate the message was sized for (a few kB of full state per publish
 # at <=400 cells), and comfortably inside the default 5 s comms TTL so a single
 # dropped message is not read as a dropout.
 TEAM_WORLD_HZ="$(flt "${TEAM_WORLD_HZ:-1.0}")"
+# TEAM_WORLD_HZ IS THE SWITCH, NOT JUST A RATE. The node builds the publisher
+# and the timer under `if (team_world_hz_ > 0.0)`, so TEAM_WORLD=1 with
+# TEAM_WORLD_HZ=0 is not a slow exchange, it is NO exchange — inside a run
+# whose manifest records `team_world=1`. Nothing downstream can tell that cell
+# from a correctly configured one: team_convergence.py just finds zero
+# `team_exchange` events, and run_campaign.sh's resume guard compares
+# `team_world=1` on both sides and certifies them alike. A negative value does
+# the same. The pairing is a contradiction, so refuse it here.
+#
+# Three spellings have to fail, not one. flt emits NOTHING for a non-finite
+# value (it prints its own FATAL to stderr and returns empty, because `exit`
+# inside $(...) kills only the subshell), so the empty string is a real input
+# here and would otherwise reach ros2 as a bare `-p team_world_hz:=` and land
+# in the manifest as ''. Exponent notation is rejected too: flt passes `1e-3`
+# through untouched, and a rate nobody writes that way is not worth the
+# ambiguity of parsing it.
+_hz_ok=1
+case "$TEAM_WORLD_HZ" in
+  ''|*[!0-9.]*|*.*.*) _hz_ok=0 ;;
+esac
+[ "$_hz_ok" = 1 ] && { awk -v h="$TEAM_WORLD_HZ" 'BEGIN{exit !(h+0 > 0)}' || _hz_ok=0; }
+if [ "$_hz_ok" != 1 ]; then
+  echo "FATAL: TEAM_WORLD_HZ='${TEAM_WORLD_HZ:-<empty: rejected by flt>}' is not a" >&2
+  echo "       positive decimal number. It is the exchange's on/off switch as" >&2
+  echo "       well as its rate: at <=0 the node builds no publisher and no" >&2
+  echo "       timer, and the run would record team_world=1 having exchanged" >&2
+  echo "       nothing. Use 1.0 unless you mean something else by it." >&2
+  exit 2
+fi
+unset _hz_ok
 if [ "$TEAM_WORLD" = "1" ] && [ "$CELL_WORLD" != "1" ]; then
   echo "TEAM_WORLD=1 requires CELL_WORLD=1 (the TeamWorld message is the cell" >&2
   echo "census, so there would be nothing to send). Set CELL_WORLD=1." >&2
@@ -593,6 +638,45 @@ if [ "$RECONNECT_GATE" = "info" ] && [ "$RECONNECT_MODE" = "off" ]; then
   echo "       carrying the P4 treatment and would not carry it." >&2
   exit 2
 fi
+# THE ARM NAME AND THE ARM STAMP MUST AGREE, IN BOTH DIRECTIONS.
+#
+# The node names the arm itself, and its rule is an OR:
+#   arm = (global_alloc_enable || reconnect_gate==info ? "mtare_" : "") +
+#         (rendezvous_enabled ? reconnect_mode : "off")
+# Everything downstream — the cell directory, campaign_index.csv, every
+# analysis script — takes the arm from RECONNECT_MODE instead. So any
+# configuration where those two disagree produces a cell whose directory says
+# one arm and whose run_start says another.
+#
+# The mtare_hybrid token guards one direction (it refuses a flag turned back
+# off). This is the other: flags turned ON under a plain token. It was
+# reachable through `--env "GLOBAL_ALLOC=1"` and through a direct invocation,
+# and the cost of not catching it here is a full cell budget (~79 s + 1.149x
+# t_sim) burned before gate_g8's check 3e reports the mismatch — or, if nobody
+# scores that root, a silently mislabelled arm that analyze_runs.py pools with
+# the untreated cells.
+#
+# Written as the node's own predicate rather than a list of bad pairs, so a
+# fifth knob that sets the prefix cannot slip past it.
+_mtare_stamped=0
+if [ "$GLOBAL_ALLOC" = "1" ] || [ "$RECONNECT_GATE" = "info" ]; then
+  _mtare_stamped=1
+fi
+_mtare_named=0
+case "$RECONNECT_MODE" in mtare_*) _mtare_named=1 ;; esac
+if [ "$_mtare_stamped" != "$_mtare_named" ]; then
+  echo "FATAL: the arm name and the arm the node will stamp disagree." >&2
+  echo "       RECONNECT_MODE=$RECONNECT_MODE names a$([ "$_mtare_named" = 1 ] \
+       && echo "n mtare" || echo " non-mtare") arm, but" >&2
+  echo "       GLOBAL_ALLOC=$GLOBAL_ALLOC RECONNECT_GATE=$RECONNECT_GATE means" >&2
+  echo "       the node will stamp $([ "$_mtare_stamped" = 1 ] \
+       && echo "arm=mtare_*" || echo "a plain arm")." >&2
+  echo "       Every directory, index and analysis keys off the name; only" >&2
+  echo "       run_start carries the stamp. Use RECONNECT_MODE=mtare_hybrid to" >&2
+  echo "       request the treatment, and do not set these knobs by hand." >&2
+  exit 2
+fi
+unset _mtare_stamped _mtare_named
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.

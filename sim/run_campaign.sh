@@ -177,6 +177,19 @@ env_has() {
   return 1
 }
 
+# The value --env carries for a key, or $2 if it does not carry one. Used to
+# predict what a cell's manifest WILL say, so the resume guard can compare a
+# banked cell against this campaign's configuration rather than assuming they
+# agree. Mirrors run_explo_sim_rviz.sh's own defaults, and the mtare_hybrid arm
+# token overrides the answer per cell below -- so this is the un-treated
+# baseline, not the final word.
+env_val() {
+  for _tok in $EXTRA_ENV; do
+    case "$_tok" in "$1"=*) printf '%s' "${_tok#*=}"; return 0;; esac
+  done
+  printf '%s' "$2"
+}
+
 case "$COMMS_ON" in
   0|1) ;;
   *) echo "FATAL: --comms must be 0 or 1 (got '$COMMS_ON'). Anything else is" >&2
@@ -203,7 +216,25 @@ fi
 # value for all cells turns 30 replicates into 30 repeats of one map, and the
 # sim is nondeterministic run-to-run ([[sim-run-to-run-nondeterminism]]), so the
 # spread would look like real between-cell variation.
-for _blocked in RECONNECT_MODE SEED; do
+#
+# GLOBAL_ALLOC and RECONNECT_GATE join them because they are arm-DEFINING: the
+# node's `arm` string is "mtare_" + the mode whenever either is live, so an
+# --env passenger turning one on renames every cell's arm from inside the
+# binary while the directory, the index and the manifest's
+# reconnect_mode_requested all still say hybrid and off. analyze_runs.py,
+# manoeuvre_events.py and progress_signature.py all key the arm off the
+# manifest, so a fully-treated P3 campaign would be summarised and
+# permutation-tested as plain hybrid-vs-off — and it would not even be an A/B,
+# since --env applies to the control arm too.
+#
+# The arm token in run_explo_sim_rviz.sh refuses the contradiction in one
+# direction only (mtare_hybrid with the allocator off). This is the other
+# direction, and it belongs here because --env is this script's channel.
+#
+# CELL_WORLD and TEAM_WORLD deliberately stay ALLOWED: P1 and P2 change no
+# decision and do not rename the arm, so they are legitimately campaign-wide
+# settings rather than treatments.
+for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -343,17 +374,32 @@ if [ "$_treated" = "1" ] && [ "$_veto_live" = "0" ] && [ "$_sil_ok" = "0" ]; the
 fi
 unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 
-# The guard above scans only $EXTRA_ENV, and the launch line strips these two
-# from the inherited environment so that assumption holds. Say so when the
-# caller has one exported, rather than ignoring it in silence: whoever typed
+# Every guard here scans only $EXTRA_ENV, and the launch line strips these from
+# the inherited environment so that assumption holds. Say so when the caller has
+# one exported, rather than ignoring it in silence: whoever typed
 # `export LINK_GATE=0` meant something by it, and the useful answer is which
 # channel actually reaches the cells.
-for _amb in LINK_GATE MIDRUN_SILENCE; do
+#
+# The M-TARE knobs are here for a sharper reason than tidiness, and it is the
+# one failure the arm-stamp guard cannot see. The node prefixes the arm with
+# `mtare_` on `global_alloc_enable_ || reconnect_gate_info_` -- so an ambient
+# GLOBAL_ALLOC or RECONNECT_GATE at least renames the arm and trips check 3e.
+# CELL_WORLD and TEAM_WORLD rename NOTHING. `export CELL_WORLD=1 TEAM_WORLD=1`
+# left over from a P2 debugging session would run the census and the 1 Hz
+# exchange in every cell of a plain hybrid-vs-off campaign, stamp the same arm
+# on both sides, pass 3e, pass check 21, and score CLEAN -- delivering sixty
+# cells of a P2-treated binary to a permutation test that believes it is
+# comparing the shipped default. Stripping them makes the guards' model true by
+# construction. --env is expanded after these flags and env applies assignments
+# after unsets, so `--env CELL_WORLD=1` still works and is still the one channel
+# the guards read.
+for _amb in LINK_GATE MIDRUN_SILENCE \
+            CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE; do
   if [ -n "${!_amb+x}" ]; then
     echo "NOTE: $_amb=${!_amb} is exported in this shell and will be IGNORED --" >&2
-    echo "      the per-cell launch strips it so the link-veto guard cannot be" >&2
+    echo "      the per-cell launch strips it so the campaign's guards cannot be" >&2
     echo "      bypassed by the ambient environment. Pass --env $_amb=... if you" >&2
-    echo "      meant it; the guard reads that." >&2
+    echo "      meant it; the guards read that." >&2
   fi
 done
 unset _amb
@@ -402,6 +448,22 @@ for cell in "${CELL_LIST[@]}"; do
     *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
   esac
 
+  # What this cell's manifest WILL say for the four M-TARE knobs, so the resume
+  # guard below can compare rather than assume. Per cell and not per campaign,
+  # because the arm token is what sets them: mtare_hybrid expands to all four
+  # inside run_explo_sim_rviz.sh, every other arm takes the --env value or the
+  # runner's default. Kept in step with that expansion by hand -- if the two
+  # ever disagree, the resume guard aborts a correct resume, which is the safe
+  # direction to be wrong in.
+  CELL_WORLD_REQ=$(env_val CELL_WORLD 0)
+  TEAM_WORLD_REQ=$(env_val TEAM_WORLD 0)
+  GLOBAL_ALLOC_REQ=$(env_val GLOBAL_ALLOC 0)
+  RECONNECT_GATE_REQ=$(env_val RECONNECT_GATE silence)
+  if [ "$cell_mode" = "mtare_hybrid" ]; then
+    CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+    GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info
+  fi
+
   # "Complete" means reached an end reason AND passed its run-time gates. A run
   # that dropped relay traffic reaches all_done exactly like a good one, so
   # resuming on run_end_reason alone would skip every invalid cell forever and
@@ -423,11 +485,28 @@ for cell in "${CELL_LIST[@]}"; do
     # An absent key counts as a mismatch (`<absent>`): a manifest predating the
     # key cannot be shown to agree, and "cannot be shown to agree" is exactly
     # what this guard is for.
+    #
+    # The four M-TARE knobs are here for the same reason, and one of them is
+    # the only member of this list whose absence is COMPLETELY silent. Resume a
+    # half-finished campaign with `--env "CELL_WORLD=1 TEAM_WORLD=1"` added and
+    # the banked cells satisfy every other key, so seeds 1-15 carry no cell
+    # world and seeds 16-30 carry one, under a single arm name. P1 and P2
+    # deliberately do not rename the arm — their claim is that they change no
+    # decision — so nothing downstream can tell: not check 3e, which compares a
+    # stamp that is identical either way, not check 21, not any analysis
+    # script. The manifest records it per cell and, until this loop, nothing
+    # ever compared it. global_alloc and reconnect_gate would at least be
+    # caught by 3e, half the cells having stamped a different arm; that is a
+    # louder failure, not a different one.
     for kv in \
       "mission_return_enabled=$want_mr" \
       "scenario=$SCENARIO" \
       "duration_s=$DURATION" \
-      "done_criterion=$DONE_CRITERION"
+      "done_criterion=$DONE_CRITERION" \
+      "cell_world=$CELL_WORLD_REQ" \
+      "team_world=$TEAM_WORLD_REQ" \
+      "global_alloc=$GLOBAL_ALLOC_REQ" \
+      "reconnect_gate=$RECONNECT_GATE_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -492,11 +571,11 @@ for cell in "${CELL_LIST[@]}"; do
   cell_expect="$EXPECT_OUT"
   [ "$COMMS_ON" = "0" ] && cell_expect=0
 
-  # -u LINK_GATE -u MIDRUN_SILENCE, and this is a correctness fix, not tidiness.
+  # The -u list, and this is a correctness fix, not tidiness.
   #
-  # `env` without -i inherits the caller's environment, and these two are the
-  # ONLY settings the link-veto guard reasons about that are not also assigned
-  # explicitly on this line. run_explo_sim_rviz.sh reads them as
+  # `env` without -i inherits the caller's environment, and these are the ONLY
+  # settings the guards above reason about that are not also assigned explicitly
+  # on this line. run_explo_sim_rviz.sh reads them as
   # "${LINK_GATE:-1}" and "${MIDRUN_SILENCE:-90}", so an exported value from the
   # launching shell -- a leftover debugging export, a line in a wrapper -- beat
   # the launcher default while the guard, which scans only $EXTRA_ENV, computed
@@ -510,6 +589,8 @@ for cell in "${CELL_LIST[@]}"; do
   # applies assignments after unsets, so `--env LINK_GATE=0` still works and is
   # still the channel the guard reads.
   env -u LINK_GATE -u MIDRUN_SILENCE \
+      -u CELL_WORLD -u TEAM_WORLD -u TEAM_WORLD_HZ \
+      -u GLOBAL_ALLOC -u RECONNECT_GATE \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
