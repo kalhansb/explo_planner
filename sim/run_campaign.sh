@@ -183,11 +183,19 @@ env_has() {
 # agree. Mirrors run_explo_sim_rviz.sh's own defaults, and the mtare_hybrid arm
 # token overrides the answer per cell below -- so this is the un-treated
 # baseline, not the final word.
+# The default is optional, and omitting it is a real call shape, not a mistake:
+# the LINK_GATE and MIDRUN_SILENCE readers below want "the value the operator
+# set, or nothing", because each decides for itself what absence means (one
+# re-derives the launcher's default a few lines down, the other only reads the
+# result inside an `env_has` branch). Under `set -u` a bare "$2" made those two
+# calls print `$2: unbound variable` on stderr on every campaign launch while
+# still returning the empty string the caller wanted — noise that reads like a
+# broken guard and would bury a real one.
 env_val() {
   for _tok in $EXTRA_ENV; do
     case "$_tok" in "$1"=*) printf '%s' "${_tok#*=}"; return 0;; esac
   done
-  printf '%s' "$2"
+  printf '%s' "${2-}"
 }
 
 case "$COMMS_ON" in

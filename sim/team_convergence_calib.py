@@ -56,8 +56,16 @@ def exchange(t, drop=""):
             "covered_fraction": 0.22}
 
 
-def build(root, series_a, series_b, exch_a=None, exch_b=None, outages=None):
-    """One cell directory. `series_*` are lists of census dicts."""
+def build(root, series_a, series_b, exch_a=None, exch_b=None, outages=None,
+          link_period=10.0):
+    """One cell directory. `series_*` are lists of census dicts.
+
+    `link_period` is the spacing of the link_states.csv rows. It defaults to
+    10 s, coarser than the 20 s census spacing, so every outage a case
+    declares contains at least one census sample. Drop it to write an outage
+    SHORTER than one census period — the flicker case, which is the whole
+    reason the reader has an empty-observation branch.
+    """
     os.makedirs(root, exist_ok=True)
     for name, series, exch in ((ROBOTS[0], series_a,
                                 exch_a if exch_a is not None else
@@ -75,11 +83,13 @@ def build(root, series_a, series_b, exch_a=None, exch_b=None, outages=None):
         with open(os.path.join(root, "link_states.csv"), "w") as f:
             f.write("t_sim,i,j,distance_m,trees_on_link,path_loss_db,snr_db,"
                     "ber,bandwidth_mbps,connected\n")
-            # One sample every 10 s from 0 to 300, connected unless inside an
-            # outage interval. The emulator writes at link_rate_hz; the period
-            # does not matter to the reader, only the up/down transitions do.
-            for k in range(0, 31):
-                t = k * 10.0
+            # One sample every `link_period` from 0 to 300, connected unless
+            # inside an outage interval. The emulator writes at link_rate_hz;
+            # the period does not matter to the reader, only the up/down
+            # transitions do — but it bounds the NARROWEST outage a case can
+            # express, and a sub-census-period outage is a distinct case.
+            for k in range(0, int(300.0 / link_period) + 1):
+                t = k * link_period
                 up = 0 if any(a <= t < b for a, b in outages) else 1
                 f.write(f"{t:.3f},0,1,12,3,70,20,0,54,{up}\n")
 
@@ -251,6 +261,26 @@ case("a heal with no room left to observe is censored, not failed", 0,
 case("a run whose every outage is censored does not pass", 1,
      r"none could be scored",
      series_a=a, series_b=b, outages=[(290.0, 295.0)])
+
+# An outage shorter than one census period observes NOTHING: no paired sample
+# falls inside it. The scoring loop used to fall through such an outage to
+# `healed`, which picks the first agreeing sample after the end — for a pair
+# that had not diverged in that window, the very next tick — and recorded a
+# "converged 1 s after the link recovered" that no merge produced. Census
+# samples here are 20 s apart, so the flicker at [245, 247) contains none.
+# link_period=1.0 because the default 10 s link grid cannot express it.
+print("\n=== an outage too short to observe anything ===")
+a, b = healthy()
+case("a flicker with no census sample inside it is not scored as a heal", 0,
+     r"contains no paired census sample",
+     series_a=a, series_b=b, link_period=1.0,
+     outages=[(100.0, 180.0), (245.0, 247.0)])
+# And the direction that proves the skip is a skip and not an excuse: with the
+# flicker as the ONLY outage there is nothing left to score, and the run must
+# fail rather than inherit a pass from the outage it declined to judge.
+case("a run whose only outage observed nothing does not pass", 1,
+     r"none could be scored",
+     series_a=a, series_b=b, link_period=1.0, outages=[(245.0, 247.0)])
 
 print()
 if fails:

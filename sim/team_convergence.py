@@ -376,7 +376,32 @@ def main():
                          f"last census sample — no post-heal sample, not "
                          f"scored")
             continue
-        if during and all(during):
+        # `not during` is the empty-population case and it must skip, not
+        # score. Was `if during and all(during)`, which meant an outage
+        # containing NO census sample fell through to be scored: `healed` then
+        # picked the first agreeing sample after `end`, which for a pair that
+        # never diverged is the very next tick, and the outage was recorded as
+        # "converged 0.9 s after the link recovered" — a heal no merge could
+        # have produced, out of a window in which nothing was observed at all.
+        #
+        # Not hypothetical, and not rare. cell_census_period_s defaults to 5.0
+        # and read_outages applies no debounce, so every sub-5-second flicker
+        # produces an outage with n_during == 0. In the p2 smoke pair that was
+        # 1 of the treatment's 2 scored heals and 3 of the control's 7 — both
+        # of the numbers that comparison rests on were substantially this bug
+        # rather than a measurement.
+        #
+        # This is the same empty-reads-as-PASS failure the module docstring
+        # claims to have eliminated; the earlier fix closed only the
+        # zero-OUTAGES case and left the zero-observations case open one level
+        # down. See [[checks-that-stopped-checking]].
+        if not during:
+            notes.append(f"outage [{start:.0f}, {end:.0f}] contains no paired "
+                         f"census sample ({end - start:.1f} s, shorter than "
+                         f"one census period) — nothing was observed, so "
+                         f"there is nothing to score either way")
+            continue
+        if all(during):
             notes.append(f"outage [{start:.0f}, {end:.0f}] passed with the "
                          f"worlds already in agreement — nothing diverged, "
                          f"not scored")
@@ -416,9 +441,11 @@ def main():
     # and that conjunct is exactly what let a zero-outage run reach the PASS.
     if scored == 0 and not fails:
         fails.append(f"{len(outages)} outage(s) happened but none could be "
-                     f"scored — every one either ran to the end of the run or "
-                     f"passed without the worlds diverging, so nothing here "
-                     f"measures a heal")
+                     f"scored — every one was censored (still down at "
+                     f"teardown, healed past the last sample, or too little "
+                     f"undisturbed link after the heal), observed nothing "
+                     f"(shorter than one census period), or passed without "
+                     f"the worlds diverging, so nothing here measures a heal")
 
     # --- the census at the end, for context, never for the verdict ----------
     last = agree[-1]

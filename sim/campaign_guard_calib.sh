@@ -380,6 +380,27 @@ if [ -n "$PRELUDE_END" ]; then
      CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_GATE=info RECONNECT_MODE=hybrid
 fi
 
+# A clean launch must be SILENT on stderr. `env_val` took its default from a
+# bare "$2" while two callers legitimately omit it, so under `set -u` every
+# campaign launch opened with two `line 190: $2: unbound variable` lines. They
+# were harmless -- the value returned was the empty string the callers wanted
+# -- and that is the problem: an operator who learns the launcher always prints
+# two errors has learned to skim past the third one that means something. This
+# asserts the absence, not a message, because the next such regression will
+# have a different line number and a different variable.
+cases=$((cases+1))
+_stderr=$(timeout 20 "$CS" --root "$TMP" --duration 3000 \
+            --scenario flatforest_dense_2robot_lidar.yaml --dry-run \
+            --arms hybrid,off --seeds 1 2>&1 >/dev/null)
+if [ -z "$_stderr" ]; then
+  echo "  PASS  a clean --dry-run writes nothing to stderr"
+else
+  echo "  FAIL  a clean --dry-run wrote to stderr:"
+  echo "$_stderr" | sed 's/^/          /'
+  fails=$((fails+1))
+fi
+unset _stderr
+
 # The ambient-export strip on the launch line. This is the one leak the
 # arm-stamp guard above CANNOT see: CELL_WORLD and TEAM_WORLD rename nothing, so
 # `export CELL_WORLD=1 TEAM_WORLD=1` in the launching shell would run the census
