@@ -6944,6 +6944,20 @@ void ExploPlannerNode::refreshRendezvousSnapshot() {
   rendezvous_world_    = cell_world_;
   rendezvous_vehicles_ = allocVehicles(latest_pos_.x(), latest_pos_.y(),
                                        nullptr);
+  // `finished` is FORCED OFF for everyone in the snapshot, and that is a
+  // correctness fix rather than a simplification. allocVehicles writes
+  // `finished = false` for self ("we are planning, so we are not done") and
+  // `finished = p.finished` for peers, which is right for the live solve and
+  // fatal here: the scheduler DROPS finished vehicles, so a robot that
+  // saturated coverage while still in contact is present in its own snapshot
+  // and absent from its partner's. The two then solve a two-vehicle and a
+  // one-vehicle allocation over the same world, get different tours, different
+  // makespans and a different argmin — different meeting cells, no meeting.
+  // Forcing the flag off on both sides is the only value both robots can agree
+  // on without exchanging it, and it costs nothing: an appointment is a place
+  // to stand, not a work assignment, so including a robot that has stopped
+  // exploring is exactly what we want.
+  for (AllocRobot& v : rendezvous_vehicles_) v.finished = false;
   have_rendezvous_snapshot_   = true;
   rendezvous_snapshot_at_sec_ = missionElapsed();
 }
@@ -6955,6 +6969,45 @@ bool ExploPlannerNode::armAppointment(const char* reason) {
   // is not choosing not to meet, the mechanism is not part of that arm at all,
   // and a stream of "refused: wrong mode" lines would make it look like one.
   if (reconnect_mode_ == ReconnectMode::PURSUIT) return false;
+
+  // An appointment already stands. KEEP IT — do not re-derive one.
+  //
+  // The mid-run trigger has always been gated on !appointment_armed_ for this
+  // reason, but the three finishOrRendezvous paths call dispatchReconnect
+  // unconditionally, and dispatchReconnect calls this. Both outcomes of
+  // re-entering were wrong:
+  //
+  //   * a SUCCESSFUL re-arm re-solved the same frozen snapshot with a new
+  //     `mission_elapsed_ms`, so t_meet slid forward by however long had
+  //     passed. A robot whose step budget expired at t+600 moved its own
+  //     t_meet from 800 to 900 while its partner still held 800; the partner
+  //     waited out the cap and left before it arrived. It also overwrote
+  //     appointment_ without calling closeAppointment, dropping the outcome
+  //     event and breaking the 1:1 agreed/outcome join that the offline
+  //     analysis is built on.
+  //   * a REFUSED re-arm fell into the else branch below, which cleared the
+  //     plan but not the flag. That left appointment_armed_ true with
+  //     t_meet_ms == -1, so appointmentDue() was false forever (the robot
+  //     never departed) AND the mid-run trigger stayed suppressed — reconnect
+  //     was dead for the remainder of the run, silently.
+  //
+  // Keeping it is also the only answer consistent with the mechanism: the
+  // appointment is a promise the PEER is holding too, and nothing that has
+  // happened on this robot since gives it the right to move a shared deadline
+  // unilaterally. It is released by closeAppointment on the paths that already
+  // own that decision — the team returning, the manoeuvre ending, the run
+  // ending — after which the next dispatch arms a fresh one normally.
+  //
+  // No event: a rendezvous_agreed here would be an `agreed` with no `outcome`,
+  // which is the very join this is protecting.
+  if (appointment_armed_) {
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous [%s]: an appointment at cell %d for t+%.0fs already "
+        "stands; keeping it rather than re-deriving a deadline the peer is "
+        "not going to move.", reason ? reason : "?", appointment_.cell,
+        appointment_.t_meet_ms / 1000.0);
+    return true;
+  }
 
   RendezvousAgreedEvent ev;
   for (int c : rendezvous_noshow_) {
