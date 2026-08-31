@@ -1,9 +1,11 @@
 # Implementation plan: evolving explo_planner into an M-TARE-style distributed explorer
 
-*Status: revised after adversarial review (round 1). Implementation happens on
-a new branch `mtare_evolution` off `new_experiments`; this document stays
-uncommitted until approved. Reference clone: `mtare_planner_ref/` at the
-workspace root (caochao39/mtare_planner, branch `noetic`, COLCON_IGNOREd).*
+*Status: v4.1. P0–P7 implemented; no validation campaign run yet.
+Implementation lives on `explo_path_planner_experiments` (NOT the
+`mtare_evolution` branch named in v1 — that branch was never cut, and this
+document is committed rather than held). Reference clone:
+`mtare_planner_ref/` at the workspace root (caochao39/mtare_planner, branch
+`noetic`, COLCON_IGNOREd).*
 
 ---
 
@@ -835,6 +837,20 @@ actually wins.
 argmax intercept vs a hand-computed case, no-tour degradation); smoke under
 forced dropout: chase dispatched at the predicted cell, not the stale goal.
 
+The predictor gets **its own arm tokens**, `mtare_pursuit_mdp` and
+`mtare_hybrid_mdp` (v4.1), rather than an environment override on the
+factorial's four. It is a third mechanism and the 2×2 has no cell for it:
+an mdp run under the name `mtare_hybrid` would be indexed as that arm and
+pooled with the trail cells by every analysis script. The two tokens are
+the exact stacks of the two arms that chase, with the predictor swapped,
+so a P6 comparison is one of them against its own trail-named control in
+one `run_campaign.sh` invocation. There is deliberately no token for the
+arms that never chase — the predictor has nothing to aim there, and the
+cell would record a treatment it cannot carry. The node's `arm` stamp
+carries the matching `_mdp` suffix so the directory name and the param
+dump cannot disagree; `trail` appends nothing, so every earlier run stamps
+the byte-identical string it stamped before.
+
 **P7 — N=3 harness + the four-arm factorial.**
 Extend `run_explo_sim_rviz.sh` to N robots (namespace loops exist; the N=2
 assertions and pairwise link-gate wiring are the work). Then the validation
@@ -910,6 +926,20 @@ keeps the reconnection-subsystem changes serial. P6 needs P2's shared tours
   defaults), and manifest identity fields. Calibrated in both directions
   before first use: A/A (two same-binary runs must pass) and a
   known-answer injection (a deliberately enabled new event kind must fail).
+  **Not run for P5 and P6** (v4.1, operator decision). Both phases are pure
+  additions behind a parameter, and neither widens the two things the pair
+  actually compares live: the event vocabulary was fixed when schema v4
+  landed (`rendezvous_agreed` / `rendezvous_outcome` were declared in P0,
+  not by P5, and P6 adds no kind at all), and neither adds a CSV column.
+  What remains is the run_start param diff, which `sim/equiv_gate.py`
+  computes from the compiled defaults and which `sim/equiv_gate_calib.py`
+  now covers for these registry groups by known-answer injection. The cost
+  being accepted is stated rather than argued away: nothing *live*
+  confirms the default path is untouched for these two phases, so if a
+  default-on leak exists it will first appear as a treated-looking control
+  in P7's `mtare_off` arm. That is the arm to read first, and a control
+  that does not behave like the pre-P5 control invalidates the campaign
+  rather than being explained.
 - **CSV stays append-only.** New per-step columns appended at the end only:
   `focus_cell_id`, `cells_exploring`, `cells_covered`, `alloc_makespan_sec`
   (sentinel −1 when the allocator is off). Everything richer goes to
@@ -973,6 +1003,17 @@ keeps the reconnection-subsystem changes serial. P6 needs P2's shared tours
 
 ## 9. Revision history
 
+- **v4.1** — during P5–P7 implementation. The **default-off equivalence
+  pair is dropped for P5 and P6** (§6): neither phase widens the event
+  vocabulary or the CSV, so what the live pair would add over the static
+  param-diff check is small, and the residual risk is named and assigned
+  to P7's `mtare_off` arm rather than left implicit. P6 gains **two arm
+  tokens of its own** (§4, P6) instead of an override on the factorial's
+  four, and the node's `arm` stamp gains the matching `_mdp` suffix, so
+  the predictor cannot be run under a name that would pool it with its own
+  control. The harness is N-robot rather than pairwise: the roster is read
+  from the scenario the emulator itself reads, and the node's link gate
+  means "all links up" rather than "the link" (identical at N=2).
 - **v4** — after mh1 (off vs m-tare-hybrid, 30/30, binary `8121506`) and an
   audit of the vendored mTARE reference. **The rendezvous objective
   changed**: from a geometric minimax 1-centre over frontier cells to the
