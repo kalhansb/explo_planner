@@ -292,6 +292,10 @@ if [ -n "$PRELUDE_END" ]; then
   # something: absence of our FATAL text is also true of a prelude that died at
   # the scenario check, and would certify a launcher that refuses everything.
   printf '%s\n' 'echo "__PRELUDE_OK__ cw=$CELL_WORLD tw=$TEAM_WORLD hz=$TEAM_WORLD_HZ ga=$GLOBAL_ALLOC rg=$RECONNECT_GATE rs=$RENDEZVOUS_SCHEDULE pp=$PURSUIT_PREDICTOR rm=$RECONNECT_MODE"' >> "$PROBE"
+  # A SECOND line rather than more fields on the first, so the roster can be
+  # asserted without rewriting the expect string of every case above -- lg
+  # matches a fixed substring of the whole output, not the whole output.
+  printf '%s\n' 'echo "__ROSTER_OK__ n=$N_ROBOTS robots=[$ROBOTS]"' >> "$PROBE"
 
   # And the cut has to CONTAIN the guards. A range that stopped short would
   # fail every BLOCK case for the wrong reason and pass every ALLOW one.
@@ -309,20 +313,32 @@ if [ -n "$PRELUDE_END" ]; then
 
   # env -i: the point of several of these guards is that an AMBIENT export must
   # not reach a cell, so the probe must not inherit one either.
+  # $SCEN, not a literal: every case here used to pin the 2-robot scenario, so
+  # the whole section only ever saw N == 2 and nothing that varies with the
+  # roster was under test in either direction. Callers that care set SCEN.
+  SCEN=flatforest_dense_2robot_lidar.yaml
   lg() {
     local want="$1" expect="$2" label="$3"; shift 3
     local out rc
     cases=$((cases+1))
     out=$(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-nobody}" \
-              SCENARIO=flatforest_dense_2robot_lidar.yaml "$@" \
+              SCENARIO="$SCEN" "$@" \
               timeout 30 bash -c \
               "source /opt/ros/humble/setup.bash >/dev/null 2>&1; bash '$PROBE'" 2>&1)
     rc=$?
-    local ok=0
+    # A sentinel is matched as a WHOLE LINE, a FATAL as a substring. The
+    # distinction is not cosmetic: the sentinel's last field is the arm name, so
+    # a substring match for `rm=mtare_hybrid` is also satisfied by an output
+    # reading `rm=mtare_hybrid_mdp`. The palette case in the derivations section
+    # below was written with a substring match and could not fail for exactly
+    # this reason -- COSTAR_..._REDUCED is a prefix of COSTAR_..._REDUCED_YELLOW
+    # -- and survived the mutation that was meant to kill it.
+    local ok=0 _mx=-qF
+    case "$expect" in __*) _mx=-qxF ;; esac
     if [ "$want" = BLOCK ]; then
-      [ "$rc" != 0 ] && printf '%s' "$out" | grep -qF "$expect" && ok=1
+      [ "$rc" != 0 ] && printf '%s\n' "$out" | grep "$_mx" "$expect" && ok=1
     else
-      [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF "$expect" && ok=1
+      [ "$rc" = 0 ] && printf '%s\n' "$out" | grep "$_mx" "$expect" && ok=1
     fi
     if [ "$ok" = 1 ]; then
       echo "  PASS  $label"
@@ -477,8 +493,175 @@ if [ -n "$PRELUDE_END" ]; then
   lg BLOCK "FATAL: RECONNECT_MODE='mtare_rendezvous_mdp' is not one of" \
      "an _mdp name for a chase-OFF arm is not a token" \
      RECONNECT_MODE=mtare_rendezvous_mdp
+
+  # --- the roster axis (P7) -------------------------------------------------
+  # Everything above this line ran at N == 2 and could not have told a harness
+  # that generalised from one that merely still works for a pair. That is not a
+  # hypothetical gap: the launch-time planner-count guard kept comparing against
+  # a literal 2 through a whole "78/78 ALL PASS" run, because no case ever asked
+  # for a third robot.
+  #
+  # The roster is read from the SCENARIO and is deliberately not overridable, so
+  # the only way to vary it is to point at a different scenario file. The N == 2
+  # case below is the control: without it, an assertion that matched a constant
+  # string would pass at both sizes and prove nothing.
+  lg ALLOW '__ROSTER_OK__ n=2 robots=[atlas bestla]' \
+     "the roster resolves to the 2-robot scenario's own names"
+  SCEN=flatforest_3robot_lidar.yaml
+  lg ALLOW '__ROSTER_OK__ n=3 robots=[atlas bestla husky]' \
+     "the roster resolves to THREE at the 3-robot scenario"
+  # And the guards are not quietly conditioned on the pair: one refusal and one
+  # token expansion, re-run at N == 3. If either changed with the roster size the
+  # M-TARE knobs would mean something different in an N-robot campaign.
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=mdp rm=mtare_hybrid_mdp' \
+     "mtare_hybrid_mdp expands to the same stack at N == 3" \
+     RECONNECT_MODE=mtare_hybrid_mdp
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "the arm-stamp guard still fires at N == 3" \
+     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
+  SCEN=flatforest_dense_2robot_lidar.yaml
 fi
 
+echo
+echo "=== the launcher's per-robot derivations (the region BELOW the prelude) ==="
+# The prelude section above stops at the arm-stamp guard, which is where the
+# launcher stops being inert. Everything the P7 change actually rewired --
+# peers_of / peers_csv / peers_ros_array, and the roster-position viz palette --
+# lives below that line and had no coverage at all, in either direction.
+#
+# They are still inert: pure shell over $ROBOTS, no ROS, no processes. So they
+# get their own cut, assembled from the prelude (which is what resolves $ROBOTS
+# from the scenario) plus this block. The two are not adjacent, and the region
+# skipped between them sets exactly one variable this block reads -- $OUTDIR --
+# which the shim supplies. If that ever stops being true the probe fails loudly
+# under `set -u` rather than testing a stub.
+DERIV_START_ANCHOR='^VIZ_PALETTE=(COSTAR_'
+DERIV_END_ANCHOR='^# --- environment: humble'
+DERIV_START=$(grep -n "$DERIV_START_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
+DERIV_END=$(grep -n "$DERIV_END_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
+DPROBE="$(dirname "$LAUNCHER")/.deriv_probe.$$.sh"
+trap 'rm -rf "$TMP"; rm -f "$PROBE" "$DPROBE"' EXIT
+
+cases=$((cases+1))
+if [ -n "$PRELUDE_END" ] && [ -n "$DERIV_START" ] && [ -n "$DERIV_END" ] \
+   && [ "$DERIV_START" -lt "$DERIV_END" ]; then
+  echo "  PASS  the derivation anchors are present (launcher $DERIV_START-$DERIV_END)"
+else
+  echo "  FAIL  the derivation anchors are missing or inverted -- every case"
+  echo "        below would be vacuous"
+  fails=$((fails+1))
+fi
+
+if [ -n "$PRELUDE_END" ] && [ -n "$DERIV_START" ] && [ -n "$DERIV_END" ] \
+   && [ "$DERIV_START" -lt "$DERIV_END" ]; then
+  sed -n "1,${PRELUDE_END}p" "$LAUNCHER" > "$DPROBE"
+  printf '%s\n' "OUTDIR=\"$TMP/deriv\"" >> "$DPROBE"
+  sed -n "${DERIV_START},$((DERIV_END - 1))p" "$LAUNCHER" >> "$DPROBE"
+
+  # The cut has to CONTAIN the helpers, or every case below matches nothing for
+  # a reason that has nothing to do with the roster.
+  for _need in "peers_of()" "peers_csv()" "peers_ros_array()" "VIZ_PALETTE=("; do
+    cases=$((cases+1))
+    if grep -qF "$_need" "$DPROBE"; then
+      echo "  PASS  the cut carries: $_need"
+    else
+      echo "  FAIL  the cut does NOT carry: $_need -- the line range is wrong"
+      fails=$((fails+1))
+    fi
+  done
+
+  cat >> "$DPROBE" <<'PY'
+for _r in $ROBOTS; do echo "__PEERS__ $_r -> $(peers_csv "$_r")"; done
+echo "__ARRAY__ $(peers_ros_array "${ROBOTS%% *}" /rx/ /exploration/intents)"
+for _r in $ROBOTS; do echo "__VIZ__ $_r=${VIZ_MODEL[$_r]}"; done
+PY
+
+  dv() {
+    local scen="$1" expect="$2" label="$3"
+    local out rc
+    cases=$((cases+1))
+    out=$(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-nobody}" \
+              SCENARIO="$scen" timeout 30 bash -c \
+              "source /opt/ros/humble/setup.bash >/dev/null 2>&1; bash '$DPROBE'" 2>&1)
+    rc=$?
+    # -qxF, whole line: see the note in lg() above. Every expectation here is a
+    # complete sentinel line, and several of the values are prefixes of each
+    # other.
+    if [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -qxF "$expect"; then
+      echo "  PASS  $label"
+    else
+      echo "  FAIL  $label"
+      echo "          rc=$rc, wanted '$expect'"
+      printf '%s\n' "$out" | tail -4 | sed 's/^/          | /'
+      fails=$((fails+1))
+    fi
+  }
+
+  _S2=flatforest_dense_2robot_lidar.yaml
+  _S3=flatforest_3robot_lidar.yaml
+
+  # At N == 2 peers_csv must emit the single name its pairwise predecessor did.
+  # This is the equivalence half: every existing 2-robot call site is unchanged.
+  dv "$_S2" '__PEERS__ atlas -> bestla' "peers_csv at N == 2 is still the one peer"
+  dv "$_S2" '__PEERS__ bestla -> atlas' "peers_csv is not self-referential"
+  # At N == 3 it must emit BOTH far ends. A helper that returned one arbitrary
+  # member would wire each robot to a single peer and the third radio would be
+  # modelled by the emulator and subscribed by nobody.
+  dv "$_S3" '__PEERS__ atlas -> bestla,husky' "peers_csv at N == 3 lists both peers"
+  dv "$_S3" '__PEERS__ husky -> atlas,bestla' "peers_csv excludes self, not position 0"
+  # The ROS array literal, which is what actually reaches -p on the launch line.
+  dv "$_S3" '__ARRAY__ ["/rx/bestla/exploration/intents","/rx/husky/exploration/intents"]' \
+     "peers_ros_array quotes and comma-joins every peer topic"
+  dv "$_S2" '__ARRAY__ ["/rx/bestla/exploration/intents"]' \
+     "peers_ros_array at N == 2 is a one-element array, not a bare string"
+  # Palette by roster POSITION. A name-keyed table would hand husky an empty
+  # model string and a URDF that fails to parse; three distinct models is the
+  # assertion, and the third robot getting the unpainted base model is correct.
+  dv "$_S3" '__VIZ__ husky=COSTAR_HUSKY_SENSOR_CONFIG_REDUCED' \
+     "the third roster slot gets a real model, not an empty string"
+  dv "$_S3" '__VIZ__ atlas=COSTAR_HUSKY_SENSOR_CONFIG_REDUCED_YELLOW' \
+     "the first roster slot keeps the model it had at N == 2"
+fi
+
+echo
+echo "=== the launch-time planner count is roster-derived, not a literal ==="
+# This one guard cannot be executed without launching gazebo -- it counts real
+# processes 8 s after a real bring-up -- so it is asserted textually. That is a
+# weaker check than running it, and it is here because the ALTERNATIVE was no
+# check: it compared against a literal 2 while everything around it was
+# generalised, so a 3-robot scenario started the entire stack and then died on
+# "expected exactly 2 explo_planner_node, found 3".
+#
+# A textual assertion is worth nothing unless it can fail, so it is run three
+# times: on the shipped launcher, on a copy mutated back to the literal, and on
+# a copy with the guard deleted. The last one matters most -- a check that
+# reports PASS when its subject is absent has stopped checking.
+nplan_guard() {
+  local f=$1 ln
+  ln=$(grep -n 'NPLAN=$(count_own' "$f" | head -1 | cut -d: -f1)
+  [ -n "$ln" ] || return 2                      # the guard is gone entirely
+  sed -n "$((ln + 1))p" "$f" | grep -qF '[ "$NPLAN" = "$N_ROBOTS" ]'
+}
+_MUT="$TMP/launcher_literal.sh"
+sed 's|\[ "\$NPLAN" = "\$N_ROBOTS" \]|[ "$NPLAN" = 2 ]|' "$LAUNCHER" > "$_MUT"
+_GONE="$TMP/launcher_noguard.sh"
+grep -v 'NPLAN=$(count_own' "$LAUNCHER" > "$_GONE"
+for _spec in "$LAUNCHER:0:the shipped launcher counts \$N_ROBOTS planners" \
+             "$_MUT:1:a launcher mutated back to the literal 2 is caught" \
+             "$_GONE:2:a launcher with no planner-count guard is not a PASS"; do
+  _f=${_spec%%:*}; _rest=${_spec#*:}; _want=${_rest%%:*}; _lbl=${_rest#*:}
+  cases=$((cases+1))
+  nplan_guard "$_f"; _rc=$?
+  if [ "$_rc" = "$_want" ]; then
+    echo "  PASS  $_lbl"
+  else
+    echo "  FAIL  $_lbl: want rc=$_want got rc=$_rc"
+    fails=$((fails+1))
+  fi
+done
+unset _spec _f _rest _want _lbl _rc _MUT _GONE
+
+echo
 # A clean launch must be SILENT on stderr. `env_val` took its default from a
 # bare "$2" while two callers legitimately omit it, so under `set -u` every
 # campaign launch opened with two `line 190: $2: unbound variable` lines. They

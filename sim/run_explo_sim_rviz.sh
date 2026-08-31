@@ -2396,9 +2396,14 @@ sleep 8
 # makes the pattern text differ from the text it matches.
 # count_own, not a machine-wide `grep -c`: see its definition. The [l] bracket
 # stays load-bearing there for the same reason it was here.
+# $N_ROBOTS, not a literal 2: the P7 harness launches one planner per robot in
+# $ROBOTS, so a three-robot scenario brought the whole stack up and then died
+# here, 8 seconds later, on "expected exactly 2 ... found 3". The count is still
+# exact — one planner per robot, no more and no fewer — it just reads the
+# expected number from the same roster the launch loop iterates.
 NPLAN=$(count_own "[l]ib/explo_planner/explo_planner_node")
-[ "$NPLAN" = 2 ] || die "expected exactly 2 explo_planner_node (own cell), found $NPLAN"
-log "planners up (exactly 2 explo_planner_node)"
+[ "$NPLAN" = "$N_ROBOTS" ] || die "expected exactly $N_ROBOTS explo_planner_node (own cell), found $NPLAN"
+log "planners up (exactly $N_ROBOTS explo_planner_node)"
 
 # --- 6b. comms gates (COMMS=1) ----------------------------------------------
 # Run AFTER the planners, because two of the four can only be judged once the
