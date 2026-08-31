@@ -80,6 +80,7 @@
 #include "explo_planner/team_model.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
+#include "explo_planner/pursuit_predictor.hpp"
 #include "explo_planner/rendezvous_scheduler.hpp"
 #include "explo_planner/home_trail.hpp"
 #include "explo_planner/proximity_guard.hpp"
@@ -411,6 +412,12 @@ private:
   struct LastContact;  // defined with the members below
   bool startPursuit(const std::string& peer_id, const LastContact& rec,
                     const char* reason);
+  /// Where `peer_id` will be when this robot could get there, from the tour it
+  /// last broadcast (P6, §3.7). An invalid/refused target means "chase the
+  /// trail", which is every case the predictor is not switched on for and
+  /// every case it is switched on for and cannot serve.
+  PursuitTarget predictIntercept(const std::string& peer_id,
+                                 double* tour_age_sec = nullptr) const;
   void armPursuitWaypoint();
   void doPursue();
   void pursuitFallback(const char* why);
@@ -686,6 +693,67 @@ private:
   // RendezvousScheduler::solve) so this list can never empty the candidate
   // set, which is the deadlock the rule exists to prevent.
   std::vector<int> rendezvous_noshow_;
+
+  // ---- MDP interception (P6, §3.7) ------------------------------------
+  //
+  // `pursuit_predictor: trail` is the shipped chase — the peer's declared goal
+  // then its last heard pose — and is the default. `mdp` replaces ONE thing:
+  // which point the chase drives to FIRST. The budget, the staleness gates,
+  // the fallback ladder and every log leaf below the head are untouched, so
+  // what the arm compares is an aiming rule and not a manoeuvre.
+  //
+  // The floor is enforced structurally rather than by review: the predictor
+  // returns a refusal for every case it cannot serve (no tour heard, tour too
+  // stale to carry mass, the intercept out of budget), and each refusal falls
+  // through to the code below it, which is today's. So "mdp is never worse
+  // than trail" is a claim about a fall-through, not about a model.
+  bool pursuit_predictor_mdp_ = false;
+  PursuitPredictor::Config pursuit_mdp_cfg_;
+  // <= 0 means "assume the peer moves as I do" and is the default. It exists
+  // as a knob because it is a different KIND of quantity from my own speed: I
+  // measure mine and I am guessing at the peer's, and a campaign that wants to
+  // test the guess needs to be able to vary it alone.
+  double pursuit_mdp_peer_speed_mps_ = -1.0;
+
+  // This robot's current global tour, as the last allocator solve left it —
+  // the thing TeamWorld.my_tour broadcasts and the peers' predictors consume.
+  // Empty whenever the allocator is off or refused, which is the honest
+  // encoding: a peer that hears no tour predicts nothing and chases the trail.
+  std::vector<int> my_tour_;
+
+  /// What a peer last told us FIRST-HAND about its route, and where it was
+  /// when it said so.
+  ///
+  /// Separate from last_contact_ because it arrives on a different message
+  /// (TeamWorld, not RobotIntent) and must stay internally consistent: the
+  /// anchor position is the one that came in the SAME message as the tour, so
+  /// the chain starts where the peer was when it declared the route. Mixing in
+  /// the RobotIntent pose would anchor a 30-second-old route at a
+  /// 1-second-old position and predict the peer backwards along its own tour.
+  ///
+  /// Keyed by fleet id, stamped with LOCAL receipt time (the same clock
+  /// discipline as last_contact_ and claim expiry — peer stamps are untrusted
+  /// and have been observed hours apart in the field).
+  struct PeerTour {
+    std::vector<int> cells;
+    Eigen::Vector3f  pos = Eigen::Vector3f::Zero();
+    rclcpp::Time     stamp;
+  };
+  std::map<int, PeerTour> peer_tours_;
+
+  /// The prediction the CURRENT chase was aimed by, for the dispatch event.
+  /// Consumed by logReconnectDispatch exactly like reconnect_decline_reason_:
+  /// it belongs to the leaf that made it, and a hold or a resume two minutes
+  /// later re-reporting an intercept it did not use would put a defensible
+  /// number in a column that was never consulted.
+  PursuitTarget dispatch_predict_;
+  bool          have_dispatch_predict_ = false;
+  /// Age of the tour the prediction ran on, seconds. Kept beside the target
+  /// rather than inside it because PursuitTarget describes an ANSWER and this
+  /// describes the input it was computed from — and it is the input that
+  /// explains most refusals, so a log without it cannot tell a model that is
+  /// wrong from a model that was handed nothing recent.
+  double dispatch_predict_tour_age_sec_ = -1.0;
 
   bool       team_merge_local_priority_ = true;
   std::string team_world_pub_topic_;
@@ -3628,6 +3696,162 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
 
+  // ---- MDP interception (P6, §3.7) ------------------------------------
+  //
+  // `trail` is the shipped chase and the default; `mdp` aims the first
+  // waypoint at the intercept instead. Read as a string rather than a bool for
+  // the same reason reconnect_gate is: the alternative to the model is not
+  // "nothing", it is a specific other aiming rule that has a name, and a
+  // `pursuit_mdp_enable=false` column would not say which one ran.
+  {
+    const std::string pp = dp("pursuit_predictor", std::string("trail"));
+    if (pp == "mdp") {
+      pursuit_predictor_mdp_ = true;
+    } else if (pp != "trail") {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_predictor='%s': expected 'trail' or 'mdp'. Refusing to "
+          "start rather than silently running the default — a typo here is a "
+          "whole arm that measured the control.", pp.c_str());
+      throw std::runtime_error("pursuit_predictor must be 'trail' or 'mdp'");
+    }
+  }
+  if (pursuit_predictor_mdp_) {
+    // Three hard requirements, all fatal for P5's reason: without them the
+    // predictor refuses on every single dispatch and the run logs a healthy
+    // stream of refusals that reads exactly like a model deciding not to fire.
+    //
+    // The tours are the allocator's OUTPUT. There is no other producer of one
+    // in this node, so with the allocator off `my_tour` is empty on every
+    // robot, nothing is ever broadcast, and every chase in the arm falls
+    // through to the trail — a treatment arm that is bit-identical to its
+    // control while looking configured.
+    if (!global_alloc_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_predictor=mdp but global_alloc_enable=false: the tour the "
+          "model propagates is the allocator's output and nothing else "
+          "produces one, so no robot would ever broadcast a route and every "
+          "chase would silently fall back to the trail.");
+      throw std::runtime_error("pursuit_predictor=mdp requires "
+                               "global_alloc_enable");
+    }
+    if (!cell_world_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_predictor=mdp but cell_world_enable=false: a tour is a "
+          "list of cells and the chain walks it through the cell grid.");
+      throw std::runtime_error("pursuit_predictor=mdp requires "
+                               "cell_world_enable");
+    }
+    // And they have to TRAVEL. my_tour rides on TeamWorld and on nothing else
+    // — it is deliberately not gossiped (TeamWorld.msg), so a peer heard only
+    // through a relay has no tour on record and degrades to the trail. With
+    // the exchange off outright, every peer is in that position.
+    if (team_world_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_predictor=mdp but team_world_hz=0: tours ride on TeamWorld, "
+          "so no robot would ever hear one and the model would refuse every "
+          "chase it was asked about.");
+      throw std::runtime_error("pursuit_predictor=mdp requires "
+                               "team_world_hz>0");
+    }
+    // Not fatal: a control run with reconnection off is legitimate and the
+    // predictor is simply never consulted. Warned because asking for it there
+    // is almost certainly a harness mistake.
+    if (!rendezvous_enabled_) {
+      RCLCPP_WARN(get_logger(),
+          "pursuit_predictor=mdp with rendezvous_enabled=false: there is no "
+          "chase to aim, so the model will never be consulted.");
+    }
+    if (reconnect_mode_ == ReconnectMode::RENDEZVOUS) {
+      RCLCPP_WARN(get_logger(),
+          "pursuit_predictor=mdp under reconnect_mode=rendezvous: that mode "
+          "never chases, so the model will never be consulted.");
+    }
+
+    // The speed the PREDICTION assumes, deliberately not nav_speed_est_mps_.
+    // Same distinction the rendezvous scheduler draws and the same numbers:
+    // nav_speed_est_mps_ is the watchdog's model and is conservative on
+    // purpose, and a horizon computed from it would propagate the chain far
+    // past where the peer can be — the model would confidently intercept ahead
+    // of a robot it had merely mis-timed. The budget still uses the
+    // conservative one, because "when will I be there" and "how long am I
+    // allowed before giving up" are different questions with different safe
+    // directions to be wrong in.
+    //
+    // Physically the same quantity as rendezvous_speed_mm_s, kept as a
+    // separate knob because the two mechanisms are separately switchable and
+    // P6 has to be runnable with P5 off. The consistency check below is there
+    // because "set one, forget the other" is the obvious way to get this
+    // wrong, and the symptom would be two subsystems disagreeing about how
+    // fast the same robot drives.
+    pursuit_mdp_cfg_.my_speed_mps = dp("pursuit_mdp_speed_mps", 0.5);
+    if (pursuit_mdp_cfg_.my_speed_mps <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_mdp_speed_mps=%.3f: every travel time would be infinite and "
+          "there is no safe value to substitute.",
+          pursuit_mdp_cfg_.my_speed_mps);
+      throw std::runtime_error("pursuit_mdp_speed_mps must be positive");
+    }
+    if (rendezvous_schedule_enable_ &&
+        std::fabs(pursuit_mdp_cfg_.my_speed_mps -
+                  static_cast<double>(rzv_cfg_.speed_mm_s) / 1000.0) > 1e-6) {
+      RCLCPP_WARN(get_logger(),
+          "pursuit_mdp_speed_mps=%.3f but rendezvous_speed_mm_s=%lld (%.3f "
+          "m/s): the same robot is modelled at two speeds. Deliberate is fine "
+          "— sharing the mistake is what this warns about.",
+          pursuit_mdp_cfg_.my_speed_mps, rzv_cfg_.speed_mm_s,
+          static_cast<double>(rzv_cfg_.speed_mm_s) / 1000.0);
+    }
+    pursuit_mdp_peer_speed_mps_ = dp("pursuit_mdp_peer_speed_mps", -1.0);
+    pursuit_mdp_cfg_.peer_speed_mps = pursuit_mdp_peer_speed_mps_ > 0.0
+        ? pursuit_mdp_peer_speed_mps_
+        : pursuit_mdp_cfg_.my_speed_mps;
+
+    pursuit_mdp_cfg_.dwell_sec = dp("pursuit_mdp_dwell_sec", 45.0);
+    pursuit_mdp_cfg_.step_sec  = dp("pursuit_mdp_step_sec", 5.0);
+    pursuit_mdp_cfg_.offroute_half_life_sec =
+        dp("pursuit_mdp_offroute_half_life_sec", 180.0);
+    pursuit_mdp_cfg_.max_horizon_sec =
+        dp("pursuit_mdp_max_horizon_sec", 600.0);
+    pursuit_mdp_cfg_.min_probability =
+        dp("pursuit_mdp_min_probability", 0.10);
+    if (pursuit_mdp_cfg_.step_sec <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "pursuit_mdp_step_sec=%.3f: the chain cannot advance.",
+          pursuit_mdp_cfg_.step_sec);
+      throw std::runtime_error("pursuit_mdp_step_sec must be positive");
+    }
+    // A zero floor is a legitimate diagnostic setting (it makes every chase
+    // MDP-aimed, which is how you measure what the floor is buying) but it is
+    // not a legitimate campaign setting, because it removes the fall-through
+    // that makes "never worse than the trail" true.
+    if (pursuit_mdp_cfg_.min_probability <= 0.0) {
+      RCLCPP_WARN(get_logger(),
+          "pursuit_mdp_min_probability=%.3f: the model will aim every chase, "
+          "including ones with no information behind them. The fall-through to "
+          "the trail is what bounds this arm's downside.",
+          pursuit_mdp_cfg_.min_probability);
+    }
+  }
+  if (exp_log_) {
+    exp_log_->addParamStr("pursuit_predictor",
+                          pursuit_predictor_mdp_ ? "mdp" : "trail");
+    if (pursuit_predictor_mdp_) {
+      exp_log_->addParamNum("pursuit_mdp_speed_mps",
+                            pursuit_mdp_cfg_.my_speed_mps);
+      exp_log_->addParamNum("pursuit_mdp_peer_speed_mps",
+                            pursuit_mdp_peer_speed_mps_);
+      exp_log_->addParamNum("pursuit_mdp_dwell_sec",
+                            pursuit_mdp_cfg_.dwell_sec);
+      exp_log_->addParamNum("pursuit_mdp_step_sec", pursuit_mdp_cfg_.step_sec);
+      exp_log_->addParamNum("pursuit_mdp_offroute_half_life_sec",
+                            pursuit_mdp_cfg_.offroute_half_life_sec);
+      exp_log_->addParamNum("pursuit_mdp_max_horizon_sec",
+                            pursuit_mdp_cfg_.max_horizon_sec);
+      exp_log_->addParamNum("pursuit_mdp_min_probability",
+                            pursuit_mdp_cfg_.min_probability);
+    }
+  }
+
   // THE arm this run belongs to, and the field an analysis must group by.
   //
   // Stamped HERE, not up with reconnect_mode among the other param lines,
@@ -3660,9 +3884,15 @@ ExploPlannerNode::ExploPlannerNode()
   // change of exactly the kind P3 and P4 make. A scheduled hybrid pooled into
   // the hybrid cell would average the new destination against the midpoint
   // the whole phase exists to replace.
+  //
+  // P6 likewise: the predictor changes where the chase drives. It cannot
+  // actually reach this predicate alone — it is fatal without the allocator,
+  // which is already in the OR — but it is listed anyway, because a term left
+  // out on the grounds that another term implies it is a term that silently
+  // stops being true the day the implication is relaxed.
   if (exp_log_) {
     const bool mtare = global_alloc_enable_ || reconnect_gate_info_ ||
-                       rendezvous_schedule_enable_;
+                       rendezvous_schedule_enable_ || pursuit_predictor_mdp_;
     std::string arm = rendezvous_enabled_
                           ? std::string(reconnectModeName(reconnect_mode_))
                           : std::string("off");
@@ -5510,6 +5740,12 @@ void ExploPlannerNode::doPlan() {
     std::vector<int> tour;
     if (self_idx >= 0 && self_idx < static_cast<int>(alloc.tours.size()))
       tour = alloc.tours[static_cast<size_t>(self_idx)];
+    // Broadcast copy (P6, §3.7). Assigned on EVERY solve including the ones
+    // that produced nothing, so a refused allocation clears it rather than
+    // leaving the last good route on the air: a peer chasing a tour this robot
+    // stopped driving is the one failure the model has no way to detect, since
+    // a stale route and a current one are the same message.
+    my_tour_ = tour;
     bool reordered = false;
     if (!tour.empty()) {
       // cell id -> tour rank of the earliest tour cell whose neighbourhood
@@ -8013,6 +8249,43 @@ ExploPlannerNode::missingPeerRecord(std::string* peer_id_out) {
 // state when the budget comes back 0 — record too stale, or pursuit disabled
 // by pursuit_budget_max_sec <= 0 — and the caller falls through to the
 // mode's fallback.
+//
+// `tour_age_sec` is set to the age of the record the prediction ran on, or left
+// at -1 when there was no record to run on — it is an out-param rather than a
+// field of the return value because it describes the input, not the answer.
+PursuitTarget ExploPlannerNode::predictIntercept(const std::string& peer_id,
+                                                 double* tour_age_sec) const {
+  if (tour_age_sec) *tour_age_sec = -1.0;
+  PursuitTarget out;
+  // The two "the model was never asked" cases, named as distinctly as the
+  // model's own refusals are, and for the same reason: a column that reads
+  // empty for "off", "no such peer" and "the chain had nothing to say" cannot
+  // separate an arm that never predicted from one that predicted badly.
+  if (!pursuit_predictor_mdp_) { out.refused = "predictor off"; return out; }
+  const int pid = fleet_.idOf(peer_id);
+  if (pid < 0) { out.refused = "peer is not in the fleet"; return out; }
+  const auto it = peer_tours_.find(pid);
+  if (it == peer_tours_.end()) { out.refused = "no tour on record"; return out; }
+
+  // These cell ids name OUR ground, which is drainTeamWorld's grid_hash gate
+  // and not an assumption made here: the predictor reads them straight into
+  // our own CellWorld and has no way to notice a foreign grid.
+  PursuitPredictor::PeerTrack track;
+  track.tour = it->second.cells;
+  track.x = it->second.pos.x();
+  track.y = it->second.pos.y();
+  track.have_position = true;
+  track.age_sec = (this->now() - it->second.stamp).seconds();
+  if (tour_age_sec) *tour_age_sec = track.age_sec;
+
+  // The cell this robot is standing in, live. Not the cell the manoeuvre was
+  // armed from: the intercept is scored at MY travel time, and the only pose
+  // that makes that a travel time is the one I am about to drive from.
+  const int my_cell = cell_world_.grid().idAt(latest_pos_.x(), latest_pos_.y());
+  return PursuitPredictor::predict(cell_world_, track, my_cell,
+                                   pursuit_mdp_cfg_);
+}
+
 bool ExploPlannerNode::startPursuit(const std::string& peer_id,
                                     const LastContact& rec,
                                     const char* reason) {
@@ -8030,6 +8303,32 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     reconnect_decline_reason_ = "record-stale";
     return false;
   }
+
+  // --- the intercept, when the model is on (P6, §3.7) --------------------
+  //
+  // Computed here, once per chase, and never refreshed while it runs: the same
+  // snapshot discipline as pursue_rec_. A prediction re-derived mid-chase off a
+  // packet heard one-way would move this robot's aim without moving anything
+  // the peer knows about, which is how a chase turns into a wander.
+  //
+  // What it replaces is exactly the FIRST waypoint, and nothing else. The
+  // legacy trail is kept behind it, so a missed intercept still sweeps the leg
+  // the peer was last known to be driving — the floor is a real fall-through,
+  // not a promise. In particular it does NOT get to touch the budget: that is
+  // computed below from the legacy trail either way, so the mdp and trail arms
+  // of the §5 factorial differ in where the chase drives and in nothing else.
+  // A model that also bought itself more chase time would confound the one
+  // comparison this arm exists to make.
+  //
+  // have_dispatch_predict_ is armed at the COMMIT point far below, not here.
+  // Everything between this line and there can still decline the chase, and a
+  // prediction left armed by a declined chase would be consumed by whatever
+  // leaf the mode falls through to — reporting an intercept for a manoeuvre
+  // that never chased anything.
+  have_dispatch_predict_ = false;
+  const PursuitTarget mdp =
+      predictIntercept(peer_id, &dispatch_predict_tour_age_sec_);
+  dispatch_predict_ = mdp;
 
   // Trail selection (see pursuit_goal_stale_sec_): a fresh record chases the
   // declared goal then the contact pose (the legacy trail); a stale one drops
@@ -8049,6 +8348,28 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     trail.push_back(rec.peer_pose);
   }
 
+  // Path length of a waypoint list from here, and the model seconds that buys
+  // at the NAV speed estimate — the conservative one, deliberately: this is the
+  // watchdog's question ("how long before I call this leg dead"), not the
+  // predictor's ("when will I actually be there"). The two want to be wrong in
+  // opposite directions and that is why they use different speeds. Factored out
+  // because the budget rule and the intercept's affordability test below must
+  // ask it identically; a second copy of this arithmetic could drift, and the
+  // symptom would be a chase dispatched with a budget sized for a different
+  // route than the one it drives.
+  auto trailMetres = [&](const std::vector<Eigen::Vector3f>& t) {
+    double m = 0.0;
+    Eigen::Vector3f prev = latest_pos_;
+    for (const auto& wp : t) {
+      m += (wp - prev).head<2>().norm();
+      prev = wp;
+    }
+    return m;
+  };
+  auto modelSec = [&](double metres) {
+    return metres * nav_safety_factor_ / std::max(nav_speed_est_mps_, 1e-3);
+  };
+
   double budget = 0.0;
   if (goal_stale) {
     // Distance-true budget: the contact-pose endpoint's value is geometric
@@ -8056,14 +8377,8 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     // the full model time — but ONLY if the cap covers the whole trail. A
     // partial chase ends at an arbitrary disconnected point, which is worse
     // than the mode's fallback (meeting point / hold-and-beacon).
-    double trail_m = 0.0;
-    Eigen::Vector3f prev = latest_pos_;
-    for (const auto& wp : trail) {
-      trail_m += (wp - prev).head<2>().norm();
-      prev = wp;
-    }
-    const double trail_model_sec =
-        trail_m * nav_safety_factor_ / std::max(nav_speed_est_mps_, 1e-3);
+    const double trail_m = trailMetres(trail);
+    const double trail_model_sec = modelSec(trail_m);
     if (trail_model_sec > pursuit_budget_max_sec_) {
       RCLCPP_INFO(get_logger(),
           "Pursuit: record of '%s' is %.0fs old (goal stale) and the contact "
@@ -8098,6 +8413,42 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     }
   }
 
+  // --- swap the intercept in front, if it fits the budget just granted ------
+  //
+  // The affordability test is the whole "never worse" rule made mechanical. An
+  // intercept the budget cannot reach is not a better aim, it is a chase that
+  // times out somewhere between here and a cell the peer has by then left; the
+  // legacy trail, sized by the rule that granted the budget, at least ends on a
+  // place the peer provably was. So an unaffordable prediction is DOWNGRADED,
+  // not declined — declining would make the model able to suppress chases the
+  // control arm performs, which is the one failure mode §3.7 rules out.
+  if (mdp.valid()) {
+    std::vector<Eigen::Vector3f> mdp_trail;
+    mdp_trail.push_back(Eigen::Vector3f(mdp.x, mdp.y, latest_pos_.z()));
+    // Same 1 m coincidence rule the legacy trail uses: an intercept that lands
+    // on the contact pose is one waypoint, not two. The contact pose stays
+    // behind it as the sweep leg — the dead goal does not, because it is the
+    // hypothesis the model was built to replace.
+    if ((rec.peer_pose - mdp_trail.front()).head<2>().norm() > 1.0f)
+      mdp_trail.push_back(rec.peer_pose);
+
+    const double mdp_m   = trailMetres(mdp_trail);
+    const double mdp_sec = modelSec(mdp_m);
+    if (mdp_sec <= budget) {
+      trail = std::move(mdp_trail);
+    } else {
+      // Report it as a refusal so the dispatch event says the model was asked,
+      // answered, and lost — distinct from the model having nothing to say. The
+      // cell/probability fields stay populated on purpose: a downgrade at
+      // p = 0.8 and one at p = 0.11 are different findings.
+      dispatch_predict_.refused = "intercept exceeds the chase budget";
+      RCLCPP_INFO(get_logger(),
+          "Pursuit: intercept for '%s' at cell %d (p=%.2f, %.1f m, needs "
+          "%.0fs > budget %.0fs) — falling back to the trail.",
+          peer_id.c_str(), mdp.cell, mdp.p, mdp_m, mdp_sec, budget);
+    }
+  }
+
   standDownExploitation();
 
   // See startReturnTo: first leg of the manoeuvre arms the clock, later legs
@@ -8115,12 +8466,21 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
   pursue_start_time_ = now;
   pursue_waypoints_ = std::move(trail);
   pursue_wp_index_ = 0;
+  // The chase is now real, so the prediction that aimed it is reportable.
+  have_dispatch_predict_ = true;
 
+  // The aim is named in the line, because "chasing its trail head" was true of
+  // every chase this node had ever dispatched until P6 and is now true of only
+  // some of them — a reader grepping these lines to tell the arms apart would
+  // otherwise find them identical.
+  const bool aimed_by_model = dispatch_predict_.valid();
   RCLCPP_INFO(get_logger(),
       "Pursuit: dispatched [%s], '%s' out of comms (record %.0fs old%s) "
-      "-> chasing its trail head (%.2f, %.2f), budget %.0fs, %zu waypoint(s).",
+      "-> chasing %s (%.2f, %.2f), budget %.0fs, %zu waypoint(s).",
       reason, peer_id.c_str(), staleness,
-      goal_stale ? ", goal stale — contact pose only" : "",
+      aimed_by_model ? "" :
+          (goal_stale ? ", goal stale — contact pose only" : ""),
+      aimed_by_model ? "the predicted intercept" : "its trail head",
       pursue_waypoints_.front().x(), pursue_waypoints_.front().y(),
       pursue_budget_sec_, pursue_waypoints_.size());
 
@@ -9330,6 +9690,28 @@ void ExploPlannerNode::logReconnectDispatch(const char* action,
   // entry and would otherwise re-report a decline from minutes earlier as
   // though it were the reason for THIS manoeuvre.
   reconnect_decline_reason_.clear();
+  // P6. The arm setting is a run-wide fact and is always written; the
+  // prediction itself belongs to ONE chase, so it is consumed exactly like
+  // decline_reason above. Without the consume, the hold or resume_exploring
+  // leaf that closes a spent chase would re-report the intercept as though the
+  // model had been consulted for it, and an offline count of "dispatches the
+  // model aimed" would over-count by however many leaves each chase produced.
+  e.predictor = pursuit_predictor_mdp_ ? "mdp" : "trail";
+  if (have_dispatch_predict_) {
+    e.predict_refused       = dispatch_predict_.refused;
+    e.predict_p             = dispatch_predict_.p;
+    e.predict_p_on_route    = dispatch_predict_.p_on_route;
+    e.predict_cell          = dispatch_predict_.cell;
+    e.predict_candidates    = dispatch_predict_.candidates;
+    if (dispatch_predict_.horizon_ms >= 0)
+      e.predict_horizon_sec = dispatch_predict_.horizon_ms / 1000.0;
+    e.predict_tour_age_sec  = dispatch_predict_tour_age_sec_;
+    have_dispatch_predict_  = false;
+  } else {
+    // An empty refusal on a chase means "the intercept was driven", so a leaf
+    // that never asked the model must not leave the field empty.
+    e.predict_refused = "not a chase";
+  }
   e.attempt        = reconnect_terminal_ ? 0 : midrun_attempts_;
   e.peers_live     = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
   e.expected_peers = rendezvous_expected_peers_;
@@ -11077,12 +11459,39 @@ void ExploPlannerNode::publishTeamWorld() {
     m.cells.push_back(c);
   }
 
-  // P3 and P5 fields, written explicitly at their "absent" values rather than
-  // left to the struct's zero-init. -1 is the documented no-proposal encoding
-  // and 0 is a valid cell id; leaving it defaulted would broadcast a standing
-  // proposal to meet in cell 0 at mission time zero the moment P5's consumer
-  // lands, and it would be a receiver-side bug when it was written here.
+  // P3/P6: this robot's current route, for the peers' interception model. The
+  // wire type is uint16 and a cell id is an int, so ids are bounds-checked
+  // rather than cast — an id that does not survive the round trip would name a
+  // different cell on the receiver, and a chase aimed at it is aimed at ground
+  // nobody chose. Out-of-range TRUNCATES the tour rather than skipping the
+  // offending entry: the consumer walks this as an ordered route and a route
+  // with a hole in it is a route through a cell the producer never planned to
+  // visit. It cannot happen on any grid this planner builds (the ROI would
+  // have to exceed 65535 cells) and it is checked anyway, because the failure
+  // is silent and the check is free.
+  //
+  // Broadcast whether or not the local predictor is enabled: it is what THIS
+  // robot's peers need, and gating the send on our own setting would make an
+  // mdp/trail mixed fleet fail in a way that looks like the model refusing.
   m.my_tour.clear();
+  m.my_tour.reserve(my_tour_.size());
+  for (int cid : my_tour_) {
+    if (cid < 0 || cid > static_cast<int>(
+                             std::numeric_limits<uint16_t>::max())) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "TeamWorld: tour cell %d does not fit the uint16 wire field; "
+          "broadcasting the route truncated at %zu of %zu cells.",
+          cid, m.my_tour.size(), my_tour_.size());
+      break;
+    }
+    m.my_tour.push_back(static_cast<uint16_t>(cid));
+  }
+
+  // P5 fields, written explicitly at their "absent" values rather than left to
+  // the struct's zero-init. -1 is the documented no-proposal encoding and 0 is
+  // a valid cell id; leaving it defaulted would broadcast a standing proposal
+  // to meet in cell 0 at mission time zero the moment P5's consumer lands, and
+  // it would be a receiver-side bug when it was written here.
   m.rendezvous_cell_id  = -1;
   m.rendezvous_time_sec = -1.0f;
 
@@ -11268,6 +11677,33 @@ void ExploPlannerNode::drainTeamWorld() {
       e.refused_local  = st.refused_local;
       e.out_of_range   = st.out_of_range;
       e.bad_status     = st.bad_status;
+    }
+
+    // --- the peer's route (P6, §3.7) ----------------------------------
+    //
+    // AFTER every check, and gated on all of them: the grid_hash test is what
+    // makes these cell ids name the same ground ours do, and a route recorded
+    // from a refused message would aim a chase by arithmetic over somebody
+    // else's map. Recorded even when this robot's own predictor is off, so
+    // switching the arm on mid-fleet does not depend on who was listening.
+    //
+    // Overwrites unconditionally on an accepted message, including with an
+    // EMPTY tour: an allocator that refused this tick is telling us it has no
+    // route, and keeping the last good one would let a chase be aimed by a
+    // plan the peer has already abandoned. Absence is information here.
+    if (e.drop_reason.empty()) {
+      PeerTour& pt = peer_tours_[sid];
+      pt.cells.clear();
+      pt.cells.reserve(msg.my_tour.size());
+      for (uint16_t c : msg.my_tour) pt.cells.push_back(static_cast<int>(c));
+      pt.pos = Eigen::Vector3f(static_cast<float>(msg.position.x),
+                               static_cast<float>(msg.position.y),
+                               static_cast<float>(msg.position.z));
+      // The RECEIPT time, not the queue time: kv.second.received is when the
+      // callback saw it, which is what "how stale is this route" means. Using
+      // now() would credit the message with a freshness the drain delay
+      // already spent, and drainTeamWorld runs on the planning tick.
+      pt.stamp = kv.second.received;
     }
 
     rows.push_back(std::move(e));

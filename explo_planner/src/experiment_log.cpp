@@ -434,6 +434,19 @@ void ExperimentLog::logReconnectDispatch(const ExperimentContext& ctx,
   // decision cannot be re-derived from the log at all — peer_record_age_sec
   // stands ~coord_claim_ttl_sec clear of it and tests a different inequality.
   num("team_incomplete_sec", e.team_incomplete_sec);
+  // P6 interception, additive for the same reason as the two above. `predictor`
+  // is written unconditionally — including "trail" on every control run — so
+  // the arm can be read off a single dispatch line instead of inferred from the
+  // absence of keys, which is what a reader would otherwise have to do and is
+  // indistinguishable from an older binary.
+  text("predictor", e.predictor);
+  text("predict_refused", e.predict_refused);
+  num("predict_p", e.predict_p);
+  num("predict_p_on_route", e.predict_p_on_route);
+  num("predict_horizon_sec", e.predict_horizon_sec);
+  num("predict_tour_age_sec", e.predict_tour_age_sec);
+  integer("predict_cell", e.predict_cell);
+  integer("predict_candidates", e.predict_candidates);
   teamCounts(e.peers_live, e.expected_peers);
   end();
 }

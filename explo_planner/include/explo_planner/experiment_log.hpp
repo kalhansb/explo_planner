@@ -254,6 +254,35 @@ struct ReconnectDispatchEvent {
   /// measurement that motivated the change. A gated run in which the two
   /// columns agree everywhere is evidence the gate is not doing anything.
   double link_down_sec = -1.0;
+  /// P6 interception (§3.7). `predictor` is the arm's setting — "trail" on
+  /// every run before this generation and on every control arm — and the rest
+  /// describe what the model said on THIS dispatch. They are stamped at the
+  /// trigger and, like gate_sec above, re-reported unchanged by every later
+  /// leaf of the same manoeuvre.
+  ///
+  /// Read `predict_refused` first: non-empty means the chase drove the legacy
+  /// trail, and the reason separates "the model was never asked" (predictor
+  /// off, no tour on record) from "the model answered and lost" (below
+  /// min_probability, or an intercept the budget could not reach). Those are
+  /// different findings and an mdp arm that silently never predicted would
+  /// otherwise be indistinguishable from one that predicted badly.
+  ///
+  /// The numeric fields stay populated THROUGH a refusal, on purpose: a
+  /// rejection at p = 0.09 against a 0.10 floor and one at p = 0.001 say
+  /// different things about the model, and only the first suggests the floor is
+  /// mis-set. `predict_candidates` says how far the model got and is the field
+  /// that makes the numbers readable: 0 means the chain never ran (the arm is
+  /// off, or there was no tour) and the zeros beside it are placeholders, 1
+  /// means it ran and the argmax was over a single node, and anything higher is
+  /// a real comparison.
+  const char* predictor = "trail";
+  std::string predict_refused;            ///< "" = the intercept was driven
+  double predict_p = -1.0;                ///< P(peer in that cell at arrival)
+  double predict_p_on_route = -1.0;       ///< 1 - P(off route) at that horizon
+  double predict_horizon_sec = -1.0;      ///< record age + my drive to the cell
+  double predict_tour_age_sec = -1.0;     ///< local age of the tour it used
+  int    predict_cell = -1;               ///< intercept cell id (-1 = none)
+  int    predict_candidates = 0;          ///< tour nodes actually scored
 };
 
 /// `reconnect_end` payload.
@@ -822,6 +851,14 @@ class ExperimentLog {
   /// equivalence pairs, which are unaffected because the kind cannot appear at
   /// defaults. Once a v4 file exists outside this branch this reasoning
   /// expires and the next widening must bump.
+  ///
+  /// P6 amended v4 a second time, but only with FIELDS: eight `predict_*`
+  /// columns on `reconnect_dispatch` (see ReconnectDispatchEvent). That is a
+  /// weaker change than team_exchange's and does not reach the stamp at all —
+  /// the vocabulary is unchanged, no field moved, and a JSON-lines reader that
+  /// does not know the keys ignores them. It is recorded here anyway so the
+  /// list of what v4 accumulated is complete in one place, rather than being
+  /// something a reader has to reconstruct by diffing structs.
   ///
   /// Vocabulary widening IS a schema change, on the precedent set by v3's
   /// home_watchdog widening: a reader with an exhaustive match on `event` now
