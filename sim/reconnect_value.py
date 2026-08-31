@@ -21,6 +21,15 @@ look plausible either way:
   * Benefit must be keyed on the RESTORATION, not the dispatch. Several
     dispatches can precede one reconnection; charging the same merge to each
     triple-counted the gain.
+  * "No dispatch" is not one thing. Since P4 the §3.6 gate can evaluate a
+    trigger and REFUSE it, and a refusal emits a `reconnect_gate` event with
+    dispatched=false and no `reconnect_dispatch` event at all. Splitting
+    outages on the presence of a dispatch event therefore filed every
+    gate-suppressed outage with the outages where the trigger never fired —
+    two opposite states of the planner under one label, and in an info-gated
+    arm the suppressed ones are exactly the outages the treatment judged not
+    worth fixing. The split below is four-way for that reason (see
+    timing_table).
 
 Benefit caveat, and it is a large one: a robot keeps mapping on its own during
 the settle window, so vox_gain is an UPPER BOUND on what the peer contributed,
@@ -203,6 +212,11 @@ def analyse(d):
         ser = cache_series(d, rob, w2s_factory(evs))
         chases = pursue_intervals(evs)
         disp = [e for e in evs if e.get("event") == "reconnect_dispatch"]
+        # Every §3.6 gate evaluation, fired or not. Absent entirely in a
+        # silence-gated arm, which is why the classification below has to treat
+        # "no gate events" as "the gate was not in play" and not as "the gate
+        # allowed everything".
+        gate = [e for e in evs if e.get("event") == "reconnect_gate"]
 
         gains = []
         for t_drop, t_res in outs:
@@ -228,6 +242,7 @@ def analyse(d):
             "actions": [e.get("action") for e in disp],
             "gains": gains,
             "_disp": disp,
+            "_gate": gate,
         }
     rec["lk"] = lk
     return rec
@@ -247,35 +262,79 @@ def timing_table(cells):
     scale-free, so a run that takes 4332 s and one that takes 1092 s compare
     directly -- which matters because run length is itself an outcome here.
 
-    Outages are split by whether the planner dispatched a reconnection during
-    them. A working reconnection strategy should show dispatched outages ending
-    sooner than undispatched ones WITHIN the same run, which controls for map
-    difficulty in a way cross-arm medians cannot.
+    Outages are classified by WHAT THE PLANNER DID during them, four ways:
+
+      acted     a manoeuvre was armed -- action chase, meeting_point or
+                anchor_return. `hold` and `resume_exploring` are excluded:
+                the first is a leaf of a manoeuvre already under way and the
+                second is the planner declining to start one.
+      gated     no manoeuvre, but the §3.6 gate evaluated and refused
+                (reconnect_gate with dispatched false). Only possible in an
+                info-gated arm; structurally zero everywhere else.
+      declined  no manoeuvre and no gate refusal, but the reconnect logic
+                itself produced a dispatch event that went nowhere.
+      silent    none of the above -- the trigger never fired at all.
+
+    The earlier two-way version pooled `gated`, `declined` and `silent` into
+    one "no dispatch" column, which is wrong in a way that flatters the
+    treatment: the first two are outages the planner CONSIDERED and chose not
+    to fix, the third is one it never looked at. Worse, in an info-gated arm
+    the gated set is chosen by the treatment itself, so the within-run
+    contrast that column feeds is a split on a post-treatment variable and
+    cannot be read as "reconnection shortens outages".
+
+    Read `acted` vs `silent` for the mechanism question. `gated` is the gate's
+    own decision and belongs beside it, not inside either side of it.
     """
     print("\n=== TIMING: how long robots stay out of contact ===")
+    print("(each class printed as n/median_sec; see the docstring -- gated and")
+    print(" declined are the planner's own choices, not a control group)")
     print(f"{'cell':<24} {'arm':<11} {'t_done':>7} {'disc_s':>7} {'disc%':>6} "
-          f"{'n_out':>5} {'med_out':>8} {'disp_out':>9} {'nodisp_out':>11}")
+          f"{'n_out':>5} {'med_out':>8} {'acted':>10} {'gated':>10} "
+          f"{'declined':>10} {'silent':>10}")
+    ACTED = ("chase", "meeting_point", "anchor_return")
     for c in cells:
         T = float(c["t_complete"] or 0)
         if not T:
             continue
-        # dispatch instants, either robot -- the decision is per-robot but the
-        # outage is a property of the pair
-        disp_t = sorted(float(e.get("t_sim_sec") or 0)
-                        for rob in ROBOTS
-                        for e in c["robots"][rob]["_disp"])
-        durs, dd, nd = [], [], []
+        # Instants, either robot -- the decision is per-robot but the outage is
+        # a property of the pair, so an outage counts as acted-on if EITHER
+        # robot armed a manoeuvre in it.
+        et = lambda e: float(e.get("t_sim_sec") or 0)
+        acted_t = sorted(et(e) for rob in ROBOTS
+                         for e in c["robots"][rob]["_disp"]
+                         if e.get("action") in ACTED)
+        other_t = sorted(et(e) for rob in ROBOTS
+                         for e in c["robots"][rob]["_disp"]
+                         if e.get("action") not in ACTED)
+        # `dispatched` is a JSON bool; a missing key means a log written before
+        # the field existed, and treating that as a refusal would invent
+        # suppressions. Only an explicit false counts.
+        gated_t = sorted(et(e) for rob in ROBOTS
+                         for e in c["robots"][rob]["_gate"]
+                         if e.get("dispatched") is False)
+        durs, cls = [], {"acted": [], "gated": [], "declined": [], "silent": []}
         for t_drop, t_res in c["outages"]:
             end = t_res if t_res is not None else T
             d = end - t_drop
             durs.append(d)
-            (dd if any(t_drop <= x <= end for x in disp_t) else nd).append(d)
+            inside = lambda ts: any(t_drop <= x <= end for x in ts)
+            if inside(acted_t):
+                cls["acted"].append(d)
+            elif inside(gated_t):
+                cls["gated"].append(d)
+            elif inside(other_t):
+                cls["declined"].append(d)
+            else:
+                cls["silent"].append(d)
         tot = sum(durs)
         med = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
         f = lambda v: f"{v:8.0f}" if v is not None else f"{'-':>8}"
+        nm = lambda xs: (f"{len(xs)}/{med(xs):.0f}" if xs else "0/-")
         print(f"{c['cell']:<24} {c['arm']:<11} {T:7.0f} {tot:7.0f} "
               f"{100.0 * tot / T:5.1f}% {len(durs):5d} {f(med(durs))} "
-              f"{f(med(dd)):>9} {f(med(nd)):>11}")
+              f"{nm(cls['acted']):>10} {nm(cls['gated']):>10} "
+              f"{nm(cls['declined']):>10} {nm(cls['silent']):>10}")
 
     print("\n=== TIMING BY ARM (median across cells) ===")
     by = {}
