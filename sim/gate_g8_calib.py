@@ -48,6 +48,11 @@ if not _m:
              "Fix the pattern above rather than hardcoding the set.")
 CONTROL_ARMS = frozenset(s.strip() for s in _m.group(1).split(",") if s.strip())
 
+# The three radio-regime fields carry the SHIPPED values, because that is what
+# a cell run today records and check 3j compares every campaign against them.
+# Leaving them out would make every fixture cell look like a pre-2026-09-03 run
+# and fire 3j on all of them — which is the correct behaviour of the check and
+# the wrong fixture.
 MANIFEST = f"""run_end_reason=all_done
 run_gates_verdict=CLEAN
 run_end_t_sim=812.4
@@ -55,6 +60,9 @@ git_explo_planner={REV}
 git_simple_nav_3d=c9f83a7
 git_scovox=078d3f7
 sha256_explo_planner_node={SHA}
+tx_power_dbm=30.0
+tree_attenuation_db=70.0
+max_range_m=30.0
 """
 
 SCHEMA_VERSION = 4
@@ -1345,6 +1353,95 @@ radius_case("an unsuffixed directory that ran a pinned radius",
             r"check 3i — directory names no claim radius but the manifest says "
             r"coord_claim_radius_override='40\.0'",
             "mtare_hybrid", R40_MANIFEST)
+
+# ---------------------------------------------------------------------------
+# check 3j — one radio regime per campaign, and it must be the declared one.
+# ---------------------------------------------------------------------------
+# The shipped regime moved on 2026-09-03: trunks 11.98 -> 70.0 dB, plus a 30 m
+# horizon that did not exist before. Nothing read those manifest fields until
+# 3j, so a campaign resumed across the change pooled two radios and every
+# analysis averaged over them. These cases pin both halves and, more
+# importantly, pin that the ESCAPE HATCH for the declaration half does not
+# reach the uniformity half — an override that quietly relaxes more than it
+# names is how a check stops checking.
+OLD_RADIO = MANIFEST.replace("tree_attenuation_db=70.0\n",
+                             "tree_attenuation_db=11.98\n") \
+                    .replace("max_range_m=30.0\n", "")
+assert "11.98" in OLD_RADIO and "max_range_m" not in OLD_RADIO, \
+    "the pre-2026-09-03 fixture no longer differs from the shipped one"
+HOT_RADIO = MANIFEST.replace("tx_power_dbm=30.0", "tx_power_dbm=160.0")
+NO_HORIZON = MANIFEST.replace("max_range_m=30.0\n", "")
+
+
+def regime_case(label, expect_pat, manifest, off_manifest=None, env=None,
+                expect_clean=False):
+    """One campaign whose two arms carry `manifest` / `off_manifest`."""
+    global fails
+    root = tempfile.mkdtemp(prefix="gatecal_")
+    try:
+        ev = {r: base_events("hybrid", r, control_arms=CONTROL_ARMS)
+              for r in ROBOTS}
+        build(root, "cal", ev, manifest=manifest,
+              off_manifest=off_manifest or manifest)
+        rc, out = run_gate(root, "cal", env_extra=env)
+        if expect_clean:
+            ok = rc == 0 and "HARD FAILURES: none" in out
+            detail = "clean" if ok else (
+                f"gate objected to a declared regime (rc={rc})"
+                if rc == 1 else f"rc={rc}: a population was empty")
+        else:
+            ok = rc == 1 and re.search(expect_pat, out) is not None
+            detail = "caught" if ok else f"did NOT match /{expect_pat}/"
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}: {detail}")
+        if not ok:
+            fails += 1
+            for ln in out.splitlines():
+                if "check 3j" in ln or "HARD" in ln or "radio regime" in ln:
+                    print(f"           | {ln}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+print("\n=== check 3j: one radio regime per campaign ===")
+regime_case("a campaign at the shipped radio scores clean", None, MANIFEST,
+            expect_clean=True)
+# The change itself, in the form a resume produces it: one arm banked before
+# 2026-09-03 and one after, under a single tag.
+regime_case("11.98 dB and 70 dB trunks in one campaign",
+            r"check 3j — this campaign mixes 2 radio regimes",
+            MANIFEST, off_manifest=OLD_RADIO)
+regime_case("the 30 m horizon present in one arm only",
+            r"check 3j — this campaign mixes 2 radio regimes",
+            MANIFEST, off_manifest=NO_HORIZON)
+# The old ideal-comms control ran tx_power_dbm=160, which is not a radio any
+# robot carries. Mixed with a real arm it is the same defect as the trunks.
+regime_case("tx_power 30 and 160 dBm in one campaign",
+            r"check 3j — this campaign mixes 2 radio regimes",
+            MANIFEST, off_manifest=HOT_RADIO)
+# The declaration half: uniform, but not the regime the gate was told to score.
+regime_case("a uniform pre-2026-09-03 campaign is not scored as current",
+            r"check 3j — this campaign ran \[tree_attenuation_db=11\.98, "
+            r"max_range_m=<absent>, tx_power_dbm=30\]",
+            OLD_RADIO)
+regime_case("...and scores clean once the old regime is declared", None,
+            OLD_RADIO, env={"GATE_TREE_ATTEN": "11.98",
+                            "GATE_MAX_RANGE": "none"},
+            expect_clean=True)
+# Formatting must not be a finding: the harness writes 30.0, a hand-edited or
+# older manifest may say 30, and they are the same radio.
+regime_case("30 and 30.0 are the same horizon", None,
+            MANIFEST.replace("max_range_m=30.0", "max_range_m=30"),
+            expect_clean=True)
+# THE ANTI-VACUITY CASE. GATE_COMMS_REGIME=0 exists to stop the gate demanding
+# a declaration; it must not also stop it noticing that two radios ran. If this
+# ever passes as clean, the escape hatch has swallowed the check that has no
+# escape.
+regime_case("GATE_COMMS_REGIME=0 must NOT excuse a mixed campaign",
+            r"check 3j — this campaign mixes 2 radio regimes",
+            MANIFEST, off_manifest=OLD_RADIO,
+            env={"GATE_COMMS_REGIME": "0"})
+regime_case("GATE_COMMS_REGIME=0 does drop the declaration half", None,
+            OLD_RADIO, env={"GATE_COMMS_REGIME": "0"}, expect_clean=True)
 
 audit_fixture_against_real_cell()
 

@@ -168,6 +168,65 @@ LINK_GATE_LIVE_REQUIRED = (
     GEN9_PARAMS_REQUIRED
     and os.environ.get("GATE_LINK_GATE_LIVE", "1") != "0")
 
+
+# The radio regime (check 3j). Three manifest fields decide what "the link
+# dropped" MEANS on a run: how much a trunk costs, how far a trunk-free link
+# reaches, and how much power it started with. Every result this project
+# reports about connectivity is conditional on them.
+#
+# They moved on 2026-09-03. tree_attenuation_db went from 11.98 dB — the IEEE
+# 9260568 per-trunk fit, under which a single trunk almost never dropped a link
+# — to 70.0, where any trunk in the Fresnel zone is fatal; max_range_m appeared
+# at the same time and bounds a CLEAR lane at 30 m, which nothing did before.
+# cr3/cr4/cr5 and everything earlier ran the old radio. Pooling across that is
+# forbidden, and until this check existed nothing read the fields: the manifest
+# recorded the difference and every analysis averaged over it.
+#
+# Overridable in the same spirit as GATE_SCHEMA_VERSION above, and for the same
+# reason: a banked campaign is perfectly valid on its own terms and must be
+# re-scorable WITHOUT editing the pin, by saying which regime it ran out loud
+# in the invocation —
+#
+#   GATE_TREE_ATTEN=11.98 GATE_MAX_RANGE=none ./gate_g8.py cr5
+#
+# "none" is how the absence of a key is declared, because absence is a VALUE
+# here, not a gap: a manifest with no max_range_m line was written by a harness
+# that had no radio horizon, and that is a fact about the run, not a missing
+# measurement.
+def _regime_val(raw):
+    """One radio-regime field, normalised so 30 and 30.0 are one value.
+
+    An unparseable value keeps its raw spelling rather than becoming 0.0 —
+    float() on a truncated line would otherwise raise, and a permissive parse
+    would silently make every non-number equal to every other non-number.
+    """
+    if raw is None:
+        return "<absent>"
+    try:
+        return f"{float(raw):g}"
+    except (TypeError, ValueError):
+        return str(raw)
+
+
+def _regime_expect(env_key, default):
+    v = os.environ.get(env_key, default).strip()
+    if v.lower() in ("", "none", "absent"):
+        return "<absent>"
+    return _regime_val(v)
+
+
+COMMS_REGIME_KEYS = ("tree_attenuation_db", "max_range_m", "tx_power_dbm")
+COMMS_REGIME_EXPECT = (
+    _regime_expect("GATE_TREE_ATTEN", "70.0"),
+    _regime_expect("GATE_MAX_RANGE", "30.0"),
+    _regime_expect("GATE_TX_POWER", "30.0"),
+)
+# The UNIFORMITY half — one regime per campaign — has no escape hatch and is
+# not meant to have one. Two regimes in one directory is not a campaign scored
+# against the wrong pin, it is two experiments, and there is no invocation that
+# makes that all right.
+COMMS_REGIME_EXPECT_REQUIRED = os.environ.get("GATE_COMMS_REGIME", "1") != "0"
+
 # The pre-registered shape of the campaign, checked so that a run which died
 # part-way cannot be scored as if it were the whole thing. run_campaign.sh is
 # seed-major, so an early abort is systematically arm-unbalanced rather than
@@ -486,6 +545,7 @@ agg_recovery_entries = 0
 rows = []
 nav_fail_by_arm = collections.Counter()
 cells_by_arm = collections.Counter()
+comms_regime_by_cell = {}
 
 # Populations for the new checks. Counted so an empty one can be reported as
 # UNRESOLVED instead of passing by vacuity.
@@ -587,6 +647,13 @@ for c in cells:
             f"{c}: check 3i — directory says claim radius {dir_claim_r} m but "
             f"the manifest says coord_claim_radius_override={_man_claim_r!r}. "
             f"The cell is filed under a level it did not run")
+
+    # 3j, first half: record this cell's radio regime. Compared campaign-wide
+    # after the loop rather than cell-by-cell, because the failure is a
+    # RELATION between cells — one cell at 11.98 dB is a valid run, and only
+    # becomes a defect next to a cell at 70.0 under the same tag.
+    comms_regime_by_cell[c] = tuple(
+        _regime_val(m.get(k)) for k in COMMS_REGIME_KEYS)
 
     # 1. run ended by the exploration criterion, not a cap
     reason = m.get("run_end_reason", "MISSING")
@@ -1224,6 +1291,57 @@ elif n_3g_gen_p5 or n_3g_gen_pre:
           f"{'P5+' if n_3g_gen_p5 else 'pre-P5'} "
           f"({n_3g_gen_p5 or n_3g_gen_pre} robot-runs, uniform)")
 
+# ==================================================================
+# 3j. ONE RADIO REGIME PER CAMPAIGN, AND IT MUST BE THE DECLARED ONE.
+# ==================================================================
+# Same shape as 3h one layer down: 3h refuses to pool two binaries, this
+# refuses to pool two radios. Every connectivity result — deep_outage_sec, the
+# dropout count, the %-time-connected mediator, and through it the completion
+# time — is conditional on how much a trunk costs and how far a clear lane
+# reaches. Two regimes under one tag is not a noisier campaign, it is two
+# experiments whose arm means something different in each.
+#
+# Read off the MANIFEST, which is written at launch from the values actually
+# passed to the emulator. The alternative — inferring the regime from observed
+# dropouts — cannot work: dropout rate is exactly the thing the regime is
+# supposed to explain, so inferring one from the other would make the check
+# agree with itself.
+def _regime_str(t):
+    return ", ".join(f"{k}={v}" for k, v in zip(COMMS_REGIME_KEYS, t))
+
+
+if comms_regime_by_cell:
+    _by_regime = collections.defaultdict(list)
+    for _c, _t in comms_regime_by_cell.items():
+        _by_regime[_t].append(_c)
+    if len(_by_regime) > 1:
+        _detail = "; ".join(
+            f"[{_regime_str(t)}] in {len(cs)} cell(s) e.g. {sorted(cs)[:2]}"
+            for t, cs in sorted(_by_regime.items()))
+        hard_fail.append(
+            f"check 3j — this campaign mixes {len(_by_regime)} radio regimes: "
+            f"{_detail}. A trunk does not cost the same on both sides, so the "
+            f"outage measurements are not comparable and the arm means "
+            f"something different in each. There is no override for this")
+    elif COMMS_REGIME_EXPECT_REQUIRED:
+        _got = next(iter(_by_regime))
+        if _got != COMMS_REGIME_EXPECT:
+            hard_fail.append(
+                f"check 3j — this campaign ran [{_regime_str(_got)}] but was "
+                f"scored expecting [{_regime_str(COMMS_REGIME_EXPECT)}]. The "
+                f"shipped regime moved on 2026-09-03 (trunks 11.98 -> 70.0 dB, "
+                f"a 30 m horizon added), so a campaign from before it is "
+                f"re-scored on its own terms by declaring the regime in the "
+                f"invocation: GATE_TREE_ATTEN=11.98 GATE_MAX_RANGE=none "
+                f"./gate_g8.py {TAG}")
+        else:
+            print(f"radio regime: {_regime_str(_got)} "
+                  f"({len(comms_regime_by_cell)} cells, uniform, as declared)")
+    else:
+        print(f"radio regime: {_regime_str(next(iter(_by_regime)))} "
+              f"({len(comms_regime_by_cell)} cells, uniform; "
+              f"GATE_COMMS_REGIME=0, so NOT compared against a declaration)")
+
 # Populations examined — printed so a pass can be read as "N rows were checked",
 # never as "nothing objected".
 print("\npopulations examined by the generation-8 checks:")
@@ -1242,6 +1360,7 @@ for label, n, check in (
         ("m-tare features certified ON", n_3g_treated,   "3g"),
         ("m-tare features certified OFF", n_3g_control,  "3g"),
         ("binary-generation witnesses", n_3g_gen_p5 + n_3g_gen_pre, "3h"),
+        ("radio-regime manifests",      len(comms_regime_by_cell), "3j"),
         ("console logs present",        n_console_logs,   "9"),
         ("mid-run reconnect lines",     n_midrun,        "20")):
     mark = "" if n else "   <- EMPTY: check is UNRESOLVED, not passed"
