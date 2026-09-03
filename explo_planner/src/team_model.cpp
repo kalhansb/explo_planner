@@ -95,6 +95,7 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   if (obs.have_position) {
     sp.have_position       = true;
     sp.position_first_hand = true;
+    sp.position_sec        = now_sec;
     sp.position_x = obs.x;
     sp.position_y = obs.y;
     sp.position_z = obs.z;
@@ -148,6 +149,13 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
             k < obs.gx.size() && k < obs.gy.size() && k < obs.gz.size()) {
           p.have_position       = true;
           p.position_first_hand = false;
+          // `at`, not now_sec: this position was measured when the RELAY heard
+          // it, and the whole point of the interval arithmetic above is to
+          // recover that instant. Stamping it with the receipt time would make
+          // a two-minute-old relayed pose look one tick old — which is the
+          // failure this field exists to prevent, reintroduced at the one site
+          // where it actually happens.
+          p.position_sec        = at;
           p.position_x = obs.gx[k];
           p.position_y = obs.gy[k];
           p.position_z = obs.gz[k];
@@ -231,6 +239,17 @@ double TeamModel::lastKnownAgeSec(int id, double now_sec) const {
   const double t = peers_[static_cast<size_t>(id)].last_known_sec;
   if (t < 0.0) return -1.0;
   return std::max(0.0, now_sec - t);
+}
+
+double TeamModel::positionAgeSec(int id, double now_sec) const {
+  if (id < 0 || id >= size_) return -1.0;
+  // Self is deliberately NOT special-cased to 0 the way the other two are:
+  // this model never stores a position for self (nothing observes us), so
+  // answering "0 seconds old" would be a confident age for a position that
+  // does not exist. -1 says what is true — ask the localiser.
+  const Peer& p = peers_[static_cast<size_t>(id)];
+  if (!p.have_position || p.position_sec < 0.0) return -1.0;
+  return std::max(0.0, now_sec - p.position_sec);
 }
 
 double TeamModel::lastDirectAgeSec(int id, double now_sec) const {

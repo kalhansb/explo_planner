@@ -36,14 +36,25 @@ void MetricsLogger::writeHeader() {
         << "phase,target_id,vantage_index,n_vantages_valid,"
         << "vantage_los_clear,dwell_sec,"
         << "prox_hold_count,prox_hold_total_sec,"
-        // Appended, never inserted: the analysis reads these by name, but older
-        // run archives are read positionally by more than one script, and
-        // widening the middle of the schema silently re-labels every one of them.
+        // Appended, never inserted. Every reader in this tree resolves columns
+        // by header name — csv.DictReader in the python, and a header-scanning
+        // awk in run_explo_sim_rviz.sh — so inserting would not in fact break
+        // any of them; a comment here used to claim otherwise and was wrong.
+        // The rule is kept anyway, for the readers that are NOT in this tree.
+        // A campaign archive outlives the binary that wrote it and gets opened
+        // by whatever is to hand months later, and a positional read of an
+        // old file against a new schema does not fail, it silently returns the
+        // wrong column. Appending costs one out-of-place block of names; that
+        // is the whole price, and it is paid below three times over.
         << "state,reconnect_range_to_goal_m,reconnect_elapsed_sec,"
         << "unknown_fraction,coverage_source,"
         // Same rule: belongs beside mean_info_gain by meaning, but goes here
         // because the schema only ever grows at the right-hand end.
-        << "info_gain_std\n";
+        << "info_gain_std,"
+        // Same rule again (separation.hpp). These belong beside
+        // rejected_by_minpos — they are the manipulation checks for the
+        // mechanism that replaces it — and they are here instead.
+        << "sep_peer_dist_m,sep_discount,sep_reordered,sep_eligible_peers\n";
   header_written_ = true;
 }
 
@@ -85,7 +96,11 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.reconnect_elapsed_sec << ","
         << m.unknown_fraction << ","
         << m.coverage_source << ","
-        << m.info_gain_std << "\n";
+        << m.info_gain_std << ","
+        << m.sep_peer_dist_m << ","
+        << m.sep_discount << ","
+        << m.sep_reordered << ","
+        << m.sep_eligible_peers << "\n";
   file_.flush();
 }
 

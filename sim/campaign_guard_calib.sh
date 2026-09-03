@@ -701,18 +701,35 @@ unset _stderr
 # and the exchange in every cell of a plain hybrid-vs-off campaign, stamp the
 # same arm on both sides, and score CLEAN. Read the -u list back out rather than
 # trusting that it was kept in step with the knobs the launcher grew.
-for _u in LINK_GATE MIDRUN_SILENCE CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ \
-          GLOBAL_ALLOC RECONNECT_GATE RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
+#
+# DERIVED, not re-listed. This loop used to enumerate nine names by hand, and a
+# hand-maintained copy of a list is a check that goes stale silently: by the
+# time anything looked, six knobs the guard reasons about (TREE_ATTEN,
+# MAX_RANGE, CELL_SIZE_M and the three SEPARATION_*) had been added to
+# run_campaign.sh and to none of them, and this section printed nine PASSes
+# without noticing. So take the knob list from the script's own env_val() calls
+# -- that IS the set of things the guard models -- and assert the invariant
+# stated at the -u list: each one is either stripped there, or assigned
+# explicitly on the same launch line. A knob that is neither is one the guard
+# scores at its default while the cell runs on the ambient shell's value.
+_launch_line=$(sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS")
+_knobs=$(grep -oE 'env_val [A-Z_][A-Z0-9_]*' "$CS" | awk '{print $2}' | sort -u)
+if [ -z "$_knobs" ]; then
+  echo "  FAIL  found no env_val knobs to check -- this loop has stopped checking"
+  fails=$((fails+1)); cases=$((cases+1))
+fi
+for _u in $_knobs; do
   cases=$((cases+1))
-  if sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS" \
-     | grep -qE -- "-u $_u( |\\\\|$)"; then
+  if printf '%s\n' "$_launch_line" | grep -qE -- "-u $_u( |\\\\|$)"; then
     echo "  PASS  the launch line strips ambient $_u"
+  elif printf '%s\n' "$_launch_line" | grep -qE "(^|[[:space:]])$_u="; then
+    echo "  PASS  the launch line assigns $_u explicitly (strip not needed)"
   else
-    echo "  FAIL  ambient $_u reaches every cell -- it is not in the -u list"
+    echo "  FAIL  ambient $_u reaches every cell -- neither stripped nor assigned"
     fails=$((fails+1))
   fi
 done
-unset _u
+unset _u _knobs _launch_line
 
 echo
 echo "=== the resume guard: a banked cell must have run THIS experiment ==="
@@ -728,9 +745,14 @@ echo "=== the resume guard: a banked cell must have run THIS experiment ==="
 # guard that never aborts is a rubber stamp; a guard that always aborts is
 # worse than none, since the operator learns to reach for a fresh --tag every
 # time and the guard stops being read. The float keys make the second failure
-# easy to write by accident: the launcher normalises 20 to 20.0, so a string
-# compare would abort a correct resume on a formatting difference alone. Cases
-# feeding the unnormalised spelling pin that.
+# easy to write by accident: the two sides of the comparison reach it by
+# different routes -- the manifest carries the value as the run recorded it,
+# the guard the value the operator typed -- so a cell banked at "20.0" can be
+# checked against a request for "20" and a string compare would abort a correct
+# resume on a formatting difference alone. Cases feeding both spellings pin
+# that, and the garbage-value cases below pin the other end of it: awk reads an
+# unparseable string as 0, so the numeric branch has to check that what it was
+# handed is a number before believing they agree.
 #
 # Nothing launches. The cases run without --dry-run -- the guard sits below the
 # point where --dry-run exits -- so MIN_FREE_MB is set absurdly high, which
@@ -760,6 +782,9 @@ tree_attenuation_db=70.0
 max_range_m=30.0
 cell_size_m=10.0
 coord_claim_radius_override=none
+separation_weight=0
+separation_radius_m=20
+separation_max_age_sec=10
 EOF
 }
 # rg WANT "label" ARM KEY VALUE
@@ -836,6 +861,53 @@ rg ABORT "an unsuffixed arm banked at a pinned 10.0"          "$RG_ARM" coord_cl
 # spellings; the four above pass either way.
 rg ABORT "a non-numeric value is not the 'none' sentinel"     "$RG_ARM" coord_claim_radius_override unset
 rg ABORT "an empty value cannot be shown to agree"            "$RG_ARM" coord_claim_radius_override ""
+# The separation term's three knobs. The weight is the obvious one; the other
+# two are guarded because they are NOT inert at weight 0 -- sep_peer_dist_m and
+# sep_eligible_peers are measured on them in every arm, so a resume that moved
+# either would bank half a campaign's counterfactual on a different bound.
+rg SKIP  "separation_weight=0 matches the campaign default"   "$RG_ARM" separation_weight 0
+rg ABORT "a cell banked at separation_weight=0.4 differs"     "$RG_ARM" separation_weight 0.4
+rg ABORT "separation_weight absent cannot be shown to agree"  "$RG_ARM" separation_weight "<none>"
+# Numeric, not string: a cell can bank "20.0" against a campaign requesting
+# "20" -- the two spellings travel by different routes, the manifest taking the
+# value the node resolved and the guard the value the operator typed -- so a
+# string compare would abort a correct resume. This is the case that would catch
+# that regression, and the 25.0 one below is what stops the fix from
+# degenerating into "any radius agrees".
+rg SKIP  "separation_radius_m=20.0 matches a requested 20"    "$RG_ARM" separation_radius_m 20.0
+rg ABORT "a cell banked at separation_radius_m=25.0 differs"  "$RG_ARM" separation_radius_m 25.0
+rg ABORT "separation_radius_m absent cannot be shown to agree" "$RG_ARM" separation_radius_m "<none>"
+rg SKIP  "separation_max_age_sec=10.0 matches a requested 10" "$RG_ARM" separation_max_age_sec 10.0
+rg ABORT "a cell banked at separation_max_age_sec=3.0 differs" "$RG_ARM" separation_max_age_sec 3.0
+rg ABORT "separation_max_age_sec absent cannot be shown to agree" \
+                                                              "$RG_ARM" separation_max_age_sec "<none>"
+# A manifest value that is not a NUMBER must abort, and separation_weight is the
+# key where getting this wrong is invisible: awk reads any unparseable string as
+# 0, the requested weight is 0 in every campaign run so far, so before the
+# numeric branch was taught to check its inputs each of these compared EQUAL and
+# banked a cell whose weight could no longer be determined. "0.0" is the control
+# alongside them -- a real number that really does agree -- so a fix that
+# degenerated into "abort on everything" would not pass this block either.
+rg ABORT "separation_weight=off is not a number"              "$RG_ARM" separation_weight off
+rg ABORT "separation_weight=unset is not a number"            "$RG_ARM" separation_weight unset
+rg ABORT "separation_weight=0x0 is not a number"              "$RG_ARM" separation_weight 0x0
+rg ABORT "separation_weight= (truncated line) is not a number" "$RG_ARM" separation_weight ""
+rg SKIP  "separation_weight=0.0 IS a number and agrees with 0" "$RG_ARM" separation_weight 0.0
+rg ABORT "separation_radius_m=default is not a number"        "$RG_ARM" separation_radius_m default
+# "nan" gets its own case at a key whose requested value is NOT 0, because it
+# fails differently from the strings above. This awk parses it as a real NaN
+# and then reports nan == <anything> as TRUE, so under a bare `a + 0 == b + 0`
+# a single corrupted value agrees with every key at every level -- 25.0 as
+# readily as 0. The "off"/"unset" cases cannot catch that: they only compare
+# equal where the request happens to be 0.
+rg ABORT "separation_max_age_sec=nan is not a number"         "$RG_ARM" separation_max_age_sec nan
+rg ABORT "separation_radius_m=nan agrees with 20 under a bare +0" \
+                                                              "$RG_ARM" separation_radius_m nan
+# The other direction, and the reason the numeric branch trims before matching:
+# the regex is STRICTER than `+ 0` was, so a value the old compare accepted
+# must not start aborting a correct resume. Whitespace is the realistic way to
+# acquire one, and this is the case that would fail if the trim were dropped.
+rg SKIP  "separation_radius_m= 20.0 (padded) still resumes"   "$RG_ARM" separation_radius_m " 20.0 "
 unset _want _lbl _arm _key _val _root _cell _out _rc _got RG_ARM
 
 echo
@@ -852,6 +924,26 @@ for _spec in TREE_ATTEN:TREE_ATTEN_REQ MAX_RANGE:MAX_RANGE_REQ \
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\$(flt \"\${$_ek:-\(.*\)}\")\"\$/\1/p" "$LAUNCHER" | head -1)
   _gd=$(sed -n "s/^$_vn=\$(env_val $_ek \(.*\))\$/\1/p" "$CS" | head -1)
+  if [ -n "$_ld" ] && [ "$_ld" = "$_gd" ]; then
+    echo "  PASS  launcher default $_ek=$_ld matches the resume guard's copy"
+  else
+    echo "  FAIL  launcher default $_ek is '${_ld:-UNREADABLE}' but the resume" \
+         "guard assumes '${_gd:-UNREADABLE}'"
+    fails=$((fails+1))
+  fi
+done
+unset _spec _ek _vn _ld _gd
+# The separation knobs are declared in the launcher WITHOUT flt() -- they are
+# validated in place instead -- so they need their own readback pattern. Same
+# hazard, same consequence: a stale copy aborts every resume of a campaign that
+# is running exactly as intended.
+for _spec in SEPARATION_WEIGHT:SEPARATION_WEIGHT_REQ \
+             SEPARATION_RADIUS_M:SEPARATION_RADIUS_REQ \
+             SEPARATION_MAX_AGE_SEC:SEPARATION_MAX_AGE_REQ; do
+  _ek=${_spec%%:*}; _vn=${_spec#*:}
+  cases=$((cases+1))
+  _ld=$(sed -n "s/^$_ek=\"\${$_ek:-\(.*\)}\"$/\1/p" "$LAUNCHER" | head -1)
+  _gd=$(sed -n "s/^$_vn=\$(env_val $_ek \(.*\))$/\1/p" "$CS" | head -1)
   if [ -n "$_ld" ] && [ "$_ld" = "$_gd" ]; then
     echo "  PASS  launcher default $_ek=$_ld matches the resume guard's copy"
   else

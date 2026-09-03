@@ -84,6 +84,7 @@ add_library(explo_planner_lib
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
+  src/separation.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -254,6 +255,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_tree_detector test/test_tree_detector.cpp)
   target_link_libraries(test_tree_detector explo_planner_lib)
+
+  ament_add_gtest(test_separation test/test_separation.cpp)
+  target_link_libraries(test_separation explo_planner_lib)
 endif()
 
 ament_package()

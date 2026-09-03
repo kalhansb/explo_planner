@@ -78,6 +78,7 @@
 #include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/team_model.hpp"
+#include "explo_planner/separation.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
 #include "explo_planner/pursuit_predictor.hpp"
@@ -603,6 +604,28 @@ private:
   // peer's census under robot bit zero.
   double     team_world_hz_ = 0.0;
   TeamModel  team_model_;
+
+  // Soft team-separation discount on the exploration utility (separation.hpp).
+  // OFF by default; `separation_weight = 0` is the pre-separation planner
+  // bit-for-bit, because SeparationTerm::apply is not called at all when the
+  // term is disabled and discount() would return exactly 1.0f if it were.
+  SeparationTerm separation_;
+  /// Peers this robot is currently willing to be repelled by, rebuilt from the
+  /// team model once per PLAN tick. `now_sec` is MISSION-ELAPSED seconds
+  /// (missionElapsed()), the clock the team model is denominated in — passing
+  /// a this->now() epoch here would make every position look billions of
+  /// seconds old and the term silently inert.
+  ///
+  /// Deliberately does NOT consult separation_.enabled(): the anchor list is
+  /// built, and the peer distance and eligible-peer count logged from it, in
+  /// EVERY arm. Those two columns in an untreated cell are the counterfactual
+  /// the treated arm is scored against, and gating this on the term being on
+  /// would silently delete them from every control run. Empty whenever the
+  /// team model is unconfigured (TEAM_WORLD=0 — then permanently so, and the
+  /// columns carry no information for that cell) or no peer has a position
+  /// fresh enough to steer on. Both are normal.
+  std::vector<SeparationTerm::Anchor> separationAnchors(double now_sec) const;
+
   /// The allocation problem's vehicle set at position (x, y): every robot in
   /// the fleet identity, self first-hand and peers from the team model.
   ///
@@ -1865,6 +1888,30 @@ private:
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
 
+  // Separation-term diagnostics (separation.hpp), filled by doPlan on every
+  // exploration tick and drained the same way.
+  //
+  // These exist because the term's predecessor is a cautionary tale: MinPos is
+  // a real mechanism whose only observable, `rejected_by_minpos`, sits at zero
+  // for a whole campaign, so nothing in the data can tell "the veto never
+  // mattered" from "the veto never ran". Every one of the four columns below
+  // is a MANIPULATION CHECK, and between them they separate the two:
+  //
+  //   sep_eligible_peers  did the term have anything to act ON this tick?
+  //   sep_peer_dist_m     how far from the teammate did the pick land?
+  //   sep_discount        by how much was the pick actually discounted?
+  //   sep_reordered       did the discount change where the robot was sent?
+  //                       1 yes, 0 no, -1 not asked on this tick
+  //
+  // sep_peer_dist_m and sep_eligible_peers are computed and logged even when
+  // the term is OFF — they are then a free measurement of the separation the
+  // untreated planner produces, which is the counterfactual any treated
+  // campaign has to be read against.
+  int   pending_sep_eligible_peers_   = 0;
+  float pending_sep_peer_dist_m_      = -1.0f;  // -1 = no eligible peer
+  float pending_sep_discount_         = 1.0f;
+  int   pending_sep_reordered_        = -1;
+
   // Per-exploit-step diagnostics (filled by doExploitPlan/doExploitDwell,
   // drained by doLogStep when phase_ == EXPLOIT).
   int   pending_exploit_target_id_    = -1;
@@ -2576,6 +2623,37 @@ ExploPlannerNode::ExploPlannerNode()
         raw, utility_cost_exponent_);
   }
 
+  // Soft team-separation discount on the utility (separation.hpp). Loaded
+  // beside utility_cost_exponent because it is the same kind of thing — a
+  // multiplier on U(c) — and a reader who finds one should find the other.
+  //
+  // Defaults are OFF (weight 0), so this block changes no shipped behaviour
+  // until a campaign turns it on. The radius default is the 20 m the
+  // rho = 0.677 correlation is stated at, and the max age is two TeamWorld
+  // heartbeats plus margin; both are inert while the weight is 0.
+  //
+  // configure() REFUSES rather than clamps (see its doc), and the refusal is
+  // logged at ERROR: a run whose manifest records separation_weight=0.6 and
+  // whose binary silently ran at 0 is a cell that would be pooled into the
+  // treated arm while carrying the control's behaviour.
+  {
+    SeparationTerm::Config scfg;
+    scfg.weight      = dp("separation_weight", 0.0);
+    scfg.radius_m    = dp("separation_radius_m", 20.0);
+    scfg.max_age_sec = dp("separation_max_age_sec", 10.0);
+    const std::string serr = separation_.configure(scfg);
+    if (!serr.empty()) {
+      RCLCPP_ERROR(get_logger(), "Separation term DISABLED: %s.", serr.c_str());
+    } else if (separation_.enabled()) {
+      RCLCPP_INFO(get_logger(),
+          "Separation term ON: weight=%.3f radius=%.1fm max_age=%.1fs "
+          "(utility is multiplied by 1 - weight*(1 - d/radius) for a "
+          "candidate d metres from the nearest fresh teammate).",
+          separation_.config().weight, separation_.config().radius_m,
+          separation_.config().max_age_sec);
+    }
+  }
+
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
   // info_gain for each candidate is the sum of score_fn evaluated at sampled
   // poses along the Dijkstra path, not just the endpoint. Evaluated locally via
@@ -3137,6 +3215,15 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("experiment_log_anchor_period_sec",
                           experiment_log_anchor_period_sec_);
     exp_log_->addParamBool("coordination_enabled", coord_enabled_);
+    // Separation term. Logged from separation_.config(), which is what the
+    // planner will actually use, NOT from the raw parameters — configure()
+    // refuses an out-of-range weight and leaves the term off, and recording
+    // the request rather than the outcome is how a control cell ends up
+    // indexed as a treated one.
+    exp_log_->addParamNum("separation_weight", separation_.config().weight);
+    exp_log_->addParamNum("separation_radius_m", separation_.config().radius_m);
+    exp_log_->addParamNum("separation_max_age_sec",
+                          separation_.config().max_age_sec);
     exp_log_->addParamNum("coord_claim_ttl_sec", coord_claim_ttl_sec_);
     exp_log_->addParamNum("coord_heartbeat_hz", coord_heartbeat_hz_);
     // Both names, one resolved value. `reconnect_enabled` is current;
@@ -3445,6 +3532,23 @@ ExploPlannerNode::ExploPlannerNode()
   // produce a fleet that looks like it is sharing and is not, which is the
   // single most expensive failure mode this whole plan exists to remove.
   team_world_hz_ = dp("team_world_hz", 0.0);
+  // The separation term reads peer positions out of the comms model, and the
+  // comms model is fed by exactly one thing: incoming TeamWorld. With the
+  // exchange off there is never an eligible anchor, so the term is on in the
+  // manifest, on in the node's startup line, and inert in every decision — the
+  // failure this project has already paid for more than once. Fatal rather
+  // than a warning: a cell that ran the control's behaviour under the
+  // treatment's name is worse than a cell that refused to start, because only
+  // one of the two is visible in the results.
+  if (separation_.enabled() && !(team_world_hz_ > 0.0)) {
+    const std::string e =
+        "separation_weight > 0 requires team_world_hz > 0: peer positions "
+        "reach the planner only through the TeamWorld exchange, so with it "
+        "off the separation term would run with no teammate to be repelled "
+        "by and silently reproduce the untreated planner.";
+    RCLCPP_FATAL(get_logger(), "%s", e.c_str());
+    throw std::runtime_error(e);
+  }
   if (team_world_hz_ > 0.0) {
     if (!cell_world_enable_) {
       RCLCPP_FATAL(get_logger(),
@@ -5185,6 +5289,47 @@ std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
   return out;
 }
 
+std::vector<SeparationTerm::Anchor> ExploPlannerNode::separationAnchors(
+    double now_sec) const {
+  std::vector<SeparationTerm::Anchor> out;
+  if (!team_model_.configured()) return out;
+
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == fleet_.self_id) continue;
+    const TeamModel::Peer& p = team_model_.peer(id);
+    if (!p.known || !p.have_position) continue;
+    // A teammate that has latched exploration done is parked or homing and is
+    // clearing no ground, so backing away from it buys nothing and costs the
+    // information that made the candidate attractive. Excluded rather than
+    // down-weighted: "how much less should a finished robot repel" is a knob
+    // with no evidence behind it, and zero is the one answer that needs none.
+    //
+    // Bounded, not exact: `finished` is only ever set from a FIRST-HAND
+    // message (team_model.cpp sets sp.finished = obs.finished for the sender
+    // and nowhere else). The wire's gossip arrays carry positions and
+    // last-heard stamps but no finished bit, so a peer reached only through a
+    // relay keeps whatever this robot last learned first-hand — false, if it
+    // has never been in direct contact. Such a peer therefore still repels
+    // after it parks. The error is one-sided and small: the term repels from
+    // somewhere a robot genuinely is, just for longer than it needs to, and
+    // it costs at most the discount on candidates near a parked robot. Adding
+    // a gossip finished bit means widening the message, which is a change to
+    // every arm, and it is not worth making inside a campaign. Note the same
+    // staleness already applies to the allocator's vehicle set, which reads
+    // p.finished the same way and long predates this term.
+    if (p.finished) continue;
+    // POSITION age, not lastKnownAgeSec: a relayed status update refreshes
+    // "when did we last hear about this robot" while leaving the pose we hold
+    // for it untouched, and steering on the second while filtering on the
+    // first is exactly the trap team_model.hpp's rule 3 is written about.
+    const double age = team_model_.positionAgeSec(id, now_sec);
+    if (!separation_.eligibleAnchor(age)) continue;
+    out.push_back(SeparationTerm::Anchor{
+        static_cast<float>(p.position_x), static_cast<float>(p.position_y)});
+  }
+  return out;
+}
+
 // ==================================================================
 // PLAN state
 // ==================================================================
@@ -5750,6 +5895,30 @@ void ExploPlannerNode::doPlan() {
   const float kGamma = static_cast<float>(utility_cost_exponent_);
   const bool  kUnitGamma = (kGamma == 1.0f);
 
+  // ---- Team-separation discount (separation.hpp) -----------------------
+  //
+  // Built once per tick, BEFORE the utility loop, and used for two different
+  // things that must not be confused: `sep_anchors` drives the discount, and
+  // it also drives the sep_* diagnostic columns, which are written in every
+  // arm — including arms where the weight is 0 and no score moves. The
+  // eligibility rules (fresh position, not finished, not self) live in
+  // separationAnchors(); the shape lives in SeparationTerm.
+  //
+  // missionElapsed(), not this->now().seconds(): the team model stamps every
+  // peer position on the mission clock, and comparing a mission-elapsed stamp
+  // against a sim-epoch now() would age every position by the epoch and empty
+  // this list on every tick of every run.
+  const std::vector<SeparationTerm::Anchor> sep_anchors =
+      separationAnchors(missionElapsed());
+  // Kept per candidate so the SELECTED one's discount can be logged after the
+  // walk below picks it — the walk can reject the top-scoring candidate for a
+  // dozen reasons, so the discount that mattered is not knowable here.
+  std::vector<float> sep_discount(candidates.size(), 1.0f);
+  // The undiscounted utility, kept only to answer "would this tick have
+  // preferred a different candidate without the term?" — the manipulation
+  // check. Not used for any decision.
+  std::vector<float> utility_undiscounted(candidates.size(), 0.0f);
+
   std::vector<float> info_gain(candidates.size(), 0.0f);
   std::vector<float> path_cost(candidates.size(), 0.0f);
   float sum_info = 0.0f;
@@ -5780,6 +5949,27 @@ void ExploPlannerNode::doPlan() {
       } else {
         // Unreachable (inf cost): U = -inf, sorts to the bottom.
         candidates[i].score = -std::numeric_limits<float>::infinity();
+      }
+      utility_undiscounted[i] = candidates[i].score;
+      // Applied to U, not to info_gain, and that is the whole design. Scaling
+      // the numerator would make the term compete with the information model
+      // — a discounted candidate would look like one the FOV evaluator had
+      // scored lower, and the two would be indistinguishable in
+      // selected_info_gain. Scaling U leaves both components of the pick
+      // reported honestly and puts the separation preference where the reader
+      // can see it, in a column of its own.
+      //
+      // Guarded by enabled() so the disabled path does not even multiply by
+      // 1.0f: an unreachable candidate carries -inf, and -inf * 1.0f is -inf
+      // in IEEE arithmetic, but "the off configuration executes no arithmetic
+      // at all" is a stronger and cheaper claim than "the arithmetic it
+      // executes happens to be exact".
+      if (separation_.enabled()) {
+        sep_discount[i] = separation_.discount(candidates[i].position.x(),
+                                               candidates[i].position.y(),
+                                               sep_anchors);
+        candidates[i].score =
+            SeparationTerm::apply(candidates[i].score, sep_discount[i]);
       }
     }
   }
@@ -5957,22 +6147,45 @@ void ExploPlannerNode::doPlan() {
         return sa > sb;
       });
 
-  int rejected_map = 0;
-  int rejected_blacklist = 0;
-  int rejected_unreachable = 0;
-  int rejected_minpos = 0;
-  int rejected_too_close = 0;
   bool found = false;
   size_t selected_idx = 0;
-  // Candidates whose ONLY disqualification was the failed-goal blacklist.
-  // Retirement makes suppression permanent within a run, so there has to be a
-  // path back: if every candidate is suppressed, the planner must re-attempt
-  // the least-recently-failed one rather than sit in the "all candidates
-  // rejected, retrying next tick" spin, which is already starvation. Amnesty
-  // makes retirement mean "last resort", not "abandoned while frontiers
-  // remain", which bounds the worst case at exactly today's behaviour.
-  std::vector<size_t> suppressed_only;
-  for (size_t idx : order) {
+
+  // The rejection counters and the suppressed list, bundled into one object so
+  // that the walk below can be run a SECOND time — over the candidate order the
+  // separation term would have produced had it been off — without that second
+  // run's throwaway rejections landing in the numbers the CSV reports. See the
+  // sep_reordered block further down for why the second run has to exist.
+  //
+  // `suppressed` holds the candidates whose ONLY disqualification was the
+  // failed-goal blacklist. Retirement makes suppression permanent within a run,
+  // so there has to be a path back: if every candidate is suppressed, the
+  // planner must re-attempt the least-recently-failed one rather than sit in
+  // the "all candidates rejected, retrying next tick" spin, which is already
+  // starvation. Amnesty makes retirement mean "last resort", not "abandoned
+  // while frontiers remain", which bounds the worst case at exactly today's
+  // behaviour.
+  struct WalkTally {
+    int too_close = 0;
+    int map = 0;
+    int unreachable = 0;
+    int blacklist = 0;
+    int minpos = 0;
+    std::vector<size_t> suppressed;
+  };
+
+  // The candidate filter chain, lifted out of the walk so that the real pick
+  // and the separation counterfactual are decided by the SAME code rather than
+  // by two copies of it that drift apart over time. A manipulation check that
+  // has quietly stopped agreeing with the mechanism it is checking is worse
+  // than no manipulation check, because it still prints a number.
+  //
+  // Every filter below is a READ of node state — the map, the cost grid, the
+  // two blacklists, the peer claims. The only writes are to `t`, which is what
+  // makes running the chain a second time safe. Note that nothing here looks at
+  // a candidate's SCORE: admissibility is score-independent, so the two walks
+  // see the identical admissible set and differ only in what order they reach
+  // it in. That is the whole reason the counterfactual is exact.
+  const auto admissible = [&](size_t idx, WalkTally& t) -> bool {
     const auto& vp = candidates[idx];
     // 0. Skip candidates at the robot's feet — these are "already reached"
     //    by goal_xy_tolerance so they waste a step without any movement —
@@ -5985,8 +6198,8 @@ void ExploPlannerNode::doPlan() {
       float dx = vp.position.x() - robot_pos.x();
       float dy = vp.position.y() - robot_pos.y();
       if (dx * dx + dy * dy < static_cast<float>(near * near)) {
-        ++rejected_too_close;
-        continue;
+        ++t.too_close;
+        return false;
       }
     }
     // 1. Single-cell free check on the planning_map. Frontier centroid
@@ -5997,9 +6210,9 @@ void ExploPlannerNode::doPlan() {
     //    is available (best-effort mode) — there is nothing to check against.
     if (latest_plan_map_) {
       if (vp.is_frontier) {
-        if (isCellOccupied(vp.position)) { ++rejected_map; continue; }
+        if (isCellOccupied(vp.position)) { ++t.map; return false; }
       } else {
-        if (!isCellFree(vp.position)) { ++rejected_map; continue; }
+        if (!isCellFree(vp.position)) { ++t.map; return false; }
       }
     }
     // 2. Cost-grid reachability — catches free pockets sealed off by
@@ -6007,21 +6220,21 @@ void ExploPlannerNode::doPlan() {
     //    anything (robot trapped in inflation zone).
     if (!skip_reachability && cost_grid_ &&
         !cost_grid_->reachable(vp.position)) {
-      ++rejected_unreachable;
-      continue;
+      ++t.unreachable;
+      return false;
     }
     // 3. Failed-goal blacklist (existing) + recently-visited suppression.
     //    Both counted as `blk` in the per-step log: they reject for the same
     //    reason from the planner's point of view -- do not go back there yet.
     if (visited_goal_radius_m_ > 0.0 &&
         visited_goals_.isNear(vp.position, visited_goal_radius_m_)) {
-      ++rejected_blacklist;
-      continue;
+      ++t.blacklist;
+      return false;
     }
     if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
-      ++rejected_blacklist;
-      suppressed_only.push_back(idx);
-      continue;
+      ++t.blacklist;
+      t.suppressed.push_back(idx);
+      return false;
     }
     // 4. MinPos peer-claim check (only when coordination is enabled).
     // live_after: exploration contests LIVE claims only. Exploit claims are
@@ -6035,15 +6248,33 @@ void ExploPlannerNode::doPlan() {
           &plan_start);
       if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
                                             *peer, robot_name_)) {
-        ++rejected_minpos;
-        continue;
+        ++t.minpos;
+        return false;
       }
     }
-    current_goal_ = vp;
+    return true;
+  };
+
+  WalkTally tally;
+  for (size_t idx : order) {
+    if (!admissible(idx, tally)) continue;
+    current_goal_ = candidates[idx];
     selected_idx = idx;
     found = true;
     break;
   }
+  // This walk is the one whose rejections are real; the counterfactual's are
+  // discarded. Aliased rather than copied so the amnesty block below, which
+  // consumes the suppressed list, needs no change.
+  const int rejected_too_close   = tally.too_close;
+  const int rejected_map         = tally.map;
+  const int rejected_unreachable = tally.unreachable;
+  const int rejected_blacklist   = tally.blacklist;
+  const int rejected_minpos      = tally.minpos;
+  std::vector<size_t>& suppressed_only = tally.suppressed;
+  // Whether the pick came from the walk itself rather than from the amnesty
+  // fallback below. sep_reordered is only defined for a walk pick — see there.
+  const bool found_in_walk = found;
   if (!found && !suppressed_only.empty()) {
     // Retired last, then least-recently-failed (see amnestyOrderBefore for why
     // the retired partition has to be there). stable_sort so equal keys keep
@@ -6224,6 +6455,81 @@ void ExploPlannerNode::doPlan() {
   pending_rejected_by_minpos_      = rejected_minpos;
   pending_rejected_by_unreachable_ = rejected_unreachable;
 
+  // ---- Separation manipulation checks ---------------------------------
+  //
+  // The first two are measured whether or not the term is on. In an untreated
+  // arm they are the counterfactual: how close to its teammate did the
+  // unmodified planner send this robot, and did it even have a teammate to be
+  // close to. Without them a null result cannot distinguish "dispersion does
+  // not help" from "the robots were never near each other anyway".
+  pending_sep_eligible_peers_ = static_cast<int>(sep_anchors.size());
+  pending_sep_peer_dist_m_ = SeparationTerm::nearestAnchorDist(
+      current_goal_.position.x(), current_goal_.position.y(), sep_anchors);
+  // The discount on the candidate that was actually taken, which is not
+  // necessarily the most-discounted one or the one that led: the walk above
+  // can reject the leader on the map, reachability, the blacklist or MinPos.
+  pending_sep_discount_ = sep_discount[selected_idx];
+  // Did the discount change WHERE THE ROBOT WAS SENT? Three states: 1 yes,
+  // 0 no, -1 the question was not asked on this tick.
+  //
+  // This compares PICKS, by re-sorting on the saved undiscounted utility and
+  // re-walking the same filter chain. An earlier version compared the two
+  // LEADERS instead — the argmax with and without the discount — on the
+  // reasoning that re-running the walk would disturb the run it was measuring.
+  // That reasoning was wrong twice over. The walk's filters are all reads, so
+  // a second run over a throwaway tally disturbs nothing; and the leader
+  // comparison silently under-reports, in the one direction that matters.
+  //
+  // The walk takes the first ADMISSIBLE candidate, not the leader, and the
+  // leader is inadmissible often enough that the node carries a whole
+  // starvation branch for it. Take a blacklisted candidate A leading both
+  // orders, with B (close to the teammate, discounted below C) and C behind
+  // it: the term reorders B and C, the walk rejects A and picks C where it
+  // would have picked B, and a leader comparison reports 0. A manipulation
+  // check that reads near-zero across a campaign in which the term was
+  // steering constantly would retire the mechanism for the wrong reason.
+  //
+  // The counterfactual is EXACT, not an estimate, because admissibility does
+  // not depend on score (see the filter chain): both walks see the identical
+  // admissible set, so the only thing that can differ is which member of it
+  // comes first. It follows that the counterfactual walk finds a candidate
+  // whenever the real one did, so a -1 here always means the question was not
+  // asked and never means it could not be answered.
+  //
+  // Not asked on three kinds of tick: the term is off (with no discount the
+  // two orders are the same by definition, so 0 would be true but vacuous, and
+  // -1 keeps it from being pooled with a measured 0); the walk selected
+  // nothing; or the pick came from the amnesty fallback, whose ordering is by
+  // failure age rather than by utility and which the term therefore cannot
+  // reach.
+  pending_sep_reordered_ = -1;
+  if (separation_.enabled() && found_in_walk) {
+    std::vector<size_t> order_undisc(candidates.size());
+    std::iota(order_undisc.begin(), order_undisc.end(), 0);
+    // Character-for-character the comparator used for the real `order` above,
+    // except for reading utility_undiscounted[] in place of the live score —
+    // same rank-primary rule, same NaN-to-the-bottom handling. If that
+    // comparator changes, this one has to change with it.
+    std::sort(order_undisc.begin(), order_undisc.end(),
+        [&utility_undiscounted, &alloc_rank](size_t a, size_t b) {
+          if (alloc_rank[a] != alloc_rank[b]) return alloc_rank[a] < alloc_rank[b];
+          const float sa = utility_undiscounted[a];
+          const float sb = utility_undiscounted[b];
+          if (std::isnan(sa)) return false;
+          if (std::isnan(sb)) return true;
+          return sa > sb;
+        });
+    WalkTally cf_tally;            // discarded: `tally` holds the real numbers
+    long cf_pick = -1;
+    for (size_t idx : order_undisc) {
+      if (!admissible(idx, cf_tally)) continue;
+      cf_pick = static_cast<long>(idx);
+      break;
+    }
+    pending_sep_reordered_ =
+        (cf_pick != static_cast<long>(selected_idx)) ? 1 : 0;
+  }
+
   auto plan_end = this->now();
   float plan_ms = static_cast<float>(
       (plan_end - plan_start).nanoseconds() * 1e-6);
@@ -6244,6 +6550,22 @@ void ExploPlannerNode::doPlan() {
       candidates.size(), rejected_too_close, rejected_map,
       rejected_unreachable, rejected_blacklist, rejected_minpos,
       coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
+
+  // Throttled, and only when the term is on: a pilot needs to be able to see
+  // from the console that the treatment is doing something, without waiting
+  // for the CSV. Throttled rather than per-tick because at 10 Hz an always-on
+  // second line would double the planner log for a diagnostic the columns
+  // already carry losslessly.
+  if (separation_.enabled()) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 15000,
+        "Separation: %d eligible peer(s), pick sits %.1fm from the nearest, "
+        "discounted x%.3f, goal moved by the term: %s.",
+        pending_sep_eligible_peers_, pending_sep_peer_dist_m_,
+        pending_sep_discount_,
+        pending_sep_reordered_ > 0 ? "yes"
+                                   : (pending_sep_reordered_ == 0
+                                          ? "no" : "not asked"));
+  }
 
   publishGoal(current_goal_);
   publishCandidateViz(candidates);
@@ -9990,6 +10312,10 @@ void ExploPlannerNode::doLogStep() {
   m.selected_utility    = current_goal_.score;
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
+  m.sep_peer_dist_m     = pending_sep_peer_dist_m_;
+  m.sep_discount        = pending_sep_discount_;
+  m.sep_reordered       = pending_sep_reordered_;
+  m.sep_eligible_peers  = pending_sep_eligible_peers_;
 
   // Exploitation columns. Left at the -1/0 defaults for exploration rows;
   // filled from the dwelled vantage for exploitation rows (m.phase itself is
@@ -10803,6 +11129,15 @@ void ExploPlannerNode::doExploitPlan() {
       pending_selected_path_cost_      = 0.0f;
       pending_rejected_by_minpos_      = rej_minpos;
       pending_rejected_by_unreachable_ = rej_unreach;
+      // The separation term does not run on the exploit path — vantages are
+      // chosen by sightline, not by utility — so these are reset to their
+      // "nothing measured" values rather than left holding whatever the last
+      // exploration tick saw. A stale peer distance on an exploit row would be
+      // read as a measurement of where this robot was sent, and it is not.
+      pending_sep_peer_dist_m_    = -1.0f;
+      pending_sep_discount_       = 1.0f;
+      pending_sep_reordered_      = -1;
+      pending_sep_eligible_peers_ = 0;
 
       RCLCPP_INFO(get_logger(),
           "Target %u: no vantage reachable yet -> approaching trunk via "
@@ -10857,6 +11192,13 @@ void ExploPlannerNode::doExploitPlan() {
   pending_selected_path_cost_      = best_cost;
   pending_rejected_by_minpos_      = rej_minpos;
   pending_rejected_by_unreachable_ = rej_unreach;
+  // As on the approach path above: the separation term has no say in vantage
+  // selection, so the exploit row must not inherit an exploration row's
+  // measurement of it.
+  pending_sep_peer_dist_m_    = -1.0f;
+  pending_sep_discount_       = 1.0f;
+  pending_sep_reordered_      = -1;
+  pending_sep_eligible_peers_ = 0;
 
   RCLCPP_INFO(get_logger(),
       "Target %u: vantage %d/%zu selected at (%.2f, %.2f) yaw=%.2f "

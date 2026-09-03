@@ -464,6 +464,17 @@ log() { echo "[$(date +%H:%M:%S)] [campaign] $*"; }
 TREE_ATTEN_REQ=$(env_val TREE_ATTEN 70.0)
 MAX_RANGE_REQ=$(env_val MAX_RANGE 30.0)
 CELL_SIZE_REQ=$(env_val CELL_SIZE_M 10.0)
+# The separation term's three knobs, same shape of fact and same defaults rule.
+# All three are guarded and not only the weight: the radius and the freshness
+# bound are what sep_peer_dist_m and sep_eligible_peers are MEASURED on, in
+# every arm including the ones running at weight 0, so a resume that changed
+# either would bank half a campaign's counterfactual on one bound and half on
+# another -- with both halves recording their own value in their own manifest
+# and nothing comparing them. That is the identical defect the radio pair was
+# added here for.
+SEPARATION_WEIGHT_REQ=$(env_val SEPARATION_WEIGHT 0)
+SEPARATION_RADIUS_REQ=$(env_val SEPARATION_RADIUS_M 20)
+SEPARATION_MAX_AGE_REQ=$(env_val SEPARATION_MAX_AGE_SEC 10)
 
 IFS=',' read -ra CELL_LIST <<< "$CELLS"
 if [ "$COMMS_ON" = "0" ]; then
@@ -617,10 +628,20 @@ for cell in "${CELL_LIST[@]}"; do
       fi
     done
     # The same rule for the keys whose manifest value is a NUMBER, which cannot
-    # go in the loop above: the run script normalises floats (0.64 stays 0.64
-    # but 1 becomes 1.0, and 20 becomes 20.0), so a string compare would abort
-    # a correct resume over a formatting difference and teach the operator to
-    # distrust the guard. Compared with awk instead.
+    # go in the loop above, because the two sides can spell the same value
+    # differently and a string compare would abort a correct resume over that
+    # alone -- teaching the operator to distrust the guard, which is the worse
+    # of the two failures. Compared with awk instead.
+    #
+    # For most of these the launcher itself introduces the difference: it runs
+    # the value through flt() at assignment, so `--tx 30` is banked as "30.0"
+    # while the campaign still holds the "30" it was handed. The three
+    # separation keys are NOT flt()'d on that path -- the launcher writes them
+    # into the manifest exactly as typed and normalises only at the -p site --
+    # so for those the difference is between two invocations rather than
+    # between the two sides. They are compared the same way regardless: a
+    # numeric key is a number, and which spelling reached the file is not
+    # something a resume decision should turn on.
     #
     # done_unknown_fraction was the only member for a long time. The radio pair
     # joined it on 2026-09-03, when the shipped tree_attenuation_db moved from
@@ -643,13 +664,37 @@ for cell in "${CELL_LIST[@]}"; do
     # a numeric-only compare every unparseable value -- "unset", "default", a
     # truncated line -- would equal "none" and a cell whose radius can no longer
     # be determined would score as agreeing.
+    #
+    # The numeric branch has to refuse non-numbers for the same reason, and it
+    # did not until a review found it. `a + 0` reads ANY unparseable string as
+    # 0, so for every key whose requested value is 0 -- separation_weight in a
+    # control campaign, which is to say all of them so far -- a manifest reading
+    # "off", "unset" or a line truncated by the out-of-disk failure the guard
+    # above exists to catch would compare EQUAL and the cell would be banked as
+    # agreeing when its value can no longer be read at all.
+    #
+    # "nan" is worse than that and is why the test is a regex rather than a
+    # comparison against 0. This awk parses it as a real NaN and then reports
+    # `nan == <anything>` as TRUE, so a single corrupted value would agree with
+    # every key at every level, not just the ones requesting 0. Checked here:
+    #   awk -v a=nan -v b=10 'BEGIN{print (a+0 == b+0)}'   ->   1
+    #
+    # So both sides must LOOK like a number before their values are compared;
+    # anything else falls through to the abort, which is the safe direction.
+    # Surrounding whitespace is stripped first, because the regex is stricter
+    # than `+ 0` was -- " 20" used to compare equal to 20 and now would not --
+    # and aborting a correct resume over a stray space is the failure this
+    # whole numeric branch exists to avoid.
     for kv in \
       "done_unknown_fraction=$DONE_UNKNOWN" \
       "tx_power_dbm=$TX" \
       "tree_attenuation_db=$TREE_ATTEN_REQ" \
       "max_range_m=$MAX_RANGE_REQ" \
       "cell_size_m=$CELL_SIZE_REQ" \
-      "coord_claim_radius_override=${cell_claim_r:-none}"
+      "coord_claim_radius_override=${cell_claim_r:-none}" \
+      "separation_weight=$SEPARATION_WEIGHT_REQ" \
+      "separation_radius_m=$SEPARATION_RADIUS_REQ" \
+      "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -657,7 +702,11 @@ for cell in "${CELL_LIST[@]}"; do
       if [ "$want" = "none" ] || [ "${have:-<absent>}" = "none" ]; then
         if [ "${have:-<absent>}" = "$want" ]; then same=1; fi
       elif awk -v a="${have:-}" -v b="$want" \
-             'BEGIN { exit !(a != "" && a + 0 == b + 0) }'; then
+             'BEGIN {
+                gsub(/^[ \t]+|[ \t]+$/, "", a)
+                gsub(/^[ \t]+|[ \t]+$/, "", b)
+                num = "^[+-]?([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][+-]?[0-9]+)?$"
+                exit !(a ~ num && b ~ num && a + 0 == b + 0) }'; then
         same=1
       fi
       if [ "$same" != "1" ]; then
@@ -730,6 +779,16 @@ for cell in "${CELL_LIST[@]}"; do
   # the 90 s clock with no veto: exactly the configuration the guard exists to
   # refuse, arriving through the one channel it could not see.
   #
+  # THE INVARIANT, stated once so it can be checked mechanically rather than
+  # remembered: every knob this script reads through env_val() must be either
+  # stripped here or assigned explicitly further down this same line. env_val
+  # scans $EXTRA_ENV alone, so any knob that is neither is one the guard models
+  # as its default while the cell runs on whatever the ambient shell held.
+  # campaign_guard_calib.sh derives the env_val list from this file and checks
+  # that invariant, rather than re-listing the names — the list was already
+  # three knobs out of date (TREE_ATTEN, MAX_RANGE, CELL_SIZE_M) by the time
+  # anything looked, which is what a hand-maintained copy is worth.
+  #
   # Stripping them makes the guard's model true by construction rather than by
   # assumption, and costs nothing: --env is expanded after these flags and env
   # applies assignments after unsets, so `--env LINK_GATE=0` still works and is
@@ -738,6 +797,8 @@ for cell in "${CELL_LIST[@]}"; do
       -u CELL_WORLD -u TEAM_WORLD -u TEAM_WORLD_HZ \
       -u GLOBAL_ALLOC -u RECONNECT_GATE -u RENDEZVOUS_SCHEDULE \
       -u PURSUIT_PREDICTOR \
+      -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
+      -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       COORD_CLAIM_R="$cell_claim_r" \

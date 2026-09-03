@@ -113,6 +113,16 @@ public:
     bool     position_first_hand = false;
     double   position_x = 0.0, position_y = 0.0, position_z = 0.0;
     bool     have_position = false;
+    /// Mission-elapsed seconds the POSITION dates from. Negative for never.
+    ///
+    /// Tracked separately from last_known_sec, and the difference is rule 3 of
+    /// the file header made concrete rather than a redundancy. Both first-hand
+    /// and gossiped updates refresh last_known_sec BEFORE testing whether the
+    /// message carried a position at all, so a status-only relay about a robot
+    /// nobody has seen in minutes leaves last_known_sec reading "fresh" over a
+    /// position that is minutes old. A consumer that steers on the position —
+    /// a chase, a separation term — must key on this field.
+    double   position_sec = -1.0;
 
     /// The peer's own claim that it has latched exploration done.
     bool     finished = false;
@@ -170,6 +180,13 @@ public:
   /// gossiped, or a negative value for "never heard". THIS is what a consumer
   /// that needs the peer's data must key on.
   double lastKnownAgeSec(int id, double now_sec) const;
+
+  /// Seconds since the POSITION we hold for `id` was measured, or negative
+  /// for "we hold no position". This is the accessor the file header has
+  /// always named and the one every consumer that STEERS on a peer position
+  /// must use; lastKnownAgeSec() answers a different question and can read
+  /// fresh over a stale position (see Peer::position_sec).
+  double positionAgeSec(int id, double now_sec) const;
 
   /// Seconds since DIRECT contact with `id`, or negative for never. The
   /// knowledge gate keys on this: what a peer has been told depends on when we

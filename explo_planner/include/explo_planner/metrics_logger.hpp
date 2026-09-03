@@ -122,6 +122,61 @@ struct StepMetrics {
   // received, or a degenerate ROI), matching coverageUnknownFraction().
   float  unknown_fraction         = -1.0f;
   std::string coverage_source     = "none";
+
+  // Team-separation diagnostics (separation.hpp). Exploration rows only; an
+  // exploitation row carries the "not applicable" defaults below, because the
+  // vantage chooser does not consult the term. So does a row emitted by the
+  // periodic metrics timer rather than by a planning step — that path builds a
+  // fresh StepMetrics and never sees these fields at all. Averaging any of
+  // these columns over a whole CSV therefore mixes in rows the term never
+  // touched and dilutes the treatment toward "no effect": filter to
+  // state == "LOG_STEP" and phase == "explore" first.
+  //
+  // The first two are measured in EVERY arm, including arms with the term
+  // switched off, and that is the point of them. The mechanism this term
+  // replaces, MinPos, has exactly one observable (rejected_by_minpos) and it
+  // reads 0 for a whole campaign — which cannot distinguish a veto that never
+  // mattered from a veto that never ran. These columns are built so the same
+  // ambiguity cannot happen twice: an off-arm row still records how close to
+  // its teammate the planner sent this robot, so the treated arm has a
+  // measured counterfactual rather than an assumed one.
+  //
+  //   sep_peer_dist_m     metres from the SELECTED goal to the nearest
+  //                       eligible teammate position; -1 for "no eligible
+  //                       teammate" (none known, none fresh, or all finished).
+  //                       Not the robot-to-robot separation — that is derivable
+  //                       from the pose stream; this is what the planner chose.
+  //   sep_discount        the multiplier actually applied to the selected
+  //                       candidate's utility. 1.0 means unchanged, which is
+  //                       what an off arm always writes. NOTE that this is
+  //                       also the factor by which selected_score and
+  //                       selected_utility above have ALREADY been reduced on
+  //                       this row: the term scales the candidate's score in
+  //                       place, so in a treated arm those two columns carry
+  //                       the discounted number and in a control arm they
+  //                       carry the raw one. To compare them across arms,
+  //                       divide by this column first.
+  //   sep_reordered       did the term change where the robot was sent?
+  //                       1 yes, 0 no, -1 the question was not asked. It is a
+  //                       comparison of PICKS, not of ordering: the planner is
+  //                       re-run over the same candidates with the discount
+  //                       removed and the two selections compared. -1 covers
+  //                       the term being off, no candidate being selected, and
+  //                       a pick that came from the blacklist-amnesty fallback,
+  //                       which orders by failure age and which the term cannot
+  //                       reach. -1 must not be pooled with 0: one means the
+  //                       term did not move the goal, the other means nobody
+  //                       asked.
+  //   sep_eligible_peers  how many teammates were eligible to repel this tick.
+  //                       Zero here makes every other column vacuous, so it is
+  //                       the first thing to read. Structurally zero for a whole
+  //                       run when TEAM_WORLD=0, since the term's anchors come
+  //                       from the team model — such a cell yields no
+  //                       counterfactual, only the confirmation that it cannot.
+  float  sep_peer_dist_m          = -1.0f;
+  float  sep_discount             = 1.0f;
+  int    sep_reordered            = -1;
+  int    sep_eligible_peers       = 0;
 };
 
 class MetricsLogger {

@@ -464,3 +464,107 @@ TEST(TeamModelObserve, TickIsIdempotentAndSafeBeforeAnyMessage) {
   EXPECT_EQ(unconf.lostCount(), 0);
   EXPECT_FALSE(unconf.inComms(0));
 }
+
+// ===========================================================================
+// Position freshness
+//
+// Rule 3 of the file header, made testable. lastKnownAgeSec() answers "when
+// did we last learn ANYTHING about this robot"; positionAgeSec() answers "how
+// old is the pose we hold for it". Both refresh paths in observe() advance
+// last_known_sec BEFORE testing whether the message carried a position at all,
+// so the two genuinely come apart, and the consumer that steers on a peer pose
+// — a chase, the separation term — is the one that would be wrong about it.
+// ===========================================================================
+
+TEST(TeamModelPositionAge, NegativeUntilAPositionArrives) {
+  TeamModel m = makeModel();
+  EXPECT_LT(m.positionAgeSec(1, 0.0), 0.0) << "nothing heard yet";
+
+  // Heard, but the message carried no position.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 10.0), "");
+  EXPECT_GE(m.lastKnownAgeSec(1, 10.0), 0.0) << "we did hear from it";
+  EXPECT_LT(m.positionAgeSec(1, 10.0), 0.0)
+      << "but a status-only message is not a position";
+}
+
+TEST(TeamModelPositionAge, FirstHandPositionAgesOnTheLocalClock) {
+  TeamModel m = makeModel();
+  TeamModel::Observation o = msg(1, robotBit(0));
+  o.have_position = true;
+  o.x = 5.0; o.y = -2.0;
+  ASSERT_EQ(m.observe(o, 100.0), "");
+
+  EXPECT_NEAR(m.positionAgeSec(1, 100.0), 0.0, 1e-9);
+  EXPECT_NEAR(m.positionAgeSec(1, 137.5), 37.5, 1e-9);
+}
+
+TEST(TeamModelPositionAge, AStatusOnlyUpdateDoesNotRefreshThePose) {
+  // THE BUG THIS ACCESSOR EXISTS FOR. A peer that keeps talking while its pose
+  // stops updating reads fresh on lastKnownAgeSec forever. A separation term
+  // or a pursuit keyed on that would steer on a pose of any age and never see
+  // a reason to doubt it.
+  TeamModel m = makeModel();
+  TeamModel::Observation with_pos = msg(1, robotBit(0));
+  with_pos.have_position = true;
+  with_pos.x = 5.0; with_pos.y = -2.0;
+  ASSERT_EQ(m.observe(with_pos, 100.0), "");
+
+  // 60 s later, same peer, still talking, but nothing about where it is.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 160.0), "");
+
+  EXPECT_NEAR(m.lastKnownAgeSec(1, 160.0), 0.0, 1e-9)
+      << "we heard from it a moment ago";
+  EXPECT_NEAR(m.positionAgeSec(1, 160.0), 60.0, 1e-9)
+      << "but the pose we hold is a minute old";
+  EXPECT_EQ(m.peer(1).position_x, 5.0) << "and it is still the old pose";
+}
+
+TEST(TeamModelPositionAge, RelayedPositionIsDatedWhenItWasHeardNotWhenItArrived) {
+  // A gossiped pose is as old as the SENDER's last contact with the subject,
+  // converted to our clock. Stamping it with our receipt time instead would
+  // make a two-minute-old relayed pose look one tick old — which is exactly
+  // the freshness bound a separation term is trusting.
+  TeamModel m = makeModel();
+  TeamModel::Observation o = gossipMsg(1, robotBit(0), {-1.0, 100.0, 40.0});
+  o.gx = {0.0, 0.0, 12.0};
+  o.gy = {0.0, 0.0, -3.0};
+  o.gz = {0.0, 0.0, 0.0};
+  o.have_gossip_pos = {0, 0, 1};
+  ASSERT_EQ(m.observe(o, 500.0), "");
+
+  ASSERT_TRUE(m.peer(2).have_position);
+  // 100 - 40 = 60 s old on the sender's clock when it left; the same 60 s here.
+  EXPECT_NEAR(m.positionAgeSec(2, 500.0), 60.0, 1e-9);
+  EXPECT_NEAR(m.positionAgeSec(2, 530.0), 90.0, 1e-9);
+}
+
+TEST(TeamModelPositionAge, NeverNegativeWhenTheClockRunsBackwards) {
+  TeamModel m = makeModel();
+  TeamModel::Observation o = msg(1, robotBit(0));
+  o.have_position = true;
+  ASSERT_EQ(m.observe(o, 100.0), "");
+  // A caller asking about an earlier instant must not get a negative age that
+  // would pass a "fresher than max_age" test by being absurd.
+  EXPECT_GE(m.positionAgeSec(1, 90.0), 0.0);
+}
+
+TEST(TeamModelPositionAge, OutOfRangeIdsAndSelfReadAsNoPosition) {
+  TeamModel m = makeModel();
+  EXPECT_LT(m.positionAgeSec(-1, 0.0), 0.0);
+  EXPECT_LT(m.positionAgeSec(99, 0.0), 0.0);
+  // Self is not special-cased to 0: the model never stores a position for
+  // self, so "0 seconds old" would be a confident age for a pose that is not
+  // there, and a consumer would happily use the (0, 0) it came with.
+  EXPECT_LT(m.positionAgeSec(m.selfId(), 0.0), 0.0);
+}
+
+TEST(TeamModelPositionAge, ReconfiguringClearsIt) {
+  TeamModel m = makeModel();
+  TeamModel::Observation o = msg(1, robotBit(0));
+  o.have_position = true;
+  ASSERT_EQ(m.observe(o, 100.0), "");
+  ASSERT_GE(m.positionAgeSec(1, 100.0), 0.0);
+
+  ASSERT_EQ(m.configure(fleet3(), goodCfg()), "");
+  EXPECT_LT(m.positionAgeSec(1, 100.0), 0.0);
+}

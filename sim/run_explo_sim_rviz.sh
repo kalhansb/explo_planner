@@ -706,6 +706,115 @@ if [ "$TEAM_WORLD" = "1" ] && [ "$CELL_WORLD" != "1" ]; then
   echo "census, so there would be nothing to send). Set CELL_WORLD=1." >&2
   exit 2
 fi
+# --- Team-separation discount (separation.hpp) ------------------------------
+# A continuous dispersion term on the exploration utility: every candidate is
+# discounted for being close to a teammate's last known position, on a linear
+# ramp that reaches 1 at SEPARATION_RADIUS_M.
+#
+# Why it exists: across cr3/cr4/cr5 the fraction of a run spent within 20 m of
+# the partner predicted finish time at rho = 0.677 and was significant at
+# n = 46 cells, while no arm mean was. Nothing in the planner acted on it —
+# MinPos vetoes a disc around the peer's GOAL and fires about once a campaign,
+# and the global allocator excludes without dispersing.
+#
+# DECLARED HERE, BELOW THE _arm_stack BLOCK, deliberately, for the same reason
+# COORD_CLAIM_R is: the weight is orthogonal to the reconnect arm token, so no
+# arm pins it and a separation campaign can cross the two. That also means the
+# four-arm reconnect design does NOT become a compound experiment by this
+# file's existence — with the weight at its default 0 the planner is
+# bit-for-bit the pre-separation one, and the only thing the term contributes
+# to those runs is the sep_* diagnostic columns, which are measured with the
+# term off and are exactly the untreated counterfactual a later separation
+# campaign has to be read against.
+#
+# The parity with COORD_CLAIM_R stops at the declaration, though. That knob has
+# a second route in: run_campaign.sh parses an "_r<N>" suffix off the arm name
+# and sets it PER CELL, so one invocation can run several radii. Separation has
+# no such suffix, so within one run_campaign.sh invocation the weight is the
+# same in every cell — which is all the four-arm redo needs (weight 0
+# throughout) and not enough for a separation campaign, where varying the
+# weight across arms would otherwise take two invocations and confound the
+# treatment with the session. Add the suffix then, and give the resume guard
+# the per-cell treatment cell_claim_r already gets; doing it now would ship an
+# untested parser to serve a campaign that is not being run.
+#
+# 0 = OFF and is the default, so an unset SEPARATION_WEIGHT reproduces every
+# campaign up to and including cr5.
+SEPARATION_WEIGHT="${SEPARATION_WEIGHT:-0}"
+SEPARATION_RADIUS_M="${SEPARATION_RADIUS_M:-20}"
+SEPARATION_MAX_AGE_SEC="${SEPARATION_MAX_AGE_SEC:-10}"
+# Validated HERE as well as in the node, and the duplication is the point. The
+# node's SeparationTerm::configure() refuses a bad value and logs why, but it
+# refuses by DISABLING the term and letting the run continue — which is the
+# right thing for a field robot and the wrong thing for a campaign cell, where
+# it would produce a directory named for a treated arm whose planner ran the
+# control. Catching it here turns that into a cell that never starts.
+for _sepkv in "SEPARATION_WEIGHT:$SEPARATION_WEIGHT" \
+              "SEPARATION_RADIUS_M:$SEPARATION_RADIUS_M" \
+              "SEPARATION_MAX_AGE_SEC:$SEPARATION_MAX_AGE_SEC"; do
+  _sepk="${_sepkv%%:*}"; _sepv="${_sepkv#*:}"
+  case "$_sepv" in
+    ''|*[!0-9.]*|*.*.*)
+      echo "FATAL: $_sepk='$_sepv' is not a plain decimal number." >&2
+      exit 2 ;;
+  esac
+  # A second case, because the first cannot express "must contain a digit" —
+  # its patterns are ORed, and a bare "." satisfies all three of them: it is
+  # not empty, every character is in [0-9.], and there is only one dot. That
+  # matters more than it looks. awk reads "." as 0, so SEPARATION_WEIGHT="."
+  # passes the [0, 1] range check below, reaches the node as 0, and the term is
+  # OFF in a cell named for a treated arm — the exact outcome the range checks
+  # here exist to prevent, arrived at through the one spelling they all agree
+  # is fine. ("1." and ".5" are real numbers and stay legal.)
+  case "$_sepv" in
+    *[0-9]*) : ;;
+    *)
+      echo "FATAL: $_sepk='$_sepv' has no digits in it. awk would read it as 0," >&2
+      echo "       which passes every range check below and silently runs the" >&2
+      echo "       term at zero weight under whatever arm name this cell has." >&2
+      exit 2 ;;
+  esac
+done
+unset _sepkv _sepk _sepv
+# Range, matching the node's refusals so the two cannot disagree about what is
+# legal. Weight is a multiplier on the utility: above 1 it drives the utility
+# negative and below 0 it is an ATTRACTION to the teammate, neither of which is
+# a separation term. (Negative spellings are already rejected above — the case
+# pattern has no minus sign — so this catches the > 1 half.)
+if [ "$(awk -v v="$SEPARATION_WEIGHT" 'BEGIN{print (v+0 >= 0.0 && v+0 <= 1.0) ? 1 : 0}')" != "1" ]; then
+  echo "FATAL: SEPARATION_WEIGHT='$SEPARATION_WEIGHT' is outside [0, 1]." >&2
+  echo "       It is the discount applied on top of a teammate: 0 is off, 1" >&2
+  echo "       scores such a candidate at exactly zero." >&2
+  exit 2
+fi
+# Radius and max-age are validated even when the weight is 0, because they are
+# NOT inert then: the planner measures sep_peer_dist_m and sep_eligible_peers
+# on this radius and this freshness bound in every arm, treated or not. A
+# control arm silently measuring on a different bound from its treated arm is
+# the kind of mismatch that survives every downstream check, since both cells
+# print the requested numbers in their manifests.
+for _sepkv in "SEPARATION_RADIUS_M:$SEPARATION_RADIUS_M" \
+              "SEPARATION_MAX_AGE_SEC:$SEPARATION_MAX_AGE_SEC"; do
+  _sepk="${_sepkv%%:*}"; _sepv="${_sepkv#*:}"
+  if [ "$(awk -v v="$_sepv" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" != "1" ]; then
+    echo "FATAL: $_sepk='$_sepv' must be > 0. The node refuses a non-positive" >&2
+    echo "       value by disabling the term, so the cell would run the control" >&2
+    echo "       under the treatment's name." >&2
+    exit 2
+  fi
+done
+unset _sepkv _sepk _sepv
+# The term reads teammate positions out of the TeamModel, which only exists
+# when the exchange is on. The node itself refuses this pairing fatally at
+# startup; refusing here as well means the campaign loses a cell's setup time
+# rather than a cell's worth of wall clock.
+if [ "$(awk -v v="$SEPARATION_WEIGHT" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" = "1" ] \
+   && [ "$TEAM_WORLD" != "1" ]; then
+  echo "FATAL: SEPARATION_WEIGHT>0 requires TEAM_WORLD=1 — with no exchange" >&2
+  echo "       the planner never learns a teammate position, so the term would" >&2
+  echo "       be on in the manifest and inert in the binary." >&2
+  exit 2
+fi
 # --- Global allocator (M-TARE evolution, P3) ------------------------------
 # GLOBAL_ALLOC=1 makes the shared cell world DECIDE: each robot solves the same
 # assignment over the same converged world and takes its own tour, and the
@@ -1984,6 +2093,22 @@ if [ "$TEAM_WORLD" = "1" ]; then
 else
   log "team world exchange OFF (TEAM_WORLD=0) — no team_world params passed; the cell world is per-robot and never shared"
 fi
+if [ "$(awk -v v="$SEPARATION_WEIGHT" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" = "1" ]; then
+  log "separation term ON: candidates within ${SEPARATION_RADIUS_M} m of a teammate position no older than ${SEPARATION_MAX_AGE_SEC} s are discounted, linearly to x$(awk -v w="$SEPARATION_WEIGHT" 'BEGIN{printf "%.3f", 1.0-w}') on top of it"
+else
+  # The counterfactual half of this line is only true when there IS a peer
+  # position to measure against. The planner builds its anchor list from the
+  # team model, so at TEAM_WORLD=0 that list is empty on every tick and
+  # sep_peer_dist_m is -1 and sep_eligible_peers 0 for the whole cell — a
+  # structural zero, not an observation that the robots stayed apart. Saying
+  # "untreated counterfactual" there would invite exactly the pooling it is
+  # meant to prevent.
+  if [ "$TEAM_WORLD" = "1" ]; then
+    log "separation term OFF (SEPARATION_WEIGHT=0) — no score is changed, but sep_peer_dist_m/sep_eligible_peers are still measured at ${SEPARATION_RADIUS_M} m / ${SEPARATION_MAX_AGE_SEC} s and are this cell's untreated counterfactual"
+  else
+    log "separation term OFF (SEPARATION_WEIGHT=0) — and with TEAM_WORLD=0 there are no peer positions to measure against, so sep_peer_dist_m stays -1 and sep_eligible_peers 0 for the whole cell. Those are structural zeros, NOT a measurement that the robots stayed apart; this cell is not an untreated counterfactual for a separation campaign"
+  fi
+fi
 if [ "$GLOBAL_ALLOC" = "1" ]; then
   log "global allocator ON: solve-same-take-own over the shared cell world; the won focus cell re-ranks each tick's frontier candidates"
 else
@@ -2140,6 +2265,14 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "reconnect_gate=$RECONNECT_GATE"
   echo "rendezvous_schedule=$RENDEZVOUS_SCHEDULE"
   echo "pursuit_predictor=$PURSUIT_PREDICTOR"
+  # Recorded even when the weight is 0, same rule as every knob above, and with
+  # one extra reason: an off cell's sep_peer_dist_m and sep_eligible_peers
+  # columns ARE measurements, taken on the radius and freshness bound below,
+  # and a reader comparing them against a treated arm has to be able to see
+  # from the cell itself that the two were measured the same way.
+  echo "separation_weight=$SEPARATION_WEIGHT"
+  echo "separation_radius_m=$SEPARATION_RADIUS_M"
+  echo "separation_max_age_sec=$SEPARATION_MAX_AGE_SEC"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -2389,6 +2522,17 @@ for r in $ROBOTS; do
   if [ -n "$COORD_CLAIM_R" ]; then
     EXTRA+=( -p coord_claim_radius_m:="$(flt "$COORD_CLAIM_R")" )
   fi
+  # Team-separation discount. Passed ALWAYS, including at weight 0, which is
+  # the opposite of the COORD_CLAIM_R rule above and deliberately so. The
+  # radius and the freshness bound are live in an off arm — they are what
+  # sep_peer_dist_m and sep_eligible_peers are measured on — so the -p code
+  # path has to be identical in the treated and untreated arms or the
+  # counterfactual is measured by a different route from the treatment. flt()
+  # on all three: they are doubles in the planner, and a bare integer makes
+  # ros2 infer int and abort the node at startup.
+  EXTRA+=( -p separation_weight:="$(flt "$SEPARATION_WEIGHT")"
+           -p separation_radius_m:="$(flt "$SEPARATION_RADIUS_M")"
+           -p separation_max_age_sec:="$(flt "$SEPARATION_MAX_AGE_SEC")" )
   if [ "$RECONNECT_GATE" = "info" ]; then
     EXTRA+=( -p reconnect_gate:=info )
   fi
@@ -2655,8 +2799,10 @@ fi
 # can also LEAVE (a target release pulls it back into the exploit sub-loop, and
 # finishOrRendezvous routes through RETURN_NAV/RETURN_SYNC before it), so a
 # one-shot "Exploration complete" log line is not terminal and grepping for it
-# would stop the run mid-manoeuvre. The column is located by header name because
-# it was appended to a schema that other scripts read positionally.
+# would stop the run mid-manoeuvre. The column is located by scanning the header
+# row rather than by a fixed field number: `state` sits partway along a schema
+# that only ever grows at the right-hand end, so its index has changed once
+# already and would change again the next time a column is appended before it.
 STOP_ON_DONE="${STOP_ON_DONE:-1}"
 # Grace, in sim seconds, between all-DONE and teardown: lets the last metrics
 # rows land, the reliable backlog drain, and the gate watcher see the final
