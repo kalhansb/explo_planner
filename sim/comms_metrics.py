@@ -81,6 +81,14 @@ metrics are even at that floor; it is not evidence of significance and must not
 be reported as such. What n=3 can support is SEPARATION -- whether the two
 groups' values overlap at all -- which is why that column exists and is listed
 first. A clean split at n=3 is a reason to run more seeds, not a result.
+
+THE p COLUMN IS modes_compare's. Exact by enumeration at the small n this file
+was written for -- the 2/20 floor above is a fact about that enumeration -- and
+a seeded 100000-draw sampled estimate above 200000 relabellings, which is any
+comparison past about 10 per side. Sampled rows are marked with a trailing `~`
+and their smallest reportable p is 1e-5. The copy that used to live here
+enumerated unconditionally and would not have returned on a 30-per-arm campaign
+at all. See modes_compare_calib.py for the known-answer cases.
 """
 import argparse
 import csv
@@ -89,6 +97,9 @@ import itertools
 import os
 import statistics as st
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import modes_compare as mc          # noqa: E402
 
 # (key, label, higher_is, note) -- higher_is describes what a LARGER value means
 METRICS = [
@@ -400,22 +411,38 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
     }
 
 
+# The permutation test is modes_compare's, imported rather than reimplemented.
+#
+# This file used to carry its own copy: a bare enumeration of C(nx+ny, nx) that
+# was fine on the 4-cell pilots it was written for and does not return at all on
+# a 30-per-arm campaign, where C(60,30) is 1.2e17. modes_compare had the same
+# defect and now samples above a threshold, with a calibration
+# (modes_compare_calib.py) pinning the sampler against exactly-known answers and
+# requiring two planted biases to be caught.
+#
+# Sharing that implementation rather than porting it is the point. Two copies of
+# a statistical procedure in one repository is two procedures: they drift, only
+# one of them is under calibration, and the campaign is scored by whichever
+# script the operator happened to run. The calibration file names modes_compare
+# in its docstring, so a reader who finds this import knows where the tests are.
 def perm_p(xs, ys):
-    """Exact two-sided permutation p on |median difference|.
+    """Two-sided permutation p on |median difference|.
 
-    Floors at 2/C(n,k) because every split is paired with its complement.
+    Exact by enumeration for small groups, a seeded 100000-draw estimate with
+    the +1 correction above modes_compare.PERM_MAX_EXACT. See modes_compare for
+    both, and modes_compare_calib.py for the known-answer cases.
     """
-    pool = list(xs) + list(ys)
-    n = len(xs)
-    obs = abs(st.median(xs) - st.median(ys))
-    hits = tot = 0
-    for combo in itertools.combinations(range(len(pool)), n):
-        left = [pool[i] for i in combo]
-        right = [pool[i] for i in range(len(pool)) if i not in combo]
-        tot += 1
-        if abs(st.median(left) - st.median(right)) >= obs - 1e-12:
-            hits += 1
-    return hits / tot if tot else 1.0
+    return mc.perm_p(xs, ys)
+
+
+def perm_sampled(xs, ys):
+    """True when that p was estimated rather than enumerated.
+
+    Printed beside the number. Which branch ran depends on the group sizes, so
+    within one table some rows are exact and some are not, and a reader cannot
+    tell from the value.
+    """
+    return not mc.perm_all(xs, ys)[2]
 
 
 def separation(xs, ys):
@@ -543,8 +570,13 @@ def main():
         # mean nothing. Without the spreads beside them, a clean split at a
         # negligible effect size reads as a finding.
         rng = f"[{min(xs):.4g}..{max(xs):.4g}] vs [{min(ys):.4g}..{max(ys):.4g}]"
+        # mc.fmt_p, not %.3f: above the enumeration threshold the smallest p
+        # this can return is 1e-5, and %.3f prints that as 0.000 -- a claim of
+        # certainty in a column the docstring above spends a paragraph warning
+        # people not to over-read. A trailing '~' marks the sampled rows.
+        pstr = mc.fmt_p(p) + ("~" if perm_sampled(xs, ys) else "")
         print(f"{label:<22}{direction:<16}{ma:>11.4f}{mb:>11.4f}{mb - ma:>11.4f}"
-              f"{sep:>9}{p:>9.3f}  {note}{'' if not note else ' '}"
+              f"{sep:>9}{pstr:>9}  {note}{'' if not note else ' '}"
               f"{'' if abs(rel) != abs(rel) else f'({rel:+.0f}%)'}  {rng}")
         if sep == "CLEAN":
             verdict.append((label, ma, mb, note))

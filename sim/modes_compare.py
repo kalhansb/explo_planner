@@ -104,13 +104,26 @@ SECONDARY, in the order they are worth reading:
              episode being shorter than the sample period. Confirm against
              manoeuvre_events.py before calling an arm inert.
 
-STATISTICS. Exact permutation over the arm-vs-`off` split, two-sided on the
-median. Each row also prints its own FLOOR: the smallest p that row could ever
-return at its group sizes, obtained from the same enumeration as the p-value.
-It is not the closed form 2/C(2n,n), which is only valid for EQUAL groups -- and
-groups become unequal precisely when censoring bites, so the formula misfired
-exactly when it mattered, once printing `perm p = 0.200` directly beneath
-`floor is 0.333`. Where floor >= 0.05 the p-value is arithmetic, not evidence.
+STATISTICS. Permutation over the arm-vs-`off` split, two-sided on the median.
+Exact by enumeration up to 200000 relabellings; above that -- which is any
+campaign bigger than about 10 cells per arm, so all of the current ones -- it is
+a 100000-draw sampled estimate with the +1 correction, on a fixed seed so the
+same cells always give the same number. Rows say which they are. Sampling was
+not a refinement: C(60,30) is 1.2e17 and the enumerating version simply did not
+return on a full-size campaign. The sampler is calibrated against exactly-known
+answers in modes_compare_calib.py, including two mutations it must catch --
+[[lcg-low-bits-bias]] is this project's own instance of a biased sampler
+producing a perfectly ordinary-looking p.
+
+Each row also prints its own FLOOR: on an enumerated row, the smallest p that
+row could ever return at its group sizes, obtained from the same enumeration as
+the p-value. It is not the closed form 2/C(2n,n), which is only valid for EQUAL
+groups -- and groups become unequal precisely when censoring bites, so the
+formula misfired exactly when it mattered, once printing `perm p = 0.200`
+directly beneath `floor is 0.333`. On a sampled row the floor is 1/(M+1), a
+bound on the printed number rather than on the test. Where floor >= 0.05 the
+p-value is arithmetic, not evidence.
+
 With four arms there are three comparisons against control, so read 0.05 as
 ~0.017 family-wise; separation (do the ranges overlap at all?) is the more honest
 small-n summary and is printed alongside.
@@ -121,6 +134,7 @@ import csv
 import itertools
 import math
 import os
+import random
 import re
 import statistics as st
 import sys
@@ -483,33 +497,141 @@ def measure(run_dir, thresh):
     )
 
 
+# Above this many relabellings the test SAMPLES instead of enumerating. The
+# value is not a performance tuning knob, it is the point past which the exact
+# test is not a thing that can be run: a 30-vs-30 campaign -- the standard size
+# since the power analysis put the completion-time floor at 30 cells per arm --
+# has C(60,30) = 118264581564861424 arrangements, and itertools.combinations
+# will sit in that loop until the box is retired. The old code called it
+# unconditionally, so the fix this replaces was not "slow", it was "modes_compare
+# does not return on a full-size campaign".
+#
+# 200000 is chosen so the largest EQUAL groups that still enumerate are 10 v 10
+# (C(20,10) = 184756); 11 v 11 is 705432 and samples. That keeps every small,
+# floor-limited comparison -- the ones where the floor line is load-bearing --
+# on the exact path, which is where it has to be, because a floor is a statement
+# about the enumeration and a sample cannot make it.
+PERM_MAX_EXACT = 200_000
+# Draws taken when sampling. The reportable minimum is then 1/(PERM_SAMPLES+1)
+# = 1e-5, three orders below any threshold this tool prints against, so the
+# sampling is never what decides a row.
+PERM_SAMPLES = 100_000
+# Fixed, and NOT exposed as a flag. A permutation p-value computed from a random
+# subset is a random variable; leaving the stream unseeded would make the same
+# campaign print a different p every invocation and there would be no way to
+# tell that drift from a data change. Seeded, re-running the tool on the same
+# cells reproduces the same number exactly.
+PERM_SEED = 20260830
+
+# perm_p and perm_floor are called back-to-back on the same two lists for every
+# printed row (see the table loop), and under sampling each call is 100k median
+# pairs. Memoised so the row costs one distribution, not two. Keyed on the
+# values, so two rows that happen to hold identical data share the answer, which
+# is correct: the distribution is a function of the data alone.
+_PERM_CACHE = {}
+
+
+def perm_split(pool, nx, rng):
+    """One relabelling: the pooled values dealt back into groups of nx and rest.
+
+    A FRESH copy of the pool is shuffled every call, rather than one list being
+    re-shuffled in place across draws. With a correct shuffle the two are
+    equivalent -- a uniform permutation composed with anything is uniform and
+    independent of it -- and the in-place version was what this first shipped.
+    It is still wrong, for a reason that has nothing to do with its own output:
+    composing many shuffles is a random walk on the permutations, and a random
+    walk converges to uniform WHATEVER the step distribution is. So the in-place
+    loop launders sampler bias. Measured on a 4-element pool, a textbook
+    off-by-one Fisher-Yates (`randint(0, n-1)` for `randint(0, i)`) deviates
+    from the uniform subset frequency by 0.088 when each draw starts fresh and
+    by 0.0016 -- pure noise -- when the list is reused.
+
+    That is the difference between a sampler whose correctness can be checked
+    and one whose correctness has to be assumed. The copy costs a 60-element
+    list per draw and buys a calibration that can fail; see
+    modes_compare_calib.py, which mutates the shuffle and requires the check to
+    go red ([[checks-that-stopped-checking]]).
+
+    Factored out rather than inlined so the calibration tests THIS function --
+    the one the p-value is actually built from -- instead of a reimplementation
+    of it that could drift.
+    """
+    shuf = list(pool)
+    rng.shuffle(shuf)
+    return shuf[:nx], shuf[nx:]
+
+
 def perm_all(xs, ys):
     """Every |median difference| reachable by relabelling, and the observed one.
 
-    Returned together so the p-value and its own attainable FLOOR come from the
-    same enumeration. They used to be computed separately -- p by enumerating
-    C(nx+ny, nx), the floor by a hardcoded 2/C(2n,n) that assumes EQUAL group
-    sizes -- and the two disagreed the moment censoring made the groups unequal.
-    The tool printed `perm p = 0.200` directly beneath `floor is 0.333`, a
-    p-value below its own stated minimum.
+    Returns (obs, diffs, exact). `exact` is False when `diffs` is a SAMPLE of
+    the relabellings rather than all of them, and every caller has to branch on
+    it: a p-value read off a sample needs the +1 correction, and a floor read
+    off a sample is not a floor at all.
+
+    obs, diffs and exact are returned together so the p-value and its own
+    attainable FLOOR come from the same enumeration. They used to be computed
+    separately -- p by enumerating C(nx+ny, nx), the floor by a hardcoded
+    2/C(2n,n) that assumes EQUAL group sizes -- and the two disagreed the moment
+    censoring made the groups unequal. The tool printed `perm p = 0.200`
+    directly beneath `floor is 0.333`, a p-value below its own stated minimum.
+
+    The sampler is random.Random, not a hand-rolled generator, and its draws are
+    whole Fisher-Yates shuffles rather than nx independent index picks. Both
+    choices are deliberate and both are checked in modes_compare_calib.py: a
+    sampler that is subtly non-uniform biases the null distribution and so
+    biases p, and that failure is invisible in the output -- it prints a
+    perfectly ordinary number.
     """
+    key = (tuple(xs), tuple(ys))
+    hit = _PERM_CACHE.get(key)
+    if hit is not None:
+        return hit
+
     pool = list(xs) + list(ys)
     nx = len(xs)
     obs = abs(st.median(xs) - st.median(ys))
+    n_arr = math.comb(len(pool), nx) if pool else 0
+
     diffs = []
-    for combo in itertools.combinations(range(len(pool)), nx):
-        left = [pool[i] for i in combo]
-        right = [pool[i] for i in range(len(pool)) if i not in combo]
-        diffs.append(abs(st.median(left) - st.median(right)))
-    return obs, diffs
+    if n_arr <= PERM_MAX_EXACT:
+        exact = True
+        for combo in itertools.combinations(range(len(pool)), nx):
+            left = [pool[i] for i in combo]
+            right = [pool[i] for i in range(len(pool)) if i not in combo]
+            diffs.append(abs(st.median(left) - st.median(right)))
+    else:
+        exact = False
+        rng = random.Random(PERM_SEED)
+        for _ in range(PERM_SAMPLES):
+            left, right = perm_split(pool, nx, rng)
+            diffs.append(abs(st.median(left) - st.median(right)))
+
+    out = (obs, diffs, exact)
+    _PERM_CACHE[key] = out
+    return out
 
 
 def perm_p(xs, ys):
-    """Exact two-sided permutation on the difference of medians."""
-    obs, diffs = perm_all(xs, ys)
+    """Two-sided permutation on the difference of medians.
+
+    Exact when the arrangements were enumerated. When they were sampled it is
+    the standard +1-corrected estimate, (1 + #{d >= obs}) / (1 + M), and the
+    correction is not cosmetic: the observed labelling is itself one of the
+    arrangements, so it belongs in the count, and it is exactly the one a random
+    sample is not guaranteed to draw. Without the +1 a large true effect prints
+    p = 0.000 -- a claim of a p-value smaller than the procedure can represent,
+    read by every downstream reader as overwhelming evidence. With it the same
+    row prints 1e-5, which is the honest statement: nothing in 100000 draws was
+    as extreme, and that is as fine a resolution as this has.
+    """
+    obs, diffs, exact = perm_all(xs, ys)
     if not diffs:
         return 1.0
-    return sum(1 for d in diffs if d >= obs - 1e-12) / len(diffs)
+    hits = sum(1 for d in diffs if d >= obs - 1e-12)
+    if exact:
+        return hits / len(diffs)
+    return (1 + hits) / (1 + len(diffs))
 
 
 def perm_floor(xs, ys):
@@ -521,12 +643,38 @@ def perm_floor(xs, ys):
     whatever share of arrangements ties the most extreme one. If this equals or
     exceeds 0.05, no data in that row can be significant and the p-value is
     reporting arithmetic, not evidence.
+
+    Under sampling that reasoning does not survive, and the honest answer is a
+    different one. The most extreme arrangement is drawn with probability ~0, so
+    counting its ties in a sample would return 1/M for essentially any data and
+    report a floor the comparison has not earned. What IS true of a sampled row
+    is that its p cannot be smaller than 1/(M+1) by construction, so that is
+    what this returns -- a floor on the REPORTED number rather than on the test.
+    It is far below 0.05, so the caller's "p cannot be significant at this n"
+    warning correctly stays silent: at the group sizes that trigger sampling,
+    n is not the binding constraint on significance any more.
     """
-    _, diffs = perm_all(xs, ys)
+    _, diffs, exact = perm_all(xs, ys)
     if not diffs:
         return 1.0
+    if not exact:
+        return 1.0 / (1 + len(diffs))
     mx = max(diffs)
     return sum(1 for d in diffs if d >= mx - 1e-12) / len(diffs)
+
+
+def fmt_p(p):
+    """A p-value that does not round itself into a different claim.
+
+    `%.3f` was fine while every p was an exact fraction of at most a few hundred
+    thousand arrangements and the smallest attainable was rarely below 0.001.
+    Under sampling the smallest reportable p is 1/(PERM_SAMPLES+1) = 1e-5, and
+    `%.3f` renders that as `0.000` -- which is not a small p-value, it is a
+    claim of certainty, and it is the exact misreading the +1 correction in
+    perm_p exists to prevent. Below 0.001 this switches to scientific notation
+    rather than truncating.
+    """
+    return f"{p:.3f}" if p >= 0.001 else f"{p:.1e}"
 
 
 def sep(xs, ys):
@@ -659,8 +807,11 @@ def ladder(run_dirs, primary, spec):
     if not arms_all:
         return
     print(f"\nTHRESHOLD SENSITIVITY — median t_team, and the rank order it implies")
-    print(f"{'unknown<=':<11}" + "".join(f"{a:>13}" for a in arms_all) + "   order (fastest first)")
-    print("-" * (11 + 13 * len(arms_all) + 28))
+    # Column width from the longest arm token, not a fixed 13: the suffixed
+    # arms overflowed it and the header ran its own names together.
+    cw = max(13, max(len(a) for a in arms_all) + 2)
+    print(f"{'unknown<=':<11}" + "".join(f"{a:>{cw}}" for a in arms_all) + "   order (fastest first)")
+    print("-" * (11 + cw * len(arms_all) + 28))
     orders = []
     for th, stats in rows_out:
         cells = []
@@ -668,9 +819,9 @@ def ladder(run_dirs, primary, spec):
         for a in arms_all:
             med, cens, n = stats.get(a, (None, 0, 0))
             if med is None:
-                cells.append(f"{'all cens':>13}")
+                cells.append(f"{'all cens':>{cw}}")
             else:
-                cells.append(f"{med:>10.0f}{('*' * min(cens, 2)):<3}")
+                cells.append(f"{med:>{cw - 3}.0f}{('*' * min(cens, 2)):<3}")
                 # An arm with censored runs is NOT rankable on the surviving
                 # median -- same reason the delta is withheld above.
                 if cens == 0:
@@ -872,9 +1023,11 @@ def main():
                   f"one of the two is wrong and the arm means nothing until "
                   f"you know which")
 
-    print(f"\n{'arm':<12}{'n':>3}{'cens':>6}{'t_team med':>12}{'range':>18}"
+    # Same adaptive width as the comparison table below, for the same reason.
+    aw = max(12, max(len(a) for a in arms) + 2)
+    print(f"\n{'arm':<{aw}}{'n':>3}{'cens':>6}{'t_team med':>12}{'range':>18}"
           f"{'lag med':>10}{'dist med':>10}{'unk med':>9}{'peak med':>10}{'fire':>7}")
-    print("-" * 107)
+    print("-" * (aw + 95))
     summary = {}
     for arm in sorted(arms):
         rs = arms[arm]
@@ -891,7 +1044,7 @@ def main():
         s = summary[arm]
         med = f"{st.median(tt):.0f}" if tt else "--"
         rng = f"[{min(tt):.0f}..{max(tt):.0f}]" if tt else "--"
-        print(f"{arm:<12}{s['n']:>3}{s['cens']:>6}{med:>12}{rng:>18}"
+        print(f"{arm:<{aw}}{s['n']:>3}{s['cens']:>6}{med:>12}{rng:>18}"
               f"{st.median(s['lag']):>10.0f}{st.median(s['dist']):>10.0f}"
               f"{st.median(s['unk']):>9.3f}{st.median(s['peak']):>10.2f}{s['fire']:>7}")
 
@@ -978,9 +1131,14 @@ def main():
         print(f"\nno '{ctl}' arm — skipping the control comparison")
         return 0
 
+    # Widened to the longest arm token actually present rather than pinned at
+    # 12. Arms grew a per-cell suffix (mtare_rendezvous_r40 is 20 characters),
+    # which ran the arm column straight into the metric column and printed
+    # `mtare_hybrid_r40t_team` — two fields with no separator, in the table the
+    # whole tool exists to produce.
     print(f"\nvs control '{ctl}'   (negative delta = FASTER completion = better)")
-    print(f"{'arm':<12}{'metric':<12}{'delta':>11}{'sep':>9}{'perm p':>9}{'floor':>8}  note")
-    print("-" * 96)
+    print(f"{'arm':<{aw}}{'metric':<12}{'delta':>11}{'sep':>9}{'perm p':>9}{'floor':>9}  note")
+    print("-" * (aw + 84))
     for arm in sorted(a for a in summary if a != ctl):
         ncens = summary[arm]["cens"] + summary[ctl]["cens"]
         for key, label in (("tt", "t_team"), ("lag", "lag"), ("dist", "dist_team")):
@@ -996,14 +1154,14 @@ def main():
             # footnote cannot repair a reversed headline number, so the number is
             # withheld instead.
             if key == "tt" and ncens:
-                print(f"{arm:<12}{label:<12}{'WITHHELD':>11}{'--':>9}{'--':>9}{'--':>8}  "
+                print(f"{arm:<{aw}}{label:<12}{'WITHHELD':>11}{'--':>9}{'--':>9}{'--':>9}  "
                       f"{summary[arm]['cens']} censored ({arm}) + "
                       f"{summary[ctl]['cens']} ({ctl}); a median over the "
                       f"survivors can invert the true ranking — read 'cens' and "
                       f"'lag' instead")
                 continue
             if len(xs) < 2 or len(ys) < 2:
-                print(f"{arm:<12}{label:<12}{'--':>11}{'--':>9}{'--':>9}{'--':>8}  "
+                print(f"{arm:<{aw}}{label:<12}{'--':>11}{'--':>9}{'--':>9}{'--':>9}  "
                       f"too few complete runs")
                 continue
             d = st.median(ys) - st.median(xs)
@@ -1018,13 +1176,31 @@ def main():
             fl = perm_floor(xs, ys)
             if fl > 0.05 and not note:
                 note = f"floor {fl:.3f} > 0.05: p cannot be significant at this n"
-            print(f"{arm:<12}{label:<12}{d:>11.1f}{sep(xs, ys):>9}"
-                  f"{perm_p(xs, ys):>9.3f}{fl:>8.3f}  {note}")
+            _, _, exact = perm_all(xs, ys)
+            if not exact:
+                # Say so IN the row. Which rows were enumerated and which were
+                # sampled depends on the group sizes, so within one table some
+                # are exact and some are not, and the two mean different things
+                # in the floor column -- an unmarked table would invite reading
+                # a sampling artefact as a property of the design.
+                note = (note + "; " if note else "") + \
+                    f"p sampled ({PERM_SAMPLES} draws), not enumerated"
+            # The floor goes through fmt_p for the same reason p does: on a
+            # sampled row it is 1e-5, and `%.3f` rendered that as `0.000` — a
+            # floor of zero, sitting in the column whose whole job is to say
+            # how small a p this row could ever reach.
+            print(f"{arm:<{aw}}{label:<12}{d:>11.1f}{sep(xs, ys):>9}"
+                  f"{fmt_p(perm_p(xs, ys)):>9}{fmt_p(fl):>9}  {note}")
 
     print(f"\n'floor' is the smallest p THAT row could ever return at its group "
           f"sizes, enumerated not assumed. Where floor >= 0.05 the p-value is "
           f"arithmetic, not evidence — read 'sep'. Three arms vs one control is "
           f"three comparisons, so read 0.05 as ~0.017 family-wise.")
+    print(f"Rows marked 'p sampled' had more than {PERM_MAX_EXACT} relabellings, "
+          f"so p is a {PERM_SAMPLES}-draw estimate (seed {PERM_SEED}, so it "
+          f"reproduces) and 'floor' there is 1/(M+1) — a floor on the printed "
+          f"number, not on the test. At those group sizes n is no longer what "
+          f"limits significance.")
     if any(s["cens"] for s in summary.values()):
         print("Censoring is present. A censored run is the WORST outcome for its "
               "arm, not a missing one: an arm with censored runs cannot be ranked "
