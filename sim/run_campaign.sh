@@ -243,8 +243,14 @@ fi
 # CELL_WORLD and TEAM_WORLD deliberately stay ALLOWED: P1 and P2 change no
 # decision and do not rename the arm, so they are legitimately campaign-wide
 # settings rather than treatments.
+#
+# COORD_CLAIM_R is here for the same reason and is the quietest of the set: it
+# is assigned per cell from the _r<N> arm suffix, so `--env COORD_CLAIM_R=40`
+# would run every cell at 40 m while half of them sat in directories named
+# _r10. Gate check 3i reads the manifest and would catch it afterwards, which
+# is a campaign too late.
 for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE \
-                RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
+                RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -445,6 +451,20 @@ INDEX="$ROOT/campaign_index.csv"
 
 log() { echo "[$(date +%H:%M:%S)] [campaign] $*"; }
 
+# What this campaign's cells will record for three knobs the resume guard below
+# compares. Campaign-wide, unlike the M-TARE stack, because no arm token sets
+# them: they arrive through --env or not at all.
+#
+# The defaults are run_explo_sim_rviz.sh's, duplicated here for the same reason
+# LINK_GATE's is duplicated above and kept honest the same way -- campaign_guard
+# _calib.sh reads all three literals back out of the launcher and fails if they
+# have drifted. That is not hypothetical maintenance: TREE_ATTEN's default moved
+# from 11.98 to 70.0 on 2026-09-03, and a guard still assuming 11.98 would abort
+# every resume of a campaign that is running exactly as intended.
+TREE_ATTEN_REQ=$(env_val TREE_ATTEN 70.0)
+MAX_RANGE_REQ=$(env_val MAX_RANGE 30.0)
+CELL_SIZE_REQ=$(env_val CELL_SIZE_M 10.0)
+
 IFS=',' read -ra CELL_LIST <<< "$CELLS"
 if [ "$COMMS_ON" = "0" ]; then
   log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (IDEAL COMMS, no emulator;" \
@@ -596,18 +616,65 @@ for cell in "${CELL_LIST[@]}"; do
         exit 2
       fi
     done
-    # done_unknown_fraction compared numerically, not as a string: the run
-    # script normalises floats (0.64 stays 0.64 but 1 becomes 1.0), so a string
-    # compare would abort a resume over a formatting difference and teach the
-    # operator to distrust the guard.
-    have_du=$(sed -n 's/^done_unknown_fraction=//p' "$out/run_manifest.txt" 2>/dev/null | head -1)
-    if ! awk -v a="${have_du:-}" -v b="$DONE_UNKNOWN" \
-         'BEGIN { exit !(a != "" && a + 0 == b + 0) }'; then
-      log "ABORT: $name is complete but its manifest says done_unknown_fraction=${have_du:-<absent>},"
-      log "       while this campaign runs $DONE_UNKNOWN. That is the primary endpoint —"
-      log "       refusing to skip OR overwrite. Use a fresh --root/--tag."
-      exit 2
-    fi
+    # The same rule for the keys whose manifest value is a NUMBER, which cannot
+    # go in the loop above: the run script normalises floats (0.64 stays 0.64
+    # but 1 becomes 1.0, and 20 becomes 20.0), so a string compare would abort
+    # a correct resume over a formatting difference and teach the operator to
+    # distrust the guard. Compared with awk instead.
+    #
+    # done_unknown_fraction was the only member for a long time. The radio pair
+    # joined it on 2026-09-03, when the shipped tree_attenuation_db moved from
+    # 11.98 to 70.0 and max_range_m appeared: resuming a half-finished campaign
+    # across that change would have banked seeds 1-15 on a radio where one
+    # trunk costs 12 dB and seeds 16-30 on one where a trunk is fatal and no
+    # link reaches past 30 m, under a single tag, with the manifests recording
+    # the difference and nothing reading them. cell_size_m and tx_power_dbm are
+    # here because they are the same shape of fact -- the unit the coverage
+    # census counts, and the power every link is scaled by.
+    #
+    # coord_claim_radius_override is compared too, and it is the one key with a
+    # sentinel: "none" means no -p was passed and the node took the yaml value.
+    # That is a positive statement about the cell, not a gap, and it is NOT the
+    # same cell as a pinned 10.0 even though the yaml default happens to be 10
+    # -- one fixed the radius, the other took whatever the config said that day.
+    #
+    # Matched as a string when either side is "none", numerically otherwise.
+    # The string branch is what stops awk from reading a non-number as 0: under
+    # a numeric-only compare every unparseable value -- "unset", "default", a
+    # truncated line -- would equal "none" and a cell whose radius can no longer
+    # be determined would score as agreeing.
+    for kv in \
+      "done_unknown_fraction=$DONE_UNKNOWN" \
+      "tx_power_dbm=$TX" \
+      "tree_attenuation_db=$TREE_ATTEN_REQ" \
+      "max_range_m=$MAX_RANGE_REQ" \
+      "cell_size_m=$CELL_SIZE_REQ" \
+      "coord_claim_radius_override=${cell_claim_r:-none}"
+    do
+      k="${kv%%=*}"; want="${kv#*=}"
+      have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+      same=0
+      if [ "$want" = "none" ] || [ "${have:-<absent>}" = "none" ]; then
+        if [ "${have:-<absent>}" = "$want" ]; then same=1; fi
+      elif awk -v a="${have:-}" -v b="$want" \
+             'BEGIN { exit !(a != "" && a + 0 == b + 0) }'; then
+        same=1
+      fi
+      if [ "$same" != "1" ]; then
+        case "$k" in
+          done_unknown_fraction) why="that is the primary endpoint's threshold";;
+          tx_power_dbm|tree_attenuation_db|max_range_m)
+                                 why="that is the radio regime, and this project does not pool across it";;
+          cell_size_m)           why="that is the unit the coverage census counts";;
+          *)                     why="that is an independent variable";;
+        esac
+        log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
+        log "       while this campaign runs $k=$want — $why."
+        log "       Same name, different experiment — refusing to skip OR"
+        log "       overwrite. Use a fresh --root/--tag."
+        exit 2
+      fi
+    done
     if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then
       # Keep the evidence. A gate can fail *because the link never dropped*, so
       # re-rolling preferentially discards mild-outage realisations; deleting the

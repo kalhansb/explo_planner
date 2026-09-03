@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Known-answer cases for the run_campaign.sh link-veto guard.
+# Known-answer cases for run_campaign.sh's guards.
+#
+# The link veto below is the one this file was written for and still the
+# longest section. Two others have joined it: the launcher's own validation
+# blocks, and the RESUME guard, which decides whether a directory already
+# holding a finished cell is "already complete" or a different experiment
+# wearing the same name (last section).
 #
 # The guard refuses a campaign that would arm the mid-run reconnect trigger at
 # the generation-9 clock (90 s, below the ~180 s heartbeat-suppression tail)
@@ -191,6 +197,12 @@ chk "DONE_SEEK"                      "--env DONE_SEEK is refused" \
     --arms hybrid,off --seeds 1 --env "DONE_SEEK=1"
 chk "MISSION_RETURN"                 "--env MISSION_RETURN is refused" \
     --arms hybrid,off --seeds 1 --env "MISSION_RETURN=0"
+# The quietest of the set: the claim radius comes from the _r<N> arm suffix, so
+# a passenger would run every cell of cr2 at one radius while half the
+# directories still said the other. Gate check 3i catches it from the manifest,
+# a campaign too late.
+chk "COORD_CLAIM_R is set per cell"  "--env COORD_CLAIM_R is refused" \
+    --arms mtare_hybrid_r10,mtare_hybrid_r40 --seeds 1 --env "COORD_CLAIM_R=40"
 # And the key matcher must not fire on a name that merely ends in the key --
 # env_has splits on whitespace and compares up to '=', so this must run.
 t ALLOW "MY_SEED=7 must not be read as SEED" --arms hybrid,off --seeds 1 --env "MY_SEED=7"
@@ -701,6 +713,154 @@ for _u in LINK_GATE MIDRUN_SILENCE CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ \
   fi
 done
 unset _u
+
+echo
+echo "=== the resume guard: a banked cell must have run THIS experiment ==="
+# The resume guard decides whether a directory that already holds a finished
+# cell counts as "already complete" or as a different experiment wearing the
+# same name. It had no known-answer case of any kind until this section, while
+# growing from one compared key to seventeen -- and the failure it exists to
+# stop is silent by construction: the campaign prints SKIP, the matrix fills
+# up, and two configurations end up pooled under one tag with nothing in the
+# analysis able to tell.
+#
+# Both directions are asserted, because each has its own way of going wrong. A
+# guard that never aborts is a rubber stamp; a guard that always aborts is
+# worse than none, since the operator learns to reach for a fresh --tag every
+# time and the guard stops being read. The float keys make the second failure
+# easy to write by accident: the launcher normalises 20 to 20.0, so a string
+# compare would abort a correct resume on a formatting difference alone. Cases
+# feeding the unnormalised spelling pin that.
+#
+# Nothing launches. The cases run without --dry-run -- the guard sits below the
+# point where --dry-run exits -- so MIN_FREE_MB is set absurdly high, which
+# trips the disk guard immediately AFTER the resume guard and before the cell
+# is started. That also gives the "guard wrongly let it through" outcome its
+# own distinguishable name (LAUNCHED) instead of a 3000 s gazebo run.
+RG_ARM=mtare_hybrid
+# Agrees with the reference campaign below on every key the guard reads. Each
+# case overwrites, or deletes, exactly one line.
+rg_manifest() {
+  cat <<'EOF'
+run_end_reason=all_done
+run_gates_verdict=VALID
+mission_return_enabled=true
+scenario=flatforest_dense_2robot_lidar.yaml
+duration_s=3000
+done_criterion=latch
+cell_world=1
+team_world=1
+global_alloc=1
+reconnect_gate=info
+rendezvous_schedule=1
+pursuit_predictor=trail
+done_unknown_fraction=0.64
+tx_power_dbm=30.0
+tree_attenuation_db=70.0
+max_range_m=30.0
+cell_size_m=10.0
+coord_claim_radius_override=none
+EOF
+}
+# rg WANT "label" ARM KEY VALUE
+#   KEY=""          -> the manifest is left agreeing
+#   VALUE="<none>"  -> the key is DELETED, i.e. a manifest predating it
+rg() {
+  _want="$1"; _lbl="$2"; _arm="$3"; _key="${4-}"; _val="${5-}"
+  cases=$((cases+1))
+  _root="$TMP/resume_$cases"; _cell="$_root/rg_${_arm}_seed1"
+  mkdir -p "$_cell"
+  if [ -n "$_key" ]; then
+    rg_manifest | grep -v "^$_key=" > "$_cell/run_manifest.txt"
+    [ "$_val" = "<none>" ] || echo "$_key=$_val" >> "$_cell/run_manifest.txt"
+  else
+    rg_manifest > "$_cell/run_manifest.txt"
+  fi
+  _out=$(MIN_FREE_MB=999999999999 timeout 60 "$CS" --root "$_root" --tag rg \
+           --duration 3000 --scenario flatforest_dense_2robot_lidar.yaml \
+           --arms "$_arm" --seeds 1 2>&1)
+  _rc=$?
+  if echo "$_out" | grep -q "ABORT: rg_${_arm}_seed1 is complete but its manifest says"; then
+    # As with the link veto above, the text alone is not the verdict: a guard
+    # that printed the refusal and then ran the cell anyway would be worse than
+    # no guard at all.
+    [ "$_rc" = 0 ] && _got=PRINTED-BUT-RAN || _got=ABORT
+  elif echo "$_out" | grep -q "SKIP rg_${_arm}_seed1 (already complete)"; then
+    _got=SKIP
+  elif echo "$_out" | grep -q "MB free under"; then
+    _got=LAUNCHED          # the guard passed the cell through to be re-run
+  else
+    _got="REFUSED(rc=$_rc)" # something else stopped it before the guard
+  fi
+  if [ "$_got" = "$_want" ]; then
+    echo "  PASS  $_lbl ($_got)"
+  else
+    echo "  FAIL  $_lbl: want $_want got $_got"
+    echo "$_out" | grep -E "FATAL|ABORT|SKIP|free under" | sed 's/^/          | /'
+    fails=$((fails+1))
+  fi
+}
+
+rg SKIP  "an agreeing manifest is skipped, not re-run"        "$RG_ARM"
+# Anti-vacuity for the numeric compare, in the direction that costs wall time
+# rather than data: these are the SAME configuration, spelled the way a hand-
+# written or older manifest spells it.
+rg SKIP  "cell_size_m=10 agrees with 10.0"                    "$RG_ARM" cell_size_m 10
+rg SKIP  "tree_attenuation_db=70 agrees with 70.0"            "$RG_ARM" tree_attenuation_db 70
+rg SKIP  "done_unknown_fraction=.64 agrees with 0.64"         "$RG_ARM" done_unknown_fraction .64
+# The radio regime. The first of these is the change of 2026-09-03 itself: a
+# cell banked under the 11.98 dB trunks, resumed by a campaign running the
+# 70 dB ones. Before this key was compared it scored SKIP.
+rg ABORT "tree_attenuation_db=11.98 is the old radio"         "$RG_ARM" tree_attenuation_db 11.98
+rg ABORT "max_range_m absent predates the horizon"            "$RG_ARM" max_range_m "<none>"
+rg ABORT "max_range_m=60.0 is a different horizon"            "$RG_ARM" max_range_m 60.0
+rg ABORT "tx_power_dbm=40.0 is a different link budget"       "$RG_ARM" tx_power_dbm 40.0
+# The census unit, and the one the original todo named: cell_size_m decides what
+# a covered cell IS, so two runs that disagree about it have incomparable
+# coverage curves and a pooled completion time that means nothing.
+rg ABORT "cell_size_m=20.0 is a different census"             "$RG_ARM" cell_size_m 20.0
+rg ABORT "cell_size_m absent cannot be shown to agree"        "$RG_ARM" cell_size_m "<none>"
+# Regression cover for the key that WAS compared before this loop existed --
+# folding it in must not have dropped it.
+rg ABORT "done_unknown_fraction=0.50 still aborts"            "$RG_ARM" done_unknown_fraction 0.50
+# cr2's independent variable, and the only key with a sentinel. "none" and
+# "10.0" are different cells even though the yaml default is 10: one pinned the
+# radius, one took whatever the config said that day.
+rg SKIP  "_r40 with a matching 40.0 override is skipped"      mtare_hybrid_r40 coord_claim_radius_override 40.0
+rg ABORT "_r40 banked at 10.0 is a different level"           mtare_hybrid_r40 coord_claim_radius_override 10.0
+rg ABORT "_r40 banked with no override at all"                mtare_hybrid_r40 coord_claim_radius_override none
+rg ABORT "an unsuffixed arm banked at a pinned 10.0"          "$RG_ARM" coord_claim_radius_override 10.0
+# The sentinel branch itself. Compared numerically, awk reads EVERY non-number
+# as 0, so "unset" would equal "none" and a cell whose radius can no longer be
+# determined would score as agreeing. This is the case that separates the two
+# spellings; the four above pass either way.
+rg ABORT "a non-numeric value is not the 'none' sentinel"     "$RG_ARM" coord_claim_radius_override unset
+rg ABORT "an empty value cannot be shown to agree"            "$RG_ARM" coord_claim_radius_override ""
+unset _want _lbl _arm _key _val _root _cell _out _rc _got RG_ARM
+
+echo
+echo "=== the resume guard's copies of the launcher defaults must still be true ==="
+# Same hazard as the LINK_GATE readback above, and the reason that one exists is
+# on display here: TREE_ATTEN's shipped default MOVED, from 11.98 to 70.0. The
+# resume guard predicts what a cell's manifest will say, so a stale copy of a
+# default does not fail loudly -- it aborts every resume of a campaign that is
+# running exactly as intended, or, in the other direction, skips a cell from
+# the wrong regime. Read all three literals back out of the launcher.
+for _spec in TREE_ATTEN:TREE_ATTEN_REQ MAX_RANGE:MAX_RANGE_REQ \
+             CELL_SIZE_M:CELL_SIZE_REQ; do
+  _ek=${_spec%%:*}; _vn=${_spec#*:}
+  cases=$((cases+1))
+  _ld=$(sed -n "s/^$_ek=\"\$(flt \"\${$_ek:-\(.*\)}\")\"\$/\1/p" "$LAUNCHER" | head -1)
+  _gd=$(sed -n "s/^$_vn=\$(env_val $_ek \(.*\))\$/\1/p" "$CS" | head -1)
+  if [ -n "$_ld" ] && [ "$_ld" = "$_gd" ]; then
+    echo "  PASS  launcher default $_ek=$_ld matches the resume guard's copy"
+  else
+    echo "  FAIL  launcher default $_ek is '${_ld:-UNREADABLE}' but the resume" \
+         "guard assumes '${_gd:-UNREADABLE}'"
+    fails=$((fails+1))
+  fi
+done
+unset _spec _ek _vn _ld _gd
 
 echo
 [ "$fails" = 0 ] && echo "ALL PASS ($cases known-answer cases)" \
