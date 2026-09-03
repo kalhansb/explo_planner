@@ -336,8 +336,8 @@ _veto_live=0
 # "hybrid" keeps a future arm inside the guard by default.
 #
 # The `mtare_` prefix is stripped before that comparison, because what decides
-# whether this hazard exists is rendezvous_enabled, and the runner sets that
-# from the arm's SUFFIX alone: mtare_off is rendezvous_enabled=false exactly
+# whether this hazard exists is reconnect_enabled, and the runner sets that
+# from the arm's SUFFIX alone: mtare_off is reconnect_enabled=false exactly
 # like off, and dispatches nothing to chase with. Leaving the prefix on would
 # have classed the P7 factorial's own control as treated and blocked a --comms
 # 0 run of it for a trigger that arm never arms.
@@ -352,6 +352,10 @@ _treated=0
 for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
   _a="${_a%%:*}"
   _a="${_a%_seek}"
+  # ... and the same for the cr2 claim-radius suffix, for the same reason: it is
+  # a runtime switch, not an arm, so "mtare_off_r40" is still an untreated cell
+  # and must not be classed as treated on the strength of a suffix.
+  case "$_a" in *_r[0-9]|*_r[0-9][0-9]) _a="${_a%_r*}";; esac
   _a="${_a#mtare_}"
   [ "$_a" = "off" ] || _treated=1
 done
@@ -467,6 +471,26 @@ for cell in "${CELL_LIST[@]}"; do
   cell_mode="$arm"; cell_seek="0"
   case "$arm" in
     *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
+  esac
+
+  # Arm-name suffix "_r<N>" = same RECONNECT_MODE, MinPos claim radius forced to
+  # N metres. Same mechanism and same reason as _seek above: the claim radius is
+  # a yaml parameter, so --env can only set it campaign-wide, and campaign cr2
+  # needs 10 m and 40 m interleaved inside ONE invocation. Stripped here, so the
+  # runner is handed a clean token and every arm-token guard it owns (the
+  # RECONNECT_MODE vocabulary, _arm_stack, the arm-name stamp cross-check) sees
+  # exactly what it saw before this existed. The suffix survives only in the
+  # OUTDIR name and the campaign index, which is where the analysis reads it.
+  #
+  # Empty = pass nothing, which leaves the node on the yaml value (0 = auto =
+  # fov_max_range = 10 m). An UNSUFFIXED arm is therefore unchanged by this
+  # block, and _r10 is written out explicitly rather than left to the default so
+  # that both cr2 levels travel through the identical -p code path -- otherwise
+  # the passthrough itself is confounded with the arm.
+  cell_claim_r=""
+  case "$cell_mode" in
+    *_r[0-9]|*_r[0-9][0-9])
+      cell_claim_r="${cell_mode##*_r}.0"; cell_mode="${cell_mode%_r*}";;
   esac
 
   # What this cell's manifest WILL say for the six M-TARE knobs, so the resume
@@ -619,7 +643,7 @@ for cell in "${CELL_LIST[@]}"; do
     break
   fi
 
-  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
+  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek claim_r=${cell_claim_r:-yaml} mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
@@ -649,6 +673,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u PURSUIT_PREDICTOR \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
+      COORD_CLAIM_R="$cell_claim_r" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \

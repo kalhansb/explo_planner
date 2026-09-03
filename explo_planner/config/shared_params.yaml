@@ -620,7 +620,44 @@
     # angles across the team. 0 = auto = vantage_visited_tol_m.
     coord_vantage_claim_radius_m: 0.0
 
-    # Rendezvous reconnection (multi-robot). ON by default: a robot that
+    # Global allocator: may a DISCONNECTED vehicle be assigned cells it has
+    # never seen first-hand? Node default is false (it may), and every campaign
+    # up to and including mt2 ran that way.
+    #
+    # EXPERIMENT cm1 (2026-09-01). False is incoherent with the reconnect gate,
+    # which prices its two futures with exactly one difference between them --
+    # reconnect_gate.cpp:155 calls it "whether the missing peers can be given
+    # cells they have never heard of" -- by setting comms_mask TRUE in the
+    # don't-reconnect future and FALSE in the reconnect one. With the mask off
+    # globally, that penalty never materialises: reconnection buys back full-map
+    # access that was never withdrawn, so the gate's modelled benefit is
+    # fictional. mt2 measured the consequence -- hybrid halves deep outage time
+    # (121 s -> 65 s, p=0.030) and moves t_explore not at all (1.049x, p=0.342).
+    #
+    # True makes an outage genuinely costly in the world BOTH arms inhabit, so
+    # it is a world property and not part of the treatment; global_alloc_enable
+    # is true in mtare_off and mtare_hybrid alike (gate_g8.py:431-448).
+    # Config-only: --symlink-install keeps sha256_explo_planner_node unchanged.
+    # Revert to false to reproduce mt2 and everything before it.
+    #
+    # REVERTED to false 2026-09-01 for campaign cr2. The cm1 pilot (4 cells) was
+    # INCONCLUSIVE: its own built-in control -- the CONNECTED samples, where the
+    # mask is inert and the two campaigns must agree -- missed in OPPOSITE
+    # directions between the arms (mtare_off 5.15 vs mt2 6.14; mtare_hybrid 6.97
+    # vs mt2 5.96), which is drift, not the mask. cr2 varies the MinPos claim
+    # radius instead, and must not change two world knobs at once; leaving this
+    # true would also break the cross-check of cr2's _r10 arms against mt2.
+    global_alloc_comms_mask: false
+
+    # Reconnect subsystem master switch (multi-robot). Called
+    # `rendezvous_enabled` until 2026-09-03; the old name still works as a
+    # deprecated alias and wins if you pass it, but it is misleading — it is
+    # NOT the rendezvous arm. False means no mid-run manoeuvre of any kind
+    # runs, i.e. the control arm; `reconnect_mode` picks WHICH manoeuvre a true
+    # dispatches, and `rendezvous_schedule_enable` is the appointment factor.
+    # The three are independent, which is what makes the 2x2 a 2x2.
+    #
+    # ON by default: a robot that
     # exhausts its exploration goals does NOT stop while a teammate is still out
     # of comms: it drives to the MEETING POINT (the midpoint of the last-contact
     # pose pair, which both sides compute from records they already hold) and
@@ -645,7 +682,7 @@
     # comms_link_states_topic / comms_link_robot_index_topic.
     # That family is NOT set here — it runs at the node defaults documented in
     # docs/ros_api.md. Pin any of it here before a campaign that A/Bs it.
-    rendezvous_enabled: true
+    reconnect_enabled: true
     rendezvous_expected_peers: 0      # teammates to wait for; 0 = inert
     # TERMINAL barrier give-up (seconds). 0 = wait forever (STAY until all
     # connected). A positive value is a field escape hatch so a robot whose

@@ -323,7 +323,7 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, run the `reconnect_mode` manoeuvre. |
+| `reconnect_enabled` | bool | `true` | Master switch for the reconnect subsystem: run the `reconnect_mode` manoeuvre when a teammate is out of comms. `false` is the control arm (no manoeuvre of any kind). Renamed from `rendezvous_enabled` 2026-09-03; the old name still works, wins if both are set, and is stamped alongside the new one in every experiment log. |
 | `rendezvous_expected_peers` | int | `0` | Teammates to wait for. **`0` leaves the feature inert** — the multi-robot launch sets team size − 1; set it by hand on hardware. |
 | `rendezvous_max_wait_sec` | double | `0.0` | **Terminal** barrier give-up (s); `0` = wait forever, which is the shipped field value. On expiry the robot escalates once to the meeting point (`hold_escalate`) and then finishes in `DONE` with the run logged `outcome=gave_up`. Mid-run barriers ignore this and use `reconnect_midrun_max_wait_sec` instead. The sim harness ships `600`. |
 | `reconnect_mode` | string | `rendezvous` | Mesh (robot-carried radio) manoeuvre: `rendezvous` = drive to the deterministic meeting point and wait (it fell back to this robot's own last-contact anchor until 2026-08-17; with radios on the robots both anchors sit one comms range apart, so the two never converged — the own anchor is now used only when the missing peer was never heard this run); `pursuit` = budgeted chase of the missing peer's last declared goal, then hold in place; `hybrid` = chase, then the deterministic meeting point (midpoint of the last-contact pose pair). Case-insensitive; the yaml/sim ship `hybrid`. Designed for the 2-robot team (like the MinPos tiebreak): with 3+ robots the chase/midpoint pairs one missing peer at a time. Needs `done_action: idle` — a finished robot keeps beaconing so a later finisher can count it; `shutdown` makes the first finisher permanently invisible (startup WARN). |
@@ -569,7 +569,7 @@ one planner per robot PC by hand — this is also the only launch that sets
 | `output_dir` / `config_id` / `world` | `/tmp` / `c1` / `flatforest` | Compose the per-robot CSV name `exp7_<planner>_<world>_<config_id>_<robot>.csv`. |
 | `max_steps` | `100` | Per-robot budget. |
 | `coordination_enabled` | `true` | MinPos deconfliction. |
-| `rendezvous_enabled` | `true` | Run the `reconnect_mode` manoeuvre on goal exhaustion with teammates out of comms. |
+| `reconnect_enabled` | `true` | Master switch for the reconnect subsystem. `reconnect_mode` picks WHICH manoeuvre; `rendezvous_schedule_enable` is the appointment factor. Deprecated alias: `rendezvous_enabled`. |
 | `rendezvous_max_wait_sec` | `0.0` | Barrier give-up. |
 | `reconnect_mode` | `hybrid` | Which manoeuvre: `rendezvous` / `pursuit` / `hybrid` (see the §4 parameter table). |
 | `proximity_stop_enabled` | `true` | Coordinated yield. |

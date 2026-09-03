@@ -41,7 +41,24 @@ def launch_setup(context):
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() \
         in ("true", "1", "yes", "on")
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
+    # Master switch for the reconnect subsystem. `rendezvous_enabled` is the
+    # deprecated alias and defaults to EMPTY, not "true", so that "the caller
+    # asked for it" is distinguishable from "the caller said nothing" — the
+    # node resolves the same way, and passing both unconditionally would make
+    # the alias win every launch and silently shadow the real argument.
+    reconnect_enabled = LaunchConfiguration("reconnect_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
+    if rendezvous_enabled.strip():
+        print("[multi_robot_exploration.launch.py] WARNING: launch argument "
+              "'rendezvous_enabled' is deprecated (it is the master switch for "
+              "the whole reconnect subsystem, not the rendezvous arm) — use "
+              "'reconnect_enabled'.")
+        # The STRIPPED value, matching what was tested one line above. The
+        # truthiness test below is an exact membership check, so carrying the
+        # padding through would read `rendezvous_enabled:=" true "` as false and
+        # turn the subsystem OFF for a caller who asked to turn it on — the one
+        # outcome this alias exists to prevent.
+        reconnect_enabled = rendezvous_enabled.strip()
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
     reconnect_mode = LaunchConfiguration("reconnect_mode").perform(context)
     proximity_stop_enabled = LaunchConfiguration("proximity_stop_enabled").perform(context)
@@ -80,13 +97,14 @@ def launch_setup(context):
                     # intents on /exploration/intents.
                     "coordination_enabled":
                         coordination_enabled.lower() in ("true", "1", "yes", "on"),
-                    # Rendezvous reconnection: on exhausting its goals a robot
-                    # returns to its last-connected anchor and waits until the
-                    # whole team is back in comms. expected_peers is the team
-                    # size minus this robot; 0 = wait forever (STAY until all
-                    # connected).
-                    "rendezvous_enabled":
-                        rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
+                    # Reconnect subsystem master switch. False = no mid-run
+                    # manoeuvre of any kind (the control arm); which manoeuvre
+                    # a true runs is reconnect_mode's job. Resolved above, so
+                    # only the canonical name reaches the node.
+                    "reconnect_enabled":
+                        reconnect_enabled.lower() in ("true", "1", "yes", "on"),
+                    # expected_peers is the team size minus this robot;
+                    # 0 = wait forever (STAY until all connected).
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
                     # Mesh reconnection manoeuvre on a robot-carried radio
@@ -130,11 +148,17 @@ def generate_launch_description():
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
-        DeclareLaunchArgument("rendezvous_enabled", default_value="true",
-                              description="Return to the last-connected anchor and "
-                                          "wait for the whole team when exploration "
-                                          "goals are exhausted (default on; set "
-                                          "false for independent finish-and-stop)"),
+        DeclareLaunchArgument("reconnect_enabled", default_value="true",
+                              description="Master switch for the reconnect "
+                                          "subsystem: run a manoeuvre when a "
+                                          "teammate is out of comms (default on; "
+                                          "set false for independent "
+                                          "finish-and-stop, the control arm). "
+                                          "reconnect_mode picks WHICH manoeuvre"),
+        DeclareLaunchArgument("rendezvous_enabled", default_value="",
+                              description="DEPRECATED alias for reconnect_enabled. "
+                                          "Empty = unset; any value overrides "
+                                          "reconnect_enabled and warns"),
         DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
                               description="Barrier give-up seconds (0 = wait forever)"),
         DeclareLaunchArgument("reconnect_mode", default_value="hybrid",

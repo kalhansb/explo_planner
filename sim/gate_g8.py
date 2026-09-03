@@ -189,10 +189,10 @@ EXPECT_ARMS = tuple(
                 for s in os.environ.get("GATE_ARMS", "hybrid,off").split(","))
     if a)
 
-# The control arm, and the ONLY arm that runs with rendezvous_enabled=false.
+# The control arm, and the ONLY arm that runs with reconnect_enabled=false.
 # Everything else — hybrid, pursuit, rendezvous and the three treated
 # `mtare_*` tokens — reaches the manoeuvre and must have it enabled. Check 3e used to spell this as
-# `arm == "hybrid"`, which asserted rendezvous_enabled=False for a pursuit or
+# `arm == "hybrid"`, which asserted reconnect_enabled=False for a pursuit or
 # rendezvous cell and would have hard-failed a correct run of either.
 #
 # The default is `off` ALONE. It briefly shipped as "off,mtare_off" on the
@@ -425,7 +425,7 @@ if not cells:
 # test with P3.
 #
 # `mtare_rendezvous` and `mtare_hybrid` have identical vectors. They are
-# separated by reconnect_mode / rendezvous_enabled, which check 3e already
+# separated by reconnect_mode / reconnect_enabled, which check 3e already
 # compares against the directory name; this table is about the stack, not the
 # mode.
 MTARE_ARM_STACK = {
@@ -612,7 +612,14 @@ for c in cells:
                     f"{c}/{r}: check 3d — schema_version={sv!r}, expected "
                     f"{SCHEMA_VERSION}")
             row.setdefault("mode_req", pr.get("arm"))
-            row.setdefault("rdv", pr.get("rendezvous_enabled"))
+            # Either spelling: `reconnect_enabled` since the 2026-09-03 rename,
+            # `rendezvous_enabled` in every cell up to and including cr5. The
+            # node stamps both now; reading both keeps one gate over a mixed
+            # set of campaigns.
+            have_rdv = pr.get("reconnect_enabled")
+            if have_rdv is None:
+                have_rdv = pr.get("rendezvous_enabled")
+            row.setdefault("rdv", have_rdv)
             # 3e. the treatment variable must not come from the directory name
             # alone. Everything downstream keys the arm off the cell directory,
             # so a launcher bug or a leaked environment variable that runs the
@@ -625,11 +632,10 @@ for c in cells:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — directory says arm={arm} but "
                     f"run_start params say arm={pr.get('arm')!r}")
-            if pr.get("rendezvous_enabled") is not None \
-                    and bool(pr.get("rendezvous_enabled")) != want_rdv:
+            if have_rdv is not None and bool(have_rdv) != want_rdv:
                 hard_fail.append(
-                    f"{c}/{r}: check 3e — arm={arm} but rendezvous_enabled="
-                    f"{pr.get('rendezvous_enabled')!r}")
+                    f"{c}/{r}: check 3e — arm={arm} but reconnect_enabled="
+                    f"{have_rdv!r}")
             # 3g. THE M-TARE ARM MUST WITNESS ITS WHOLE STACK, NOT ONE BIT.
             #
             # The node reconstitutes the arm itself and prefixes `mtare_` when

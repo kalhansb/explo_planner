@@ -104,7 +104,7 @@ enum class State {
   // Rendezvous sub-states (multi-robot). On exhausting its exploration goals a
   // robot drives back to its last-connected anchor (RETURN_NAV) and holds there
   // (RETURN_SYNC) until the whole team is back in comms, then re-plans against
-  // the merged map. Gated by rendezvous_enabled_; see the rendezvous_* params.
+  // the merged map. Gated by reconnect_enabled_; see the rendezvous_* params.
   RETURN_NAV,
   RETURN_SYNC,
   // Mesh-reconnection pursuit (robot-carried radios). Instead of driving home
@@ -952,7 +952,7 @@ private:
   // re-plans against the merged map. Requires coordination_enabled (peers are
   // what the barrier waits on) and a positive expected-peer count; stays inert
   // otherwise (single-robot runs are unaffected).
-  bool   rendezvous_enabled_       = true;
+  bool   reconnect_enabled_       = true;
   // How many teammates to wait for at the barrier (team size minus self). The
   // multi_robot launch sets this from the robot list; override in YAML on
   // hardware. <= 0 disables rendezvous.
@@ -1183,7 +1183,7 @@ private:
   //
   // "" (the default) leaves the feature OFF and the trigger bit-identical to
   // the campaigns already banked. Nothing about the `off` arm can reach this:
-  // the whole mid-run block requires rendezvous_enabled_, which is false there.
+  // the whole mid-run block requires reconnect_enabled_, which is false there.
   std::string comms_link_states_topic_;
   std::string comms_link_robot_index_topic_;
   // Newest sample older than this and the gate stands down to the legacy clock
@@ -2616,22 +2616,73 @@ ExploPlannerNode::ExploPlannerNode()
   coord_heartbeat_hz_    = dp("coord_heartbeat_hz", 1.0);
   coord_vantage_claim_radius_m_ = dp("coord_vantage_claim_radius_m", 0.0);
 
-  // Rendezvous. ON by default: return-to-anchor-and-wait on exploration
-  // exhaustion. It only *activates* where it is meaningful — coordination on
-  // (the barrier waits on peer claims) and a positive expected-peer count. In
-  // single-robot / no-coordination runs (or a one-robot team) it silently
-  // stays inert with no behaviour change, so a missing precondition is a plain
-  // INFO, not a warning.
-  rendezvous_enabled_        = dp("rendezvous_enabled", true);
+  // Master on/off for the WHOLE reconnect subsystem. ON by default. It is NOT
+  // the appointment factor (that is rendezvous_schedule_enable) and NOT a
+  // selector for the legacy return-to-anchor barrier (that is reconnect_mode):
+  // false means no mid-run manoeuvre of any kind runs, which is the control
+  // arm. The arm string below is literally `reconnect_enabled_ ? mode : "off"`.
+  //
+  // Renamed from `rendezvous_enabled` on 2026-09-03. The old name predates
+  // pursuit and hybrid existing, and by cr3-cr5 it read off the manifest as
+  // "the rendezvous arm is on" in three arms out of four — including pure
+  // pursuit, which cannot arm an appointment at all (armAppointment refuses on
+  // mode). It cost a reader a double-take on a finished campaign; that is the
+  // whole reason for the rename.
+  //
+  // The old name still works and WINS when explicitly set. Rationale: after the
+  // rename NOTHING in this tree passes the old name, so an override under it can
+  // only have come from a caller outside the tree — a stale script — and the
+  // safe reading of a stale script is that it means what it says. The new name,
+  // by contrast, is passed by the harness on every single run
+  // (run_explo_sim_rviz.sh: `-p reconnect_enabled:=$RECONNECT_ENABLED`), so
+  // "the new name is present" carries no intent at all.
+  //
+  // The sharp edge, stated rather than hidden: get_parameter_overrides() merges
+  // the params file and the command line into one map and this rule cannot tell
+  // them apart, so a params file carrying the LEGACY key would beat an explicit
+  // `-p reconnect_enabled:=false` — the reverse of ROS's own precedence. No
+  // in-tree yaml carries the legacy key (shared_params.yaml was renamed with
+  // everything else), so that inversion is unreachable from here; it is a trap
+  // only for someone who reintroduces the old spelling into a params file. The
+  // WARN below fires on every disagreement, which is the mitigation.
+  //
+  // Both names are stamped into the experiment log with the RESOLVED value, so
+  // no analysis can be misled about which one was passed.
+  {
+    const auto& ovr =
+        this->get_node_parameters_interface()->get_parameter_overrides();
+    const bool has_new = ovr.count("reconnect_enabled") > 0;
+    const bool has_old = ovr.count("rendezvous_enabled") > 0;
+    const bool v_new = dp("reconnect_enabled", true);
+    const bool v_old = dp("rendezvous_enabled", true);
+    reconnect_enabled_ = has_old ? v_old : v_new;
+    if (has_old && has_new && v_new != v_old) {
+      RCLCPP_WARN(get_logger(),
+          "Both reconnect_enabled=%d and the deprecated alias "
+          "rendezvous_enabled=%d were set, and they DISAGREE. The alias wins "
+          "(reconnect subsystem %s). Drop one of them.",
+          v_new, v_old, v_old ? "ON" : "OFF");
+    } else if (has_old) {
+      RCLCPP_WARN(get_logger(),
+          "Parameter 'rendezvous_enabled' is deprecated — it is the master "
+          "switch for the whole reconnect subsystem, not the rendezvous arm. "
+          "Use 'reconnect_enabled' instead (value %d carried over).", v_old);
+    }
+  }
+  // Rendezvous barrier preconditions. It only *activates* where it is
+  // meaningful — coordination on (the barrier waits on peer claims) and a
+  // positive expected-peer count. In single-robot / no-coordination runs (or a
+  // one-robot team) it silently stays inert with no behaviour change, so a
+  // missing precondition is a plain INFO, not a warning.
   rendezvous_expected_peers_ = dp("rendezvous_expected_peers", 0);
   rendezvous_max_wait_sec_   = dp("rendezvous_max_wait_sec", 0.0);
-  if (rendezvous_enabled_ &&
+  if (reconnect_enabled_ &&
       (!coord_enabled_ || rendezvous_expected_peers_ <= 0)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous inactive (coordination_enabled=%d, expected_peers=%d): "
         "running as plain exploration, finishing when goals are exhausted.",
         coord_enabled_, rendezvous_expected_peers_);
-    rendezvous_enabled_ = false;
+    reconnect_enabled_ = false;
   }
   // The barrier counts peers by their claim beacons, and only a DONE-idle
   // robot keeps beaconing after it finishes (finishOrRendezvous publishes the
@@ -2639,7 +2690,7 @@ ExploPlannerNode::ExploPlannerNode()
   // robot exits the process instead: the first finisher becomes permanently
   // invisible and a teammate finishing later runs the whole reconnect
   // manoeuvre against a robot that no longer exists.
-  if (rendezvous_enabled_ && done_action_ != "idle") {
+  if (reconnect_enabled_ && done_action_ != "idle") {
     RCLCPP_WARN(get_logger(),
         "Rendezvous barrier with done_action='%s': the first robot to finish "
         "exits and stops beaconing, so a teammate finishing later can never "
@@ -2650,7 +2701,7 @@ ExploPlannerNode::ExploPlannerNode()
   // Mesh reconnection mode. Default "rendezvous" = the legacy return-to-anchor
   // barrier, bit-for-bit; "pursuit"/"hybrid" are the robot-carried-radio
   // manoeuvres (see the param comments above). Gated by the same
-  // rendezvous_enabled_ preconditions — the mode only picks WHICH manoeuvre
+  // reconnect_enabled_ preconditions — the mode only picks WHICH manoeuvre
   // runs once shouldRendezvous() says one should.
   {
     const std::string mode_str =
@@ -2850,7 +2901,7 @@ ExploPlannerNode::ExploPlannerNode()
   // (§32.14's inert-check family). Conversely a low threshold with no gate is
   // now the genuinely dangerous combination, and it says so.
   //
-  // Three conjuncts, each earning its place. rendezvous_enabled: with the
+  // Three conjuncts, each earning its place. reconnect_enabled: with the
   // manoeuvre off the trigger cannot fire whatever the threshold is, and the
   // control arm runs exactly that way — without this the off arm would warn on
   // every run about a risk it does not carry, and a warning that fires on half
@@ -2858,7 +2909,7 @@ ExploPlannerNode::ExploPlannerNode()
   // row into "my pair", so states-without-index is a gate that stands down on
   // every tick while looking configured, which is the same silent-veto-removal
   // this guard exists to catch.
-  if (reconnect_midrun_silence_sec_ > 0.0 && rendezvous_enabled_ &&
+  if (reconnect_midrun_silence_sec_ > 0.0 && reconnect_enabled_ &&
       reconnect_midrun_silence_sec_ < 200.0 &&
       (comms_link_states_topic_.empty() ||
        comms_link_robot_index_topic_.empty())) {
@@ -3078,7 +3129,12 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamBool("coordination_enabled", coord_enabled_);
     exp_log_->addParamNum("coord_claim_ttl_sec", coord_claim_ttl_sec_);
     exp_log_->addParamNum("coord_heartbeat_hz", coord_heartbeat_hz_);
-    exp_log_->addParamBool("rendezvous_enabled", rendezvous_enabled_);
+    // Both names, one resolved value. `reconnect_enabled` is current;
+    // `rendezvous_enabled` is kept verbatim and forever, so the cr3-cr5
+    // analysis and the gate scripts read a new log exactly as they read an
+    // old one, whichever name the harness passed.
+    exp_log_->addParamBool("reconnect_enabled", reconnect_enabled_);
+    exp_log_->addParamBool("rendezvous_enabled", reconnect_enabled_);
     exp_log_->addParamNum("rendezvous_expected_peers",
                           rendezvous_expected_peers_);
     exp_log_->addParamNum("rendezvous_max_wait_sec", rendezvous_max_wait_sec_);
@@ -3572,9 +3628,9 @@ ExploPlannerNode::ExploPlannerNode()
     // Not fatal: a run with reconnection disabled entirely is a legitimate
     // control, and the gate simply never evaluates. Warned because asking for
     // `info` in that configuration is almost certainly a harness mistake.
-    if (!rendezvous_enabled_) {
+    if (!reconnect_enabled_) {
       RCLCPP_WARN(get_logger(),
-          "reconnect_gate=info with rendezvous_enabled=false: there is no "
+          "reconnect_gate=info with reconnect_enabled=false: there is no "
           "mid-run reconnection to gate, so the gate will never evaluate.");
     }
     // The gate prices its two futures with the allocator's own solver, so it
@@ -3646,9 +3702,9 @@ ExploPlannerNode::ExploPlannerNode()
     // Not fatal: a control run with reconnection off is legitimate and the
     // scheduler simply never arms. Warned because asking for it there is
     // almost certainly a harness mistake.
-    if (!rendezvous_enabled_) {
+    if (!reconnect_enabled_) {
       RCLCPP_WARN(get_logger(),
-          "rendezvous_schedule_enable=true with rendezvous_enabled=false: "
+          "rendezvous_schedule_enable=true with reconnect_enabled=false: "
           "there is no reconnect manoeuvre to schedule, so no appointment "
           "will ever be armed.");
     }
@@ -3767,9 +3823,9 @@ ExploPlannerNode::ExploPlannerNode()
     // Not fatal: a control run with reconnection off is legitimate and the
     // predictor is simply never consulted. Warned because asking for it there
     // is almost certainly a harness mistake.
-    if (!rendezvous_enabled_) {
+    if (!reconnect_enabled_) {
       RCLCPP_WARN(get_logger(),
-          "pursuit_predictor=mdp with rendezvous_enabled=false: there is no "
+          "pursuit_predictor=mdp with reconnect_enabled=false: there is no "
           "chase to aim, so the model will never be consulted.");
     }
     if (reconnect_mode_ == ReconnectMode::RENDEZVOUS) {
@@ -3874,7 +3930,7 @@ ExploPlannerNode::ExploPlannerNode()
   //
   // reconnect_mode alone is NOT the arm. The control arm is "no reconnection
   // at all", which is not a reconnect_mode value — it is expressed as
-  // rendezvous_enabled=false, and the harness has to pass SOME mode alongside
+  // reconnect_enabled=false, and the harness has to pass SOME mode alongside
   // it (it passes "hybrid"). So a control run is stamped reconnect_mode
   // "hybrid", and anything grouping on that column pools the control into the
   // hybrid cell: the hybrid mean becomes the average of treatment and control,
@@ -3916,7 +3972,7 @@ ExploPlannerNode::ExploPlannerNode()
   if (exp_log_) {
     const bool mtare = global_alloc_enable_ || reconnect_gate_info_ ||
                        rendezvous_schedule_enable_ || pursuit_predictor_mdp_;
-    std::string arm = rendezvous_enabled_
+    std::string arm = reconnect_enabled_
                           ? std::string(reconnectModeName(reconnect_mode_))
                           : std::string("off");
     if (mtare) arm = "mtare_" + arm;
@@ -4006,7 +4062,7 @@ ExploPlannerNode::ExploPlannerNode()
           // cheapest point to return to for reconnection. onIntent already
           // drops our own echo, but we gate on robot_id here too since we read
           // our live pose. have_pose_ guards the very first ticks before TF.
-          if (rendezvous_enabled_ && have_pose_ &&
+          if (reconnect_enabled_ && have_pose_ &&
               msg->robot_id != robot_name_) {
             last_connected_anchor_ = latest_pos_;
             have_anchor_ = true;
@@ -5301,7 +5357,7 @@ void ExploPlannerNode::doPlan() {
   // — without the re-check a peer that reconnected within the last heartbeat
   // period still reads missing and we brake for a manoeuvre that dissolves on
   // its first tick.
-  if (reconnect_midrun_silence_sec_ > 0.0 && rendezvous_enabled_ &&
+  if (reconnect_midrun_silence_sec_ > 0.0 && reconnect_enabled_ &&
       have_anchor_ && team_seen_complete_ && !appointment_armed_) {
     if (midrun_attempts_ < reconnect_midrun_max_attempts_) {
       const auto trig_now = this->now();
@@ -6743,7 +6799,7 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
     abandonNavGoal(reason);
     return startReturnHome(reason);
   }
-  if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
+  if (shouldRendezvous(reconnect_enabled_, have_anchor_, active,
                        rendezvous_expected_peers_)) {
     // Confirmation gate. `active` above is one read of a claim table that may
     // not yet have absorbed intents already delivered to this node, so a
@@ -6773,7 +6829,7 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
     hold_escalated_ = false;
     return dispatchReconnect(reason);
   }
-  if (rendezvous_enabled_ && rendezvous_expected_peers_ > 0) {
+  if (reconnect_enabled_ && rendezvous_expected_peers_ > 0) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: exploration ended [%s] with full team present "
         "(%d/%d peers) -> DONE.",

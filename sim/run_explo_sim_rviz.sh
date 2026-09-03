@@ -205,7 +205,7 @@ EXPLOIT="${EXPLOIT:-1}"
 # finite comms.
 #
 # `off` is a FOURTH value handled here, not by the planner: it disables the
-# manoeuvre outright (rendezvous_enabled:=false) and is the control arm the
+# manoeuvre outright (reconnect_enabled:=false) and is the control arm the
 # matrix compares the other three against. It cannot be expressed as a
 # reconnect_mode — reconnectModeFromString() falls back to RENDEZVOUS on any
 # string it does not recognise (planner_util.cpp), setting only a `known` flag
@@ -228,7 +228,7 @@ EXPLOIT="${EXPLOIT:-1}"
 # suffix — are together the 2x2 factorial of doc §3.6.1, chase on/off x
 # appointment on/off:
 #
-#   token              chase   appointment   reconnect_mode  rendezvous_enabled
+#   token              chase   appointment   reconnect_mode  reconnect_enabled
 #   mtare_off            -          -          (hybrid)          false
 #   mtare_pursuit       yes         -           pursuit           true
 #   mtare_rendezvous     -         yes         rendezvous         true
@@ -323,6 +323,47 @@ if [ -n "$_arm_stack" ]; then
   unset _kv _k _want _got
 fi
 unset _arm_stack
+
+# MinPos claim radius override (campaign cr2). Empty = pass no parameter at all,
+# which leaves the node on the yaml value; coord_claim_radius_m: 0.0 there means
+# "auto", and the node resolves it to fov_max_range (10 m) at
+# explo_planner_node.cpp:2992. Every campaign up to and including mt2 ran that
+# way, so an unset COORD_CLAIM_R reproduces them exactly.
+#
+# Declared HERE, below the _arm_stack block, so it is not one of the knobs an
+# arm token pins -- the radius is deliberately orthogonal to the arm. It is set
+# per cell by run_campaign.sh from the "_r<N>" arm-name suffix, which that script
+# strips before it hands over RECONNECT_MODE, so nothing in this file sees the
+# suffix and no arm-token guard below has to learn about it.
+#
+# Validated rather than passed through, and NOT merely for tidiness: this value
+# is the bound the receiver clamps every peer-advertised claim to
+# (coordination.cpp:56-57, fed from our own resolved radius at :3211), so a
+# garbage value does not fail loudly -- it silently changes how much of the
+# candidate set a peer can veto. A non-finite spelling would reach the node as a
+# double and disarm MinPos in one direction or veto everything in the other.
+COORD_CLAIM_R="${COORD_CLAIM_R:-}"
+if [ -n "$COORD_CLAIM_R" ]; then
+  case "$COORD_CLAIM_R" in
+    ''|*[!0-9.]*|*.*.*|.|'.'*[!0-9]*)
+      echo "FATAL: COORD_CLAIM_R='$COORD_CLAIM_R' is not a plain decimal number." >&2
+      echo "       It is the MinPos claim disc in metres and also the clamp on" >&2
+      echo "       every peer-advertised radius, so a bad value changes the" >&2
+      echo "       experiment silently instead of failing." >&2
+      exit 2 ;;
+  esac
+  # Reject 0 and anything that rounds to it. Zero is not "no override" here --
+  # the node reads <= 0 as AUTO, so `-p coord_claim_radius_m:=0.0` would quietly
+  # resolve back to fov_max_range and produce a cell named _r0 that ran at 10 m.
+  # Leave COORD_CLAIM_R unset for the yaml default; that path passes no -p.
+  if [ "$(awk -v v="$COORD_CLAIM_R" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" != "1" ]; then
+    echo "FATAL: COORD_CLAIM_R='$COORD_CLAIM_R' must be > 0. The node reads a" >&2
+    echo "       non-positive claim radius as AUTO and would resolve it back to" >&2
+    echo "       fov_max_range, so the cell would be named for a radius it did" >&2
+    echo "       not run. Unset COORD_CLAIM_R to request the yaml default." >&2
+    exit 2
+  fi
+fi
 # Barrier cap. The planner's code default is 0 = wait forever, which is the
 # right field behaviour and the wrong experiment: a robot that gives up on the
 # chase raises the barrier at its current pose and never lowers it, so the run
@@ -848,7 +889,7 @@ unset _pp_nochase
 #   arm = (global_alloc_enable || reconnect_gate==info ||
 #          rendezvous_schedule_enable || pursuit_predictor==mdp
 #            ? "mtare_" : "") +
-#         (rendezvous_enabled ? reconnect_mode : "off") +
+#         (reconnect_enabled ? reconnect_mode : "off") +
 #         (pursuit_predictor==mdp ? "_mdp" : "")
 # Everything downstream — the cell directory, campaign_index.csv, every
 # analysis script — takes the arm from RECONNECT_MODE instead. So any
@@ -918,8 +959,18 @@ TX_POWER="$(flt "${TX_POWER:-30.0}")"
 # to move it, and until now the only way to do that was to edit the installed
 # comms_sim_params.yaml — which re-scopes every later run on the machine and
 # leaves no field in any run directory saying which severity that run used.
-# Default matches the shipped yaml, so a bare invocation changes nothing.
-TREE_ATTEN="$(flt "${TREE_ATTEN:-11.98}")"
+# Default matches the shipped yaml, so a bare invocation changes nothing. The
+# shipped value moved 2026-09-03 from 11.98 (the IEEE 9260568 per-trunk fit,
+# under which one trunk almost never dropped a link) to 70.0 (any trunk in the
+# Fresnel zone is fatal). cr3/cr4/cr5 and everything earlier ran 11.98 — a
+# different radio regime; never pool across the change.
+TREE_ATTEN="$(flt "${TREE_ATTEN:-70.0}")"
+# The THIRD severity dial, added with the 70 dB trunks: a hard radio horizon.
+# The other two shape where a link fails; this one bounds how far a TREE-FREE
+# link reaches at all — free-space loss alone never drops a 30 dBm link inside
+# the ROI, so with trunks fatal, clear lanes would otherwise carry for ever.
+# Recorded in the manifest for the same reason as the other two.
+MAX_RANGE="$(flt "${MAX_RANGE:-30.0}")"
 # Does this run's arm expect the link to drop? 1 = yes (every treatment arm),
 # 0 = the control arm, deliberately run at a tx_power_dbm that keeps the link
 # up. Only affects the run-time outage gate's verdict, never the radio itself:
@@ -969,7 +1020,7 @@ EXPECT_OUTAGE="${EXPECT_OUTAGE:-1}"
 # circuit, which also keeps a COMMS=0 smoke test quiet.
 #
 # Set identically for EVERY arm. The arms must differ in RECONNECT_MODE alone;
-# `off` cannot reach the gated code at all (it needs rendezvous_enabled, which
+# `off` cannot reach the gated code at all (it needs reconnect_enabled, which
 # is false there), so passing it the same parameters costs nothing and removes
 # a whole class of "did the arms differ in something else too" question.
 LINK_GATE="${LINK_GATE:-1}"
@@ -1689,10 +1740,11 @@ if [ "$COMMS" = "1" ]; then
       scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
       tx_power_dbm:="$TX_POWER" \
       tree_attenuation_db:="$TREE_ATTEN" \
+      max_range_m:="$MAX_RANGE" \
       reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES"
   sleep 3
   log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
-      "tree_attenuation_db=$TREE_ATTEN" \
+      "tree_attenuation_db=$TREE_ATTEN max_range_m=$MAX_RANGE" \
       "relay_queue=${RELAY_QUEUE_BYTES}B) ahead of the mappers"
   # Per-run connectivity trace. link_states is published at link_rate_hz and
   # kept nowhere else: the gate watcher reads the aggregate `stats` topic, and
@@ -1879,7 +1931,7 @@ fi
 POLAR_ARG="true"; [ "$FRONTIER_ONLY" = "1" ] && POLAR_ARG="false"
 DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # The control arm. `off` is not a reconnect_mode (see the RECONNECT_MODE block);
-# it is rendezvous_enabled:=false, which is the switch the planner actually
+# it is reconnect_enabled:=false, which is the switch the planner actually
 # gates the manoeuvre on. reconnect_mode is left at its yaml value in that case
 # and is inert, since shouldRendezvous() returns false before the mode is
 # consulted.
@@ -1888,14 +1940,14 @@ DWELL_SYNC_ARG="true"; [ "$DWELL_SYNC" = "0" ] && DWELL_SYNC_ARG="false"
 # them is a reconnect_mode either, each is one of the four §3.6.1 cells (or, for
 # the two `_mdp` names, a chasing cell with the P6 predictor) plus the P1-P6
 # stack the blocks above have already switched on. `mtare_off` is
-# `off` with that stack, so it drops rendezvous_enabled exactly as plain `off`
+# `off` with that stack, so it drops reconnect_enabled exactly as plain `off`
 # does. The planner reconstitutes the arm label itself from what it was handed
 # (see its addParamStr("arm", ...)), so nothing here has to carry the name
 # forward — the token strips to its suffix and the prefix comes back from the
 # knobs. That round trip is what the name/stamp check above verifies.
-RDV_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
+RECONNECT_ENABLED="true"; MODE_ARG="$RECONNECT_MODE"
 case "$RECONNECT_MODE" in
-  off|mtare_off)              RDV_ENABLED="false"; MODE_ARG="hybrid" ;;
+  off|mtare_off)              RECONNECT_ENABLED="false"; MODE_ARG="hybrid" ;;
   mtare_pursuit|mtare_pursuit_mdp) MODE_ARG="pursuit" ;;
   mtare_rendezvous)           MODE_ARG="rendezvous" ;;
   mtare_hybrid|mtare_hybrid_mdp)   MODE_ARG="hybrid" ;;
@@ -1954,7 +2006,7 @@ else
 fi
 log "exploitation_enabled=$EXPLOIT_ARG (EXPLOIT=$EXPLOIT)"
 log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
-log "reconnect_mode=$MODE_ARG rendezvous_enabled=$RDV_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
+log "reconnect_mode=$MODE_ARG reconnect_enabled=$RECONNECT_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
 log "reconnect gates: confirm=${RECONNECT_CONFIRM}s barrier_max_wait=${RDV_MAX_WAIT}s"
 log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field site's ROI)"
 # done_coverage_source is pinned to scovox, NOT left on "auto". auto switches to
@@ -1993,7 +2045,20 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "experiment_log=<robot>.events.jsonl"
   echo "reconnect_mode_requested=$RECONNECT_MODE"
   echo "reconnect_mode_param=$MODE_ARG"
-  echo "rendezvous_enabled=$RDV_ENABLED"
+  # cr2's independent variable. "none" means no -p was passed and the node took
+  # the yaml value, which is what every campaign through mt2 did -- so this key
+  # reading "none" is a positive statement about those cells, not a gap. The
+  # arm token cannot carry it: run_campaign.sh strips the _r<N> suffix before
+  # RECONNECT_MODE is formed, so without this line the radius would be
+  # recoverable only from the directory NAME, and a directory can be renamed
+  # while a manifest written at launch cannot.
+  echo "coord_claim_radius_override=${COORD_CLAIM_R:-none}"
+  # Both spellings, one value. `reconnect_enabled` is the current name; the
+  # legacy line stays FOREVER, because the cr3-cr5 manifests carry it and any
+  # tool that reads a mixed set of campaigns must not have to know which side
+  # of the 2026-09-03 rename a cell fell on.
+  echo "reconnect_enabled=$RECONNECT_ENABLED"
+  echo "rendezvous_enabled=$RECONNECT_ENABLED"
   echo "rendezvous_max_wait_sec=$RDV_MAX_WAIT"
   echo "reconnect_confirm_sec=$RECONNECT_CONFIRM"
   echo "reconnect_midrun_silence_sec=$MIDRUN_SILENCE"
@@ -2044,6 +2109,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "seed=$SEED"
   echo "tx_power_dbm=$TX_POWER"
   echo "tree_attenuation_db=$TREE_ATTEN"
+  echo "max_range_m=$MAX_RANGE"
   # The arm's label for the outage gate, recorded because it is a claim about
   # what this run was FOR, not something recoverable from tx_power_dbm alone.
   echo "expect_outage=$EXPECT_OUTAGE"
@@ -2190,6 +2256,25 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     echo "done_action_in_params=$(sed -n \
       's/^[[:space:]]*done_action:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
       "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
+    # Two more world properties that live ONLY in the params file, and that a
+    # campaign can therefore be run under without any record of but the hash.
+    #
+    # global_alloc_comms_mask was flipped true for the cm1 pilot and back to
+    # false for cr2. It is invisible in every mt2-era manifest: the hash moves,
+    # but nothing says WHICH way, so a reader holding two campaigns could see
+    # that the params differed and not what differed. That is exactly the shape
+    # of a check that has stopped checking.
+    #
+    # coord_claim_radius_m is the yaml side of cr2's independent variable, so
+    # the pair (this, coord_claim_radius_override above) pins the effective disc
+    # without reading the source tree: override wins when set, otherwise this
+    # value applies, and 0.0 here means auto = fov_max_range.
+    echo "global_alloc_comms_mask_in_params=$(sed -n \
+      's/^[[:space:]]*global_alloc_comms_mask:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
+      "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
+    echo "coord_claim_radius_m_in_params=$(sed -n \
+      's/^[[:space:]]*coord_claim_radius_m:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
+      "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
   else
     # BOTH keys, not just the hash. Dropping done_action_in_params here made a
     # missing params file the one case where the field vanishes from the
@@ -2200,6 +2285,11 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     # present and say so.
     echo "sha256_shared_params=missing"
     echo "done_action_in_params=missing"
+    # Same argument as done_action_in_params above: present and saying "missing"
+    # beats absent, because an absent key is indistinguishable from a manifest
+    # written before the key existed.
+    echo "global_alloc_comms_mask_in_params=missing"
+    echo "coord_claim_radius_m_in_params=missing"
   fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
@@ -2292,6 +2382,13 @@ for r in $ROBOTS; do
   if [ "$GLOBAL_ALLOC" = "1" ]; then
     EXTRA+=( -p global_alloc_enable:=true )
   fi
+  # MinPos claim disc. Passed only when overridden, so an unset value leaves the
+  # node on the yaml "0 = auto" path and reproduces every campaign before cr2
+  # byte for byte. Both cr2 levels (10 and 40) come through here, so the -p code
+  # path itself is common to the two arms and cannot be confounded with them.
+  if [ -n "$COORD_CLAIM_R" ]; then
+    EXTRA+=( -p coord_claim_radius_m:="$(flt "$COORD_CLAIM_R")" )
+  fi
   if [ "$RECONNECT_GATE" = "info" ]; then
     EXTRA+=( -p reconnect_gate:=info )
   fi
@@ -2313,7 +2410,7 @@ for r in $ROBOTS; do
       -p proximity_resume_dist_m:=$PROX_RESUME_M \
       -p exploit_dwell_sync_enabled:=$DWELL_SYNC_ARG \
       -p reconnect_mode:=$MODE_ARG \
-      -p rendezvous_enabled:=$RDV_ENABLED \
+      -p reconnect_enabled:=$RECONNECT_ENABLED \
       -p rendezvous_max_wait_sec:=$RDV_MAX_WAIT \
       -p reconnect_confirm_sec:=$RECONNECT_CONFIRM \
       -p reconnect_link_down_confirm_sec:=$LINK_DOWN_CONFIRM \

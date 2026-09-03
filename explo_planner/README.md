@@ -71,11 +71,12 @@ that *has* finished keeps beaconing its presence while idling in `DONE`
 `docs/planner_method.md` §10.2 for the guarantee arguments and
 `doc/limitations.md` §10–11 for the accepted failure modes.
 
-This is `rendezvous_enabled` and it defaults **on**, but it only *activates*
+This is `reconnect_enabled` (called `rendezvous_enabled` before 2026-09-03,
+still accepted) and it defaults **on**, but it only *activates*
 where it is meaningful: `coordination_enabled` must be on (the barrier waits on
 peer claims) and `rendezvous_expected_peers` must be positive. Single-robot runs
 and one-robot teams are therefore unaffected — it stays inert, and behaviour is
-bit-for-bit the finish-and-stop of before. Set `rendezvous_enabled:=false` to
+bit-for-bit the finish-and-stop of before. Set `reconnect_enabled:=false` to
 force that independent finish even in a multi-robot run.
 
 The anchor needs no configuration — it is recorded automatically from incoming
@@ -350,7 +351,7 @@ which is heavily commented. Common overrides:
 - `candidate_*` — polar candidate-grid density and radii
 - `fov_*` — FOV geometry for information-gain ray-casting
 - `coordination_enabled` — turn multi-robot MinPos on/off
-- `rendezvous_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
+- `reconnect_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
   / `reconnect_mode` / `pursuit_budget_max_sec` / `pursuit_staleness_max_sec`
   — reconnection barrier and manoeuvre (see "Reconnection: rendezvous /
   pursuit / hybrid")

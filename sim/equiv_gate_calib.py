@@ -523,6 +523,40 @@ case("a roster whose scenario changed under it", 1,
          "scenario=flatforest_3robot_lidar.yaml")
          + "robots=atlas,bestla,husky\nn_robots=3\n"})
 
+# The 2026-09-03 rename of the reconnect master switch. The harness echoes one
+# variable to both spellings, so the new key restates the legacy one — which
+# both sides still write, and which the direct comparison above already fails
+# on. The case that has to hold is the second: when the two sides ran DIFFERENT
+# arms, the new key must fail on its own line rather than being waved through
+# beside the legacy key's failure, or the relaxation becomes a way to smuggle an
+# arm change past a reader who saw one complaint and stopped reading.
+case("the renamed reconnect switch, restating a key both sides record", 0,
+     r"1 new manifest key\(s\) restating a key both sides record: "
+     r"reconnect_enabled",
+     parent_kw={"manifest": STACKED},
+     child_kw={"manifest": STACKED + "reconnect_enabled=true\n"})
+case("the renamed switch where the two sides ran different arms", 1,
+     r"manifest reconnect_enabled: .*derived from rendezvous_enabled, but "
+     r"rendezvous_enabled is 'true' on the parent and 'false' on the child",
+     parent_kw={"manifest": STACKED},
+     child_kw={"manifest": STACKED.replace("rendezvous_enabled=true",
+                                           "rendezvous_enabled=false")
+               + "reconnect_enabled=false\n"})
+# The alias relaxation rests on the harness echoing both spellings from ONE
+# variable — an invariant enforced in run_explo_sim_rviz.sh, not here. This is
+# the case that notices if that ever stops being true. Without the intra-manifest
+# check the pair below reads EQUIVALENT: the source key agrees across the sides,
+# and nothing would look at what the child says under the new name.
+case("a child whose two spellings of the switch disagree", 1,
+     r"manifest reconnect_enabled: declared a rename of rendezvous_enabled, "
+     r"but the child writes reconnect_enabled='true' and "
+     r"rendezvous_enabled='false' in the SAME manifest",
+     parent_kw={"manifest": STACKED.replace("rendezvous_enabled=true",
+                                            "rendezvous_enabled=false")},
+     child_kw={"manifest": STACKED.replace("rendezvous_enabled=true",
+                                           "rendezvous_enabled=false")
+               + "reconnect_enabled=true\n"})
+
 print("\n=== silence must never read as a pass ===")
 
 rc, out = run(parent_side(), child_side(), child_cells=())

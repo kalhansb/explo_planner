@@ -157,7 +157,7 @@ struct StepEvent {
 ///
 /// There is deliberately NO last_contact_age_sec here. It was removed after the
 /// g6pilot campaign showed it could not mean the same thing in both arms: the
-/// last_contact_ record it aged is written only under `rendezvous_enabled_`, so
+/// last_contact_ record it aged is written only under `reconnect_enabled_`, so
 /// all 160 peer events in the off arm carried the "never contacted" sentinel -1
 /// including in runs with dozens of real contacts, while in the hybrid arm all
 /// 58 populated values equalled `silent_sec` to the last digit (both are stamped

@@ -193,6 +193,25 @@ GATED_MANIFEST_GROUPS = {
     # written down; what catches it is the hard failure at the bottom of this
     # ladder, which is why that failure is not softened.
     "pursuit_predictor": ("trail", set()),
+    # cr2's claim-radius override, and the two params-file witnesses added
+    # beside it. Registered in the same commit that adds the manifest lines —
+    # the habit the P3/P4 and P6 notes above were written to enforce, having
+    # now been skipped twice and caught the third time by this ladder's bottom
+    # rung rather than by anyone remembering.
+    #
+    # The override's off value is the WORD "none", not "0", and deliberately so:
+    # the runner passes no -p at all when COORD_CLAIM_R is unset, and the node
+    # reads a claim radius <= 0 as AUTO. Registering this as ("0.0", ...) would
+    # certify a cell that ran the 10 m auto radius as if it had been pinned
+    # there, which is the confound the "none" spelling exists to prevent.
+    "coord_claim_radius_override": ("none", set()),
+    # These two restate what the params file said, so their off value is the
+    # shipped yaml value: coord_claim_radius_m: 0.0 (auto) and
+    # global_alloc_comms_mask: false. A child reading "missing" fails here
+    # rather than relaxing — correct, because a missing params file is the very
+    # failure these witnesses were added to expose.
+    "coord_claim_radius_m_in_params": ("0.0", set()),
+    "global_alloc_comms_mask_in_params": ("false", set()),
 }
 
 # Manifest keys that RESTATE a key both sides already record, rather than
@@ -211,6 +230,24 @@ GATED_MANIFEST_GROUPS = {
 DERIVED_MANIFEST = {
     "robots": "scenario",
     "n_robots": "scenario",
+}
+
+# Keys that are a pure RENAME of another key: not merely derived from it, but
+# carrying the identical value under a second spelling, because a rename kept
+# the old name writing alongside the new one.
+#
+# Separate from DERIVED_MANIFEST because a stronger check is available and a
+# strictly stronger check should not be optional. A roster cannot be compared
+# against the scenario it came from — different values by nature — so that
+# relaxation can only ask whether the SOURCE agrees across the two sides. An
+# alias can be compared against its own source within one manifest, and is:
+# both conditions below must hold. Without the second, a manifest claiming
+# rendezvous_enabled=false and reconnect_enabled=true reads as EQUIVALENT
+# against a parent that also says false — the gate would be trusting an
+# invariant that lives in a different file (run_explo_sim_rviz.sh echoes both
+# lines from one variable) and would go silent the day that file changed.
+ALIAS_MANIFEST = {
+    "reconnect_enabled": "rendezvous_enabled",   # renamed 2026-09-03
 }
 
 
@@ -587,6 +624,25 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                         f"{cm.get(g, '<absent>')!r}, not "
                         f"{GATED_MANIFEST_GROUPS[g][0]!r}. Nothing here shows "
                         f"the knob is inert, so it is read as live.")
+            elif k in ALIAS_MANIFEST:
+                s = ALIAS_MANIFEST[k]
+                sp, sc = pm.get(s, "<absent>"), cm.get(s, "<absent>")
+                if not (sp == sc and s in pm and s in cm):
+                    fails.append(
+                        f"manifest {k}: new in the child ({b!r}) and declared "
+                        f"as derived from {s}, but {s} is {sp!r} on the parent "
+                        f"and {sc!r} on the child. It restates a key the two "
+                        f"sides do not share, so it is read as a difference of "
+                        f"its own.")
+                elif b != sc:
+                    fails.append(
+                        f"manifest {k}: declared a rename of {s}, but the child "
+                        f"writes {k}={b!r} and {s}={sc!r} in the SAME manifest. "
+                        f"One run cannot have had the switch both ways: the "
+                        f"harness has stopped writing the two spellings from "
+                        f"one value, and this relaxation is no longer safe.")
+                else:
+                    derived_ok.append(k)
             elif k in DERIVED_MANIFEST:
                 s = DERIVED_MANIFEST[k]
                 sp, sc = pm.get(s, "<absent>"), cm.get(s, "<absent>")
@@ -606,8 +662,9 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                     f"whether it is inert. Declare it under the switch that "
                     f"gates it — adding the switch to the manifest if the "
                     f"harness does not write one — or, if it only restates a "
-                    f"key both sides already record, in DERIVED_MANIFEST. Do "
-                    f"not delete this check.")
+                    f"key both sides already record, in DERIVED_MANIFEST (or "
+                    f"ALIAS_MANIFEST, if it is a rename carrying that key's "
+                    f"identical value). Do not delete this check.")
         if relaxed:
             notes.append(f"{len(relaxed)} new manifest key(s) recording a "
                          f"subsystem that is OFF: {', '.join(relaxed)}")

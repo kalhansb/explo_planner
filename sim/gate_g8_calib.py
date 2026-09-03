@@ -27,7 +27,7 @@ ROBOTS = ["atlas", "bestla"]
 
 # WHICH ARMS ARE CONTROLS, read out of the gate rather than restated here.
 #
-# The fixture writes rendezvous_enabled=False and omits the reconnect_dispatch
+# The fixture writes reconnect_enabled=False and omits the reconnect_dispatch
 # row for a control arm, and gate check 3e compares exactly that against the arm
 # name. So if the two files ever disagree about what "control" means, every case
 # in this file exercises a cell the gate refuses for a reason no case mentions:
@@ -97,7 +97,8 @@ PARAMS = {
     # gate must read them from.
     "arm": "hybrid",
     "git_rev": REV,
-    "rendezvous_enabled": True,
+    "reconnect_enabled": True,
+    "rendezvous_enabled": True,   # deprecated alias; the node stamps both
     "goal_rotate_timeout_sec": 20.0,
     "nav_speed_estimate_mps": 0.5,
     "nav_safety_factor": 2.0,
@@ -152,7 +153,7 @@ def base_events(arm="hybrid", robot="atlas", control_arms=None):
     """A clean robot's event stream, one of each row the new checks read.
 
     `arm` is honoured because the off arm is not a cosmetic variation: check 3e
-    asserts rendezvous_enabled tracks the directory's arm, and that branch had
+    asserts reconnect_enabled tracks the directory's arm, and that branch had
     never been executed by anything before round 4 -- the fixture built a hybrid
     cell only, so the half of the check that guards against an off cell running
     the reconnect logic was as untested as the reconnect logic it guards.
@@ -161,16 +162,21 @@ def base_events(arm="hybrid", robot="atlas", control_arms=None):
     params["arm"] = arm
     # Every arm but the control reaches the manoeuvre. Was `arm == "hybrid"`,
     # which made the fixture unable to express any OTHER treated arm: an
-    # mtare_hybrid cell would have been written with rendezvous_enabled=False
+    # mtare_hybrid cell would have been written with reconnect_enabled=False
     # and check 3e would have "caught" a defect the fixture invented.
     # `control_arms` overrides the default parsed out of gate_g8.py, for the
     # cases that declare their own GATE_CONTROL_ARMS. Without it a fixture for
     # a newly-declared control arm — mtare_off, the §3.6.1 factorial's own
-    # control — would be written with rendezvous_enabled=True while the gate
+    # control — would be written with reconnect_enabled=True while the gate
     # was told to expect False, so check 3e would hard-fail alongside the
     # planted defect and the case would "pass" on a failure it did not plant.
-    params["rendezvous_enabled"] = arm not in (
-        CONTROL_ARMS if control_arms is None else control_arms)
+    # Both spellings, exactly as the node stamps them since the 2026-09-03
+    # rename. A fixture carrying only one would leave the gate's fallback
+    # untested on the shape it will actually meet; the two cases below then
+    # take each spelling away in turn, so neither read can rot silently.
+    _rdv = arm not in (CONTROL_ARMS if control_arms is None else control_arms)
+    params["reconnect_enabled"] = _rdv
+    params["rendezvous_enabled"] = _rdv
     # Each m-tare arm ran ITS OWN stack; anything else ran none. This mirrors
     # the launcher's own per-token expansion rather than the node's OR,
     # deliberately: the OR is what check 3g exists to close, so a fixture built
@@ -225,12 +231,12 @@ def base_events(arm="hybrid", robot="atlas", control_arms=None):
         _row("mission_complete", 9, result="arrived"),
         _row("run_end", 10, metrics_timer_rows=163),
     ]
-    # Whether the manoeuvre ran is `rendezvous_enabled`, not the module-level
+    # Whether the manoeuvre ran is `reconnect_enabled`, not the module-level
     # control list: mtare_off is the factorial's own control and dispatches
     # nothing, so keying off CONTROL_ARMS here would have written it a dispatch
     # pair while `build()` gave it the reconnect-free planner log, and check 17
     # would hard-fail on a defect the fixture invented.
-    if params["rendezvous_enabled"]:
+    if params["reconnect_enabled"]:
         # logReconnectDispatch, experiment_log.cpp:401-437 -- the only writer of
         # team_incomplete_sec, and therefore the only event on which check 19
         # can legitimately demand it. A real generation-6 dispatch row carries
@@ -539,8 +545,23 @@ case("hybrid directory holding an off configuration",
      r"check 3e — directory says arm=hybrid but run_start params say arm='off'")
 case("hybrid directory with the reconnect logic disabled",
      lambda ev: _each_runstart(ev, lambda e: e["params"].update(
-         rendezvous_enabled=False)),
-     r"check 3e — arm=hybrid but rendezvous_enabled=False")
+         reconnect_enabled=False, rendezvous_enabled=False)),
+     r"check 3e — arm=hybrid but reconnect_enabled=False")
+# The master switch has two spellings after the 2026-09-03 rename, and check 3e
+# reads whichever is present. Each of the next two cases DELETES one spelling
+# and disables the other, so a gate that stopped reading either one fails here
+# instead of passing a control run in a treated directory. The legacy case is
+# not hypothetical: every cell up to and including cr5 carries only that key.
+case("reconnect disabled, LEGACY key only (a pre-rename cell)",
+     lambda ev: _each_runstart(ev, lambda e: (
+         e["params"].pop("reconnect_enabled", None),
+         e["params"].update(rendezvous_enabled=False))),
+     r"check 3e — arm=hybrid but reconnect_enabled=False")
+case("reconnect disabled, CURRENT key only",
+     lambda ev: _each_runstart(ev, lambda e: (
+         e["params"].pop("rendezvous_enabled", None),
+         e["params"].update(reconnect_enabled=False))),
+     r"check 3e — arm=hybrid but reconnect_enabled=False")
 
 
 print("\n=== check 3f: the treatment must have been able to happen ===")
@@ -819,7 +840,7 @@ print("\n=== the m-tare arm: a second treated arm the gate had never seen ===")
 #
 # The first is the one that matters: an off-vs-mtare_hybrid campaign is the
 # same experiment with a different treatment, and before this it hard-failed on
-# a correct run — check 3e demanded rendezvous_enabled=False of every arm that
+# a correct run — check 3e demanded reconnect_enabled=False of every arm that
 # was not literally "hybrid", and check 21 called mtare_hybrid unexpected.
 
 

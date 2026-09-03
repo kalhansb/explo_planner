@@ -136,8 +136,23 @@ run_side() {
   # — certifying "no behaviour change at defaults" from a run in which no
   # default was in effect on either side. The gate cannot catch it; only this
   # line can.
+  #
+  # The second row was added later, after a review found three of these knobs
+  # (RENDEZVOUS_SCHEDULE, PURSUIT_PREDICTOR from P5/P6, COORD_CLAIM_R from cr2)
+  # missing while the paragraph above described the hazard exactly.
+  #
+  # What this list covers, stated so the next reader does not over-trust it: the
+  # cell/comms geometry and the per-phase FEATURE switches. It is not every
+  # environment knob run_explo_sim_rviz.sh reads. SCENARIO, SEED, MAX_STEPS,
+  # DONE_CRITERION, DONE_SEEK and MISSION_RETURN are all still inherited from the
+  # calling shell, and each one leaks by the identical mechanism — exported
+  # equally to both sides, compared equal, never examined. They are left alone
+  # here only because widening the list is a change to what "defaults" MEANS for
+  # this gate, which deserves its own commit and its own re-run of a known-good
+  # pair, not a drive-by. Until then: run equiv_pair.sh from a clean shell.
   ( unset CELL_WORLD CELL_SIZE_M CELL_CENSUS_S COMMS LINK_GATE EXPLOIT \
-          RECONNECT_MODE TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE
+          RECONNECT_MODE TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
+          RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R
     export RVIZ=0 DURATION_S="$DURATION_S" OUTDIR="$OUT/$side/cell_001"
     "$HERE/run_explo_sim_rviz.sh"
   ) >"$OUT/run_$side.log" 2>&1 \

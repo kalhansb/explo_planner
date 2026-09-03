@@ -30,11 +30,16 @@ double navBudgetSec(double dist_m, double speed_est_mps, double safety_factor,
 /// release test and the "safe to declare DONE" test.
 bool teamComplete(int active_peers, int expected_peers);
 
-/// Decision at exploration exhaustion: return to the anchor and wait for the
-/// team (true), or finish now (false). Returns true only when the feature is
-/// on, a comms anchor has been recorded, and the team is NOT already complete
-/// (if it is, we are synced and can finish straight away).
-bool shouldRendezvous(bool rendezvous_enabled, bool have_anchor,
+/// Decision at exploration exhaustion: run a reconnect manoeuvre (true), or
+/// finish now (false). Returns true only when the feature is on, a comms
+/// anchor has been recorded, and the team is NOT already complete (if it is,
+/// we are synced and can finish straight away).
+///
+/// `reconnect_enabled` is the subsystem master switch, not the rendezvous arm:
+/// which manoeuvre a true answer dispatches is reconnect_mode's business, and
+/// the caller is dispatchReconnect. The name says "Rendezvous" for history
+/// only, from before pursuit and hybrid existed.
+bool shouldRendezvous(bool reconnect_enabled, bool have_anchor,
                       int active_peers, int expected_peers);
 
 /// Barrier give-up test: with `max_wait_sec` <= 0 the robot waits forever

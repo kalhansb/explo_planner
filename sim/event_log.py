@@ -127,11 +127,26 @@ def arm_from_dirname(run_dir):
     return m.group(1) if m else None
 
 
+def reconnect_enabled(params, default=True):
+    """Master switch for the reconnect subsystem, under either spelling.
+
+    Renamed from `rendezvous_enabled` to `reconnect_enabled` on 2026-09-03: the
+    old name read off a manifest as "the rendezvous arm is on" in three arms
+    out of four, including pure pursuit, which cannot arm an appointment at
+    all. The node stamps BOTH names now, but every cell up to and including
+    cr5 carries only the old one, so both are read and the current name wins.
+    """
+    v = params.get("reconnect_enabled")
+    if v is None:
+        v = params.get("rendezvous_enabled")
+    return default if v is None else bool(v)
+
+
 def run_arm(params):
     """The ARM a run belongs to. NOT params["reconnect_mode"].
 
     The control arm is "no reconnection", which is not a reconnect_mode value:
-    it is rendezvous_enabled=false, and the harness still has to pass some mode
+    it is reconnect_enabled=false, and the harness still has to pass some mode
     alongside it (it passes "hybrid"). So a control run is stamped
     reconnect_mode "hybrid", and grouping on that column silently pools the
     control into the hybrid cell -- the hybrid mean becomes the average of
@@ -147,7 +162,7 @@ def run_arm(params):
     mode = params.get("reconnect_mode")
     if mode is None:
         return None
-    return mode if params.get("rendezvous_enabled", True) else "off"
+    return mode if reconnect_enabled(params) else "off"
 
 
 def robot_logs(run_dir):
