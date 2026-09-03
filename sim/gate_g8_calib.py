@@ -1267,6 +1267,85 @@ def audit_fixture_against_real_cell():
         fails += 1
 
 
+print("\n=== checks 3e/3i: the per-cell _r<N> claim-radius suffix ===")
+# cr2 varies the MinPos claim radius PER CELL, inside one campaign invocation,
+# by appending _r10/_r40 to the arm name -- run_campaign.sh strips the suffix
+# before setting RECONNECT_MODE, so the node stamps `mtare_hybrid` in an
+# `_mtare_hybrid_r10_` directory. Before this was taught to the gate, every
+# correctly-run cr2 cell hard-failed twice (3e "directory says arm=X but params
+# say Y", 3g "not an arm this binary can stamp") and cr3/cr4/cr5 could not be
+# scored at all.
+#
+# The fix strips the suffix for those two comparisons only. That is exactly the
+# shape of change that can turn a check into a rubber stamp, so the first two
+# cases below are the ones that matter: (a) a suffixed campaign must now score
+# CLEAN, and (b) 3e must STILL catch a genuinely mis-assigned cell. Without (b),
+# stripping harder and harder until nothing fails would look like progress.
+#
+# The suffix is not merely tolerated either. It names a treatment level the
+# analysis reads straight off the directory, so 3i holds it against the
+# manifest, and the three ways that can be wrong each get a case.
+R10_MANIFEST = MANIFEST + "coord_claim_radius_override=10.0\n"
+R40_MANIFEST = MANIFEST + "coord_claim_radius_override=40.0\n"
+
+
+def radius_case(label, expect_pat, treated_arm, manifest, stamp_arm=None,
+                expect_clean=False):
+    """One suffixed-campaign fixture. `stamp_arm` is what the NODE recorded."""
+    global fails
+    root = tempfile.mkdtemp(prefix="gatecal_")
+    try:
+        ev = {r: base_events(stamp_arm or "mtare_hybrid", r,
+                             control_arms={"off"}) for r in ROBOTS}
+        # off_manifest is the UNSUFFIXED default on purpose: the control cell is
+        # plain `off`, so a manifest carrying a pinned radius would fire 3i on
+        # the control and every case here would "pass" on the wrong cell.
+        build(root, "cal", ev, treated_arm=treated_arm, manifest=manifest,
+              off_manifest=MANIFEST)
+        rc, out = run_gate(root, "cal", env_extra={
+            "GATE_ARMS": f"{treated_arm},off", "GATE_CONTROL_ARMS": "off"})
+        if expect_clean:
+            ok = rc == 0 and "HARD FAILURES: none" in out
+            detail = "clean" if ok else (
+                f"gate objected to a correctly-run suffixed cell (rc={rc})"
+                if rc == 1 else f"rc={rc}: a population was empty")
+        else:
+            ok = rc == 1 and re.search(expect_pat, out) is not None
+            detail = "caught" if ok else f"did NOT match /{expect_pat}/"
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}: {detail}")
+        if not ok:
+            fails += 1
+            for ln in out.splitlines():
+                if "check 3" in ln or "HARD" in ln:
+                    print(f"           | {ln}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+radius_case("a correctly-run _r10 cell scores clean", None,
+            "mtare_hybrid_r10", R10_MANIFEST, expect_clean=True)
+# The anti-vacuity case. Same suffixed directory, but the node stamped the
+# CONTROL configuration -- a leaked RECONNECT_MODE, the corruption 3e exists
+# for. Stripping the suffix must not have cost the gate its ability to see it.
+radius_case("a suffixed directory running the wrong arm is still caught",
+            r"check 3e — directory says arm=mtare_hybrid_r10 "
+            r"\(policy mtare_hybrid\) but run_start params say arm='mtare_off'",
+            "mtare_hybrid_r10", R10_MANIFEST, stamp_arm="mtare_off")
+# 3i, three ways. Each one files a cell under a radius it did not run, which no
+# other check in this gate looks at: the arm token says nothing about the knob.
+radius_case("an _r40 directory that ran 10 m",
+            r"check 3i — directory says claim radius 40\.0 m but the manifest "
+            r"says coord_claim_radius_override='10\.0'",
+            "mtare_hybrid_r40", R10_MANIFEST)
+radius_case("a suffixed directory with no radius recorded at all",
+            r"check 3i — directory says the claim radius was 10\.0 m, but the "
+            r"manifest records no coord_claim_radius_override at all",
+            "mtare_hybrid_r10", MANIFEST)
+radius_case("an unsuffixed directory that ran a pinned radius",
+            r"check 3i — directory names no claim radius but the manifest says "
+            r"coord_claim_radius_override='40\.0'",
+            "mtare_hybrid", R40_MANIFEST)
+
 audit_fixture_against_real_cell()
 
 print(f"\n{'ALL PASS' if fails == 0 else str(fails) + ' FAILURE(S)'}")

@@ -28,26 +28,34 @@ find_package(std_msgs REQUIRED)
 # carried provenance before, and the metrics CSV's schema changed silently
 # between campaigns with nothing in the data to date it.
 #
-# Configure-time, so it identifies the checkout the build tree was CONFIGURED
-# from: editing a source file and rebuilding without re-running cmake leaves it
-# stale. That is why the event log also records the translation unit's compile
-# timestamp, which is always exactly right. Degrades to "unknown" outside a git
-# checkout (release tarball, vendored copy) rather than failing the build.
-set(EXPLO_PLANNER_GIT_REV "unknown")
-find_package(Git QUIET)
-if(GIT_FOUND)
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} describe --always --dirty --tags
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE _explo_git_rev
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    RESULT_VARIABLE _explo_git_rc)
-  if(_explo_git_rc EQUAL 0 AND NOT _explo_git_rev STREQUAL "")
-    set(EXPLO_PLANNER_GIT_REV "${_explo_git_rev}")
-  endif()
-endif()
-message(STATUS "explo_planner git revision: ${EXPLO_PLANNER_GIT_REV}")
+# Stamped at BUILD time, not configure time, into a generated header. This used
+# to be an execute_process() right here, which runs exactly once — when the
+# build tree is configured — so every later source edit rebuilt the binary
+# while leaving the old revision compiled into it. Campaign cr5 ran a binary
+# stamped 6ce7ad0 against a manifest recording 1a097dc for that reason, and the
+# gate's check 3b, whose whole job is comparing those two, could not pass on a
+# single cell of it.
+#
+# The custom target re-runs the query on every build; the script writes the
+# header only when the answer changes, so the extra recompile happens on the
+# builds after a commit and not otherwise. Degrades to "unknown" outside a git
+# checkout rather than failing the build.
+set(EXPLO_PLANNER_GIT_REV_HDR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/explo_planner_git_rev.h")
+add_custom_target(explo_planner_git_rev_hdr ALL
+  BYPRODUCTS "${EXPLO_PLANNER_GIT_REV_HDR}"
+  COMMAND ${CMAKE_COMMAND}
+          -DOUT=${EXPLO_PLANNER_GIT_REV_HDR}
+          -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampGitRev.cmake
+  COMMENT "Stamping explo_planner git revision")
+# Configure time too, so the header EXISTS before the first compile in a clean
+# build tree. The target above overwrites it with the same answer moments later.
+execute_process(
+  COMMAND ${CMAKE_COMMAND}
+          -DOUT=${EXPLO_PLANNER_GIT_REV_HDR}
+          -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/StampGitRev.cmake)
 
 # ==================================================================
 # Library
@@ -106,9 +114,13 @@ target_link_libraries(explo_planner_node
   explo_planner_lib
 )
 
-# Provenance for the experiment event log's run_start event (see above).
-target_compile_definitions(explo_planner_node PRIVATE
-  EXPLO_PLANNER_GIT_REV="${EXPLO_PLANNER_GIT_REV}"
+# Provenance for the experiment event log's run_start event (see above). The
+# revision arrives through the generated header rather than a compile
+# definition, because a definition is fixed at configure time and that is the
+# staleness this replaced.
+add_dependencies(explo_planner_node explo_planner_git_rev_hdr)
+target_include_directories(explo_planner_node PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 ament_target_dependencies(explo_planner_node

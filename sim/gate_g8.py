@@ -530,12 +530,63 @@ for c in cells:
     # on a perfectly good cell, check 21 finds an unexpected arm, and check 3f
     # would run the treated-arm assertions over an off_seek control. Such cells
     # are banked (ds1_hybrid_seek_seed1..4), so this is not hypothetical.
+    #
+    # The trailing _r<N> is cr2's MinPos claim radius, and it is handled
+    # DIFFERENTLY from _seek on purpose. run_campaign.sh strips it before
+    # setting RECONNECT_MODE exactly as it strips _seek, so the node likewise
+    # stamps arm=mtare_hybrid in a _mtare_hybrid_r10_ directory and every
+    # comparison against the node's own answer has to use the stripped form.
+    # But it is NOT pooled away into the arm the way _seek is: in cr2 the radius
+    # is the independent variable, the thing the campaign contrasts, so folding
+    # r10 and r40 into one bucket would leave check 21 unable to notice that
+    # half the design never ran — the precise failure check 21 exists for.
+    #
+    # Hence two names. `arm` is the CELL's identity: what to count, what
+    # GATE_ARMS must have declared, which column of the design this is.
+    # `policy_arm` is what the BINARY can stamp: the reconnect policy alone,
+    # with every runtime switch removed. Anything comparing against run_start or
+    # against the m-tare vocabulary uses policy_arm; everything else uses arm.
     _mid = c[len(TAG) + 1:]
     arm = _mid.rsplit("_seed", 1)[0] if "_seed" in _mid else _mid
     if arm.endswith("_seek"):
         arm = arm[:-len("_seek")]
+    _rm = re.match(r"^(.*)_r([0-9]{1,3})$", arm)
+    policy_arm = _rm.group(1) if _rm else arm
+    dir_claim_r = f"{float(_rm.group(2)):.1f}" if _rm else None
     cells_by_arm[arm] += 1
     row = {"cell": c, "arm": arm}
+
+    # 3i. the claim radius the directory NAME advertises must be the one the
+    # run actually used. Same argument as 3e one level down: the analysis reads
+    # r10 vs r40 off the directory, so a launcher bug or a leaked COORD_CLAIM_R
+    # that runs 10 m inside an _r40_ directory silently swaps cr2's two levels
+    # and every downstream number is attributed to the wrong one. The manifest
+    # is written at launch from the value actually passed, so it is the witness.
+    #
+    # An absent key is only forgiven when the directory claims nothing either:
+    # a campaign predating the override wrote no such line and its unsuffixed
+    # cells really did run the yaml default. A suffixed directory with no line
+    # to check it against is unverifiable, and unverifiable is not a pass.
+    _man_claim_r = m.get("coord_claim_radius_override")
+    row["claim_r"] = _man_claim_r if _man_claim_r is not None else "-"
+    if dir_claim_r is None:
+        if _man_claim_r not in (None, "none"):
+            hard_fail.append(
+                f"{c}: check 3i — directory names no claim radius but the "
+                f"manifest says coord_claim_radius_override={_man_claim_r!r}. "
+                f"The cell ran a pinned radius under a name that promises the "
+                f"yaml default")
+    elif _man_claim_r is None:
+        hard_fail.append(
+            f"{c}: check 3i — directory says the claim radius was "
+            f"{dir_claim_r} m, but the manifest records no "
+            f"coord_claim_radius_override at all, so nothing here can confirm "
+            f"it. Score this campaign with a harness that writes the key")
+    elif _man_claim_r == "none" or float(_man_claim_r) != float(dir_claim_r):
+        hard_fail.append(
+            f"{c}: check 3i — directory says claim radius {dir_claim_r} m but "
+            f"the manifest says coord_claim_radius_override={_man_claim_r!r}. "
+            f"The cell is filed under a level it did not run")
 
     # 1. run ended by the exploration criterion, not a cap
     reason = m.get("run_end_reason", "MISSING")
@@ -627,11 +678,19 @@ for c in cells:
             # silently and the gate would have said CLEAN. mode_req/rdv were
             # parsed and PRINTED as an informational line; printing is not
             # checking.
+            #
+            # Compared against policy_arm, not arm: the node stamps the
+            # reconnect policy, and per-cell runtime suffixes like _r<N> are
+            # stripped by run_campaign.sh before it ever sees one. Comparing the
+            # full directory identity here would hard-fail every correctly-run
+            # cr2 cell. What the suffix itself claims is not dropped — check 3i
+            # above holds it against the manifest.
             want_rdv = arm not in CONTROL_ARMS
-            if pr.get("arm") is not None and pr.get("arm") != arm:
+            if pr.get("arm") is not None and pr.get("arm") != policy_arm:
                 hard_fail.append(
-                    f"{c}/{r}: check 3e — directory says arm={arm} but "
-                    f"run_start params say arm={pr.get('arm')!r}")
+                    f"{c}/{r}: check 3e — directory says arm={arm} "
+                    + (f"(policy {policy_arm}) " if policy_arm != arm else "")
+                    + f"but run_start params say arm={pr.get('arm')!r}")
             if have_rdv is not None and bool(have_rdv) != want_rdv:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — arm={arm} but reconnect_enabled="
@@ -725,10 +784,16 @@ for c in cells:
                     }
                     if _gen_p5:
                         _feat["rendezvous_schedule_enable"] = bool(_p5_raw)
-                    _want = mtare_expect(arm, _gen_p5)
+                    # policy_arm again: MTARE_ARM_STACK is keyed by the reconnect
+                    # policy vocabulary, which has no room for a per-cell knob
+                    # suffix. A radius does not change which m-tare features the
+                    # arm promises, so mtare_hybrid_r10 must be looked up as
+                    # mtare_hybrid or the whole stack assertion is skipped in
+                    # favour of a spurious "not an arm this binary can stamp".
+                    _want = mtare_expect(policy_arm, _gen_p5)
                     if _want is None:
                         hard_fail.append(
-                            f"{c}/{r}: check 3g — arm={arm} is not an arm a "
+                            f"{c}/{r}: check 3g — arm={policy_arm} is not an arm a "
                             f"{'P5-or-later' if _gen_p5 else 'pre-P5'} binary "
                             f"can stamp (known: "
                             f"{sorted(MTARE_ARM_STACK if _gen_p5 else MTARE_ARMS_PRE_P5)}"

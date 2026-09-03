@@ -87,6 +87,14 @@
 #include "explo_planner/target_queue.hpp"
 #include "explo_planner/vantage_planner.hpp"
 
+// Generated into the build tree on every build; defines EXPLO_PLANNER_GIT_REV.
+// Guarded because this translation unit must still compile in a tree that has
+// not run the generator (an IDE index pass, a standalone syntax check) — the
+// #ifdef at the stamping site already handles the revision being unavailable.
+#if __has_include("explo_planner_git_rev.h")
+#include "explo_planner_git_rev.h"
+#endif
+
 namespace explo_planner {
 
 enum class State {
@@ -3085,11 +3093,13 @@ ExploPlannerNode::ExploPlannerNode()
     // recorded which version produced it. schema_version (written by the logger
     // itself) covers the event format; these identify the binary.
     //
-    // EXPLO_PLANNER_GIT_REV is injected by CMake at configure time — so it
-    // identifies the checkout the build was CONFIGURED from, and a source edit
-    // without a reconfigure leaves it stale. It is a strong hint, not a
-    // guarantee; the build stamp below is what disambiguates two binaries built
-    // from the same revision.
+    // EXPLO_PLANNER_GIT_REV comes from explo_planner_git_rev.h, regenerated on
+    // every build (cmake/StampGitRev.cmake), so it is the revision this binary
+    // was actually compiled from. It was previously a configure-time compile
+    // definition and went stale on any rebuild without a reconfigure, which is
+    // why cr5's binary said 6ce7ad0 while its manifest said 1a097dc. The build
+    // stamp below still disambiguates two binaries built from the same
+    // revision, which a revision alone cannot.
 #ifdef EXPLO_PLANNER_GIT_REV
     exp_log_->addParamStr("git_rev", EXPLO_PLANNER_GIT_REV);
 #else
