@@ -83,6 +83,16 @@ double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
   return std::clamp(raw, std::min(min_sec, max_sec), max_sec);
 }
 
+bool allocPeerPositionFresh(double age_sec, double max_age_sec) {
+  // Unbounded first, and written as `<= 0` rather than `== 0` so a negative
+  // parameter reads as "no limit" too — same convention as max_sec above.
+  if (max_age_sec <= 0.0) return true;
+  // A negative age is TeamModel's "no position held". Not fresh: under a live
+  // TTL, "we know nothing" must never come out the same as "we just heard".
+  if (age_sec < 0.0) return false;
+  return age_sec <= max_age_sec;
+}
+
 Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,
                              const Eigen::Vector3f& peer_at_contact) {
   return 0.5f * (self_at_contact + peer_at_contact);

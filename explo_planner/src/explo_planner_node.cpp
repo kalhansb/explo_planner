@@ -629,14 +629,40 @@ private:
   /// The allocation problem's vehicle set at position (x, y): every robot in
   /// the fleet identity, self first-hand and peers from the team model.
   ///
-  /// ONE definition, because there are now two callers — the allocator and the
-  /// §3.6 reconnect gate — and the gate's whole output is a comparison between
-  /// two solves over this set. Two copies of "who is in the fleet, where are
-  /// they, who is reachable" that drift by one robot would move C_no and C_re
-  /// against each other and there is no field in either event that would show
-  /// it. `all_in_comms` is optional (nullptr to ignore).
-  std::vector<AllocRobot> allocVehicles(float x, float y,
-                                        bool* all_in_comms) const;
+  /// ONE definition, because there are three callers — the allocator, the
+  /// §3.6 reconnect gate and the rendezvous snapshot. `all_in_comms` is
+  /// optional (nullptr to ignore).
+  ///
+  /// One definition, but no longer one ANSWER: `pos_max_age_sec` lets a caller
+  /// bound how stale a latched peer position may be, and only the doPlan solve
+  /// passes a bound (see alloc_peer_pos_max_age_sec_). That relaxes what this
+  /// comment used to require — that the allocator and the gate agree exactly,
+  /// because the gate's output is the difference between two solves over this
+  /// set and a set that drifted by one robot would move C_no and C_re against
+  /// each other with no field in either event to show it.
+  ///
+  /// They may now differ by design, and the asymmetry is the point rather than
+  /// an oversight: the gate exists to decide whether reconnecting is worth
+  /// leaving exploration for, and it needs the stale estimate to have anything
+  /// to value or to steer toward — expiring the pose there would make the gate
+  /// blind to exactly the peer it is being asked about. The allocator is the
+  /// opposite case: a stale pose there does not describe a peer, it silently
+  /// reserves ground. The gate is still internally consistent, because both of
+  /// ITS solves run over one vehicle set built in one call.
+  ///
+  /// `now_sec` is MISSION-ELAPSED seconds (missionElapsed()), the clock the
+  /// team model dates positions on. It is a parameter because this method is
+  /// const and missionElapsed() latches its baseline, so the clock has to come
+  /// from the caller. A negative `now_sec` (clock not live yet) makes every
+  /// age read 0, i.e. fresh — the unbounded behaviour, which is the safe
+  /// direction. That holds because TeamModel::observe refuses a negative
+  /// now_sec outright (team_model.cpp), so no stored position can carry a
+  /// negative stamp, so positionAgeSec's max(0, now - stamp) is 0 rather than
+  /// the -1 it returns for "no position held". If that guard ever goes, the
+  /// TTL starts dropping peers during the pre-clock window instead.
+  std::vector<AllocRobot> allocVehicles(float x, float y, bool* all_in_comms,
+                                        double now_sec,
+                                        double pos_max_age_sec) const;
 
   // Global allocator (P3). OFF by default, and off means doPlan never calls
   // solve(), never reorders a candidate, and emits no `allocation` event — the
@@ -657,6 +683,18 @@ private:
   std::vector<int> alloc_focus_skips_;
   /// How many consecutive skips demote a phantom EXPLORING cell to COVERED.
   int        alloc_focus_skip_k_ = 3;
+  /// How long a latched peer POSITION may keep holding cells in the allocator
+  /// solve, in mission-elapsed seconds. `<= 0` = unbounded, which is this
+  /// file's convention for "no limit" and reproduces the pre-TTL planner
+  /// bit-for-bit — that default is what lets one binary run both behaviours as
+  /// arms of one campaign.
+  ///
+  /// Applied at the doPlan solve ONLY (see allocVehicles). Every other
+  /// consumer of a peer position in this planner already bounds its staleness
+  /// — the separation term at 10 s, pursuit at 900 s, the link state at 3 s —
+  /// and the allocator was the one exception: a peer last seen an hour ago
+  /// still owned the cells around wherever it was standing then.
+  double     alloc_peer_pos_max_age_sec_ = 0.0;
 
   // §3.6. false = `reconnect_gate: silence`, today's exact behaviour: the
   // mid-run silence clock alone decides. true = `info`, which layers the
@@ -2654,6 +2692,32 @@ ExploPlannerNode::ExploPlannerNode()
     }
   }
 
+  // Time-to-live on the peer POSITION the allocator solves over. Loaded here,
+  // beside separation_max_age_sec, because it is the same kind of thing — a
+  // bound on how long a latched pose keeps steering this robot — and the two
+  // should be read together. See alloc_peer_pos_max_age_sec_ for what it does
+  // and why only one of the three allocVehicles callers gets it.
+  //
+  // Default 0 = unbounded = today's planner exactly, so this line changes no
+  // shipped behaviour until a campaign sets it. NOT clamped and NOT refused:
+  // unlike separation_weight there is no invalid value here — every finite
+  // number is either a TTL or the off switch — but a NaN would make the
+  // `age <= ttl` test false for every peer and quietly amputate the whole
+  // fleet from the allocation, so that one case is caught and logged.
+  alloc_peer_pos_max_age_sec_ = dp("alloc_peer_pos_max_age_sec", 0.0);
+  if (!std::isfinite(alloc_peer_pos_max_age_sec_)) {
+    RCLCPP_WARN(get_logger(),
+        "alloc_peer_pos_max_age_sec=%f is not finite; using 0 (unbounded).",
+        alloc_peer_pos_max_age_sec_);
+    alloc_peer_pos_max_age_sec_ = 0.0;
+  } else if (alloc_peer_pos_max_age_sec_ > 0.0) {
+    RCLCPP_INFO(get_logger(),
+        "Allocator peer-position TTL ON: %.1f s (a peer whose pose is older "
+        "than this is dropped from the allocation and its cells return to the "
+        "pool). Applies to the doPlan solve only.",
+        alloc_peer_pos_max_age_sec_);
+  }
+
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
   // info_gain for each candidate is the sum of score_fn evaluated at sampled
   // poses along the Dijkstra path, not just the endpoint. Evaluated locally via
@@ -3224,6 +3288,12 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("separation_radius_m", separation_.config().radius_m);
     exp_log_->addParamNum("separation_max_age_sec",
                           separation_.config().max_age_sec);
+    // Allocator peer-position TTL, from the member the solve actually reads,
+    // for the reason the separation block above gives: a NaN is coerced to 0
+    // at load time, and recording the request rather than the outcome would
+    // index a cell that ran unbounded as a treated one.
+    exp_log_->addParamNum("alloc_peer_pos_max_age_sec",
+                          alloc_peer_pos_max_age_sec_);
     exp_log_->addParamNum("coord_claim_ttl_sec", coord_claim_ttl_sec_);
     exp_log_->addParamNum("coord_heartbeat_hz", coord_heartbeat_hz_);
     // Both names, one resolved value. `reconnect_enabled` is current;
@@ -5250,14 +5320,14 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
 // gossip included (§3.4). Self first-hand at (x, y); peers from the team model,
 // which is the only place a relayed position is dated.
 //
-// Callers: the P3 allocator (from doPlan, at the planning pose) and the §3.6
-// reconnect gate (from tick, at the current pose). Shared on purpose — the
-// gate's entire output is the difference between two solves over THIS set, so a
-// second copy of "who is in the fleet, where are they, who is reachable" that
-// drifted by one robot would move C_no and C_re against each other, and no
-// field in either event would show it.
+// Callers: the P3 allocator (from doPlan, at the planning pose), the §3.6
+// reconnect gate (from tick, at the current pose) and the rendezvous snapshot.
+// Shared on purpose, but see the header comment: `pos_max_age_sec` is now a
+// deliberate exception to "one vehicle set, and every consumer sees the same
+// one". Only the allocator passes a bound; the gate and the snapshot pass 0.
 std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
-    float x, float y, bool* all_in_comms) const {
+    float x, float y, bool* all_in_comms,
+    double now_sec, double pos_max_age_sec) const {
   std::vector<AllocRobot> out;
   if (all_in_comms) *all_in_comms = true;
   if (!cell_world_.configured()) return out;
@@ -5272,11 +5342,31 @@ std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
       r.finished = false;   // we are planning, so we are not done
     } else {
       const TeamModel::Peer& p = team_model_.peer(id);
+      // POSITION age, not lastKnownAgeSec: a relayed status update refreshes
+      // "when did we last hear about this robot" while leaving the pose we
+      // hold for it untouched, so keying the TTL on the latter would let a
+      // peer we can hear about but not locate keep its cells forever. That is
+      // team_model.hpp's rule 3, and the separation term keys the same way.
+      //
+      // Returns -1 when no position is held, which allocPeerPositionFresh
+      // rejects — but have_position already decides that case, so the -1 never
+      // has to mean anything here.
+      const double age = team_model_.positionAgeSec(id, now_sec);
+      const bool fresh = allocPeerPositionFresh(age, pos_max_age_sec);
       // No position at all is not "at the origin": an unlocatable robot is
       // dropped from the problem (cell -1) rather than defaulted onto a cell
       // it is not in, because a fictional position moves the makespan and so
       // moves THIS robot's tour too.
-      r.cell = p.have_position
+      //
+      // An EXPIRED position is treated as the same thing, and that is the
+      // whole change: `cell = -1` already means "drop this robot from the
+      // problem and return its cells to the pool", so the TTL reuses the
+      // existing unlocatable-robot semantics and GlobalAllocator needs no
+      // change at all. Note what is NOT dropped — the robot stays in the
+      // vehicle list with its in_comms and finished flags intact, so it still
+      // counts toward all_in_comms and toward the fleet size. Only its claim
+      // on ground goes away.
+      r.cell = (p.have_position && fresh)
                    ? g.idAt(static_cast<float>(p.position_x),
                             static_cast<float>(p.position_y))
                    : -1;
@@ -5648,8 +5738,18 @@ void ExploPlannerNode::doPlan() {
               // Same vehicle set the allocator would solve over, at the pose we
               // would actually leave from, and the missing list read straight
               // off it so the two cannot disagree about who is reachable.
+              //
+              // UNBOUNDED (0), even when the allocator's TTL is on. The gate is
+              // being asked "is reconnecting with this peer worth abandoning
+              // exploration for?", and the only handle it has on that peer IS
+              // the stale pose — expiring it here would drop the peer to
+              // cell -1, delete it from the missing list built two lines below,
+              // and make the gate refuse to value a reconnection with the one
+              // robot it exists to reconnect to. Staleness is bounded downstream
+              // where it matters: pursuit caps its own chase estimate at 900 s.
               const std::vector<AllocRobot> vehicles =
-                  allocVehicles(latest_pos_.x(), latest_pos_.y(), nullptr);
+                  allocVehicles(latest_pos_.x(), latest_pos_.y(), nullptr,
+                                missionElapsed(), 0.0);
               std::vector<MissingPeer> missing;
               std::string peers_str;
               for (const AllocRobot& r : vehicles) {
@@ -6016,7 +6116,12 @@ void ExploPlannerNode::doPlan() {
     const auto t_solve0 = std::chrono::steady_clock::now();
 
     bool all_in_comms = true;
-    alloc_robots = allocVehicles(robot_pos.x(), robot_pos.y(), &all_in_comms);
+    // The ONE call site that bounds peer-position staleness. A pose older than
+    // the TTL stops holding cells here and they return to the pool; 0 (the
+    // default) is unbounded and is the pre-TTL planner exactly.
+    alloc_robots = allocVehicles(robot_pos.x(), robot_pos.y(), &all_in_comms,
+                                 missionElapsed(),
+                                 alloc_peer_pos_max_age_sec_);
 
     alloc = GlobalAllocator::solve(cell_world_, alloc_robots, alloc_cfg_);
     const double solve_ms =
@@ -7330,8 +7435,13 @@ void ExploPlannerNode::refreshRendezvousSnapshot() {
   // a distance matrix, taken at most once per heartbeat and only while the
   // team is complete, so its cost is bounded and it is off the PLAN path.
   rendezvous_world_    = cell_world_;
+  // UNBOUNDED (0), and here the TTL could not bite even if it were passed: the
+  // snapshot is refreshed ONLY while the whole team is in comms (see the
+  // caller's guard and rendezvous_world_ above), so every peer position in it
+  // is seconds old by construction. Passing 0 says that in the signature
+  // instead of relying on the guard staying where it is.
   rendezvous_vehicles_ = allocVehicles(latest_pos_.x(), latest_pos_.y(),
-                                       nullptr);
+                                       nullptr, missionElapsed(), 0.0);
   // `finished` is FORCED OFF for everyone in the snapshot, and that is a
   // correctness fix rather than a simplification. allocVehicles writes
   // `finished = false` for self ("we are planning, so we are not done") and

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include "explo_planner/planner_util.hpp"
 
@@ -175,6 +176,62 @@ TEST(PlannerUtil, PursuitBudgetDegenerateInputs) {
   // Zero speed: raw = 10/1e-3*3 = 30000 -> ceiling.
   EXPECT_NEAR(pursuitBudgetSec(10.0, 0.0, 0.0, 3.0, 180.0, 30.0, 240.0),
               240.0, 1e-9);
+}
+
+// max_age <= 0 is UNBOUNDED. This is the case that matters most: it is the
+// default the parameter ships with, and it is what makes the TTL binary
+// reproduce the pre-TTL planner, so one build can run both arms of a campaign.
+// Nothing about the age may change the answer here — not a huge age, not the
+// "no position held" sentinel, not a negative bound.
+TEST(PlannerUtil, AllocPeerPositionUnboundedAdmitsEverything) {
+  EXPECT_TRUE(allocPeerPositionFresh(0.0, 0.0));
+  EXPECT_TRUE(allocPeerPositionFresh(3600.0, 0.0));
+  EXPECT_TRUE(allocPeerPositionFresh(-1.0, 0.0));
+  // A negative bound reads as "no limit" too, same as pursuit's max_sec.
+  EXPECT_TRUE(allocPeerPositionFresh(3600.0, -5.0));
+}
+
+// Under a live TTL the boundary is INCLUSIVE: a pose measured exactly N
+// seconds ago still holds its cells at a TTL of N. Just past it, the peer is
+// dropped from the allocation and its cells return to the pool.
+TEST(PlannerUtil, AllocPeerPositionBoundIsInclusive) {
+  EXPECT_TRUE(allocPeerPositionFresh(0.0, 120.0));
+  EXPECT_TRUE(allocPeerPositionFresh(119.9, 120.0));
+  EXPECT_TRUE(allocPeerPositionFresh(120.0, 120.0));
+  EXPECT_FALSE(allocPeerPositionFresh(120.1, 120.0));
+  EXPECT_FALSE(allocPeerPositionFresh(3600.0, 120.0));
+}
+
+// TeamModel::positionAgeSec() returns a NEGATIVE age for "no position held".
+// Under a live TTL that must read as NOT fresh. The caller also tests
+// have_position, so this is belt-and-braces — but the failure it guards is
+// silent: "we have never located this peer" coming out identical to "we heard
+// from it a moment ago" would hand the whole map to a robot we cannot find.
+TEST(PlannerUtil, AllocPeerPositionUnknownIsNotFresh) {
+  EXPECT_FALSE(allocPeerPositionFresh(-1.0, 120.0));
+  EXPECT_FALSE(allocPeerPositionFresh(-0.001, 120.0));
+}
+
+// Before the mission clock is live, missionElapsed() returns -1 and every age
+// computed against it is 0 (TeamModel clamps), i.e. brand new. That is the
+// UNBOUNDED direction — start-up plans behave exactly as they did pre-TTL,
+// rather than briefly dropping every peer while the clock latches.
+TEST(PlannerUtil, AllocPeerPositionPreClockAgeIsFresh) {
+  EXPECT_TRUE(allocPeerPositionFresh(0.0, 120.0));
+}
+
+// A non-finite input drops the peer instead of admitting it. The node refuses
+// a non-finite parameter at load, so this should be unreachable from the
+// harness; it is asserted because the NaN answer falls out of comparison
+// semantics rather than from any written branch, and the safe direction (drop)
+// and the dangerous one (admit) are one operator apart.
+TEST(PlannerUtil, AllocPeerPositionNonFiniteIsNotFresh) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(allocPeerPositionFresh(nan, 120.0));
+  EXPECT_FALSE(allocPeerPositionFresh(60.0, nan));
+  // But an infinite BOUND is a real "never expires" and must admit.
+  EXPECT_TRUE(allocPeerPositionFresh(
+      1e9, std::numeric_limits<double>::infinity()));
 }
 
 // The meeting point is the plain midpoint of the last-contact pose pair; both

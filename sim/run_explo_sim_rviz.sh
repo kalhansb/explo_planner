@@ -841,6 +841,56 @@ if [ "$GLOBAL_ALLOC" = "1" ] && [ "$TEAM_WORLD" != "1" ]; then
   echo "would allocate the whole map to itself and call that agreement)." >&2
   exit 2
 fi
+# Allocator peer-position TTL, in seconds of mission-elapsed time. A peer whose
+# latched pose is older than this is dropped from the allocation problem and the
+# cells it was holding go back into the pool; 0 = unbounded = every campaign up
+# to and including sr3, bit-for-bit.
+#
+# Set per cell by run_campaign.sh from the "_ttl<N>" arm-name suffix, which that
+# script strips before handing over RECONNECT_MODE — so nothing in this file sees
+# the suffix and no arm-token guard has to learn about it. Third knob to use that
+# mechanism, after DONE_SEEK and COORD_CLAIM_R.
+#
+# Placed HERE and not up beside COORD_CLAIM_R because the pairing check below
+# needs GLOBAL_ALLOC to have been resolved, and that happens ten lines up.
+#
+# Empty = pass no -p at all, leaving the node on its compiled default. Unlike
+# COORD_CLAIM_R, "0" is a legal explicit value rather than a spelling of "unset":
+# the node reads <= 0 as unbounded, which is the control level of this treatment
+# and needs to travel the same -p path as the treated level.
+ALLOC_POS_TTL="${ALLOC_POS_TTL:-}"
+if [ -n "$ALLOC_POS_TTL" ]; then
+  case "$ALLOC_POS_TTL" in
+    ''|*[!0-9.]*|*.*.*)
+      echo "FATAL: ALLOC_POS_TTL='$ALLOC_POS_TTL' is not a plain decimal number." >&2
+      echo "       It is the age in seconds past which a latched peer position" >&2
+      echo "       stops holding cells in the allocator." >&2
+      exit 2 ;;
+  esac
+  # Second case for the same reason the separation block has one: the pattern
+  # above is an OR, and a bare "." satisfies every branch of it. awk then reads
+  # "." as 0, which is this knob's OFF value — so "_ttl." would produce a cell
+  # named for a TTL that ran unbounded.
+  case "$ALLOC_POS_TTL" in
+    *[0-9]*) : ;;
+    *) echo "FATAL: ALLOC_POS_TTL='$ALLOC_POS_TTL' has no digits in it; awk" >&2
+       echo "       would read it as 0, which is this knob's OFF value." >&2
+       exit 2 ;;
+  esac
+  # A TTL with no allocator is a manifest that records the treatment and a binary
+  # that cannot express it: alloc_peer_pos_max_age_sec is read at exactly one
+  # place, the doPlan allocator solve, which does not run when GLOBAL_ALLOC=0.
+  # Refused rather than warned, because the cell would otherwise be pooled into
+  # the treated arm carrying the control's behaviour — the same failure the
+  # SEPARATION_WEIGHT/TEAM_WORLD pairing above exists to prevent.
+  if [ "$(awk -v v="$ALLOC_POS_TTL" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" = "1" ] \
+     && [ "$GLOBAL_ALLOC" != "1" ]; then
+    echo "FATAL: ALLOC_POS_TTL>0 requires GLOBAL_ALLOC=1. The TTL is read only" >&2
+    echo "       at the allocator solve, so with the allocator off it would be" >&2
+    echo "       on in the manifest and inert in the binary." >&2
+    exit 2
+  fi
+fi
 # --- Utility-gated reconnection (M-TARE evolution, P4) --------------------
 # RECONNECT_GATE=info arms the §3.6 knowledge + value gate: when the mid-run
 # silence clock expires, dispatch only if the missing peer is actually missing
@@ -2114,6 +2164,13 @@ if [ "$GLOBAL_ALLOC" = "1" ]; then
 else
   log "global allocator OFF (GLOBAL_ALLOC=0) — no allocation event, candidate ordering is the per-robot utility alone"
 fi
+if [ -z "$ALLOC_POS_TTL" ]; then
+  log "allocator peer-position TTL: not requested (node default 0 = unbounded) — a latched peer pose holds its cells for the rest of the run however old it gets, which is every campaign through sr3"
+elif [ "$(awk -v v="$ALLOC_POS_TTL" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" = "1" ]; then
+  log "allocator peer-position TTL ON: ${ALLOC_POS_TTL} s — a peer whose pose is older than that is dropped from the allocation and the cells it held return to the pool. Applies to the doPlan solve only; the §3.6 gate and the rendezvous snapshot stay unbounded on purpose"
+else
+  log "allocator peer-position TTL requested as ${ALLOC_POS_TTL} = unbounded — this is the CONTROL level, passed explicitly so it travels the same -p path as the treated arm"
+fi
 if [ "$RECONNECT_GATE" = "info" ]; then
   log "reconnect gate = info: the mid-run silence clock is a FLOOR; past it, dispatch only if the peer is missing something we hold AND the leg pays for itself (C_re < C_no). Every evaluation is logged, suppressed or not."
 else
@@ -2178,6 +2235,18 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # recoverable only from the directory NAME, and a directory can be renamed
   # while a manifest written at launch cannot.
   echo "coord_claim_radius_override=${COORD_CLAIM_R:-none}"
+  # Same contract as the line above, and for the same reason: run_campaign.sh
+  # strips the _ttl<N> suffix before RECONNECT_MODE is formed, so this is the
+  # only record of the level that is not the directory name. "none" = no -p was
+  # passed and the node took its compiled default (0 = unbounded), which is a
+  # positive statement about every campaign through sr3 rather than a gap.
+  #
+  # Note "0.0" and "none" are the same BEHAVIOUR and deliberately different
+  # STRINGS: 0.0 means the campaign asked for unbounded explicitly, through the
+  # same -p path as the treated arm, and none means the question was never asked.
+  # An analysis that pools them is fine; one that uses "none" to identify the
+  # control arm of a TTL campaign is reading a cell that ran no -p at all.
+  echo "alloc_peer_pos_max_age_sec=${ALLOC_POS_TTL:-none}"
   # Both spellings, one value. `reconnect_enabled` is the current name; the
   # legacy line stays FOREVER, because the cr3-cr5 manifests carry it and any
   # tool that reads a mixed set of campaigns must not have to know which side
@@ -2521,6 +2590,15 @@ for r in $ROBOTS; do
   # path itself is common to the two arms and cannot be confounded with them.
   if [ -n "$COORD_CLAIM_R" ]; then
     EXTRA+=( -p coord_claim_radius_m:="$(flt "$COORD_CLAIM_R")" )
+  fi
+  # Allocator peer-position TTL. Passed only when set, so an unset value leaves
+  # the node on its compiled 0 and reproduces every campaign through sr3 byte for
+  # byte. BOTH levels of a TTL campaign come through here — the control arm is
+  # _ttl0, not the absence of a suffix — so the -p path is common to the two arms
+  # and cannot be confounded with them. flt() because the node declares a double
+  # and ros2 infers int from a bare "0", which aborts the node at startup.
+  if [ -n "$ALLOC_POS_TTL" ]; then
+    EXTRA+=( -p alloc_peer_pos_max_age_sec:="$(flt "$ALLOC_POS_TTL")" )
   fi
   # Team-separation discount. Passed ALWAYS, including at weight 0, which is
   # the opposite of the COORD_CLAIM_R rule above and deliberately so. The

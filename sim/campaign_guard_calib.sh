@@ -782,6 +782,7 @@ tree_attenuation_db=70.0
 max_range_m=30.0
 cell_size_m=10.0
 coord_claim_radius_override=none
+alloc_peer_pos_max_age_sec=none
 separation_weight=0
 separation_radius_m=20
 separation_max_age_sec=10
@@ -861,6 +862,34 @@ rg ABORT "an unsuffixed arm banked at a pinned 10.0"          "$RG_ARM" coord_cl
 # spellings; the four above pass either way.
 rg ABORT "a non-numeric value is not the 'none' sentinel"     "$RG_ARM" coord_claim_radius_override unset
 rg ABORT "an empty value cannot be shown to agree"            "$RG_ARM" coord_claim_radius_override ""
+# The allocator peer-position TTL, set from the "_ttl<N>" suffix. Same sentinel
+# shape as the radius above, with one difference that matters: 0 is a REAL level
+# here (unbounded, the control arm) rather than a spelling of "unset", so "0.0"
+# and "none" are the same behaviour and must still be different cells.
+#
+# The two SKIP cases below are also the only test of the SUFFIX PARSER itself,
+# and they test both halves of it at once. A parser that failed to strip "_ttl120"
+# would leave cell_pos_ttl empty (want "none" against a manifest saying 120.0 ->
+# ABORT, not SKIP) AND leave cell_mode as "mtare_hybrid_ttl120", which matches no
+# branch of the arm-stack case, so cell_world would fall back to 0 against a
+# manifest saying 1 and abort there instead. Either way the SKIP does not happen.
+rg SKIP  "_ttl120 with a matching 120.0 is skipped"           mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec 120.0
+rg SKIP  "_ttl0 (the control level) matches an explicit 0.0"  mtare_hybrid_ttl0 alloc_peer_pos_max_age_sec 0.0
+# The case this key exists for: a cell named for the treatment, banked with the
+# control's behaviour. Nothing else in the manifest differs -- the arm token, the
+# six M-TARE knobs and the radio regime are all identical between the two levels.
+rg ABORT "_ttl120 banked at 0.0 ran unbounded under the treated name" \
+                                                              mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec 0.0
+rg ABORT "_ttl120 banked before the knob existed"             mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec "<none>"
+rg ABORT "_ttl0 banked with no -p at all is a different route" mtare_hybrid_ttl0 alloc_peer_pos_max_age_sec none
+rg ABORT "an unsuffixed arm banked at a pinned 120.0"         "$RG_ARM" alloc_peer_pos_max_age_sec 120.0
+rg ABORT "an unsuffixed arm predating the knob"               "$RG_ARM" alloc_peer_pos_max_age_sec "<none>"
+# The numeric branch at this key, exercised at a level that is NOT 0 so that the
+# `a + 0` reading of an unparseable string cannot accidentally agree.
+rg ABORT "_ttl120 banked as 'unset' is not a number"          mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec unset
+rg ABORT "_ttl120 banked as nan agrees with 120 under a bare +0" \
+                                                              mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec nan
+rg SKIP  "_ttl120 banked as ' 120.0 ' (padded) still resumes" mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec " 120.0 "
 # The separation term's three knobs. The weight is the obvious one; the other
 # two are guarded because they are NOT inert at weight 0 -- sep_peer_dist_m and
 # sep_eligible_peers are measured on them in every arm, so a resume that moved

@@ -249,8 +249,15 @@ fi
 # would run every cell at 40 m while half of them sat in directories named
 # _r10. Gate check 3i reads the manifest and would catch it afterwards, which
 # is a campaign too late.
+# ALLOC_POS_TTL joins for exactly the COORD_CLAIM_R reason, and it is the one
+# where getting it wrong is hardest to see afterwards: the TTL's control level
+# is 0 = unbounded = the pre-TTL planner, so `--env ALLOC_POS_TTL=120` would put
+# the treatment in EVERY cell, including the ones sitting in directories named
+# _ttl0, and the campaign would be a treated-vs-treated comparison that returns
+# a clean null. Set it with the _ttl<N> suffix, which is per cell.
 for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE \
-                RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R; do
+                RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R \
+                ALLOC_POS_TTL; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -358,6 +365,15 @@ _treated=0
 for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
   _a="${_a%%:*}"
   _a="${_a%_seek}"
+  # ... and the same for the allocator peer-position TTL suffix. Position in this
+  # chain is not free: suffixes come off in reverse order of how they were put
+  # on, so _ttl<N> must be stripped BEFORE _r<N> and AFTER _seek. The full
+  # append order is <mode>_r<N>_ttl<N>_seek, and "mtare_off_r40_ttl120" does not
+  # match the _r patterns below until the _ttl part is gone.
+  case "$_a" in
+    *_ttl[0-9]|*_ttl[0-9][0-9]|*_ttl[0-9][0-9][0-9]|*_ttl[0-9][0-9][0-9][0-9])
+      _a="${_a%_ttl*}";;
+  esac
   # ... and the same for the cr2 claim-radius suffix, for the same reason: it is
   # a runtime switch, not an arm, so "mtare_off_r40" is still an untreated cell
   # and must not be classed as treated on the strength of a suffix.
@@ -502,6 +518,38 @@ for cell in "${CELL_LIST[@]}"; do
   cell_mode="$arm"; cell_seek="0"
   case "$arm" in
     *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
+  esac
+
+  # Arm-name suffix "_ttl<N>" = same RECONNECT_MODE, the allocator's peer-position
+  # TTL forced to N seconds. Third instance of the _seek/_r<N> mechanism and the
+  # same reason: alloc_peer_pos_max_age_sec is a node parameter, --env sets it
+  # campaign-wide, and the whole design of this treatment is that ONE binary runs
+  # both levels as interleaved arms of one invocation.
+  #
+  # Stripped BEFORE _r<N> below and AFTER _seek above, because suffixes come off
+  # in reverse order of how they went on and the append order is
+  # <mode>_r<N>_ttl<N>_seek: "mtare_off_r40_ttl120" does not match the _r
+  # patterns until the _ttl part is gone, and "mtare_off_ttl120_seek" does not
+  # match the _ttl patterns until _seek is gone. Moving this block either way
+  # breaks one of the two combinations — loudly, which is the one piece of luck
+  # here: an unstripped suffix is still attached to cell_mode when it is handed
+  # over as RECONNECT_MODE, and the runner whitelists that against the known
+  # modes and refuses. So a mis-ordered strip fails the cell rather than running
+  # the unsuffixed arm under the suffixed name. Four digits, so a TTL up
+  # to 9999 s is expressible -- longer than any cell runs, which is the point,
+  # since a TTL above the run length is a second spelling of "off".
+  #
+  # 0 IS LEGAL HERE, unlike _r0. The claim radius reads 0 as AUTO and resolves it
+  # back to fov_max_range, so _r0 would name a cell for a radius it did not run;
+  # the TTL reads 0 as unbounded, which is a real and wanted level -- it is the
+  # control arm. So "_ttl0" is written out explicitly rather than left to the
+  # unsuffixed default, for the reason the _r block gives: both levels then travel
+  # the identical -p code path, and the passthrough itself is not confounded with
+  # the arm.
+  cell_pos_ttl=""
+  case "$cell_mode" in
+    *_ttl[0-9]|*_ttl[0-9][0-9]|*_ttl[0-9][0-9][0-9]|*_ttl[0-9][0-9][0-9][0-9])
+      cell_pos_ttl="${cell_mode##*_ttl}.0"; cell_mode="${cell_mode%_ttl*}";;
   esac
 
   # Arm-name suffix "_r<N>" = same RECONNECT_MODE, MinPos claim radius forced to
@@ -692,6 +740,7 @@ for cell in "${CELL_LIST[@]}"; do
       "max_range_m=$MAX_RANGE_REQ" \
       "cell_size_m=$CELL_SIZE_REQ" \
       "coord_claim_radius_override=${cell_claim_r:-none}" \
+      "alloc_peer_pos_max_age_sec=${cell_pos_ttl:-none}" \
       "separation_weight=$SEPARATION_WEIGHT_REQ" \
       "separation_radius_m=$SEPARATION_RADIUS_REQ" \
       "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ"
@@ -759,7 +808,7 @@ for cell in "${CELL_LIST[@]}"; do
     break
   fi
 
-  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek claim_r=${cell_claim_r:-yaml} mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
+  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek claim_r=${cell_claim_r:-yaml} pos_ttl=${cell_pos_ttl:-yaml} mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
@@ -802,6 +851,7 @@ for cell in "${CELL_LIST[@]}"; do
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       COORD_CLAIM_R="$cell_claim_r" \
+      ALLOC_POS_TTL="$cell_pos_ttl" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \

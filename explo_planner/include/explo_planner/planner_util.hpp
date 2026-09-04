@@ -96,6 +96,31 @@ double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
                         double staleness_max_sec, double min_sec,
                         double max_sec);
 
+/// May a peer's latched POSITION still hold cells in the allocation problem?
+///
+/// `age_sec` is what TeamModel::positionAgeSec() returned — seconds since the
+/// pose we hold was measured, or NEGATIVE for "we hold no position". Both
+/// arguments are on the mission clock.
+///
+/// Three rules, and the first two are the ones that make the default safe:
+///   - `max_age_sec <= 0` is UNBOUNDED and returns true for everything. This
+///     is the file-wide convention for "no limit" (see pursuitBudgetSec) and
+///     it is what makes `alloc_peer_pos_max_age_sec = 0` reproduce the
+///     pre-TTL planner bit-for-bit, so one binary can run both arms.
+///   - A negative `age_sec` is never fresh under a live bound. It means no
+///     position exists, and a robot with no position is dropped from the
+///     problem anyway — but returning true here would make "unknown" read as
+///     "recent" the moment a caller forgot the have-position test.
+///   - Otherwise fresh means `age_sec <= max_age_sec`, inclusive, so a TTL of
+///     exactly N seconds admits a pose measured N seconds ago.
+///
+/// NaN in either argument returns false (every comparison against NaN is
+/// false, and the `<= 0` unbounded test fails too), which drops every peer
+/// rather than admitting every peer. That is the safe direction for a
+/// misconfiguration, and the node refuses a non-finite parameter at load
+/// anyway so it should be unreachable from the campaign harness.
+bool allocPeerPositionFresh(double age_sec, double max_age_sec);
+
 /// Meeting point for the HYBRID fallback: the midpoint of the last-contact
 /// pose pair (all three axes — on flat worlds the z average is the shared
 /// ground height; the arrival test is xy-only either way). Each side computes
