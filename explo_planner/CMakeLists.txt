@@ -211,6 +211,9 @@ if(BUILD_TESTING)
   target_compile_definitions(test_failed_goal_blacklist PRIVATE
     SHARED_PARAMS_YAML="${CMAKE_CURRENT_SOURCE_DIR}/config/shared_params.yaml")
 
+  ament_add_gtest(test_metrics_logger test/test_metrics_logger.cpp)
+  target_link_libraries(test_metrics_logger explo_planner_lib)
+
   ament_add_gtest(test_home_trail test/test_home_trail.cpp)
   target_link_libraries(test_home_trail explo_planner_lib)
 

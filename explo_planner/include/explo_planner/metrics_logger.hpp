@@ -177,6 +177,60 @@ struct StepMetrics {
   float  sep_discount             = 1.0f;
   int    sep_reordered            = -1;
   int    sep_eligible_peers       = 0;
+
+  // ---- Last planning attempt: why the candidates were thrown away ----
+  //
+  // These are the ONLY columns in this struct that are populated on a timer row
+  // as well as a LOG_STEP row, and they have to be, because of what they are
+  // for. A robot whose every candidate is rejected never completes a step, so
+  // it emits no LOG_STEP row at all — the run keeps producing timer rows with
+  // state == "PLAN" and every plan-attribution column zero by construction. In
+  // at1 seed 2 that is 60 rows across a 1094 s stall saying only "still in
+  // PLAN", while the planner's own log had the answer (map=82 unreach=94) the
+  // whole time. Reconstructing it meant reading 2.6 MB of unstructured text per
+  // robot-run. So these carry forward from the most recent doPlan attempt and
+  // are readable on every row.
+  //
+  // They do NOT replace rejected_by_minpos / rejected_by_unreachable above.
+  // Those keep their existing LOG_STEP-only semantics exactly, so no archived
+  // CSV changes meaning and no analysis written against them changes answer.
+  // The duplication is deliberate: a profile split across two column families
+  // with two different row semantics is a trap, so this set is complete on its
+  // own and self-consistent (plan_rej_* sums to plan_cand_total on any row
+  // where plan_stall_ticks > 0, since that is what "all rejected" means).
+  //
+  // -1 means NO PLANNING ATTEMPT HAS HAPPENED YET, which is not the same as a
+  // measured zero. That distinction is the whole lesson of rejected_by_minpos
+  // reading 0 for a campaign: nothing in the data could separate "the veto
+  // never mattered" from "the veto never ran". A 0 in these columns is always
+  // a measurement.
+  //
+  // Staleness caveat: doPlan has earlier returns (no map yet, no candidates
+  // generated). Those leave the previous attempt's values standing, because a
+  // tick that never reached the admissibility filter has no profile of its own
+  // to report. plan_stall_ticks is the discriminator for freshness — it is
+  // written on every tick that DID reach the filter.
+  //
+  //   plan_cand_total    candidates the admissibility filter was given
+  //   plan_rej_close     rejected for being too close to the robot
+  //   plan_rej_map       rejected by the single-cell free check on the
+  //                      planning map. Seed 2's second-largest cause and the
+  //                      one with no column at all before this.
+  //   plan_rej_unreach   rejected by the cost-grid flood
+  //   plan_rej_blacklist rejected by visited_goals_ or failed_goals_
+  //   plan_rej_minpos    rejected by a peer's MinPos claim
+  //   plan_stall_ticks   consecutive ticks on which EVERY candidate was
+  //                      rejected, 0 on a tick that selected a goal. This is
+  //                      the starvation length, and it is the column that
+  //                      turns "the robot sat in PLAN" into "the robot could
+  //                      not plan for N ticks and here is why".
+  int    plan_cand_total          = -1;
+  int    plan_rej_close           = -1;
+  int    plan_rej_map             = -1;
+  int    plan_rej_unreach         = -1;
+  int    plan_rej_blacklist       = -1;
+  int    plan_rej_minpos          = -1;
+  int    plan_stall_ticks         = -1;
 };
 
 class MetricsLogger {

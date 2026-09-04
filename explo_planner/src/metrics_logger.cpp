@@ -54,7 +54,12 @@ void MetricsLogger::writeHeader() {
         // Same rule again (separation.hpp). These belong beside
         // rejected_by_minpos — they are the manipulation checks for the
         // mechanism that replaces it — and they are here instead.
-        << "sep_peer_dist_m,sep_discount,sep_reordered,sep_eligible_peers\n";
+        << "sep_peer_dist_m,sep_discount,sep_reordered,sep_eligible_peers,"
+        // Same append-only rule. These belong next to rejected_by_unreachable
+        // by meaning and are here instead. Unlike every other block in this
+        // header they are populated on timer rows too — see the struct.
+        << "plan_cand_total,plan_rej_close,plan_rej_map,plan_rej_unreach,"
+        << "plan_rej_blacklist,plan_rej_minpos,plan_stall_ticks\n";
   header_written_ = true;
 }
 
@@ -100,7 +105,14 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.sep_peer_dist_m << ","
         << m.sep_discount << ","
         << m.sep_reordered << ","
-        << m.sep_eligible_peers << "\n";
+        << m.sep_eligible_peers << ","
+        << m.plan_cand_total << ","
+        << m.plan_rej_close << ","
+        << m.plan_rej_map << ","
+        << m.plan_rej_unreach << ","
+        << m.plan_rej_blacklist << ","
+        << m.plan_rej_minpos << ","
+        << m.plan_stall_ticks << "\n";
   file_.flush();
 }
 

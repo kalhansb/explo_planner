@@ -1926,6 +1926,19 @@ private:
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
 
+  // Full rejection profile of the most recent doPlan attempt. Unlike the two
+  // above these are drained by fillCommonMetrics, so they reach EVERY row
+  // including the timer rows a starved planner emits — which are the only rows
+  // it emits, since a tick that selects nothing never completes a step. See
+  // metrics_logger.hpp. -1 = no planning attempt yet, never a measured zero.
+  int   pending_plan_cand_total_    = -1;
+  int   pending_plan_rej_close_     = -1;
+  int   pending_plan_rej_map_       = -1;
+  int   pending_plan_rej_unreach_   = -1;
+  int   pending_plan_rej_blacklist_ = -1;
+  int   pending_plan_rej_minpos_    = -1;
+  int   pending_plan_stall_ticks_   = -1;
+
   // Separation-term diagnostics (separation.hpp), filled by doPlan on every
   // exploration tick and drained the same way.
   //
@@ -6497,6 +6510,19 @@ void ExploPlannerNode::doPlan() {
     if (exp_log_) exp_log_->logAllocation(expCtx(), alloc_ev);
   }
 
+  // ---- Rejection profile of THIS attempt ------------------------------
+  //
+  // Written here, above the starvation return, so it covers both outcomes. The
+  // starved branch below returns without ever reaching doLogStep, so anything
+  // recorded after that point is recorded only on ticks that succeeded — which
+  // is precisely how the old columns came to read zero through a 1094 s stall.
+  pending_plan_cand_total_    = static_cast<int>(candidates.size());
+  pending_plan_rej_close_     = rejected_too_close;
+  pending_plan_rej_map_       = rejected_map;
+  pending_plan_rej_unreach_   = rejected_unreachable;
+  pending_plan_rej_blacklist_ = rejected_blacklist;
+  pending_plan_rej_minpos_    = rejected_minpos;
+
   if (!found) {
     // Throttled, and carrying its own consecutive count because the throttle
     // alone would destroy the quantity that matters. doPlan runs at 10 Hz and
@@ -6508,6 +6534,11 @@ void ExploPlannerNode::doPlan() {
     // retries. The count is what separates "one unlucky tick" from "this robot
     // has not been able to plan since t=900".
     ++consecutive_all_rejected_;
+    // After the increment, so the row shows the stall length INCLUDING this
+    // tick. The WARN below is throttled to one line per 5 s; this column is
+    // not, which is the point — the throttle is what made the log an
+    // unreliable place to measure stall length from.
+    pending_plan_stall_ticks_ = consecutive_all_rejected_;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "Step %d: all %zu candidates rejected (close=%d map=%d unreach=%d "
         "blk=%d minpos=%d). Retrying next tick; %d consecutive rejected ticks.",
@@ -6525,6 +6556,11 @@ void ExploPlannerNode::doPlan() {
         step_, consecutive_all_rejected_);
     consecutive_all_rejected_ = 0;
   }
+  // Unconditional, not inside the branch above: a tick that selected a goal is
+  // a tick with zero stall, whether or not it followed a stall. Setting this
+  // only on recovery would leave the last stall's length standing on every
+  // healthy row after it.
+  pending_plan_stall_ticks_ = 0;
 
   // Drain utility / coord diagnostics into pending_* fields for the
   // upcoming LOG_STEP. doLogStep() will copy these into StepMetrics.
@@ -9936,6 +9972,19 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
   m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
   m.phase = (phase_ == Phase::EXPLOIT) ? "exploit" : "explore";
   m.state = stateName(state_);
+
+  // Rejection profile of the last planning attempt. Filled HERE, in the common
+  // path, rather than in doLogStep with the other plan diagnostics — that is
+  // the entire fix. doLogStep runs only when a step completes, and a planner
+  // rejecting every candidate completes none, so these are the columns that
+  // have to survive on a timer row or they are absent exactly when they matter.
+  m.plan_cand_total    = pending_plan_cand_total_;
+  m.plan_rej_close     = pending_plan_rej_close_;
+  m.plan_rej_map       = pending_plan_rej_map_;
+  m.plan_rej_unreach   = pending_plan_rej_unreach_;
+  m.plan_rej_blacklist = pending_plan_rej_blacklist_;
+  m.plan_rej_minpos    = pending_plan_rej_minpos_;
+  m.plan_stall_ticks   = pending_plan_stall_ticks_;
 
   // Reconnect columns. Both stay at their -1 "not applicable" sentinel outside
   // a manoeuvre — 0.0 would read as "arrived", which is a real and different
