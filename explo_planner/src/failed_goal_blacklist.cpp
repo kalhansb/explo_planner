@@ -24,6 +24,11 @@ int FailedGoalBlacklist::add(const Eigen::Vector3f& pos, double now_sec,
     for (auto& s : sites_) {
       if (dist2_xy(s.pos, pos) < r2) {
         s.last_fail_time = now_sec;
+        // Failing here again revives the suppression. The count carries over
+        // from before the expiry — that carry-over IS the fix: it is what lets
+        // a trap the robot only returns to every few minutes reach
+        // retire_after at all.
+        s.expired = false;
         ++s.count;
         if (retire_after_ > 0 && s.count >= retire_after_) s.retired = true;
         return s.count;
@@ -46,19 +51,48 @@ void FailedGoalBlacklist::prune(double now_sec, double ttl_sec) {
   // stamps a fresh entry with an *older* timestamp than the one behind it, and
   // the break then left every expired entry after it blacklisting goals
   // forever. Entries stamped in the future (age < 0) are treated as fresh.
-  sites_.erase(
-      std::remove_if(sites_.begin(), sites_.end(),
-                     [now_sec, ttl_sec](const FailedGoalSite& s) {
-                       return !s.retired && now_sec - s.last_fail_time > ttl_sec;
-                     }),
-      sites_.end());
+  const auto is_stale = [now_sec, ttl_sec](const FailedGoalSite& s) {
+    return !s.retired && now_sec - s.last_fail_time > ttl_sec;
+  };
+
+  // Retirement OFF: nothing counts failures, so there is no history worth
+  // keeping and erasing is strictly cheaper. This is the `visited_goals_`
+  // path and it behaves exactly as it always has.
+  if (retire_after_ <= 0) {
+    sites_.erase(std::remove_if(sites_.begin(), sites_.end(), is_stale),
+                 sites_.end());
+    return;
+  }
+
+  // Retirement ON: expire, do not erase. prune() runs every PLAN tick, so a
+  // robot that returns to the same trap after longer than the TTL used to find
+  // the record gone and start counting from 1 again — which made retirement
+  // unreachable in exactly the case it exists for (a trap revisited every few
+  // minutes). Keeping the record costs one struct per distinct failure SITE,
+  // and a site costs a whole failed navigation to create, so the list stays in
+  // the tens over a full run.
+  for (auto& s : sites_) {
+    if (is_stale(s)) s.expired = true;
+  }
+}
+
+std::size_t FailedGoalBlacklist::size() const {
+  std::size_t n = 0;
+  for (const auto& s : sites_) {
+    if (!s.expired) ++n;
+  }
+  return n;
 }
 
 bool FailedGoalBlacklist::isNear(const Eigen::Vector3f& pos,
                                  double radius_m) const {
+  // Expired records are history, not vetoes. Suppression still ends exactly at
+  // the TTL — keeping the count must not quietly turn every past failure into
+  // a permanent no-go zone, which would be a much bigger behaviour change than
+  // the one intended and would starve the planner instead of unsticking it.
   const float r2 = static_cast<float>(radius_m * radius_m);
   for (const auto& s : sites_) {
-    if (dist2_xy(s.pos, pos) < r2) return true;
+    if (!s.expired && dist2_xy(s.pos, pos) < r2) return true;
   }
   return false;
 }
@@ -83,10 +117,16 @@ bool FailedGoalBlacklist::isRetiredNear(const Eigen::Vector3f& pos,
 
 double FailedGoalBlacklist::lastFailTimeNear(const Eigen::Vector3f& pos,
                                              double radius_m) const {
+  // Expired records excluded, to match isNear. Both callers — the amnesty
+  // ordering and the amnesty log line — only ever see candidates that were
+  // SUPPRESSED this tick, so an expired site can never be the subject; letting
+  // one through would only change the answer for a candidate that is not
+  // suppressed at all.
   const float r2 = static_cast<float>(radius_m * radius_m);
   double latest = -std::numeric_limits<double>::infinity();
   for (const auto& s : sites_) {
-    if (dist2_xy(s.pos, pos) < r2) latest = std::max(latest, s.last_fail_time);
+    if (!s.expired && dist2_xy(s.pos, pos) < r2)
+      latest = std::max(latest, s.last_fail_time);
   }
   return latest;
 }

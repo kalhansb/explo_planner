@@ -10,11 +10,17 @@
 namespace explo_planner {
 
 /// One clustered site: a position, when it last failed, and how often.
+///
+/// `expired` separates "this site no longer suppresses goals" from "this site
+/// is forgotten". A site past its TTL stops vetoing candidates but keeps its
+/// failure count, because the count is what retirement is counted in — see
+/// prune().
 struct FailedGoalSite {
   Eigen::Vector3f pos{Eigen::Vector3f::Zero()};
   double last_fail_time{0.0};
   int count{0};
   bool retired{false};
+  bool expired{false};
 };
 
 /// Records goal positions the robot failed to reach (navigate timeout / no
@@ -41,6 +47,15 @@ struct FailedGoalSite {
 /// busy failing somewhere else, and the same unreachable goal wins the argmax
 /// again. A site that has failed `retire_after` times is held for the rest of
 /// the run and is only released by actually reaching it (clearNear).
+///
+/// For that to be more than a comment, the failure COUNT has to outlive the
+/// suppression window. It did not: prune() erased the whole record, so a
+/// re-failure at the same place started again at 1, and retirement could only
+/// ever fire when every failure landed inside one TTL. That is the opposite of
+/// the case it was written for. Measured over at1+sr3 — 64 robot-runs, 177 nav
+/// failures — the count was 1 every single time and retirement never fired
+/// once. So an expired site is now kept as HISTORY (see prune): it stops
+/// suppressing, but add() can still find it and carry the count forward.
 class FailedGoalBlacklist {
 public:
   /// Retire a site after this many failures. 0 disables retirement entirely,
@@ -53,8 +68,14 @@ public:
   int add(const Eigen::Vector3f& pos, double now_sec,
           double cluster_radius_m = 0.0);
 
-  /// Drop entries older than `ttl_sec` relative to `now_sec`. Retired sites
-  /// are never dropped.
+  /// Age out entries older than `ttl_sec` relative to `now_sec`. Retired sites
+  /// are never aged out.
+  ///
+  /// With retirement ON the entry is marked expired rather than erased: it
+  /// stops suppressing goals immediately, but its failure count is kept so a
+  /// later failure at the same place counts as the second, not the first.
+  /// With retirement OFF (the default, and what `visited_goals_` uses) the
+  /// entry is erased exactly as before — there is no count to preserve.
   void prune(double now_sec, double ttl_sec);
 
   /// True if the XY of `pos` is within `radius_m` of any stored entry.
@@ -68,13 +89,23 @@ public:
   /// if there is none. Used to order amnesty picks (oldest failure first).
   double lastFailTimeNear(const Eigen::Vector3f& pos, double radius_m) const;
 
-  /// Forget every entry within `radius_m` of `pos`, retired ones included.
-  /// Returns how many were removed. Arriving at a goal is proof the ground is
-  /// reachable, which outranks any amount of failure history.
+  /// Forget every entry within `radius_m` of `pos` — retired and expired
+  /// history included. Returns how many were removed. Arriving at a goal is
+  /// proof the ground is reachable, which outranks any amount of failure
+  /// history, so the carried-over count is dropped here too and the next
+  /// failure there genuinely starts at 1.
   std::size_t clearNear(const Eigen::Vector3f& pos, double radius_m);
 
-  std::size_t size() const { return sites_.size(); }
-  bool empty() const { return sites_.empty(); }
+  /// Sites that are currently SUPPRESSING goals. Expired history does not
+  /// count: this is what the planner logs as "active failed-goal sites", and
+  /// counting records that no longer veto anything would make that line grow
+  /// without bound while meaning less and less.
+  std::size_t size() const;
+  bool empty() const { return size() == 0; }
+
+  /// Every record held, expired history included. For tests and introspection
+  /// — the planner never branches on it.
+  std::size_t historySize() const { return sites_.size(); }
 
 private:
   std::vector<FailedGoalSite> sites_;

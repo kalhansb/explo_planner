@@ -306,6 +306,123 @@ TEST(FailedGoalBlacklist, LongSeed18GapsNeedRetirementNotTtl) {
 }
 
 // ---------------------------------------------------------------------------
+// Failure history has to outlive the suppression window.
+//
+// The test above builds its retirement history from gaps of 210 s and 203 s —
+// both UNDER the 240 s TTL, so no prune ever lands between two failures at the
+// same site. That is what let it pass while the mechanism it names was dead in
+// the field: prune() runs every PLAN tick, and it used to ERASE the record, so
+// a robot returning to a trap after longer than the TTL found nothing there and
+// started counting at 1 again. Retirement was therefore reachable only when
+// every failure fell inside one TTL — the opposite of the "entry ages out while
+// the robot is busy failing somewhere else" case it was written for.
+//
+// The field evidence: across at1 + sr3, 64 robot-runs and 177 nav failures, the
+// logged failure count was 1 on every single one. retire_after=3 never fired.
+// ---------------------------------------------------------------------------
+
+// The core of the fix. Each failure is separated by more than the TTL, with a
+// prune between them exactly as the planner does — the count must still climb.
+TEST(FailedGoalBlacklist, CountSurvivesTtlExpirySoRetirementCanFire) {
+  const double ttl = 240.0;
+  FailedGoalBlacklist bl;
+  bl.setRetireAfter(3);
+  const Eigen::Vector3f trap = p(-42.03f, -23.66f);
+
+  EXPECT_EQ(bl.add(trap, 0.0, 2.0), 1);
+  bl.prune(500.0, ttl);                       // 500 s > ttl: suppression ends
+  EXPECT_EQ(bl.add(trap, 500.0, 2.0), 2)      // ...but the history does not
+      << "a re-failure at a known site restarted the count at 1";
+  bl.prune(1000.0, ttl);
+  EXPECT_EQ(bl.add(trap, 1000.0, 2.0), 3);
+  EXPECT_TRUE(bl.isRetiredNear(trap, 2.0))
+      << "three failures at one site must retire it however far apart they are";
+  bl.prune(1e6, ttl);
+  EXPECT_TRUE(bl.isNear(trap, 2.0)) << "a retired site is never aged out";
+}
+
+// The other half of the contract: keeping the count must NOT extend the veto.
+// Suppression still ends at the TTL, or every place the robot ever failed
+// becomes permanent no-go ground and the planner starves rather than unsticks.
+TEST(FailedGoalBlacklist, ExpiredSiteKeepsHistoryButStopsSuppressing) {
+  FailedGoalBlacklist bl;
+  bl.setRetireAfter(3);
+  bl.add(p(0, 0), 0.0, 2.0);
+  EXPECT_TRUE(bl.isNear(p(0, 0), 2.0));
+
+  bl.prune(300.0, 240.0);
+  EXPECT_FALSE(bl.isNear(p(0, 0), 2.0)) << "expiry must still release the veto";
+  EXPECT_EQ(bl.size(), 0u) << "an expired site is not an ACTIVE site";
+  EXPECT_EQ(bl.historySize(), 1u) << "...but the record is still held";
+  EXPECT_TRUE(bl.empty());
+
+  // Failing there again revives the suppression rather than leaving a record
+  // that counts up invisibly and never vetoes anything.
+  EXPECT_EQ(bl.add(p(0, 0), 300.0, 2.0), 2);
+  EXPECT_TRUE(bl.isNear(p(0, 0), 2.0));
+  EXPECT_EQ(bl.size(), 1u);
+  EXPECT_EQ(bl.historySize(), 1u) << "revival must reuse the record, not append";
+}
+
+// Regression built from the run that exposed this: at1 seed2, atlas. Two sites
+// in the SW corner each caught the robot twice, and the gaps are the real ones
+// (818 s and 804 s) — both far past the 240 s TTL, which is why both were
+// logged k=1 and neither ever retired. Under the fix the second visit counts as
+// the second, and a third would close the trap for the run.
+TEST(FailedGoalBlacklist, Seed2SwCornerTrapAccumulatesAcrossItsRealGaps) {
+  const double ttl = 240.0;
+  const Eigen::Vector3f a = p(-42.03f, -23.66f);
+  const Eigen::Vector3f b = p(-37.66f, -32.81f);
+
+  FailedGoalBlacklist bl;
+  bl.setRetireAfter(3);
+  // t=0 / t=128: the first pass through both traps.
+  EXPECT_EQ(bl.add(a, 0.0, 2.0), 1);
+  EXPECT_EQ(bl.add(b, 128.0, 2.0), 1);
+  // The planner prunes every tick throughout the gap; only the last matters.
+  bl.prune(818.0, ttl);
+  EXPECT_EQ(bl.add(a, 818.0, 2.0), 2) << "seed2 logged this as k=1";
+  bl.prune(932.0, ttl);
+  EXPECT_EQ(bl.add(b, 932.0, 2.0), 2) << "seed2 logged this as k=1";
+  // Neither has failed three times, so neither is written off yet — the fix
+  // makes retirement REACHABLE, it does not make it eager.
+  EXPECT_FALSE(bl.isRetiredNear(a, 2.0));
+  EXPECT_FALSE(bl.isRetiredNear(b, 2.0));
+  bl.prune(1700.0, ttl);
+  EXPECT_EQ(bl.add(a, 1700.0, 2.0), 3);
+  EXPECT_TRUE(bl.isRetiredNear(a, 2.0));
+}
+
+// Arrival outranks history. Reaching a goal proves the ground is passable, so
+// the carried-over count goes with the record and the next failure there is
+// honestly a first failure — otherwise a site the robot has since driven
+// through keeps a head start toward being written off for the run.
+TEST(FailedGoalBlacklist, ArrivalDropsCarriedOverHistory) {
+  FailedGoalBlacklist bl;
+  bl.setRetireAfter(3);
+  bl.add(p(4, 4), 0.0, 2.0);
+  bl.prune(500.0, 240.0);          // expired, but still on the books
+  ASSERT_EQ(bl.historySize(), 1u);
+  EXPECT_EQ(bl.clearNear(p(4, 4), 2.0), 1u);
+  EXPECT_EQ(bl.historySize(), 0u) << "expired history survived an arrival";
+  EXPECT_EQ(bl.add(p(4, 4), 600.0, 2.0), 1);
+}
+
+// visited_goals_ is this same class with retirement off. It has no count to
+// preserve, so it must keep erasing — a growing list of records that veto
+// nothing would be pure leak on the hotter of the two call sites.
+TEST(FailedGoalBlacklist, RetirementOffStillErasesOnPrune) {
+  FailedGoalBlacklist bl;
+  ASSERT_EQ(bl.retireAfter(), 0);
+  for (int i = 0; i < 5; ++i) bl.add(p(1, 1), 100.0);
+  ASSERT_EQ(bl.historySize(), 5u);
+  bl.prune(1000.0, 60.0);
+  EXPECT_EQ(bl.historySize(), 0u) << "retirement-off must not accumulate";
+  EXPECT_EQ(bl.size(), 0u);
+  EXPECT_TRUE(bl.empty());
+}
+
+// ---------------------------------------------------------------------------
 // Retirement as a veto, and the amnesty ordering built on top of it.
 // ---------------------------------------------------------------------------
 
