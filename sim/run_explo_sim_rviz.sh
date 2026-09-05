@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Host-side orchestrator for a WATCHABLE 2-robot exploration + exploitation run
+# Host-side orchestrator for a WATCHABLE N-robot exploration + exploitation run
 # in the hmr_sim `flatforest` world, lidar-only, with RViz.
+#
+# N comes from the scenario yaml, not from this file. It was 2 for every campaign
+# up to 2026-09-05 and the script said so in several places; the team-size series
+# runs 2, 3 and 4, so those literals have been replaced by $ROBOTS/$N_ROBOTS.
 #
 # This is the 2026-08-02 campaign stack (Bags/2026_08_02__flatforest_2robot_lidar
 # _ablation/run_experiment.sh, condition B) with the visualization it never had:
@@ -1828,7 +1832,14 @@ wait_for() {
 }
 
 # --- 0. preflight -----------------------------------------------------------
-log "=== flatforest 2-robot lidar explore+exploit, RViz=$RVIZ gui=$GZ_GUI ==="
+# The banner reports the team from $ROBOTS, which is parsed from the scenario,
+# rather than the "2-robot" literal it used to hardcode. That literal was
+# harmless while every campaign ran two robots and actively misleading the
+# moment one did not: the team-size series makes N the treatment, so a log whose
+# first line names the wrong N misidentifies the arm it belongs to. $N_ROBOTS is
+# set at the top from the same parse the planner census asserts on, so this line
+# cannot drift from what actually spawned.
+log "=== $SCENARIO: ${N_ROBOTS}-robot ($ROBOTS) lidar explore+exploit, RViz=$RVIZ gui=$GZ_GUI ==="
 log "ROS_DOMAIN_ID=$ROS_DOMAIN_ID  (export the same value to inspect by hand)"
 log "targets: $TARGETS"
 log "outputs: $OUTDIR"
@@ -1839,7 +1850,7 @@ if [ "$RVIZ" = "1" ]; then
   log "RViz will use DISPLAY=$DISPLAY"
 fi
 
-# --- 1. simulator (2 robots, lidar-only models) -----------------------------
+# --- 1. simulator (N robots from the scenario, lidar-only models) -----------
 GUI_ARG="headless:=true"; [ "$GZ_GUI" = "1" ] && GUI_ARG="headless:=false"
 start sim "$OUTDIR/sim.log" \
   ros2 launch hmr_sim robot_sim.launch.py scenario:="$SCENARIO" $GUI_ARG
