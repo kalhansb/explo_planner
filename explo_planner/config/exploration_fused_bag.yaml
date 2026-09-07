@@ -1,0 +1,179 @@
+# =======================================================================
+# explo_planner — bag-driven fused-map experiment (waypoint visualization)
+# =======================================================================
+# Param set for HMR_Explo/ws/src/run_explo_experiment.sh: the EIG planner
+# runs against the LIVE fused SCovox map built from the map-test-2 bag
+# (LiDAR occupancy + optional RGB-D semantics, run_fused_experiment.sh
+# pipeline) and publishes its candidate viewpoints (~/candidates
+# MarkerArray, score-colored arrows + cyan selected-goal sphere) and the
+# selected goal (/goal_pose) for RViz.
+#
+# NOTHING CONSUMES THE GOAL: the "robot" replays the bag trajectory, so
+# every NAVIGATE leg ends by the distance-budgeted timeout and the planner
+# replans — that is the point: a fresh candidate set + selection every
+# ~27-45 s of BAG time along the recorded walk. The no-progress watchdog is
+# deliberately disabled (see the nav block); on a skid-steer platform that
+# is not chasing the goal it fires on turns and pauses, not on real stalls.
+#
+# TERRAIN (3D mode): terrain_relative_z: true makes the planner fully
+# terrain-relative on this hilly site (ground spans ~[-11, +22] m):
+#  - the map z-band (roi_min_z/roi_max_z) rides WITH the robot,
+#  - candidates snap to local ground + candidate_z_clearance (frontier
+#    candidates to the ground under their own centroid), so goals and
+#    markers carry a real 3D z,
+#  - NO 2D planning_map: use_planning_map: false runs the planner in
+#    its straight-line fallback — Euclidean candidate costs, no 2D
+#    reachability/free-cell filter. The live scovox projection covers only
+#    the walked corridor and a static GT prior came out ~90% unknown at
+#    planning resolution (unknown counts as occupied), so both starved the
+#    candidate filter. Obstacle rejection still happens against the 3D map
+#    (candidate_occ_thresh at generation + ground snapping).
+# NAV2 NOTE: nav2's 2D stack consumes only (x, y, yaw) from the goal and
+# ignores z — the 3D z rides along for RViz/3D consumers. Set
+# flatten_goal_z: true if a strict-2D consumer chokes on non-zero z.
+#
+# Wiring (single robot, no namespace — overrides the /<robot>/dscovox_node
+# defaults): map/planning_map from the fused scovox_node, pose from TF
+# map->base_link (NDT map->odom + EKF odom->base_link).
+# =======================================================================
+# NODE KEY: `/**` (not `explo_planner:`) — run_explo_dual.sh renames the
+# nodes to explo_planner_bunker / explo_planner_curt, and a params-file
+# block only applies to a node whose name matches its key. With a literal
+# `explo_planner:` key this ENTIRE FILE was silently ignored and every
+# value below fell back to the C++ default.
+/**:
+  ros__parameters:
+    use_sim_time: true               # bag-driven (ros2 bag play --clock)
+    robot_name: "atlas"              # cosmetic here (all topics overridden)
+    max_steps: 200
+    output_csv: "/tmp/exploration_fused_bag.csv"
+    map_resolution: 0.10             # matches scovox resolution
+
+    # Frames — pose is TF map->base_frame; goals published in map_frame.
+    map_frame: "map"
+    base_frame: "base_link"          # no robot namespace in the bag stack
+
+    # Live fused map from the fused scovox_node (run_fused_experiment.sh
+    # node, remapped __node:=scovox_node). No 2D planning grid: scovox runs
+    # publish_planning_map:=false, so the planner starts in its
+    # straight-line fallback (see header) as soon as map + pose are ready.
+    dscovox_topic: "/scovox_node/scovox"
+    planning_map_topic: "/scovox_node/planning_map"   # unused while disabled
+    use_planning_map: false          # straight-line mode (see header)
+
+    # Selected NBV goal. Nothing subscribes (no nav stack in the bag replay);
+    # RViz displays it as the selected-waypoint arrow.
+    goal_topic: "/goal_pose"
+
+    # Navigation — tuned for "goal is never pursued": short budgets so a
+    # NAVIGATE leg times out (or the no-progress watchdog fires while the
+    # bag robot stands still) and the planner replans frequently.
+    goal_xy_tolerance: 0.3
+    # >= 0.3 or the node warns: nav2's default yaw checker is 0.25, so a
+    # tighter gate here lets the navigator stop inside its own tolerance but
+    # outside ours, failing a goal the robot is standing on.
+    goal_yaw_tolerance: 0.4
+    goal_rotate_timeout_sec: 20.0    # skid-steer 180 deg in place, slow yaw rate
+    integrate_wait: 2.0
+
+    # --- Distance-budgeted timeout: the ONLY replan trigger in bag replay ---
+    # budget = clamp(dist / speed * safety, min, max), evaluated in BAG time
+    # (use_sim_time: true), so it is independent of the `ros2 bag play --rate`.
+    # speed 0.15 m/s is the survey pace measured off the replayed TF (~0.13);
+    # the stock 0.5 m/s is a driving-robot number and made every budget 3x
+    # too short. Candidate radii are 2-8 m, so this yields a replan every
+    # ~27 s (2 m goal) to 45 s (>=3.4 m, ceiling) of bag time.
+    nav_speed_estimate_mps: 0.15
+    nav_safety_factor: 2.0
+    nav_min_timeout_sec: 15.0
+    nav_max_timeout_sec: 45.0
+
+    # --- No-progress watchdog: DISABLED for bag replay ---
+    # It compares cumulative_distance_ (total path length walked, NOT closing
+    # distance to the goal) against a threshold per window. Two reasons it is
+    # meaningless here and actively harmful:
+    #   1. Nothing consumes /goal_pose — the robot replays a fixed trajectory,
+    #      so its motion is statistically independent of the goal. "No
+    #      progress" therefore carries ZERO information about navigation; it
+    #      just trips whenever the recorded walk happens to pause.
+    #   2. Bunker Mini (tracked) and CURT Mini (wheeled) are both skid-steer
+    #      and CANNOT strafe, so they turn in place to face a goal. An in-place
+    #      turn translates 0 m and is indistinguishable from being wedged.
+    # threshold 0.0 disables it cleanly: the check is `delta < threshold` and
+    # delta is a cumulative sum, so delta >= 0 always and it can never fire.
+    # Re-enable (0.2 m / 30 s) only with a navigator actually driving.
+    progress_min_distance_m: 0.0
+    progress_window_sec: 30.0        # inert while the threshold is 0.0
+    max_pose_jump_m: 1.0             # NDT/EKF corrections are jumps, not travel
+
+    # Failed goals stay blacklisted briefly so consecutive replans from the
+    # same spot pick DIFFERENT waypoints (more varied visualization).
+    failed_goal_radius_m: 2.0
+    failed_goal_ttl_sec: 60.0
+
+    # Coverage termination OFF: a fixed bag path can never saturate the ROI;
+    # the run ends with the bag (or max_steps), not with "done".
+    done_unknown_fraction: 0.0
+    done_min_consecutive_steps: 3
+
+    # Candidate generation (polar grid around the live pose + frontier
+    # centroids from the fused map).
+    candidate_enable_polar: true
+    candidate_n_radial: 8
+    candidate_n_rings: 3
+    candidate_min_radius: 2.0
+    candidate_max_radius: 8.0
+    candidate_n_yaw: 4
+    candidate_robot_z: 0.3           # unused in terrain mode (flat-world z)
+    candidate_occ_thresh: 0.7
+    frontier_cluster_radius_m: 5.0
+
+    # --- Terrain-relative 3D mode (see header) ---
+    terrain_relative_z: true
+    # Candidate/goal height above the detected ground. The platform is the
+    # CURT mini robot (small UGV) — same viewpoint height as the legacy
+    # flat-world candidate_robot_z.
+    candidate_z_clearance: 0.3
+    # Ground search window around the reference z (robot z for polar
+    # candidates, centroid z for frontiers): covers ~20% slopes across the
+    # 8 m candidate disc with margin.
+    ground_search_below_m: 4.0
+    ground_search_above_m: 1.0
+    # Contiguous occupied-stack cap: absorbs the residual ~0.4 m vertical
+    # measurement smear without climbing walls/trunks.
+    ground_stack_max_m: 0.6
+    # Publish the true 3D z on /goal_pose (nav2 ignores z; RViz shows it).
+    flatten_goal_z: false
+
+    # ROI = the whole gt-map footprint (map spans x[-110,120] y[-95,111]),
+    # so no candidate is rejected just for leaving a toy box.
+    roi_min_x: -115.0
+    roi_max_x:  125.0
+    roi_min_y: -100.0
+    roi_max_y:  115.0
+    # With terrain_relative_z: true this z band is RELATIVE to the robot's
+    # current altitude and rides with it (map-cache ingest clip, frontier
+    # extraction and the FOV/EIG ray z-clip all re-band as the robot climbs).
+    # +4 covers the 10 m FOV rays at +-22.5 deg pitch plus local slope; the
+    # floor is ground_search_below_m plus the ~1 m re-band hysteresis, so the
+    # candidate ground search can never poke below the ingested slab.
+    roi_min_z: -5.0
+    roi_max_z:  4.0
+
+    # FOV evaluation for EIG scoring (matches the RGB-D-ish default geometry).
+    fov_hfov: 1.047
+    fov_vfov: 0.785
+    fov_min_range: 0.3
+    fov_max_range: 10.0
+    fov_h_rays: 16
+    fov_v_rays: 12
+    fov_occ_stop: 0.7
+
+    cost_grid_radius_cap_m: 0.0      # unused in straight-line mode (no
+                                     # planning_map to flood); auto if one
+                                     # ever comes back
+
+    # Single robot, pure exploration: no MinPos, no tree-target overlay
+    # (no target_scheduler_node runs in this experiment).
+    coordination_enabled: false
+    exploitation_enabled: false

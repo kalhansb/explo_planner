@@ -281,6 +281,36 @@ docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/i
   && ros2 launch explo_planner exploration_experiment.launch.py robot:=atlas'
 ```
 
+### Real-robot runs (Bunker Mini + CURT Mini)
+
+Layer [`config/exploration_real_robot.yaml`](config/exploration_real_robot.yaml)
+over the shared file with the `params_file` argument that both launch files
+accept. Its timeouts are derived from measured motion in the 2026-07-31 bags,
+and it carries each platform's `base_frame` — without which the node falls back
+to `<robot_name>/base_link`, a frame that exists on neither robot, and the
+planner never acquires a pose:
+
+```bash
+CFG=$(ros2 pkg prefix explo_planner)/share/explo_planner/config
+
+# two robots — per-robot blocks in the overlay supply the frames
+ros2 launch explo_planner multi_robot_exploration.launch.py \
+     robots:=bunker,curt params_file:=$CFG/exploration_real_robot.yaml
+
+# one robot — this launch has no namespace, so pass the frame as an argument
+ros2 launch explo_planner exploration_experiment.launch.py \
+     robot:=curt base_frame:=base_link_curt \
+     params_file:=$CFG/exploration_real_robot.yaml
+```
+
+The reasoning behind every value in the overlay, the script that measures them
+from a bag of the robot driving, and the site values that cannot be measured
+are in [docs/real_robot_tuning.md](../docs/real_robot_tuning.md).
+
+Read that file's header before the first run at a new site: the ROI box,
+`proximity_peer_pose_topics` and the bunker TF conflict all need attention and
+all fail *quietly* if skipped.
+
 All tuning lives in [`config/shared_params.yaml`](config/shared_params.yaml)
 (the shared parameter file, loaded by every launch file). It now ships **field defaults**: `use_sim_time:
 false`, `done_action: idle`, `terrain_relative_z: true`, `coordination_enabled:

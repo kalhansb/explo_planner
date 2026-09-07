@@ -1,0 +1,186 @@
+# =======================================================================
+# explo_planner — REAL ROBOT OVERLAY (Bunker Mini + CURT Mini)
+# =======================================================================
+# This is an OVERLAY, not a standalone param set. Both launch files take a
+# params_file argument that layers it on top of shared_params.yaml.
+#
+#   CFG=$(ros2 pkg prefix explo_planner)/share/explo_planner/config
+#
+#   # --- TWO ROBOTS -------------------------------------------------
+#   # The per-robot blocks at the bottom supply each platform's frames.
+#   ros2 launch explo_planner multi_robot_exploration.launch.py \
+#        robots:=bunker,curt \
+#        params_file:=$CFG/exploration_real_robot.yaml
+#
+#   # --- ONE ROBOT --------------------------------------------------
+#   # exploration_experiment.launch.py has NO namespace, so its node is
+#   # /explo_planner and the per-robot blocks below do NOT match it. Its
+#   # per-node dict also wins over this file for map_frame/base_frame, so
+#   # PASS THE FRAME AS A LAUNCH ARG — the `/**` block below still applies
+#   # everything else (the no-progress watchdog above all).
+#   ros2 launch explo_planner exploration_experiment.launch.py \
+#        robot:=curt base_frame:=base_link_curt \
+#        params_file:=$CFG/exploration_real_robot.yaml
+#   #    ... or robot:=bunker base_frame:=base_link
+#
+# It carries ONLY the keys where hardware differs from shared_params.yaml,
+# plus the per-robot frames. Everything else is inherited, so there is one
+# place to change a shared value and no silent drift between the two files.
+#
+# -----------------------------------------------------------------------
+# MEASURED MOTION — the basis for every timeout below
+# -----------------------------------------------------------------------
+# Derived from the two 2026-07-31 bags with scripts/measure_bag_motion.py
+# (repo root), not guessed. Bunker needed --only-3d to read past its doubled
+# odom->base_link edge; see the TF WARNING below. docs/real_robot_tuning.md
+# walks through how each figure became a value here.
+#
+#                         BUNKER (tracked)   CURT (wheeled)
+#   mean speed              0.223 m/s          0.203 m/s
+#   p90 / p99 speed         0.510 / 0.816      0.603 / 1.459 m/s
+#   max speed               1.99 m/s           2.26 m/s
+#   yaw rate p90            0.241 rad/s        0.261 rad/s
+#   -> 180 deg turn         13.0 s             12.0 s
+#   stationary fraction     18 %               49 %
+#   longest standstill      1.9 s              22.6 s
+#   min travel / 30 s win   1.33 m             0.51 m
+#
+# CURT is the binding constraint on every timeout: it is stationary half
+# the time and stands still for up to 22.6 s at a stretch.
+#
+# BOTH PLATFORMS ARE SKID-STEER AND CANNOT STRAFE. They stop and rotate to
+# face a goal, and an in-place rotation translates 0 m. Every
+# distance-over-time watchdog must therefore tolerate at least one full
+# 180 deg turn (~13 s) of zero translation on a perfectly healthy robot.
+#
+# -----------------------------------------------------------------------
+# !!! TF BLOCKER — FIX BEFORE ANY HARDWARE RUN !!!
+# -----------------------------------------------------------------------
+# The bunker recording carries TWO publishers on odom->base_link:
+#   - 10 Hz, 3D (roll/pitch present, z=-0.124)   <- coherent, used above
+#   - 50 Hz, planar (z=0.0 exactly, yaw-only)    <- freezes for up to 54.7 s
+# They interleave and disagree by ~6.4 m; 8545 of 25642 samples jump >1 m.
+# tf2 cannot arbitrate two publishers on one edge — lookups oscillate
+# between contradictory poses, and max_pose_jump_m will silently swallow
+# the resulting deltas as "teleports", freezing cumulative_distance_.
+# Shut down whichever publisher is wrong before any real run.
+#
+# SECOND TF CONSTRAINT — no two robots may publish the same TF edge. The
+# localiser configs (hmr_localisation/config/gt_ouster_ndt_tree_*.yaml)
+# currently BOTH declare global_frame_id: map + odom_frame_id: odom, which
+# collides the moment the two robots share a ROS domain. The bags avoid it
+# because curt was recorded as map_curt -> odom_curt -> base_link_curt.
+# Give each robot its own odom (and map, if not fusing) frame at launch,
+# and make the per-robot blocks at the bottom of this file match.
+# =======================================================================
+/**:
+  ros__parameters:
+    # -------------------------------------------------------------------
+    # No-progress watchdog — THE ONE VALUE THAT MUST NOT BE INHERITED
+    # -------------------------------------------------------------------
+    # shared_params.yaml ships 15.0 s / 0.2 m. That is unsafe on these two
+    # platforms: CURT stands still for up to 22.6 s at a stretch on a
+    # healthy run, which is LONGER than the whole 15 s window, and a 180
+    # deg in-place turn adds ~13 s of zero translation on top. The check is
+    # `cumulative_distance_ - mark < progress_min_distance_m`, i.e. total
+    # path walked, NOT closing distance — so a stationary-but-fine robot
+    # trips it, failGoal("no-progress") fires, and the goal the robot is
+    # standing on gets blacklisted under a failed_goal_radius_m disc for
+    # failed_goal_ttl_sec.
+    #
+    # 30 s clears CURT's worst measured standstill (22.6 s) with margin,
+    # and 0.25 m sits at half its worst measured travel in any 30 s window
+    # (0.51 m) — so a genuinely wedged robot still trips it within one
+    # window, but a slow or turning one never does.
+    progress_window_sec: 30.0
+    progress_min_distance_m: 0.25
+
+    # A 180 deg in-place turn measures 12-13 s at the p90 yaw rate. The
+    # inherited 15.0 leaves ~2 s for settling before failGoal("budget-
+    # rotate") blacklists a goal the robot has already reached. 25 s is
+    # one full turn plus a comfortable settle.
+    goal_rotate_timeout_sec: 25.0
+
+    # INHERITED DELIBERATELY (do not "tighten" these for hardware):
+    #   nav_safety_factor 3.0 / nav_min_timeout_sec 30.0 /
+    #   nav_max_timeout_sec 180.0 — CURT is stationary 49 % of the time, so
+    #   wall-clock budgets must be ~2x the moving-time estimate before any
+    #   safety factor. The watchdog above is what catches a wedged robot;
+    #   the budget is not, and shortening it only aborts healthy slow hops.
+    #   max_pose_jump_m 1.0 — UNVALIDATED. map->odom is constant in both
+    #   bags (max correction 0.000 m: odometry only, no loop closure), so
+    #   this pipeline has never met a real SLAM discontinuity. Watch
+    #   distance_traveled across the first NDT correction in the field.
+
+# =======================================================================
+# PER-ROBOT BLOCKS
+# =======================================================================
+# Keys match the fully-qualified node names produced by
+# multi_robot_exploration.launch.py (namespace=<robot>, name=explo_planner).
+#
+# base_frame is the reason this file exists. Left unset, the node computes
+# base_frame = robot_name + "/base_link" (explo_planner_node.cpp:668) —
+# `bunker/base_link` and `curt/base_link`, NEITHER of which exists in these
+# robots' TF trees. The lookup fails, the planner never gets a pose, and it
+# sits silently without ever reaching PLAN.
+# -----------------------------------------------------------------------
+/bunker/explo_planner:
+  ros__parameters:
+    robot_name: "bunker"
+    base_frame: "base_link"
+    map_frame: "map"
+    nav_speed_estimate_mps: 0.22     # measured mean, tracked platform
+    # Used only by a hand-run `ros2 run`; both launch files compute their own
+    # output_csv in the per-node dict, which is applied after this file.
+    output_csv: "/tmp/exploration_bunker.csv"
+    # Two-robot team membership. multi_robot_exploration.launch.py sets both
+    # of these from its robots:= list (its dict wins, with the same values);
+    # a hand launch (`ros2 run ... -r __ns:=/bunker`) gets them only from
+    # here. Neither block matches the single-robot launch's /explo_planner
+    # node, so a robot running alone keeps rendezvous inert (0), as it should.
+    rendezvous_expected_peers: 1
+    targets_topic: "/exploration/targets/bunker"
+
+/curt/explo_planner:
+  ros__parameters:
+    robot_name: "curt"
+    base_frame: "base_link_curt"
+    map_frame: "map"                 # map_curt if the two are NOT map-fused
+    nav_speed_estimate_mps: 0.20     # measured mean, wheeled platform
+    output_csv: "/tmp/exploration_curt.csv"
+    rendezvous_expected_peers: 1     # see bunker's block
+    targets_topic: "/exploration/targets/curt"
+
+# =======================================================================
+# SET BEFORE THE FIRST RUN AT A NEW SITE — these cannot be measured from
+# the bags and are WRONG by default. Left as-is they fail quietly.
+# =======================================================================
+# 1. ROI BOX. shared_params.yaml ships roi_min/max_x -51.3..100.9 and
+#    roi_min/max_y -38.7..74.5 — the extent of a PREVIOUS site. Candidates
+#    outside the box are discarded, so a box that misses the real survey
+#    area starves the planner of candidates and it reports done with an
+#    unexplored site. Set the four keys to the actual survey extent in the
+#    map frame, with roi_min_z/roi_max_z (-5.5 / 4.0, terrain-relative)
+#    spanning ground-to-canopy.
+#
+# 2. proximity_peer_pose_topics. UNSET, and the node warns at startup that
+#    the proximity guard is then running on the 1 Hz intent heartbeat
+#    alone. These robots close at up to 2 x 2.26 m/s in the worst measured
+#    case, which is ~4.5 m of unseen approach between heartbeats against a
+#    proximity_hold_dist_m of 5.0 — i.e. effectively no guard at the only
+#    moment it matters. Point it at the peers' 30 Hz localiser poses
+#    (pose_publish_frequency: 30.0 in gt_ouster_ndt_tree_*.yaml); it is
+#    left unset here rather than guessed, because a WRONG topic name
+#    produces exactly the same silent never-holds behaviour.
+#    Entries are "<robot_name>:<topic>" of a PoseWithCovarianceStamped in
+#    the map frame; a bare topic is skipped with a warning at startup. The
+#    NDT pipeline publishes its pose as /pcl_pose — confirm the namespaced
+#    name on the platform with `ros2 topic info -v`, then:
+#      proximity_peer_pose_topics: ["curt:/curt/pcl_pose"]      # bunker's block
+#      proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]  # curt's block
+#
+# 3. rendezvous_max_wait_sec inherits 0.0 = WAIT FOREVER. A robot that
+#    exhausts its goals returns to its anchor and blocks until the whole
+#    team is back in comms. That is correct for a controlled trial and a
+#    field hazard otherwise — set a finite give-up if the team may not
+#    reconvene.

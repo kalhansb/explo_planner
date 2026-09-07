@@ -101,6 +101,13 @@
     # No-progress watchdog (runs in parallel with the budget). If the robot
     # hasn't accumulated >= progress_min_distance_m of travel within
     # progress_window_sec, the goal fails immediately — wedged-robot case.
+    #
+    # HARDWARE: these values are TOO TIGHT for the Bunker Mini / CURT Mini
+    # pair. CURT stands still for up to 22.6 s on a healthy run — longer
+    # than this whole window — and a 180 deg in-place turn adds ~13 s of
+    # zero translation on a skid-steer that cannot strafe. Layer
+    # config/exploration_real_robot.yaml (params_file:= on either launch
+    # file) to get the measured 30.0 / 0.25 instead.
     progress_window_sec: 15.0
     progress_min_distance_m: 0.2
 
@@ -226,7 +233,7 @@
     # (starved candidates / phantom frontiers at the boundary).
     #
     # Values below are the ones proven in the terrain-mode bag run
-    # (scovox/config/exploration_fused_bag.yaml): enough below to catch ground
+    # (exploration_fused_bag.yaml, alongside this file): enough below to catch ground
     # on a downslope, enough above for canopy and overhangs.
     #
     # INVARIANT — the band must contain the whole ground-search window from

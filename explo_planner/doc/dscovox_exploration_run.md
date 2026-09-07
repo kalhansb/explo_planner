@@ -106,7 +106,7 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
 ## 3. explo_planner against the dscovox map — leave running
 
 Reuses the bag-tuned param set
-([../../scovox/config/exploration_fused_bag.yaml](../../scovox/config/exploration_fused_bag.yaml),
+([../config/exploration_fused_bag.yaml](../config/exploration_fused_bag.yaml),
 bind-mounted live), overriding only the map topic to the merger. `base_frame:
 base_link` and `use_planning_map: false` in that yaml already fit — the merger
 publishes no `planning_map`, and terrain-3D mode does not need one.
@@ -116,7 +116,7 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
   source /opt/ros/jazzy/setup.bash; source /scovox/install/setup.bash
   source /tmp/ovl/install/setup.bash
   ros2 run explo_planner explo_planner_node --ros-args \
-    --params-file /scovox/config/exploration_fused_bag.yaml \
+    --params-file /tmp/ovl/install/explo_planner/share/explo_planner/config/exploration_fused_bag.yaml \
     -p dscovox_topic:=/robot1/dscovox_node/scovox
 '
 ```
@@ -145,7 +145,7 @@ with nobody subscribed to `/explo_planner/candidates` it publishes nothing
 (headless = markers silent; the CSV still logs scores). Start RViz **before** the
 bag (step 4) so it's subscribed when the first PLAN tick fires.
 
-Use the purpose-built [../../scovox/config/explo_experiment_dscovox.rviz](../../scovox/config/explo_experiment_dscovox.rviz):
+Use the purpose-built [../rviz/explo_experiment_dscovox.rviz](../rviz/explo_experiment_dscovox.rviz):
 same layout as `explo_experiment.rviz`, but its **Semantic Map** cloud already
 points at the merger (`/robot1/dscovox_node/pointcloud`), so the dscovox map draws
 under the markers with **no manual retarget**. **Candidates**
@@ -163,7 +163,7 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
   export DISPLAY="${DISPLAY:-:1}"
   export __NV_PRIME_RENDER_OFFLOAD=1
   export __GLX_VENDOR_LIBRARY_NAME=nvidia
-  rviz2 -d /scovox/config/explo_experiment_dscovox.rviz --ros-args -p use_sim_time:=true
+  rviz2 -d /tmp/ovl/install/explo_planner/share/explo_planner/rviz/explo_experiment_dscovox.rviz --ros-args -p use_sim_time:=true
 '
 # software-GL fallback if RViz crashes on GL:
 #   export LIBGL_ALWAYS_SOFTWARE=1

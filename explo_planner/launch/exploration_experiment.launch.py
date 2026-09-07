@@ -37,6 +37,19 @@ def generate_launch_description():
                               description='Frame the dscovox map (and goals) live in'),
         DeclareLaunchArgument('base_frame', default_value='',
                               description='Robot base frame (empty = <robot>/base_link)'),
+        # Optional overlay layered ON TOP of shared_params.yaml — e.g. the
+        # hardware set, config/exploration_real_robot.yaml. Defaults to
+        # shared_params.yaml itself, so the unset case loads that file twice
+        # (a no-op) rather than needing a conditional here.
+        #
+        # NOTE: the per-node dict below is applied AFTER this file and wins,
+        # so map_frame/base_frame/output_csv/max_steps must still come from
+        # the launch arguments — on hardware pass base_frame:=base_link (or
+        # base_link_curt) explicitly. The overlay's `/**` block still applies
+        # to every key the dict does not set (the no-progress watchdog above
+        # all).
+        DeclareLaunchArgument('params_file', default_value=shared_params,
+                              description='Extra param file layered over shared_params.yaml'),
         DeclareLaunchArgument('trajectory_scoring', default_value='false',
                               description='Sum FOV scores along path (SSMI ablation)'),
         DeclareLaunchArgument('trajectory_sample_spacing_m', default_value='1.5',
@@ -50,6 +63,7 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 shared_params,
+                LaunchConfiguration('params_file'),
                 {
                     'robot_name': LaunchConfiguration('robot'),
                     'use_sim_time': ParameterValue(

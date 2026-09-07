@@ -190,8 +190,18 @@ All tuning lives in [`shared_params.yaml`](../explo_planner/config/shared_params
 that file unchanged, plus a small **per-robot overlay** for the handful of
 values that must differ.
 
-Ship the overlay as its own file and pass both — later `--params-file` wins,
-the same base + overlay idiom SCovox uses:
+The shipped overlay for the Bunker Mini + CURT Mini pair is
+[`exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml).
+Its `/bunker/explo_planner` and `/curt/explo_planner` blocks carry each
+platform's `base_frame`, `robot_name`, `targets_topic` and
+`rendezvous_expected_peers`, and its `/**` block the timeouts measured from
+the robots' own bags. How every value in it was derived, and which keys are
+required to update before real runs, is the
+[real-robot tuning guide](real_robot_tuning.md). Site-specific keys (ROI box,
+peer pose topics, CSV names) go in a further per-robot file on top.
+
+Ship that file as its own overlay and pass all of them — later `--params-file`
+wins, the same base + overlay idiom SCovox uses:
 
 ```yaml
 # field_curt.yaml   ('/**' so it matches the node in any namespace)
@@ -231,13 +241,13 @@ the same base + overlay idiom SCovox uses:
 
 | Setting | Shipped | Check |
 |---------|---------|-------|
-| `base_frame` | `""` → `<robot_name>/base_link` | If the localiser publishes a bare `base_link`, set it explicitly or every TF lookup fails. |
+| `base_frame` | `""` → `<robot_name>/base_link` | Neither platform has that frame: bunker publishes `base_link`, curt `base_link_curt`. The shipped overlay sets both; a single-robot launch must pass `base_frame:=` as an argument (its dict wins over the yaml). Wrong → every TF lookup fails and the planner never reaches PLAN. |
 | `goal_xy_tolerance` / `goal_yaw_tolerance` | `0.4` / `0.4` | Must be strictly **looser** than Nav2's goal checker (shipped default 0.25/0.25). If tighter, Nav2 stops inside its own tolerance but outside the planner's, arrival is never registered, and the planner blacklists a goal the robot is standing on. The node warns at startup. |
 | `goal_republish_sec` | `5.0` | Nav2 turns every `goal_pose` into a fresh `NavigateToPose` goal; an unthrottled re-send fires `GoalUpdated` continuously, which halts the recovery subtree while still burning its retries — transient failures become aborts. Set `0` for publish-on-change once bringup is known reliable. |
 | `roi_min/max_x/y` | full-AO box | Tighten to the phase-1 box (commented next to these values in the yaml) when only part of the AO is worked. The full box wastes candidates and leaves the coverage floor high enough that `done_unknown_fraction: 0.05` may never be satisfiable — the run then ends on battery instead of on coverage. |
 | Z-band | planner `roi_min/max_z` = `-5.5 … +4.0`, **robot-relative** | With `terrain_relative_z: true` this band rides with the robot. The SCovox/DScovox `share_roi_z_min/max` filters are **absolute** and must be a **superset** of everywhere that window can sit. Otherwise free voxels near the edge never reach the fused map and read as unknown — starved candidates and phantom frontiers at the boundary. |
-| `done_unknown_fraction` | `0.05` × 3 steps | **Calibrate at the shakedown run.** Watch where the logged `source=scovox` fraction plateaus and set the threshold above that floor. |
-| `candidate_enable_polar` | `true` | Check at shakedown whether selected goals sit far apart or bunch near the robot. The 96-sample polar ring can outscore frontier goals and burn battery on short hops; if so run frontier-only for the timed runs. |
+| `done_unknown_fraction` | `0.05` × 3 steps | **Calibrate from the validation run.** Watch where the logged `source=scovox` fraction plateaus and set the threshold above that floor. |
+| `candidate_enable_polar` | `true` | Check on the validation run whether selected goals sit far apart or bunch near the robot. The 96-sample polar ring can outscore frontier goals and burn battery on short hops; if so run frontier-only for the timed runs. |
 
 ---
 
@@ -281,17 +291,24 @@ cells painted lethal.
 **6. Segmentation** (bunker), **multispectral calibration panel capture**
 (curt), E-stop test, then **start all recordings**.
 
-**7. T0 — the planners.** One per robot, on that robot's own PC:
+**7. T0 — the planners.** One per robot, on that robot's own PC,
+**namespaced so the overlay's `/bunker/explo_planner` block matches the node**:
 ```bash
-ros2 run explo_planner explo_planner_node --ros-args \
-    --params-file /tmp/explo_ws/install/explo_planner/share/explo_planner/config/shared_params.yaml \
-    --params-file /field/field_bunker.yaml
+CFG=/tmp/explo_ws/install/explo_planner/share/explo_planner/config
+ros2 run explo_planner explo_planner_node --ros-args -r __ns:=/bunker \
+    --params-file $CFG/shared_params.yaml \
+    --params-file $CFG/exploration_real_robot.yaml \
+    --params-file /field/field_bunker.yaml     # site keys: ROI box, peer pose topic, CSV
 ```
-The launch-file form is convenient when no overlay is needed, but it cannot
-pass the per-robot settings in §5:
+Both launch files also accept the same overlay via `params_file:=`. The
+single-robot launch is for a robot running **alone**: its node is the
+un-namespaced `/explo_planner`, which the per-robot blocks do not match, and
+its own argument dict wins for the frames — so pass `base_frame:=`
+explicitly:
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
-    robot:=bunker output_csv:=/tmp/RA-1_bunker.csv
+    robot:=bunker base_frame:=base_link output_csv:=/tmp/RA-1_bunker.csv \
+    params_file:=$CFG/exploration_real_robot.yaml
 ```
 
 > `multi_robot_exploration.launch.py` starts **both** planners on one host. That
@@ -479,7 +496,7 @@ Per robot, after every run:
 
 The exploitation-contribution metric needs **both** the planner CSV and
 `/exploration/intents` carrying the exploit fields. Verify both are present in
-the shakedown bag before spending a battery on a measured run.
+the validation-run bag before spending a battery on a measured run.
 
 ---
 
@@ -490,6 +507,7 @@ the shakedown bag before spending a battery on a measured run.
 | `doc/experiment_script_forest_inspection.md` (hmr_explo workspace) | Campaign design: AO, sub-areas, targets, run matrix, metrics. |
 | [explo_planner README](../explo_planner/README.md) | Planner internals: EIG scoring, MinPos, rendezvous, vantage selection. |
 | [`shared_params.yaml`](../explo_planner/config/shared_params.yaml) | The shared parameter file: every parameter, heavily commented with the reasoning behind each field default. |
+| [real_robot_tuning.md](real_robot_tuning.md) | How the hardware overlay's values were derived from the robots' own bags, each parameter it sets, and the keys required to update before real runs. |
 | [SCovox user manual](../../scovox/docs/user_manual.md) | Mapping and fusion: bring-up, the three delta-stream gates, bandwidth tuning. |
 | [dscovox_exploration_run.md](../explo_planner/doc/dscovox_exploration_run.md) | Bag-replay dry run of the exploration half. |
 | [dscovox_exploitation_run.md](../explo_planner/doc/dscovox_exploitation_run.md) | Bag-replay dry run of the vantage ring and target queue, plus the live tree detector. |

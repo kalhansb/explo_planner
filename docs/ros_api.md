@@ -516,6 +516,7 @@ yaml — set `exploitation_enabled: false` there for strictly-pure runs).
 | `map_frame` / `base_frame` | `map` / `''` | Frame overrides. |
 | `trajectory_scoring` | `false` | SSMI ablation (always passed — wins over the yaml). |
 | `trajectory_sample_spacing_m` | `1.5` | ⬑ |
+| `params_file` | `shared_params.yaml` | Extra parameter file layered over the shared file; the arguments above still win for their keys. |
 
 ### exploitation_experiment.launch.py
 
@@ -550,6 +551,7 @@ one planner per robot PC by hand — this is also the only launch that sets
 | `rendezvous_enabled` | `true` | Anchor-return reconnection. |
 | `rendezvous_max_wait_sec` | `0.0` | Barrier give-up. |
 | `proximity_stop_enabled` | `true` | Coordinated yield. |
+| `params_file` | `''` | Overlay layered over the shared file — [`config/exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml) on hardware, whose `/<robot>/explo_planner` blocks match these namespaced nodes. See [real_robot_tuning.md](real_robot_tuning.md). |
 
 ---
 

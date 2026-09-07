@@ -27,6 +27,13 @@ from launch_ros.actions import Node
 def launch_setup(context):
     pkg_dir = get_package_share_directory("explo_planner")
     shared_params = os.path.join(pkg_dir, "config", "shared_params.yaml")
+    # Optional overlay layered ON TOP of shared_params.yaml — e.g. the hardware
+    # set, config/exploration_real_robot.yaml, whose per-robot
+    # `/<robot>/explo_planner:` blocks carry each platform's base_frame. Unset
+    # falls back to shared_params itself, i.e. loading it twice: a no-op.
+    # Unlike the single-robot launch, base_frame is NOT in the per-node dict
+    # below, so the overlay is the mechanism for it here.
+    params_file = LaunchConfiguration("params_file").perform(context) or shared_params
 
     robots_raw = LaunchConfiguration("robots").perform(context)
     robots = [r.strip() for r in robots_raw.split(",") if r.strip()]
@@ -66,6 +73,7 @@ def launch_setup(context):
             output="screen",
             parameters=[
                 shared_params,
+                params_file,
                 {
                     "use_sim_time": use_sim_time,
                     "robot_name": robot,
@@ -111,6 +119,10 @@ def generate_launch_description():
         # dead and every planner silently idle. Gazebo/bag runs must pass true.
         DeclareLaunchArgument("use_sim_time", default_value="false",
                               description="Use /clock (sim/bag runs only)"),
+        DeclareLaunchArgument("params_file", default_value="",
+                              description="Extra param file layered over "
+                                          "shared_params.yaml (e.g. "
+                                          "config/exploration_real_robot.yaml)"),
         DeclareLaunchArgument("planner", default_value="eig",
                               description="Planner type: eig, entropy, frontier, random"),
         DeclareLaunchArgument("output_dir", default_value="/tmp",
