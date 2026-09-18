@@ -131,7 +131,8 @@ EvalResult FovEvaluator::evaluate(
     auto c_origin = map.posToCoord(ray_start);
     auto c_end    = map.posToCoord(ray_end);
 
-    scovox::RayIterator(c_origin, c_end,
+    scovox::ExactRayIterator(ray_start.cast<double>(), c_origin, c_end,
+        map.resolution(),
         [&](const Bonxai::CoordT& c) -> bool {
           result.total_ray_voxels++;
           const UnifiedVoxel* ptr = acc.value(c);
@@ -195,7 +196,8 @@ EvalResult FovEvaluator::evaluateSSMI(
     float free_kl_acc = 0.0f;  // accumulated KL from free observations
     bool  occluded = false;    // ray terminated early on an occupied voxel
 
-    scovox::RayIterator(c_origin, c_end,
+    scovox::ExactRayIterator(ray_start.cast<double>(), c_origin, c_end,
+        map.resolution(),
         [&](const Bonxai::CoordT& c) -> bool {
           result.total_ray_voxels++;
           const UnifiedVoxel* ptr = acc.value(c);
