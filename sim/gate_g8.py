@@ -25,7 +25,7 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
                                     (default "hybrid,off")
         GATE_CONTROL_ARMS           arms that run with the manoeuvre disabled
                                     (default "off")
-        GATE_SCHEMA_VERSION         event-log schema to require (default 10;
+        GATE_SCHEMA_VERSION         event-log schema to require (default 11;
                                     pass the banked generation's own number to
                                     re-gate an older campaign, e.g. 5 for a
                                     gen-16 one or 3 for a gen-9 one)
@@ -417,7 +417,12 @@ DONE_UNKNOWN_FRACTION = 0.640
 # a reader pooling v6 with v5 gets numbers rather than an error. The pin exists
 # to make that pooling impossible inside one campaign directory. It cannot do
 # that job if the reason for a version is only in the commit that raised it.
-SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "10"))
+#
+# v10 (generation 29) and v11 (generation 31) moved with the header and are
+# recorded there, not here — the paragraph above already says the authority is
+# `kSchemaVersion` and that this list must not be re-derived. v11 is the first
+# VOCABULARY widening since v4: `appointment_leg`.
+SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "11"))
 # Generation-9 treatment configuration (check 3f). Overridable so the check can
 # be calibrated against a known-answer case — a gate that has never been shown
 # to FAIL on a bad input is not evidence of anything, which is the lesson the

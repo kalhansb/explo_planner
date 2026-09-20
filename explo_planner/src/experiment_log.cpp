@@ -1070,6 +1070,29 @@ void ExperimentLog::logRendezvousOutcome(const ExperimentContext& ctx,
   end();
 }
 
+void ExperimentLog::logAppointmentLeg(const ExperimentContext& ctx,
+                                      const AppointmentLegEvent& e) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("appointment_leg", ctx);
+  text("kind", e.kind);
+  text("cause", e.cause);
+  num("dist_m", e.dist_m);
+  num("dest_x", e.dest_x);
+  num("dest_y", e.dest_y);
+  integer("cell", e.cell);
+  integer("escapes_used", e.escapes_used);
+  // Written on every row rather than left to the param dump: normalising a
+  // rung count against a cap the reader had to go and fetch is exactly how
+  // "3/3 escapes spent" gets read as "3 escapes, plenty left".
+  integer("escapes_max", e.escapes_max);
+  // Both carry -1.0 off their own kind. Written anyway, for the reason the
+  // refusal columns on rendezvous_agreed are: an absent key and a sentinel one
+  // must not be the same thing to a reader counting rows.
+  num("leg_sec", e.leg_sec);
+  num("rolled_to_sec", e.rolled_to_sec);
+  end();
+}
+
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));

@@ -698,14 +698,35 @@ private:
   void startReturnTo(const Eigen::Vector3f& dest, const char* what,
                      const char* reason);
   void doReturnNav();
-  /// doReturnNav's two give-up watchdogs, asking whether the leg they are about
-  /// to end was an APPOINTMENT leg that died too far from the cell to hand the
-  /// barrier an honest presence. Returns true when it has taken the robot back
-  /// to PLAN for a later rung, in which case the caller must not also transition;
-  /// false leaves the watchdog's own RETURN_SYNC hand-off untouched. Shared
-  /// because the budget and the no-progress exits differ only in what tripped
-  /// them, and a rule enforced at one of two exits is a rule with a door in it.
-  bool deferAppointmentLeg(const char* what_failed, float dist);
+  /// doReturnNav's two give-up watchdogs, asking what to do about an
+  /// APPOINTMENT leg that has stopped too far from the cell to hand the barrier
+  /// an honest presence. Returns true when it has taken the leg over — an
+  /// escape manoeuvre, or the terminal roll back to PLAN — in which case the
+  /// caller must not also transition; false leaves the watchdog's own
+  /// RETURN_SYNC hand-off untouched. Shared because the budget and the
+  /// no-progress exits differ only in what tripped them, and a rule enforced at
+  /// one of two exits is a rule with a door in it.
+  bool appointmentLegWatchdog(const char* what_failed, float dist);
+  /// End an escape leg and aim at the agreed cell again, with a fresh budget
+  /// and a fresh no-progress window. The other half of the escape rung above;
+  /// `why` is what ended the leg, for the log.
+  void resumeAppointmentDrive(const char* why);
+  /// Size the nav budget and open the no-progress window for a manoeuvre leg of
+  /// `dist` metres. Shared by the departure in startReturnTo and by every escape
+  /// resume, which must not inherit the budget that just fired. Reads
+  /// state_enter_time_ as the leg's start, so a caller that is not entering a
+  /// state has to stamp it first.
+  void armManoeuvreLegBudget(float dist);
+  /// Write one `appointment_leg` row for the rung just taken. Exists because
+  /// all three rungs report the same seven quantities about the same leg, and
+  /// a ladder whose rows disagree about which leg they describe is worse than
+  /// no rows. `leg_sec` belongs to escape-end rows and `rolled_to_sec` to
+  /// unreached ones; both default to the -1.0 the schema reads as "not this
+  /// kind of row". Call BEFORE any transition — the cell id and the manoeuvre
+  /// can both be closed on the way out.
+  void logAppointmentLegRow(const char* kind, const char* cause, float dist,
+                            double leg_sec = -1.0,
+                            double rolled_to_sec = -1.0);
   void doReturnSync();
   // Mission return (RETURN_HOME). startReturnHome enters the state WITHOUT
   // publishing a goal — abandonNavGoal's cancel-all is fire-and-forget, so a
@@ -1661,6 +1682,33 @@ private:
   /// false and one lapse can cost at most one resume; a second resume needs a
   /// second genuine settle to convert on.
   bool           appointment_settle_converted_ = false;
+  /// "THE DRIVE TO THE CELL IS CURRENTLY STEERING AROUND A STALL."
+  ///
+  /// A watchdog firing on an appointment leg has not shown the cell to be
+  /// unreachable — only that THIS approach stopped working, which is the one
+  /// thing simple_nav_3d cannot say for itself. So the leg answers the way the
+  /// homing ladder does: drive somewhere else briefly, then aim at the same
+  /// destination again from somewhere the approach is different. While this is
+  /// true current_goal_ holds the escape target; the cell it will go back to is
+  /// return_dest_, which the detour never touches.
+  ///
+  /// Bookkeeping, not a safety guard. It answers "is a detour in flight", and
+  /// nothing else in doReturnNav depends on the answer being right, because
+  /// every distance test there measures against return_dest_. The earlier
+  /// design made this flag load-bearing — the arrival test was correct only
+  /// because it ran after a check on this — and that is the arrangement
+  /// return_dest_ exists to retire.
+  ///
+  /// Read only inside doReturnNav, cleared per leg in startReturnTo (the same
+  /// convention as appointment_settle_converted_ above), so leaving it set on
+  /// an exit to RETURN_SYNC is inert: the only ways back into RETURN_NAV are
+  /// startReturnTo, which clears it, and the proximity-hold resume, which is
+  /// resuming this very leg and must preserve it.
+  bool           appointment_escape_active_ = false;
+  /// Escapes spent on the CURRENT appointment leg, against
+  /// rendezvous_escape_max_attempts_. Reset per leg in startReturnTo, so a
+  /// resumed leg gets its own ladder instead of inheriting a spent one.
+  int            appointment_escapes_used_ = 0;
   double         appointment_armed_at_sec_   = -1.0;
   double         appointment_arrived_at_sec_ = -1.0;
   /// HYBRID only: the mid-run trigger has already been allowed one chase for
@@ -2664,8 +2712,20 @@ private:
   // Sized against the link, not the cell grid, though the two happen to agree:
   // two robots inside this of one cell are at most 2x it apart, so 10 m keeps a
   // whole meeting inside a 20 m spread against a 30 m horizon, with the margin
-  // spent on trunks. Wider trades that margin for fewer rolls.
+  // spent on trunks. Wider trades that margin for fewer escape ladders.
   double rendezvous_present_tol_m_ = 10.0;
+  // Escape manoeuvres one appointment leg may spend before its watchdogs stop
+  // re-aiming at the cell and roll the robot to the next rung of the agreed
+  // recurrence. Separate from return_escape_max_attempts_, which governs the
+  // mission-return ladder, so one knob does not silently retune two subsystems
+  // that fail for different reasons at opposite ends of a run.
+  //
+  // 0 disables the ladder and restores the straight-to-roll behaviour, which
+  // makes it the A/B control for the ladder itself. The ceiling that actually
+  // bounds the cost is return_escape_leg_sec (30 s), shared with the homing
+  // ladder because it describes the same manoeuvre: three rungs is at most
+  // 90 s of driving away from a meeting whose barrier waits without limit.
+  int    rendezvous_escape_max_attempts_ = 3;
   // Ceiling on ONE manoeuvre drive leg. The distance-true budget in
   // startReturnTo is deliberately exempt from nav_max_timeout_sec (see there),
   // but "exempt" was unbounded: at nav_speed_estimate 0.15 x safety 3.0 = 20 s/m
@@ -3348,6 +3408,25 @@ private:
   // value until the midpoint drives were deleted on 2026-09-16; nothing writes
   // it now.
   std::string  return_dest_label_;
+  // WHERE THE CURRENT RETURN_NAV LEG IS ACTUALLY GOING — the agreed appointment
+  // cell, or the last-connected anchor. Set by startReturnTo beside the label
+  // above, and the two always describe the same place.
+  //
+  // It exists because current_goal_ answers a DIFFERENT question: "where are
+  // the wheels pointed right now". Those two agree for a plain drive, and they
+  // stop agreeing the moment anything borrows the goal to steer around a
+  // problem — which the escape ladder does. Measuring "have I arrived?" against
+  // current_goal_ therefore meant a robot that aimed 2.5 m behind itself to
+  // break a stall reported reaching the MEETING, from wherever it happened to
+  // be standing, because 2.5 m is inside reconnect_arrive_tol_m_ (4.0). It then
+  // joined a headcount that has no time limit, and waited forever for partners
+  // 40 m away. Ordering the tests so the escape was noticed first would hide
+  // that, not remove it: the next borrow of current_goal_ — for a detour, a
+  // yield, anything — would reintroduce it silently. Holding the destination
+  // separately is what makes the false arrival impossible rather than merely
+  // not-currently-reachable, so every distance test in doReturnNav measures
+  // against this and none against current_goal_.
+  Eigen::Vector3f return_dest_ = Eigen::Vector3f::Zero();
 
   // Reconnect-manoeuvre clock, for the CSV's reconnect_elapsed_sec. Deliberately
   // NOT state_enter_time_: the manoeuvre spans state changes that must not
@@ -4824,6 +4903,7 @@ ExploPlannerNode::ExploPlannerNode()
   hold_escalate_wait_sec_        = dp("hold_escalate_wait_sec", 300.0);
   reconnect_arrive_tol_m_        = dp("reconnect_arrive_tol_m", 4.0);
   rendezvous_present_tol_m_      = dp("rendezvous_present_tol_m", 10.0);
+  rendezvous_escape_max_attempts_ = dp("rendezvous_escape_max_attempts", 3);
   reconnect_nav_max_sec_         = dp("reconnect_nav_max_sec", 600.0);
   // A presence radius inside the arrival tolerance inverts the pair: every
   // give-up short of the cell would roll, including the ones that stopped
@@ -5242,6 +5322,8 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("hold_escalate_wait_sec", hold_escalate_wait_sec_);
     exp_log_->addParamNum("reconnect_arrive_tol_m", reconnect_arrive_tol_m_);
     exp_log_->addParamNum("rendezvous_present_tol_m", rendezvous_present_tol_m_);
+    exp_log_->addParamNum("rendezvous_escape_max_attempts",
+                          rendezvous_escape_max_attempts_);
     exp_log_->addParamNum("reconnect_nav_max_sec", reconnect_nav_max_sec_);
     exp_log_->addParamNum("done_unknown_fraction", done_unknown_fraction_);
     exp_log_->addParamNum("done_min_consecutive_steps",
@@ -12762,6 +12844,7 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   }
 
   return_dest_label_ = what;
+  return_dest_       = dest;
   current_goal_ = CandidateViewpoint{};
   current_goal_.position = dest;
   current_goal_.yaw = latest_yaw_;
@@ -12789,10 +12872,13 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   // started to keep an appointment", which stays true until the manoeuvre
   // ends regardless of what happens to the appointment record.
   appointment_manoeuvre_ = (std::strcmp(what, "appointment") == 0);
-  // A new leg is on the road, not at a barrier: whatever brought the last one
-  // to a stop is spent. Cleared here rather than at the manoeuvre end so a
+  // A new leg is on the road, not at a barrier and not mid-manoeuvre: whatever
+  // brought the last one to a stop is spent, and so is the escape ladder it
+  // spent getting there. Cleared here rather than at the manoeuvre end so a
   // resumed leg cannot resume itself.
   appointment_settle_converted_ = false;
+  appointment_escape_active_    = false;
+  appointment_escapes_used_     = 0;
 
   RCLCPP_INFO(get_logger(),
       "Rendezvous: dispatched [%s], team incomplete (%d/%d peers) "
@@ -12830,17 +12916,20 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
 
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
-  const float dist = std::sqrt(dx * dx + dy * dy);
-  // Manoeuvre legs are exempt from nav_max_timeout_sec: the smart-timeout
-  // ceiling was sized for exploration hops, and a cross-world return clipped
-  // to it dies tens of metres short of a destination whose whole value is
-  // ARRIVING (the connected geometry). Distance-true budget, floor kept; the
-  // no-progress window remains the stuck-robot watchdog.
-  //
-  // Exempt from THAT ceiling, but not unbounded — reconnect_nav_max_sec stops a
-  // leg outspending the barrier it drives toward. The 20 s/m model rate is 3x
-  // conservative, so this binds only on a leg failing SLOWLY; one failing fast
-  // still exits on the 15 s no-progress window, the primary guard, unchanged.
+  armManoeuvreLegBudget(std::sqrt(dx * dx + dy * dy));
+}
+
+// Manoeuvre legs are exempt from nav_max_timeout_sec: the smart-timeout
+// ceiling was sized for exploration hops, and a cross-world return clipped to
+// it dies tens of metres short of a destination whose whole value is ARRIVING
+// (the connected geometry). Distance-true budget, floor kept; the no-progress
+// window remains the stuck-robot watchdog.
+//
+// Exempt from THAT ceiling, but not unbounded — reconnect_nav_max_sec stops a
+// leg outspending the barrier it drives toward. The 20 s/m model rate is 3x
+// conservative, so this binds only on a leg failing SLOWLY; one failing fast
+// still exits on the 15 s no-progress window, the primary guard, unchanged.
+void ExploPlannerNode::armManoeuvreLegBudget(float dist) {
   nav_budget_sec_ = std::max(
       nav_min_timeout_sec_,
       static_cast<double>(dist) * nav_safety_factor_ /
@@ -12919,10 +13008,18 @@ void ExploPlannerNode::doReturnNav() {
     return;
   }
 
+  // return_dest_, NOT current_goal_.position: every test below asks how far
+  // this robot is from the place the MANOEUVRE is for, and current_goal_ only
+  // answers that while nothing has borrowed the goal to steer around something
+  // — see the member for what measuring against the borrowed goal cost. The two
+  // are equal for the whole of an ordinary drive, so this changes no behaviour
+  // outside an escape leg; what it changes is that the borrowed case can no
+  // longer produce a wrong answer at all.
   const auto robot_pos = latest_pos_;
-  const float dx = robot_pos.x() - current_goal_.position.x();
-  const float dy = robot_pos.y() - current_goal_.position.y();
+  const float dx = robot_pos.x() - return_dest_.x();
+  const float dy = robot_pos.y() - return_dest_.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
+
   // reconnect_arrive_tol_m_, NOT goal_xy_tol_: the destination's value is
   // connectivity, not position (see the member). Both robots stopping within
   // this of the same destination leaves them <= 2x it apart, and it turns an
@@ -12988,6 +13085,28 @@ void ExploPlannerNode::doReturnNav() {
     return;
   }
 
+  // ESCAPE-LEG TERMINATION. Bookkeeping, not a guard: the tests above measure
+  // against return_dest_ and are already true during a leg, so this only
+  // decides when the DETOUR is over. Placed after them deliberately — a robot
+  // that reaches the cell, or whose team settles, while steering around a stall
+  // should take that exit now rather than finish a detour it no longer needs.
+  //
+  // The leg ends on arrival at its own target or on its own cap, and
+  // resumeAppointmentDrive puts current_goal_ back on the cell. Note the two
+  // radii are different quantities: kEscapeArriveM is "the detour is done",
+  // reconnect_arrive_tol_m_ above is "I am at the meeting".
+  if (appointment_escape_active_) {
+    const float d = (latest_pos_ - escape_target_).head<2>().norm();
+    const double leg = (this->now() - escape_leg_start_).seconds();
+    if (d < kEscapeArriveM || leg > return_escape_leg_sec_) {
+      resumeAppointmentDrive(d < kEscapeArriveM ? "escape-arrived"
+                                                : "escape-leg-cap");
+    } else {
+      republishGoal(current_goal_);
+    }
+    return;
+  }
+
   const auto now = this->now();
   const double elapsed = (now - state_enter_time_).seconds();
   // Distance-budgeted timeout / no-progress watchdog: if the destination
@@ -13002,10 +13121,10 @@ void ExploPlannerNode::doReturnNav() {
   // where the link once worked, so any progress toward it is progress toward the
   // radio; an appointment drives at the one place the OTHER robots will be, and
   // stopping short of it is not a shorter version of arriving — it is being
-  // somewhere nobody is going. deferAppointmentLeg is where that distinction is
-  // made, and it is asked before both exits.
+  // somewhere nobody is going. appointmentLegWatchdog is where that distinction
+  // is made, and it is asked before both exits.
   if (elapsed > nav_budget_sec_) {
-    if (deferAppointmentLeg("the budget", dist)) return;
+    if (appointmentLegWatchdog("budget", dist)) return;
     RCLCPP_WARN(get_logger(),
         "Rendezvous: %s unreachable within budget (%.1fs, dist=%.2f) "
         "-> waiting for team from current pose.",
@@ -13018,7 +13137,7 @@ void ExploPlannerNode::doReturnNav() {
   if (window_elapsed > progress_window_sec_) {
     const float delta = cumulative_distance_ - progress_check_dist_;
     if (delta < progress_min_distance_m_) {
-      if (deferAppointmentLeg("no progress", dist)) return;
+      if (appointmentLegWatchdog("no-progress", dist)) return;
       RCLCPP_WARN(get_logger(),
           "Rendezvous: no progress toward %s -> waiting for team from "
           "current pose.", return_dest_label_.c_str());
@@ -13046,14 +13165,69 @@ void ExploPlannerNode::doReturnNav() {
 // the pair is wedged until the harness kills the run. That is the ts4 gen-30
 // seed8 cell in one sentence.
 //
-// THE ANSWER IS THE LATTICE, NOT A TIMEOUT, and the lattice already has the
-// machinery. armAppointment rolls a robot whose PREDICTED drive cannot make a
-// rung onto a later one and lets it explore in the meantime — "a fork here is
-// priced, not prevented", paid for by the barrier's patience. What it could not
-// see is a drive that was affordable when priced and failed anyway; that is the
-// same robot missing the same rung for the same reason, discovered late. So it
-// takes the same exit: roll to the next rung of the pair the team already
-// agreed, and go back to exploring until it is time to leave again.
+// A WATCHDOG FIRE IS NOT A REACHABILITY VERDICT, which is what makes giving up
+// on the first one wrong. Neither watchdog can see WHY the drive stopped:
+// simple_nav_3d has no failure-reporting channel at all, so "the budget ran
+// out" and "no progress in 15 s" are the only two things the planner is ever
+// told, and both are equally consistent with a cell that is unreachable and
+// with a platform wedged against one trunk on an otherwise open approach. The
+// seed8 robot was the second case — it closed 3.8 m and then stopped dead, 40 m
+// from a cell its partner was standing in.
+//
+// SO THE LEG ESCALATES INSTEAD OF SURRENDERING, and the ladder is the one the
+// mission return already uses (homeWatchdogFire): drive briefly to a pose the
+// approach is different from, then aim at the SAME destination again.
+// pickEscapeTarget is reused unchanged — a breadcrumb 1.5-6.0 m back, else a
+// pose 2.5 m behind rotated 0/+-60 deg on successive tries — because its whole
+// design is about the two front-arc freeze modes, and it is goal-agnostic. The
+// homing ladder's resend rung is deliberately SKIPPED: republishing the same
+// pose is the one rung whose own header says it cannot unstick a stuck
+// platform, and RETURN_NAV has been republishing that goal every 5 s since the
+// leg started, so it is a rung already spent. Retrace does not transfer either
+// — it is a path back along a trail this robot walked, and no such trail leads
+// to a cell it has never been to.
+//
+// THE ROLL IS THE TERMINAL RUNG, NOT THE FIRST ANSWER. It cannot simply be
+// deleted: an appointment whose t_meet_ms is already past is due on the very
+// next PLAN tick, so a robot released to PLAN on a rung it has missed is
+// re-dispatched onto the drive that just failed, forever. Once the ladder is
+// spent the honest reading IS that this rung is lost, and the lattice already
+// has the exit — armAppointment rolls a robot whose PREDICTED drive cannot make
+// a rung onto a later one and lets it explore in the meantime ("a fork here is
+// priced, not prevented", paid for by the barrier's patience). A drive that was
+// affordable when priced and failed anyway is the same robot missing the same
+// rung for the same reason, discovered late, so it takes the same exit.
+//
+// SO IT TAKES armAppointment's FLOOR, NOT A BARE `now`. Rolling past the
+// present instant alone is only half the rule, and the missing half is the same
+// defect one lattice step later: the next rung can be a millisecond away, this
+// robot's own drive to the cell prices in the hundreds of seconds, and
+// appointmentDue() is therefore true on the very next PLAN tick. That is a
+// re-dispatch onto the drive that just failed, a fresh ladder, another roll,
+// for the rest of the run — no exploration between the cycles, and
+// appointment_inbound chattering peers' barriers open throughout, which is
+// worse than the wedge it replaced, because the wedge at least stopped. The
+// appointment_leg rows this function writes are what make such a cycle
+// countable rather than merely loud. arrivalShortfallSec is what
+// makes "and exploring until then" true: the same helper, the same lateness
+// budget and the same clamp at zero as the arming path, so the rung this lands
+// on is one the robot can still BE AT, and a robot that can make the nearest
+// rung still takes it.
+//
+// MANOEUVRE, NOT RECORD, IS WHAT THIS GATES ON. The barrier a fall-through
+// hands the robot to waits without limit on appointment_manoeuvre_ alone, and
+// that is deliberate — see the wait_cap note in doReturnSync. The appointment
+// RECORD, meanwhile, can be closed and disarmed underneath a live manoeuvre:
+// transitionTo's appointment classifier is gated on `appointment_armed_` and
+// carries no `!manoeuvre` term, so any transition taken while the team reads
+// settled closes it while the drive continues — the departure tick itself, or a
+// proximity hold taken and released mid-leg. Gating this function on the record
+// therefore left exactly one door open into the unbounded barrier from 40 m
+// out: the seed8 wedge, through the one state the 2026-09-18 wait_cap fix
+// exists to name. The distance question is asked of every appointment leg; only
+// the ROLL needs a record to roll, and a leg that has none still exits to PLAN,
+// which clears appointment_manoeuvre_ and with it the patience that made the
+// wedge possible.
 //
 // UNDEPARTED, NOT UNARMED, and the ordering matters. transitionTo's P5 block
 // closes an appointment that is `departed && !manoeuvre`, so leaving the flag
@@ -13062,41 +13236,107 @@ void ExploPlannerNode::doReturnNav() {
 // Clearing it first puts the appointment back in the DEFERRED state the block
 // explicitly preserves, which is also the state doPlan's departure gate reads.
 // The re-agreement path is untouched: this moves the occurrence this robot
-// aims at along the agreed recurrence, it does not derive a new pair.
-bool ExploPlannerNode::deferAppointmentLeg(const char* what_failed, float dist) {
-  if (!appointment_manoeuvre_ || !appointment_armed_ || !appointment_.valid()) {
-    return false;
-  }
+// aims at along the agreed recurrence, it does not derive a new pair. An escape
+// rung needs none of this — it stays inside RETURN_NAV, which is a `manoeuvre`
+// state, so the block cannot fire on it at all.
+bool ExploPlannerNode::appointmentLegWatchdog(const char* what_failed,
+                                              float dist) {
+  if (!appointment_manoeuvre_) return false;
   // Close enough that the barrier still means something — see
-  // rendezvous_present_tol_m_. Rolling these would spend an interval to fix a
+  // rendezvous_present_tol_m_. Escalating these would spend the ladder to fix a
   // few metres, and the robot is already where the others are heading.
   if (dist <= static_cast<float>(rendezvous_present_tol_m_)) return false;
 
-  // Strictly forward, and past NOW as well as past the rung being abandoned: a
-  // leg that failed slowly can outlive its own meeting, and a rung already in
-  // the past is due the instant it is set — which would re-dispatch this robot
-  // onto the drive that just failed, on the next PLAN tick, forever. The +1 ms
-  // is what makes it strict; nextAgreedOccurrence keeps an instant that is
-  // merely >= its floor.
-  const long long now_ms =
-      static_cast<long long>(std::llround(missionElapsed() * 1000.0));
-  const long long floor_ms = std::max(appointment_.t_meet_ms, now_ms) + 1;
-  const long long rolled =
-      nextAgreedOccurrence(appointment_.t_meet_ms, appointment_.interval_ms,
-                           floor_ms / 1000.0);
-  // No rung to roll to. nextAgreedOccurrence hands back the input for a
-  // non-recurrence, and an appointment that cannot be moved is better kept
-  // badly than dropped: fall through to the watchdog's own exit, which is the
-  // pre-2026-09-20 behaviour.
-  if (rolled <= appointment_.t_meet_ms) return false;
-  appointment_.t_meet_ms = rolled;
+  // RUNG 1..N: escape, then aim at the same cell again. No guard on
+  // appointment_escape_active_ is needed — doReturnNav's escape block returns
+  // before both watchdogs, so this line is only ever reached between legs and
+  // the counter is always a count of ENDED ones.
+  if (appointment_escapes_used_ < rendezvous_escape_max_attempts_) {
+    const bool on_crumb = pickEscapeTarget();
+    ++appointment_escapes_used_;
+    appointment_escape_active_ = true;
+    escape_leg_start_          = this->now();
+    // return_dest_ is deliberately NOT touched: the detour changes where the
+    // wheels point, not where the meeting is, and keeping the two apart is what
+    // makes the arrival test above immune to this whole manoeuvre.
+    current_goal_.position     = escape_target_;
+    current_goal_.yaw          = latest_yaw_;
+    // return_dest_, not appointment_.cell: the record can be closed underneath a
+    // live leg (see the header), and a WARN that prints "cell -1" on the one
+    // path the reader most needs to follow is worse than no cell id at all. The
+    // destination is true on every path and it is what startReturnTo's own
+    // dispatch line names.
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous: the %s watchdog ended the drive to the agreed cell at "
+        "(%.2f, %.2f) %.1f m out -> escape %d/%d, driving %.2f m to %s "
+        "(%.2f, %.2f) before aiming at the cell again.",
+        what_failed, return_dest_.x(), return_dest_.y(), dist,
+        appointment_escapes_used_, rendezvous_escape_max_attempts_,
+        (escape_target_ - latest_pos_).head<2>().norm(),
+        on_crumb ? "a breadcrumb" : "a pose behind the robot",
+        escape_target_.x(), escape_target_.y());
+    logAppointmentLegRow("escape", what_failed, dist);
+    // No brake first, unlike the homing ladder: that one publishes the escape
+    // goal a tick LATER, so it needs abandonNavGoal's own-pose goal to stop the
+    // platform in between. Here the replacement goes out in the same tick, and
+    // a new goal_pose is what supersedes the old one — a brake published
+    // alongside it would only be overwritten before the controller saw it.
+    publishGoal(current_goal_);
+    // The budget and the no-progress window are deliberately left as they are.
+    // Both are read only by the watchdogs below, which this leg cannot reach,
+    // and resumeAppointmentDrive re-arms both from the escape's end pose.
+    // Re-arming here as well would be dead state overwritten within the leg.
+    return true;
+  }
+
+  // THE TERMINAL RUNG, taken with or without a record to roll: the exit to PLAN
+  // is what drops the unbounded barrier patience, so a leg whose appointment was
+  // closed underneath it takes the exit too and simply has no rung to move.
+  char rung[128];
+  double rolled_to_sec = -1.0;
+  if (appointment_armed_ && appointment_.valid()) {
+    // Strictly forward, and past NOW as well as past the rung being abandoned: a
+    // leg that failed slowly can outlive its own meeting, and a rung already in
+    // the past is due the instant it is set. The +1 ms is what makes it strict;
+    // nextAgreedOccurrence keeps an instant that is merely >= its floor. The
+    // shortfall raises the floor again by however much this robot's own drive
+    // is short of the lateness budget, which is the half of the rule that stops
+    // the roll landing on a rung it cannot make either — see the header. A cell
+    // it cannot price answers -1, which arrivalShortfallSec reads as "no
+    // estimate" and returns 0.0 for: the nearest rung, as before.
+    const long long now_ms =
+        static_cast<long long>(std::llround(missionElapsed() * 1000.0));
+    const long long floor_ms = std::max(appointment_.t_meet_ms, now_ms) + 1;
+    const double shortfall_sec = arrivalShortfallSec(
+        appointmentLeadMs(appointment_.cell), rendezvous_max_lateness_sec_);
+    // Strictly later than the rung being abandoned, by construction: the floor
+    // is above it and interval_ms is positive by valid(), so this takes
+    // nextAgreedOccurrence's ceiling-division path and lands at least one whole
+    // interval on. A guard against the other case stood here. It could not fire
+    // — valid() had already excluded the non-recurrence it named — and what it
+    // did on the way was `return false`, i.e. the fall-through into the
+    // unbounded barrier that this function exists to close.
+    appointment_.t_meet_ms =
+        nextAgreedOccurrence(appointment_.t_meet_ms, appointment_.interval_ms,
+                             floor_ms / 1000.0 + shortfall_sec);
+    rolled_to_sec = appointment_.t_meet_ms / 1000.0;
+    std::snprintf(rung, sizeof(rung),
+                  "rolling to t+%.0fs and exploring until then", rolled_to_sec);
+  } else {
+    std::snprintf(rung, sizeof(rung),
+                  "the appointment was already closed, so back to exploring");
+  }
 
   RCLCPP_WARN(get_logger(),
-      "Rendezvous: %s ended the drive to cell %d %.1f m out (present within "
-      "%.1f m) -> not at the meeting; rolling to t+%.0fs and exploring until "
-      "then.",
-      what_failed, appointment_.cell, dist, rendezvous_present_tol_m_,
-      rolled / 1000.0);
+      "Rendezvous: the %s watchdog ended the drive to the agreed cell at "
+      "(%.2f, %.2f) %.1f m out (present within %.1f m) with %d/%d escapes "
+      "spent -> not at the meeting; %s.",
+      what_failed, return_dest_.x(), return_dest_.y(), dist,
+      rendezvous_present_tol_m_, appointment_escapes_used_,
+      rendezvous_escape_max_attempts_, rung);
+  // Before the exit, not after: transitionTo(PLAN) clears the manoeuvre and can
+  // close the record, and both are columns on this row.
+  logAppointmentLegRow("unreached", what_failed, dist, -1.0, rolled_to_sec);
 
   appointment_departed_ = false;
   // RETURN_NAV is a driving state and PLAN can spend ticks before it publishes
@@ -13110,6 +13350,63 @@ bool ExploPlannerNode::deferAppointmentLeg(const char* what_failed, float dist) 
   have_active_intent_ = false;
   transitionTo(State::PLAN, "appointment-unreached");
   return true;
+}
+
+// Back onto the road to the SAME cell. The destination is return_dest_, which
+// the detour left alone, and never a fresh appointmentPoint(): the manoeuvre
+// exists to change the approach, not the meeting, and the recompute answers
+// latest_pos_ for a cell it cannot place — which would put the goal under the
+// robot's own feet. No state change — RETURN_NAV is already the state, and the
+// leg it is driving is the one that was interrupted.
+void ExploPlannerNode::resumeAppointmentDrive(const char* why) {
+  const double leg_sec = (this->now() - escape_leg_start_).seconds();
+  appointment_escape_active_ = false;
+  current_goal_.position     = return_dest_;
+  current_goal_.yaw          = latest_yaw_;
+  const float dist = (current_goal_.position - latest_pos_).head<2>().norm();
+  RCLCPP_WARN(get_logger(),
+      "Rendezvous: appointment escape %d/%d ended [%s] after %.1f s -> driving "
+      "at the agreed cell (%.2f, %.2f) again, %.2f m out.",
+      appointment_escapes_used_, rendezvous_escape_max_attempts_, why, leg_sec,
+      return_dest_.x(), return_dest_.y(), dist);
+  logAppointmentLegRow("escape-end", why, dist, leg_sec);
+  publishGoal(current_goal_);
+  // A resumed leg is a NEW leg and must be judged as one. The budget and the
+  // window still in force are the ones that just fired, so without this the
+  // next tick spends another rung immediately and the whole ladder burns in
+  // three ticks without the robot driving anywhere. armManoeuvreLegBudget reads
+  // state_enter_time_ as the leg's start and there is no transition here to
+  // stamp it, so it is stamped directly — the same thing the proximity-hold
+  // resume does, for the same reason.
+  state_enter_time_ = this->now();
+  armManoeuvreLegBudget(dist);
+}
+
+// The ladder's only instrument. Until this existed the rungs were RCLCPP_WARN
+// text, which is the same as unmeasured: nothing counted escapes per arm, and a
+// robot cycling give-up -> roll -> re-depart looked in the tables exactly like
+// one making ordinary dispatches — quieter, in fact, since it never reached a
+// rendezvous_outcome. The cell id comes from the RECORD and the position from
+// return_dest_ on purpose: the record can be closed underneath a live leg while
+// the destination stays true, and a row that carried only the cell would print
+// -1 on precisely the give-up path a reader is there to follow.
+void ExploPlannerNode::logAppointmentLegRow(const char* kind,
+                                            const char* cause, float dist,
+                                            double leg_sec,
+                                            double rolled_to_sec) {
+  if (!exp_log_) return;
+  AppointmentLegEvent ev;
+  ev.kind          = kind;
+  ev.cause         = cause;
+  ev.dist_m        = dist;
+  ev.dest_x        = return_dest_.x();
+  ev.dest_y        = return_dest_.y();
+  ev.cell          = appointment_armed_ ? appointment_.cell : -1;
+  ev.escapes_used  = appointment_escapes_used_;
+  ev.escapes_max   = rendezvous_escape_max_attempts_;
+  ev.leg_sec       = leg_sec;
+  ev.rolled_to_sec = rolled_to_sec;
+  exp_log_->logAppointmentLeg(expCtx(), ev);
 }
 
 // Hold at the anchor until the whole team is back in comms, then re-plan. With
@@ -14980,9 +15277,11 @@ void ExploPlannerNode::doPursue() {
   //
   // THE MEETING IS A SHARED INSTANT; THE BREAK-OFF IS NOT (2026-09-19).
   // appointment_.t_meet_ms only ever moves by whole intervals of the agreed
-  // recurrence — at arming, and since 2026-09-20 when a failed drive rolls the
-  // robot onto a later rung (deferAppointmentLeg) — so the ARRIVAL every robot
-  // aims at is always an instant on the agreed lattice. The
+  // recurrence — at arming, and since 2026-09-20 when a failed drive has spent
+  // its escape ladder without reaching the cell and rolls the robot onto a
+  // later rung (appointmentLegWatchdog; the escapes themselves move nothing,
+  // which is the point of preferring them) — so the ARRIVAL every robot aims at
+  // is always an instant on the agreed lattice. The
   // moment each robot has to stop chasing to make it is its own, because
   // appointmentDue() now leaves early enough to arrive: a chase that has driven
   // this robot AWAY from the meeting cell grows its live lead and cuts the
@@ -16015,6 +16314,16 @@ void ExploPlannerNode::doProximityHold() {
   if (prox_resume_state_ == State::PURSUE) {
     pursue_start_time_ =
         pursue_start_time_ + rclcpp::Duration::from_seconds(held);
+  }
+  // An appointment escape leg in flight gets it back for the third time and the
+  // same reason: return_escape_leg_sec is 30 s and proximity_max_hold_sec is
+  // 120, so without this a single hold expires the leg cap while the robot is
+  // deliberately braked. The first tick after release would then end a detour
+  // that was never driven — and three such holds spend the whole ladder without
+  // the platform moving, which is precisely the ladder failing to do the one
+  // thing it exists for.
+  if (appointment_escape_active_) {
+    escape_leg_start_ = escape_leg_start_ + rclcpp::Duration::from_seconds(held);
   }
   prox_hold_total_sec_ += held;
   const char* why = d.hold ? "max-hold" : d.note.c_str();

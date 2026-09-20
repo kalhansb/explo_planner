@@ -357,6 +357,64 @@ TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
   EXPECT_NEAR(v, 0.03, 1e-6);
 }
 
+// --- appointment_leg (schema v11) ---
+//
+// Two of this row's columns belong to one kind each — `leg_sec` to escape-end,
+// `rolled_to_sec` to unreached — and the writer carries both on every row at
+// -1.0 rather than omitting them off their own kind. That choice is what the
+// reader depends on, and it is invisible in the data if it breaks: an omitted
+// key and a sentinel one look identical to any `.get(k, -1)` reader, so the
+// give-up that HAD no appointment left to roll and the one whose roll was never
+// written would fold into the same count. Asserted at the byte level, on the
+// kind that owns NEITHER column, because that is the row where a writer that
+// omitted them would still look right on both of the others.
+TEST(ExperimentLogAppointmentLeg, CarriesBothConditionalColumnsOnEveryKind) {
+  TempLogPath tmp("appointment_leg");
+  std::string row;
+  {
+    ExperimentLog log(tmp.path, "testbot",
+                      rclcpp::get_logger("test_experiment_log"));
+    ASSERT_TRUE(log.open()) << "could not open " << tmp.path;
+    ExperimentContext ctx;
+    ctx.sim_time_sec = 10.0;
+    ctx.state = "RETURN_NAV";
+    log.startRun(ctx, {});
+    ctx.sim_time_sec = 256.7;
+    AppointmentLegEvent e;
+    e.kind         = "escape";
+    e.cause        = "no-progress";
+    e.dist_m       = 39.97;
+    e.dest_x       = 15.0;
+    e.dest_y       = -5.0;
+    e.cell         = 12;
+    e.escapes_used = 1;
+    e.escapes_max  = 3;
+    log.logAppointmentLeg(ctx, e);
+  }
+  std::ifstream in(tmp.path);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.find("\"appointment_leg\"") != std::string::npos) row = line;
+  }
+  ASSERT_FALSE(row.empty()) << "no appointment_leg row was written at all";
+
+  double v = 0.0;
+  ASSERT_TRUE(readNum(row, "leg_sec", &v)) << row;
+  EXPECT_NEAR(v, -1.0, 1e-6);
+  ASSERT_TRUE(readNum(row, "rolled_to_sec", &v)) << row;
+  EXPECT_NEAR(v, -1.0, 1e-6);
+
+  // The cap travels with the count for the same reason: normalising "1" against
+  // a limit fetched from a param row is the step a reader skips.
+  ASSERT_TRUE(readNum(row, "escapes_used", &v)) << row;
+  EXPECT_NEAR(v, 1.0, 1e-6);
+  ASSERT_TRUE(readNum(row, "escapes_max", &v)) << row;
+  EXPECT_NEAR(v, 3.0, 1e-6);
+
+  EXPECT_NE(row.find("\"kind\":\"escape\""), std::string::npos) << row;
+  EXPECT_NE(row.find("\"cause\":\"no-progress\""), std::string::npos) << row;
+}
+
 // --- The declared event vocabulary (schema v4) ---
 //
 // kEventKinds is what sim/equiv_gate.py scores "did a new event kind appear at

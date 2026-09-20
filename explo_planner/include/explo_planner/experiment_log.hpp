@@ -1286,6 +1286,63 @@ struct RendezvousOutcomeEvent {
   bool mutual = false;
 };
 
+/// One rung of the escape ladder that guards the drive to an agreed cell
+/// (appointmentLegWatchdog / resumeAppointmentDrive). The homing ladder's
+/// `home_watchdog` is the direct analogue and the kind/cause split is its
+/// convention, not a new one; the two are kept apart because `dist_home_m` and
+/// `next_mode` have no meaning here and overloading them would silently change
+/// what a home_watchdog count measures.
+///
+/// A ROW IS NOT A REACHABILITY VERDICT. simple_nav_3d has no failure-reporting
+/// channel, so `cause` names the only two things the planner is ever told, and
+/// both are equally consistent with an unreachable cell and with a platform
+/// wedged against one trunk on an open approach. Count rungs, not verdicts.
+struct AppointmentLegEvent {
+  /// Which rung. One of:
+  ///   "escape"     a watchdog ended the drive and a detour was dispatched.
+  ///                `escapes_used` is POST-increment, so the first row reads 1.
+  ///   "escape-end" the detour finished and the cell is the goal again. NOT a
+  ///                rung being spent; do not pool these with "escape" when
+  ///                counting how much ladder a leg used.
+  ///   "unreached"  the ladder was spent and the leg was abandoned to PLAN.
+  ///                One per give-up, and the row the livelock check keys on:
+  ///                a robot alternating "unreached" with fresh departures and
+  ///                never exploring in between is the failure mode this event
+  ///                was added to make visible.
+  std::string kind;
+  /// On "escape"/"unreached", the watchdog that ended the drive: "budget" |
+  /// "no-progress". On "escape-end", why the detour ended: "escape-arrived" |
+  /// "escape-leg-cap".
+  std::string cause;
+  /// Straight-line metres from the robot to the agreed cell at this instant —
+  /// to `return_dest_`, which a detour deliberately leaves alone, so it is the
+  /// same quantity on all three kinds and comparable across them.
+  double dist_m = -1.0;
+  /// The agreed cell's position, i.e. `return_dest_`. Written rather than
+  /// derived from `cell` because the appointment RECORD can be closed
+  /// underneath a live leg (see appointmentLegWatchdog's header) while the
+  /// destination stays true.
+  double dest_x = 0.0;
+  double dest_y = 0.0;
+  /// The agreed cell id, or -1 when the record was already closed under the
+  /// leg. A -1 here is NOT an unplaceable cell — that case is
+  /// `rendezvous_outcome.outcome == "unplaceable"`.
+  int cell = -1;
+  /// Rungs spent against `rendezvous_escape_max_attempts`, which is the second
+  /// field so a reader never has to fetch the param row to normalise.
+  int escapes_used = 0;
+  int escapes_max  = 0;
+  /// The detour's duration, on "escape-end" rows only; -1.0 elsewhere, which
+  /// is a "not this kind of row" sentinel and not a reading.
+  double leg_sec = -1.0;
+  /// On "unreached", the occurrence the appointment was rolled to, mission
+  /// elapsed. -1.0 means there was no record left to roll, so the robot simply
+  /// went back to exploring — the two are different mechanisms and only this
+  /// column separates them. -1.0 on every other kind for the same reason
+  /// `leg_sec` is.
+  double rolled_to_sec = -1.0;
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -1577,7 +1634,26 @@ class ExperimentLog {
   ///     instant rather than a departure one, and the barrier holds until the
   ///     whole team is present rather than until a wait expires. Rendezvous and
   ///     hybrid timings do not pool across the v9/v10 line on any metric.
-  static constexpr int kSchemaVersion = 10;
+  ///
+  /// v11: generation 31 (2026-09-21). A VOCABULARY WIDENING, which is what
+  /// moves the stamp on the v3 home_watchdog precedent — nothing moved and
+  /// nothing was removed, so the additive half alone would not have:
+  ///
+  ///   - `appointment_leg` is NEW (AppointmentLegEvent). The drive to an agreed
+  ///     cell now escalates through an escape ladder instead of falling through
+  ///     to the barrier, and every rung of that ladder is a row. Before it the
+  ///     ladder was RCLCPP_WARN-only, which is the same as unmeasured: a robot
+  ///     cycling give-up -> roll -> re-depart was indistinguishable in the
+  ///     tables from one making ordinary dispatches, and escapes could not be
+  ///     counted per arm at all.
+  ///
+  /// A v10 reader is otherwise unaffected — every v10 column means exactly what
+  /// it meant — but one with an exhaustive match on `event` now hits an
+  /// unhandled case, which is the reason vocabulary widening bumps the stamp at
+  /// all. The kind is emitted only under an armed appointment, so a run at the
+  /// shipped defaults emits exactly the v10 set and the per-phase equivalence
+  /// gate is unmoved.
+  static constexpr int kSchemaVersion = 11;
 
   /// Every `event` value this writer can emit, and the ONLY authority on that
   /// set. It exists because the equivalence gate has to answer "did a new kind
@@ -1596,7 +1672,7 @@ class ExperimentLog {
       "pose_health", "goal_amnesty", "home_watchdog", "coverage_milestone",
       // --- v4, all default-off ---
       "cell_census", "allocation", "rendezvous_agreed", "rendezvous_outcome",
-      "reconnect_gate", "team_exchange",
+      "reconnect_gate", "team_exchange", "appointment_leg",
   };
   static constexpr size_t kEventKindCount =
       sizeof(kEventKinds) / sizeof(kEventKinds[0]);
@@ -1903,6 +1979,13 @@ class ExperimentLog {
   /// armed, so the two kinds join 1:1 within an outage.
   void logRendezvousOutcome(const ExperimentContext& ctx,
                             const RendezvousOutcomeEvent& e);
+
+  /// Emits one `appointment_leg` (schema v11). Zero or more per appointment —
+  /// a meeting the robot simply drives to writes none — so this does NOT join
+  /// 1:1 with `rendezvous_outcome`, and on the give-up path it can outlive it:
+  /// a leg whose record was closed underneath it still writes its rungs.
+  void logAppointmentLeg(const ExperimentContext& ctx,
+                         const AppointmentLegEvent& e);
 
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;

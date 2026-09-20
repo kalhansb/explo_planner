@@ -1077,20 +1077,40 @@
     # reconnect_arrive_tol_m if set below it.
     #
     # Deliberately looser than the arrival tolerance: that one decides when a
-    # drive has SUCCEEDED, this one decides whether a drive that GAVE UP ended
-    # somewhere the barrier still means something. Farther out than this, the
-    # node rolls the robot to the next rung of the agreed recurrence and sends
-    # it back to exploring rather than letting it join a presence count from
-    # somewhere nobody else is going -- ts4 gen-30 n2/rendezvous/seed8 wedged
-    # exactly that way, one robot at the cell and its partner's dead drive
-    # 40.0 m out, 41.3 m apart against a 30 m horizon, both stationary for
-    # 2609 s until the hang detector fired.
+    # drive has SUCCEEDED, this one decides whether a drive that STOPPED ended
+    # somewhere the barrier still means something. Inside it, the robot waits
+    # where it is. Farther out, it is not at the meeting and must not join a
+    # presence count from somewhere nobody else is going -- ts4 gen-30
+    # n2/rendezvous/seed8 wedged exactly that way, one robot at the cell and
+    # its partner's dead drive 40.0 m out, 41.3 m apart against a 30 m horizon,
+    # both stationary for 2609 s until the hang detector fired.
+    #
+    # Being outside it does NOT give up on the meeting. A watchdog fire says
+    # only that this approach stopped working -- simple_nav_3d has no failure
+    # channel, so the planner cannot tell a blocked platform from an unreachable
+    # cell -- so the leg first spends rendezvous_escape_max_attempts escape
+    # manoeuvres, each one breaking the stall and then aiming at the SAME cell
+    # again. Only once those are spent does it roll to the next rung of the
+    # agreed recurrence and go back to exploring until it is time to leave.
     #
     # Sized against the LINK, not the cell grid, though 10 m happens to be one
     # coarse cell: two robots each within this of the cell are at most 2x it
     # apart, so a whole meeting fits in a 20 m spread with the remaining 10 m
-    # of horizon spent on trunks. Widening trades that margin for fewer rolls.
+    # of horizon spent on trunks. Widening trades that margin for fewer ladders.
     rendezvous_present_tol_m: 10.0
+    # Escape manoeuvres one appointment drive may spend before the node stops
+    # re-aiming at the cell and rolls to the next rung. Each is a short drive to
+    # a breadcrumb 1.5-6.0 m back, or failing that a pose 2.5 m behind the robot
+    # rotated 0/+-60 deg, capped at return_escape_leg_sec (30 s) -- the same
+    # manoeuvre and the same cap as the mission-return ladder, whose
+    # return_escape_max_attempts this is deliberately NOT, so one knob does not
+    # retune two subsystems that fail for different reasons.
+    #
+    # 0 disables the ladder and restores the straight-to-roll behaviour, making
+    # it the A/B control. At 3 the worst case is ~90 s of driving away from a
+    # meeting whose barrier waits without limit, which is the trade: the
+    # alternative on offer is a whole rung (300 s) lost to one wedged platform.
+    rendezvous_escape_max_attempts: 3
     # Ceiling on ONE manoeuvre drive leg (s). <= 0 = unbounded.
     #
     # startReturnTo exempts manoeuvre legs from nav_max_timeout_sec on purpose

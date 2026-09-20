@@ -113,7 +113,7 @@ max_range_m=30.0
 # prose reminder has now failed twice at the only job it had, and the third
 # occurrence would have taken ts4 with it (check 3d is an exact equality, so a
 # gate pinned at 7 hard-fails every cell of a schema-8 campaign).
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 # The schema the injected regression below downgrades TO. One less than the pin,
 # always: the case has to be a version the gate must reject, and hard-coding a 2
 # after the pin moved to 4 would have kept passing while testing a two-step
