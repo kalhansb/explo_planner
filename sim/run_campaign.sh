@@ -154,22 +154,13 @@ case " $EXTRA_ENV " in
     echo "       on resume; an --env passenger is neither." >&2
     exit 2;;
 esac
-# Read one KEY=VALUE out of EXTRA_ENV, exactly. Substring matching on the whole
-# string is what the first draft of the guard below did, and it is wrong in both
-# directions at once: `GATE_MIDRUN_SILENCE=240` (a variable for the gate script,
-# not the launcher) contains "MIDRUN_SILENCE=" and silently DISARMED the guard,
-# while `MY_LINK_GATE=0` contains "LINK_GATE=0" and would have armed it on a
-# campaign that never touched the veto. Splitting on whitespace and comparing
-# the key up to the first '=' removes both.
-env_val() {
-  _k="$1"; _v=""
-  for _tok in $EXTRA_ENV; do
-    case "$_tok" in
-      "$_k"=*) _v="${_tok#*=}";;
-    esac
-  done
-  printf '%s' "$_v"
-}
+# BOTH helpers below read EXTRA_ENV one KEY=VALUE token at a time, exactly.
+# Substring matching on the whole string is what the first draft of the guard
+# did, and it is wrong in both directions at once: `GATE_MIDRUN_SILENCE=240` (a
+# variable for the gate script, not the launcher) contains "MIDRUN_SILENCE=" and
+# silently DISARMED the guard, while `MY_LINK_GATE=0` contains "LINK_GATE=0" and
+# would have armed it on a campaign that never touched the veto. Splitting on
+# whitespace and comparing the key up to the first '=' removes both.
 env_has() {
   for _tok in $EXTRA_ENV; do
     case "$_tok" in "$1"=*) return 0;; esac
@@ -177,7 +168,11 @@ env_has() {
   return 1
 }
 
-# The value --env carries for a key, or $2 if it does not carry one. Used to
+# The value --env carries for a key, or $2 if it does not carry one. (A second,
+# defaultless copy of this function used to sit above env_has and was shadowed
+# by this one at parse time -- dead code that read as if it were the live
+# definition. Deleted; its rationale is folded into the comment above env_has.)
+# Used to
 # predict what a cell's manifest WILL say, so the resume guard can compare a
 # banked cell against this campaign's configuration rather than assuming they
 # agree. Mirrors run_explo_sim_rviz.sh's own defaults, and the mtare_hybrid arm
@@ -377,7 +372,13 @@ for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
   # ... and the same for the cr2 claim-radius suffix, for the same reason: it is
   # a runtime switch, not an arm, so "mtare_off_r40" is still an untreated cell
   # and must not be classed as treated on the strength of a suffix.
-  case "$_a" in *_r[0-9]|*_r[0-9][0-9]) _a="${_a%_r*}";; esac
+  # THREE DIGITS, not two (2026-09-18): gate_g8.py's DESIGN_SUFFIXES has always
+  # read `_r([0-9]{1,3})`, so the gate and the launcher disagreed about which
+  # cell names are well-formed. Widening HERE rather than narrowing there is
+  # deliberate — narrowing the gate to two digits would make its greedy `(.*)`
+  # match `mtare_hybrid_r1` out of `mtare_hybrid_r100` and report a 0 m claim
+  # radius, trading a loud disagreement for a silent misparse.
+  case "$_a" in *_r[0-9]|*_r[0-9][0-9]|*_r[0-9][0-9][0-9]) _a="${_a%_r*}";; esac
   _a="${_a#mtare_}"
   [ "$_a" = "off" ] || _treated=1
 done
@@ -416,6 +417,18 @@ if [ "$_treated" = "1" ] && [ "$_veto_live" = "0" ] && [ "$_sil_ok" = "0" ]; the
   fi
   exit 2
 fi
+# C3 (2026-09-14): the resume guard below compares these, so they have to
+# outlive the guard that derived them. LINK_GATE_REQ / LINK_GATE_EFFECTIVE_REQ
+# are exactly _link_gate_req / _veto_live -- the request, and the request AND an
+# emulator -- and re-deriving them at the comparison site would be a second copy
+# of the launcher's rule to keep in step. MIDRUN_SILENCE_REQ and
+# TEAM_WORLD_HZ_REQ mirror run_explo_sim_rviz.sh's own defaults (90 and 1.0) the
+# same way _link_gate_req mirrors LINK_GATE's, and are compared numerically
+# because the launcher flt()s both.
+LINK_GATE_REQ="$_link_gate_req"
+LINK_GATE_EFFECTIVE_REQ="$_veto_live"
+MIDRUN_SILENCE_REQ="$(env_val MIDRUN_SILENCE 90)"
+TEAM_WORLD_HZ_REQ="$(env_val TEAM_WORLD_HZ 1.0)"
 unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 
 # Every guard here scans only $EXTRA_ENV, and the launch line strips these from
@@ -439,9 +452,39 @@ unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 # construction. --env is expanded after these flags and env applies assignments
 # after unsets, so `--env CELL_WORLD=1` still works and is still the one channel
 # the guards read.
+#
+# C2 (2026-09-14) adds the run-control knobs on the second line. They are not
+# guard inputs, they are ENDPOINT inputs: STOP_ON_DONE decides whether a cell
+# stops when the robots finish or grinds to the duration cap, DONE_GRACE_S is
+# the sim-second drain counted into every run_end_t_sim, and the rest are the
+# abort/watchdog thresholds that decide whether a slow cell is killed or banked
+# -- i.e. a selection rule on the sample. An `export DONE_GRACE_S=0` left in a
+# shell would shift every cell of a campaign with nothing anywhere to show it.
+# They are now recorded in run_manifest.txt as well, so the strip list and the
+# record agree.
+#
+# EIGHTEEN OF THE NINETEEN DO. The exception is MAP_AGREE_MAX_PCT, and the
+# sentence above read as though it covered the whole list until 2026-09-18.
+# That name is not recorded because it is not READ: grep the tree and it occurs
+# exactly twice, both of them here (this list and the `-u` on the launch line),
+# and nowhere in run_explo_sim_rviz.sh or map_agreement.py. It is the vestige of
+# the era when map agreement was a PASS/FAIL gate with a threshold; the gate is
+# report-only now (see the "THAT THEORY DID NOT SURVIVE" note in
+# run_explo_sim_rviz.sh) and the threshold went with it.
+#
+# Kept in both lists anyway, deliberately. Stripping a name nothing reads costs
+# nothing, and the failure directions are not symmetric: leaving it means one
+# spurious NOTE if someone has it exported, while dropping it means that if the
+# gate is ever re-armed on this name it silently inherits whatever the launching
+# shell happened to hold. What is NOT kept is the claim that it is recorded.
+# Nothing records it, and an unrecorded knob that no longer exists is fine
+# precisely because it cannot affect a cell.
 for _amb in LINK_GATE MIDRUN_SILENCE \
             CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
-            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR; do
+            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR \
+            STOP_ON_DONE DONE_GRACE_S HANG_HB GATES_STRICT POLL_S \
+            CLOCK_EVERY_S CLOCK_DEADMAN_S CLOCK_FAIL_MAX MAP_AGREE_MAX_PCT \
+            GZ_GUI; do
   if [ -n "${!_amb+x}" ]; then
     echo "NOTE: $_amb=${!_amb} is exported in this shell and will be IGNORED --" >&2
     echo "      the per-cell launch strips it so the campaign's guards cannot be" >&2
@@ -451,12 +494,97 @@ for _amb in LINK_GATE MIDRUN_SILENCE \
 done
 unset _amb
 
+# THE LIST ABOVE IS THE KNOBS *THIS SCRIPT* REASONS ABOUT. IT IS NOT THE KNOBS
+# THAT CHANGE A CELL, and the gap between the two is about seventy names.
+#
+# run_explo_sim_rviz.sh reads its whole configuration as `${NAME:-default}` --
+# RDV_DEPART_DELAY, RDV_SETTLE, RDV_APPT_WAIT, RDV_MAX_WAIT, RDV_LATCHED_HOLD,
+# START_HOLD, PROX_HOLD_M, VOXEL_RES, MAX_STEPS, ROI_HALF, UTIL_GAMMA, every
+# PURSUIT_*, every RECONNECT_*, every RETURN_* -- and this script had never
+# heard of any of them. `env` without -i inherits the launching shell, so a
+# single leftover `export RDV_DEPART_DELAY=30` retunes EVERY cell of a
+# multi-day matrix, and for most of these names nothing downstream can say so:
+# they do not rename the arm, they are not compared by the resume guard, and
+# the ones that do reach run_manifest.txt are read by no analysis script.
+#
+# Two of ts4's four arms ARE the rendezvous. RDV_APPT_WAIT=0 is the unbounded
+# appointment wait that makes the meeting exact, and an ambient export of it
+# does not corrupt the campaign loudly; it silently replaces the treatment
+# with a different one. RDV_DEPART_DELAY has been inert in the binary since
+# generation 25, but it still reaches the manifest and the logged param rows,
+# so a leak of it forges a provenance difference between cells that ran
+# identical treatments — quieter than retuning, still a corruption.
+#
+# DERIVED, NOT LISTED, for the reason written at the -u list itself: the last
+# hand-kept copy of a knob list in this file was three names out of date before
+# anything looked at it, and the runner grows knobs far faster than this script
+# does. So the names are read out of the runner, and the only thing maintained
+# by hand is the short KEEP list below of things deliberately inherited.
+#
+# Over-stripping is safe by construction and that is what makes this tractable:
+# `env` applies -u before assignments, so a name that is also assigned on the
+# launch line is unaffected, and a name that is not falls back to the runner's
+# own documented default -- which is precisely the value every guard here
+# already models. `--env NAME=...` still wins, and is still the one channel the
+# guards read.
+#
+# KEEP is not "knobs we like". It is names whose ambient value is INFRASTRUCTURE
+# rather than configuration -- where stripping would not neutralise a treatment,
+# it would move the run onto different plumbing:
+#   ROS_DOMAIN_ID   the DDS domain. Forcing it back to the runner's 42 would put
+#                   a cell deliberately isolated onto another domain straight
+#                   back on top of whatever is already running there.
+#   DISPLAY         where rendering goes; the runner falls back to :1.
+#   IGN_PARTITION   the Gazebo transport namespace. Recorded in
+#                   run_manifest.txt, and stripping it moves discovery out from
+#                   under a host that needs one.
+#   XDG_*_SNAP_ORIG the snap-escape probe the runner uses to recover the real
+#                   system paths -- deleting these defeats the escape.
+#
+# Everything else goes, including the runner's own internals (NFAIL, NUNRUN,
+# RUN_END_REASON, DONE_DRAIN_COMPLETE). Those are not knobs, and stripping them
+# is not neutral either -- it is protective. Each is assigned on some paths and
+# read with `${NAME:-...}` on all of them, so an ambient
+# `export RUN_END_REASON=all_done` would be written into run_manifest.txt by any
+# path that never reached the assignment, and the resume guard reads that key.
+#
+# One line on purpose: the awk below matches " NAME " inside it, so a name
+# wrapped onto a continuation would be bounded by a newline instead of a space
+# and would silently stop being kept.
+RUNNER_ENV_KEEP="ROS_DOMAIN_ID DISPLAY IGN_PARTITION XDG_DATA_DIRS_VSCODE_SNAP_ORIG XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG"
+RUNNER_STRIP=$(awk -v keep=" $RUNNER_ENV_KEEP " '
+  { line = $0
+    sub(/^[ \t]*#.*/, "", line)
+    while (match(line, /\$\{[A-Z][A-Z0-9_]+:?[-=]/)) {
+      tok  = substr(line, RSTART, RLENGTH)
+      line = substr(line, RSTART + RLENGTH)
+      sub(/^\$\{/, "", tok); sub(/:?[-=]$/, "", tok)
+      if (length(tok) >= 3 && index(keep, " " tok " ") == 0) seen[tok] = 1
+    } }
+  END { for (n in seen) printf " -u %s", n }
+' "$HERE/run_explo_sim_rviz.sh")
+# A derivation that silently returns nothing is a strip list that silently
+# reverts to the hand-written one -- the exact failure `checks-that-stopped-
+# checking` is about, arriving through the mechanism that was supposed to end
+# it. The runner reads seventy-odd of these; under ten means the scan broke or
+# the file moved, not that the knobs went away.
+_nstrip=$(printf '%s\n' "$RUNNER_STRIP" | tr ' ' '\n' | grep -c '^-u$' || true)
+if [ "${_nstrip:-0}" -lt 10 ]; then
+  echo "FATAL: derived only ${_nstrip:-0} ambient knob(s) from" >&2
+  echo "       $HERE/run_explo_sim_rviz.sh -- the scan is broken, not the" >&2
+  echo "       runner. Every \${NAME:-default} knob in that file would reach" >&2
+  echo "       each cell from the launching shell unchecked. Refusing to run." >&2
+  exit 2
+fi
+unset _nstrip
+
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY RUN: every validation passed, nothing launched."
   echo "  tag=$TAG comms=$COMMS_ON tx=$TX duration=${DURATION}s record=$REC"
   echo "  scenario=$SCENARIO mission_return=$MISSION_RETURN_FLAG"
   echo "  done_criterion=$DONE_CRITERION done_unknown=$DONE_UNKNOWN"
   echo "  env='$EXTRA_ENV'"
+  echo "  ambient knobs stripped from every cell:$RUNNER_STRIP"
   echo "  cells=$CELLS"
   exit 0
 fi
@@ -501,6 +629,11 @@ else
 fi
 
 n_ok=0; n_fail=0; n_skip=0; consec_fail=0
+# Cells that are COMPLETE but not CLEAN. Tracked separately from n_skip because
+# they are the ones the summary line hid: `skipped=N` is the same number whether
+# every banked cell passed its gates or none of them did, and gate_g8 -- the only
+# thing that reads the verdict -- does not run until the campaign is over.
+n_susp=0; SUSP_CELLS=""
 for cell in "${CELL_LIST[@]}"; do
   arm="${cell%%:*}"; seed="${cell##*:}"
   name="${TAG}_${arm}_seed${seed}"
@@ -566,11 +699,27 @@ for cell in "${CELL_LIST[@]}"; do
   # block, and _r10 is written out explicitly rather than left to the default so
   # that both cr2 levels travel through the identical -p code path -- otherwise
   # the passthrough itself is confounded with the arm.
+  #
+  # Three digits, matching the strip in _arm_stack above and gate_g8.py's
+  # `_r([0-9]{1,3})`. All three have to accept the same set of names or a cell
+  # is stamped one way and read another: before this, `_r100` fell past every
+  # arm of this case, so cell_claim_r stayed empty (the node kept the yaml
+  # default) while the OUTDIR name still said r100 and the gate still parsed
+  # 100 out of it. Nothing would have failed; the radius would simply not have
+  # been applied, under a directory named for it.
   cell_claim_r=""
   case "$cell_mode" in
-    *_r[0-9]|*_r[0-9][0-9])
+    *_r[0-9]|*_r[0-9][0-9]|*_r[0-9][0-9][0-9])
       cell_claim_r="${cell_mode##*_r}.0"; cell_mode="${cell_mode%_r*}";;
   esac
+
+  # What this cell's manifest WILL say for done_seek_enabled. The runner spells
+  # the flag as a ROS bool ("true"/"false") while the campaign carries it as
+  # 0/1, and the resume guard compares manifest text, so the translation has to
+  # happen on this side. C3: done-seek changes the endpoint -- it keeps a robot
+  # exploring past its own done criterion -- so a tag with _seek cells banked
+  # beside plain ones is two experiments, and until now nothing said so.
+  if [ "$cell_seek" = "1" ]; then cell_seek_arg="true"; else cell_seek_arg="false"; fi
 
   # What this cell's manifest WILL say for the six M-TARE knobs, so the resume
   # guard below can compare rather than assume. Per cell and not per campaign,
@@ -610,6 +759,28 @@ for cell in "${CELL_LIST[@]}"; do
       CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
       GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1
       PURSUIT_PREDICTOR_REQ=mdp ;;
+    # NO SILENT DEFAULT (2026-09-18). This case had no `*)` arm, so an arm token
+    # that reached here unrecognised kept the six --env-derived defaults above —
+    # CELL_WORLD/TEAM_WORLD/GLOBAL_ALLOC at 0, RECONNECT_GATE at silence,
+    # RENDEZVOUS_SCHEDULE at 0 — i.e. the expectation set of an UNTREATED cell,
+    # and then wrote them into the manifest under a treated arm's name. Nothing
+    # downstream could recover the discrepancy, because the manifest is the
+    # record of what was expected. run_explo_sim_rviz.sh's RECONNECT_MODE
+    # vocabulary check does refuse the run a few seconds later, but only after
+    # this has already built and recorded the wrong expectations.
+    #
+    # The reachable route in is a suffix the strip above cannot express: before
+    # today the claim-radius strip took 1-2 digits, so `..._r100` never became
+    # `mtare_hybrid` and landed here. That strip now takes three (see the two
+    # `*_r[0-9]...` cases), which closes the known path — this arm is for the
+    # next one.
+    *)
+      echo "FATAL: unrecognised arm stack '$cell_mode' (from arm '$arm')." >&2
+      echo "       Refusing rather than recording an untreated cell's" >&2
+      echo "       expectations under a treated arm's name. Add a case above" >&2
+      echo "       if this is a real stack; check the _r/_ttl/_seek suffix" >&2
+      echo "       strips if it is a token they failed to remove." >&2
+      exit 2;;
   esac
 
   # "Complete" means reached an end reason AND passed its run-time gates. A run
@@ -664,7 +835,10 @@ for cell in "${CELL_LIST[@]}"; do
       "global_alloc=$GLOBAL_ALLOC_REQ" \
       "reconnect_gate=$RECONNECT_GATE_REQ" \
       "rendezvous_schedule=$RENDEZVOUS_SCHEDULE_REQ" \
-      "pursuit_predictor=$PURSUIT_PREDICTOR_REQ"
+      "pursuit_predictor=$PURSUIT_PREDICTOR_REQ" \
+      "link_gate=$LINK_GATE_REQ" \
+      "link_gate_effective=$LINK_GATE_EFFECTIVE_REQ" \
+      "done_seek_enabled=$cell_seek_arg"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -743,7 +917,9 @@ for cell in "${CELL_LIST[@]}"; do
       "alloc_peer_pos_max_age_sec=${cell_pos_ttl:-none}" \
       "separation_weight=$SEPARATION_WEIGHT_REQ" \
       "separation_radius_m=$SEPARATION_RADIUS_REQ" \
-      "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ"
+      "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ" \
+      "reconnect_midrun_silence_sec=$MIDRUN_SILENCE_REQ" \
+      "team_world_hz=$TEAM_WORLD_HZ_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -773,7 +949,70 @@ for cell in "${CELL_LIST[@]}"; do
         exit 2
       fi
     done
-    if grep -q '^run_gates_verdict=INVALID' "$out/run_manifest.txt" 2>/dev/null; then
+    # C3: team size, checked for CONSISTENCY rather than against a prediction.
+    # n_robots is derived inside the runner from the scenario roster, and this
+    # script does not carry that mapping -- so the honest check is not "is it
+    # the number I expected" but "do all the banked cells of this tag agree".
+    # That is the hazard that matters: scenario IS compared above, but the
+    # scenario -> roster expansion lives in an install tree that can be rebuilt
+    # between two halves of a campaign, and a tag holding 40 two-robot cells and
+    # 40 three-robot cells under one name would pass every other check here.
+    # Order statistics over robots move with N under a pure null, so pooling
+    # across team sizes is not a small error.
+    #
+    # IT IS DETECTIVE, NOT PREVENTIVE, AND IT FIRES ONE INVOCATION LATE. This
+    # whole block sits in the COMPLETE branch of the single `for cell` loop
+    # above, so it only ever reads cells that were already banked when the loop
+    # reached them. Cells THIS invocation runs are never compared against
+    # BANKED_N_ROBOTS — nothing reads their manifest until some later run of
+    # this script walks past them as complete. So the rebuilt-roster case plays
+    # out as: invocation 2 banks its differently-sized cells without a word, and
+    # invocation 3 aborts on a tag that is already mixed. The abort is still
+    # worth having (it stops the mixed tag being EXTENDED, and it names the
+    # problem in a place the operator will look), but do not read it as a
+    # promise that a tag on disk is homogeneous just because the last run did
+    # not abort. It only proves the cells that were complete BEFORE that run
+    # agreed with each other. To check a tag as it stands, compare n_robots
+    # across the banked manifests directly.
+    have_n=$(sed -n 's/^n_robots=//p' "$out/run_manifest.txt" 2>/dev/null | head -1)
+    if [ -n "${have_n:-}" ]; then
+      if [ -z "${BANKED_N_ROBOTS:-}" ]; then
+        BANKED_N_ROBOTS="$have_n"
+      elif [ "$have_n" != "$BANKED_N_ROBOTS" ]; then
+        log "ABORT: $name is complete with n_robots=$have_n, but another banked"
+        log "       cell of this tag has n_robots=$BANKED_N_ROBOTS. One tag,"
+        log "       two team sizes — endpoints computed over robots are not"
+        log "       comparable across N. Use a fresh --root/--tag."
+        exit 2
+      fi
+    fi
+    # THE VERDICT IS READ, NOT MERELY TESTED FOR `=INVALID`. A banked cell
+    # carries exactly one of CLEAN / SUSPECT / INVALID, or no key at all, and
+    # until 2026-09-18 this site asked only the third of those four questions.
+    # Everything that was not literally INVALID -- SUSPECT, and the absent key --
+    # fell through to the `else` and was logged `SKIP (already complete)`: the
+    # same line, character for character, that a CLEAN cell gets. gate_g8
+    # hard-fails both, but gate_g8 is run by hand after the campaign, so the
+    # first anyone heard of a bank full of uncertifiable cells was at analysis
+    # time with every hour of sim already spent.
+    #
+    # `tail -1` and not `head -1`: the teardown APPENDS this key, so if a
+    # manifest ever carries two the last one is the verdict that was reached.
+    # (It should not -- the OUTDIR is rm -rf'd before a retry -- but reading the
+    # first would silently prefer a stale verdict over the live one, and the
+    # cheap read is the one that cannot be wrong.)
+    banked_verdict=$(sed -n 's/^run_gates_verdict=//p' \
+                       "$out/run_manifest.txt" 2>/dev/null | tail -1)
+    # REDO_SUSPECT IS OPT-IN, AND DELIBERATELY SO. Re-rolling a cell conditions
+    # the retained sample on whatever made it fail, which is the argument
+    # recorded just below for keeping the INVALID attempts; SUSPECT's causes are
+    # mostly harness defects rather than outage severity, but "mostly" is not a
+    # basis for silently re-rolling somebody's arm. The default therefore keeps
+    # the evidence and makes the operator look; the env var exists for when the
+    # operator has looked and decided.
+    if [ "$banked_verdict" = "INVALID" ] || \
+       { [ "${REDO_SUSPECT:-0}" = "1" ] && [ -n "$banked_verdict" ] \
+         && [ "$banked_verdict" != "CLEAN" ]; }; then
       # Keep the evidence. A gate can fail *because the link never dropped*, so
       # re-rolling preferentially discards mild-outage realisations; deleting the
       # attempt makes a cell that needed four tries indistinguishable from one
@@ -784,9 +1023,20 @@ for cell in "${CELL_LIST[@]}"; do
       k=$(( $(ls -1 "$att" 2>/dev/null | grep -c '_manifest.txt$') + 1 ))
       cp "$out/run_manifest.txt" "$att/attempt${k}_manifest.txt" 2>/dev/null || true
       cp "$out/comms_gates.txt"  "$att/attempt${k}_gates.txt"    2>/dev/null || true
-      log "REDO $name (attempt $k failed its gates; evidence kept in ${name}.attempts/)"
+      log "REDO $name (attempt $k banked ${banked_verdict:-<absent>}; evidence kept in ${name}.attempts/)"
     else
-      log "SKIP $name (already complete)"
+      if [ "${banked_verdict:-}" = "CLEAN" ]; then
+        log "SKIP $name (already complete)"
+      else
+        # Named, counted, and repeated in the summary, because this is the one
+        # state that costs nothing to notice now and a whole campaign to notice
+        # later.
+        log "SKIP $name (complete, but run_gates_verdict=${banked_verdict:-<absent>}"
+        log "     — gate_g8 hard-fails this cell. REDO_SUSPECT=1 re-runs it instead;"
+        log "       read $out/comms_gates.txt before deciding.)"
+        n_susp=$((n_susp + 1))
+        SUSP_CELLS="${SUSP_CELLS:+$SUSP_CELLS }$name"
+      fi
       n_skip=$((n_skip + 1))
       continue
     fi
@@ -842,12 +1092,23 @@ for cell in "${CELL_LIST[@]}"; do
   # assumption, and costs nothing: --env is expanded after these flags and env
   # applies assignments after unsets, so `--env LINK_GATE=0` still works and is
   # still the channel the guard reads.
-  env -u LINK_GATE -u MIDRUN_SILENCE \
+  #
+  # $RUNNER_STRIP is the SUPERSET, derived from the runner's own
+  # `${NAME:-default}` reads, where this literal list is derived from what THIS
+  # script models -- see its construction near the dry-run exit. The two
+  # overlap heavily and that is fine; repeating a -u is a no-op. The literal
+  # names stay because each carries a reason a derivation cannot, and because
+  # campaign_guard_calib.sh reads them back out of this line.
+  env $RUNNER_STRIP \
+      -u LINK_GATE -u MIDRUN_SILENCE \
       -u CELL_WORLD -u TEAM_WORLD -u TEAM_WORLD_HZ \
       -u GLOBAL_ALLOC -u RECONNECT_GATE -u RENDEZVOUS_SCHEDULE \
       -u PURSUIT_PREDICTOR \
       -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
       -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
+      -u DONE_GRACE_S -u HANG_HB -u POLL_S \
+      -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
+      -u MAP_AGREE_MAX_PCT -u GZ_GUI \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
       RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
       COORD_CLAIM_R="$cell_claim_r" \
@@ -867,7 +1128,20 @@ for cell in "${CELL_LIST[@]}"; do
   echo "$cell,$arm,$seed,$out,$rc,${reason:-none},${endt:-},$wall,$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$INDEX"
 
   if [ "$rc" = 0 ]; then
-    log "OK $name rc=0 ${reason:-?} t_sim=${endt:-?} wall=${wall}s"
+    # THE VERDICT TRAVELS ON THE OK LINE. rc=0 says the stack came up and the
+    # run reached its end condition; it says nothing about whether the gates
+    # certified it, and under the default GATES_STRICT a SUSPECT cell exits 0.
+    # So `OK ... rc=0` was the operator-facing report for a cell that gate_g8
+    # will hard-fail, and the campaign log gave no way to tell the two apart
+    # while there was still time to stop.
+    fresh_verdict=$(sed -n 's/^run_gates_verdict=//p' \
+                      "$out/run_manifest.txt" 2>/dev/null | tail -1)
+    log "OK $name rc=0 ${reason:-?} t_sim=${endt:-?} wall=${wall}s gates=${fresh_verdict:-<absent>}"
+    if [ "${fresh_verdict:-}" != "CLEAN" ]; then
+      log "     ^ NOT CLEAN — this cell banks but gate_g8 hard-fails it; see $out/comms_gates.txt"
+      n_susp=$((n_susp + 1))
+      SUSP_CELLS="${SUSP_CELLS:+$SUSP_CELLS }$name"
+    fi
     n_ok=$((n_ok + 1)); consec_fail=0
   else
     log "FAIL $name rc=$rc wall=${wall}s — see $ROOT/$name.console.log"
@@ -886,6 +1160,21 @@ for cell in "${CELL_LIST[@]}"; do
   sleep 10
 done
 
-log "$TAG done: ok=$n_ok fail=$n_fail skipped=$n_skip"
+log "$TAG done: ok=$n_ok fail=$n_fail skipped=$n_skip not_clean=$n_susp"
+# NOT_CLEAN IS NAMED, NOT JUST COUNTED. A count tells the operator to go
+# looking; the names tell them where, and this is the last line of output the
+# campaign produces, so anything not said here has to be reconstructed from a
+# few hundred console logs later.
+if [ "$n_susp" != 0 ]; then
+  log "  $n_susp cell(s) are COMPLETE but not run_gates_verdict=CLEAN. They are"
+  log "  banked and will be skipped by every later resume, and gate_g8 hard-fails"
+  log "  each of them, so the campaign is short by that many cells until they are"
+  log "  dealt with (read their comms_gates.txt; REDO_SUSPECT=1 re-runs them):"
+  for s in $SUSP_CELLS; do log "    $s"; done
+fi
 log "index: $INDEX"
+# The exit status still tracks FAILURES ONLY. not_clean cells exited 0 by the
+# runner's own contract and re-rolling them is the operator's call, so turning
+# them into a non-zero status here would abort the ts4 chain on a condition the
+# chain cannot resolve. They are reported, loudly, and that is the remedy.
 [ "$n_fail" = 0 ]

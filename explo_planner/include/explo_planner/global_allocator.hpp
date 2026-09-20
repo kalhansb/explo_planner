@@ -73,6 +73,79 @@ struct Allocation {
   /// present identically as empty tours.
   std::string refused;
 
+  /// R3 / §3.6. FNV-1a over the PROBLEM this solve was given, not over its
+  /// answer: the vehicle set sorted by id as `(id, cell, in_comms, finished)`,
+  /// then the candidate cell ids in ascending order, then the world's
+  /// `edgeHash()`, then `cfg.comms_mask` and `cfg.max_candidates`. Two robots
+  /// that solve the same problem must produce the same value; two robots that
+  /// produce different tours with the SAME value have found a determinism bug
+  /// in the solver, and two robots with different values were never solving
+  /// the same problem and their disagreement is not the allocator's fault.
+  ///
+  /// `cfg.polish_passes` is deliberately NOT in it, and the two that are were
+  /// added 2026-09-18. The line is drawn at whether a field changes the
+  /// PROBLEM or the approach to it: comms_mask changes the feasible assignment
+  /// set, max_candidates decides refused-versus-solved, and 2-opt passes change
+  /// only the tours. That last exclusion is what keeps the second reading above
+  /// meaningful -- two robots differing only in polish_passes really are
+  /// getting different answers to one problem, and folding it in would restate
+  /// that as "different problems" and lose it. See the digest block in
+  /// global_allocator.cpp for the full argument, and
+  /// AllocHash.SolverConfigSplitsOnWhatChangesTheProblem for the assertions.
+  ///
+  /// That distinction is the whole point. `shared_hash` was being used as the
+  /// join key for "both robots saw the same world", and it cannot bear that --
+  /// for a STRUCTURAL reason, which is the one to rely on: `shared_hash`
+  /// covers cell statuses, while the problem also contains a vehicle set (not
+  /// part of the world at all) and a cost matrix (never exchanged). Equal
+  /// `shared_hash` therefore does not mean the same problem, so restricting an
+  /// agreement analysis to it does not restrict it to the same problem, and
+  /// every such analysis to date is unsound for that reason.
+  ///
+  /// An earlier version of this comment quantified the leak as "4.5% at N=2
+  /// and 23% at N=4". **Do not cite those numbers.** They could not be
+  /// reproduced from the banked campaigns -- no denominator, filter or time
+  /// window was recorded with them, five reconstructions disagreed and three
+  /// of the five inverted the N ordering. A leak that looks like a clean
+  /// team-size gradient is also the exact shape of an artifact this project
+  /// has been caught by before. The structural argument above needs no
+  /// measurement and is not weakened by withdrawing one.
+  ///
+  /// Computed INSIDE solve(), from the same values the solve used, rather than
+  /// re-derived by the caller. A digest of the inputs that is assembled a
+  /// second time somewhere else is a digest of a second thing that is believed
+  /// to be equal, and drift between the two would be invisible in exactly the
+  /// way this is supposed to make visible.
+  ///
+  /// Pure instrumentation. Nothing branches on it.
+  unsigned int alloc_hash = 0;
+
+  /// The `edgeHash()` component of `alloc_hash`, logged separately so a
+  /// disagreement can be attributed. If two robots differ in `alloc_hash` but
+  /// agree here, they disagreed about the fleet, the candidate set, or one of
+  /// the two config terms; if they differ here too, their local maps produced
+  /// different traversability and no amount of status exchange would have
+  /// fixed it.
+  ///
+  /// That third arm is checkable without a second digest WHENEVER P3 IS ON:
+  /// both values are written to the run params (`global_alloc_comms_mask`,
+  /// `global_alloc_max_candidates`), so compare those across the two robots'
+  /// logs and eliminate them before reaching for the fleet or the candidates.
+  /// Every arm of every campaign runs global_alloc_enable=true, so in practice
+  /// they are always there.
+  ///
+  /// WITH P3 OFF THEY ARE BOTH ABSENT, and this said "written to the run
+  /// params" flat until 2026-09-18. The two addParam calls sit inside `if
+  /// (global_alloc_enable_)` (explo_planner_node.cpp), while the solver is
+  /// still reached by the §3.6 gate and by the rendezvous scheduler, which
+  /// re-read max_candidates on their own paths and log nothing;
+  /// `global_alloc_comms_mask` is not even declared there, on purpose, because
+  /// the gate overwrites it per solve. So an allocator-off configuration
+  /// produces edge_hash values with no record of the config that made them.
+  /// Nothing to fix while no such campaign exists — but do not read the
+  /// absence of the params as "the defaults were used".
+  unsigned int edge_hash = 0;
+
   /// The first cell of robot `self_id`'s tour — the focus cell — or -1 if it
   /// has no tour. This is the only value doPlan needs from the whole solve.
   int focusFor(int self_id, const std::vector<AllocRobot>& robots) const;

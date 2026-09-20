@@ -38,12 +38,27 @@ struct CoordHash {
   }
 };
 
+/// Voxel size to divide by, carrying the same fallback fitAndScore() already
+/// applies to the same field. A non-positive resolution is a configuration
+/// error rather than a geometry, and every division by it in this file is
+/// unrecoverable once it slips through: 1.0/0.0 is +inf, inf*0.0 is NaN, and a
+/// float->int32 cast of either is undefined behaviour, so one bad parameter
+/// turns the clustering hash key of every voxel into whatever the compiler felt
+/// like emitting, and turns connectionRadius()'s window into a loop bound of
+/// indeterminate size. The guard was present in fitAndScore() and absent
+/// everywhere else, which is the asymmetry this closes; tree_detector_node
+/// clamps n_azimuth_bins / n_height_bins at load but does NOT clamp
+/// voxel_size, and it re-reads voxel_size from the incoming map's resolution on
+/// every scan, so the value arriving here is not one this file may assume.
+/// (2026-09-18)
+double safeRes(double res) { return (res > 0.0) ? res : 0.15; }
+
 Coord toCoord(const Eigen::Vector3f& p, double res) {
   // floor, not round: a regular voxel lattice maps to consecutive integers for
   // any grid phase offset, with no gaps or collisions. lround would open a
   // one-cell gap at the zero crossing (…-1, [no 0], 1…), splitting a straddling
   // object into two clusters and corrupting the radius fit.
-  const double inv = 1.0 / res;
+  const double inv = 1.0 / safeRes(res);
   return Coord{static_cast<int32_t>(std::floor(p.x() * inv)),
                static_cast<int32_t>(std::floor(p.y() * inv)),
                static_cast<int32_t>(std::floor(p.z() * inv))};
@@ -188,22 +203,66 @@ float medianOf(std::vector<float>& v) {
   return v[mid];
 }
 
-/// Connection window radius in cells: two occupied cells join if within
-/// cluster_tol_m. A window > 1 voxel bridges the 1-2 cell gaps a thin/sparse
-/// trunk surface leaves under strict 26-connectivity, without merging trees
-/// metres apart.
+/// Half-width in cells of the CANDIDATE CUBE the flood-fill scans around each
+/// cell. This is a prefilter and nothing more — connectionRadiusSqCells() below
+/// is what decides whether a candidate actually joins. A window > 1 voxel
+/// bridges the 1-2 cell gaps a thin/sparse trunk surface leaves under strict
+/// 26-connectivity, without merging trees metres apart.
+///
+/// The cube always encloses the Euclidean ball it stands in for, so nothing is
+/// lost by prefiltering: lround(x) >= floor(x) for x >= 0, and a ball of radius
+/// x holds no integer offset with any component above floor(x).
 int connectionRadius(const TreeDetectorConfig& cfg) {
   return std::max(1, static_cast<int>(std::lround(
-                         cfg.cluster_tol_m / cfg.voxel_size)));
+                         cfg.cluster_tol_m / safeRes(cfg.voxel_size))));
+}
+
+/// SQUARED connection radius in cells, for the Euclidean acceptance test.
+///
+/// Connectivity used to be decided by the cube alone, i.e. as a Chebyshev
+/// (axis-max) distance, so the effective merge distance was the cube's CORNER —
+/// up to sqrt(3) * cluster_tol_m. At the shipped 0.15 m voxel and 0.30 m
+/// tolerance that is 0.52 m, and two stems 0.520 m apart merged into a single
+/// tree, which changes the reported tree count: the quantity the whole detector
+/// exists to produce, silently, in the direction of under-counting a stand.
+/// Testing a Euclidean radius makes the merge distance the same on every
+/// bearing instead of reaching 73% further along the diagonals. (2026-09-18)
+///
+/// The radius is the cube's INSCRIBED ball, not the raw cluster_tol_m ball, and
+/// the difference is deliberate. Those two agree at the shipped configuration —
+/// 0.30 / 0.15 is exactly 2 cells, so the merge distance is 0.30 m on every
+/// bearing and the 0.52 m corner is gone — but they part company whenever
+/// cluster_tol_m / voxel_size rounds UP in connectionRadius(). Taking the raw
+/// ball there would tighten connectivity below what the cube has always
+/// delivered along its own axes, which is a second, unasked-for behaviour
+/// change and a destructive one: at 0.30 m tolerance on a 0.20 m map it drops
+/// the axial reach from 2 cells to 1, and a trunk whose voxel column skips a
+/// layer — which a float32 lattice landing on a cell boundary does — splits in
+/// half and is reported at half its height. Shrinking the cube to its inscribed
+/// ball removes the anisotropy without removing any reach. Where the rounding
+/// binds, the merge distance is connectionRadius() * voxel_size (at most
+/// cluster_tol_m + voxel_size/2); that rounding predates this change and is
+/// unaltered by it.
+///
+/// Floored at 3 — the (1,1,1) corner — because the inscribed ball of the R = 1
+/// cube is the whole cube, and anything less would silently drop to
+/// 6-connectivity (faces only) and shred every thin trunk surface into separate
+/// clusters, which is a worse failure than the one being fixed.
+float connectionRadiusSqCells(const TreeDetectorConfig& cfg) {
+  const double r = cfg.cluster_tol_m / safeRes(cfg.voxel_size);
+  const double cube = static_cast<double>(connectionRadius(cfg));
+  return static_cast<float>(std::max({r * r, cube * cube, 3.0}));
 }
 
 /// Flood-fill connected-component labelling over `sel` (indices into `voxels`),
-/// joining cells within a (2R+1)^3 window. `sel` must hold at most one voxel
-/// per grid cell (both front-ends dedup while gating). Returns clusters as
-/// vectors of voxel indices.
+/// joining cells within the Euclidean radius `r2_cells` (squared, in cells) and
+/// using the (2R+1)^3 window only to enumerate candidates. `sel` must hold at
+/// most one voxel per grid cell (both front-ends dedup while gating). Returns
+/// clusters as vectors of voxel indices.
 std::vector<std::vector<int>> clusterVoxels(const std::vector<SemVoxel>& voxels,
                                             const std::vector<int>& sel,
-                                            double res, int R) {
+                                            double res, int R,
+                                            float r2_cells) {
   std::unordered_map<Coord, int, CoordHash> grid;  // coord -> position in sel
   grid.reserve(sel.size() * 2);
   for (size_t k = 0; k < sel.size(); ++k)
@@ -226,6 +285,16 @@ std::vector<std::vector<int>> clusterVoxels(const std::vector<SemVoxel>& voxels,
         for (int dy = -R; dy <= R; ++dy)
           for (int dz = -R; dz <= R; ++dz) {
             if (dx == 0 && dy == 0 && dz == 0) continue;
+            // The cube enumerates candidates; THIS decides. Accepting the whole
+            // cube made connectivity a Chebyshev test, so the real merge radius
+            // was the corner, sqrt(3) * cluster_tol_m — 0.52 m at the shipped
+            // 0.30 m, enough to fuse two 0.520 m-apart stems into one tree and
+            // change the count the detector reports. Kept before the hash
+            // lookup, so the corners of the cube cost three integer multiplies
+            // rather than a find(): at the default radius this does about a
+            // quarter of the lookups the old loop did. (2026-09-18)
+            const float d2 = static_cast<float>(dx * dx + dy * dy + dz * dz);
+            if (d2 > r2_cells) continue;
             auto it = grid.find(Coord{c.x + dx, c.y + dy, c.z + dz});
             if (it == grid.end()) continue;
             const int nb = it->second;
@@ -359,7 +428,24 @@ std::optional<TreeDetection> fitAndScore(const TreeDetectorConfig& cfg,
   // fraction of sectors that hold at least one voxel. A trunk seen from one
   // side fills only the sectors on that arc; the occluded far side is absent
   // and reads as empty sectors -- exactly what the vantage circle then fills.
-  std::vector<char> az_hit(cfg.n_azimuth_bins, 0);
+  //
+  // The bin count is normalised locally, exactly as bearingBit() and
+  // bearingCoverage() further down already normalise the same parameter. A zero
+  // is not a configuration this block can express: az_hit would be empty, `b`
+  // would clamp to -1 and write off the front of it, and `filled / n` below
+  // would be 0/0 = NaN. tree_detector_node clamps both bin counts to >= 1 at
+  // parameter load, so none of that is reachable from the campaign harness
+  // today — but TreeDetectorConfig is a plain struct of public fields and
+  // TreeDetector is public API, so unreachable here only means one caller away
+  // from reachable, and what waits there is undefined behaviour rather than a
+  // wrong number. A NaN coverage would then INVERT the verdict at the bottom of
+  // this function (`deficit > deficit_thresh` compares false against NaN, so an
+  // unmeasurable tree reads well-observed and can never be nominated) and
+  // destroy the strict weak ordering std::sort relies on in
+  // TreeDetector::detect — the same failure normEntropy() is guarded against
+  // at the top of this file, arriving by a different route. (2026-09-18)
+  const int n_az = std::max(cfg.n_azimuth_bins, 1);
+  std::vector<char> az_hit(n_az, 0);
   float entropy_sum = 0.0f;
   for (int idx : trunk) {
     // Bin about the axis AT THIS VOXEL'S HEIGHT (layer reference + the fitted
@@ -386,32 +472,47 @@ std::optional<TreeDetection> fitAndScore(const TreeDetectorConfig& cfg,
 
     float a = std::atan2(dy, dx);
     if (a < 0.0f) a += two_pi;
-    int b = static_cast<int>(a / two_pi * cfg.n_azimuth_bins);
-    if (b >= cfg.n_azimuth_bins) b = cfg.n_azimuth_bins - 1;
+    int b = static_cast<int>(a / two_pi * n_az);
+    if (b >= n_az) b = n_az - 1;
     az_hit[b] = 1;
   }
   int filled = 0;
   for (char h : az_hit) filled += h ? 1 : 0;
-  const float coverage = static_cast<float>(filled) / cfg.n_azimuth_bins;
+  const float coverage = static_cast<float>(filled) / static_cast<float>(n_az);
 
   // --- Occupancy entropy (secondary) --- thin / freshly-seen surface sits
   // near the Beta prior (p~0.5) and reads high; a well-hit surface reads ~0.
-  const float mean_entropy = entropy_sum / static_cast<float>(trunk.size());
+  //
+  // The denominator is floored for the same reason and with the same
+  // consequences as n_az above: an empty trunk gives 0/0 = NaN, which reaches
+  // under_informed and the sort comparator. It is NOT ruled out by the
+  // min_trunk_voxels gate at the top of this function — with min_trunk_voxels
+  // set to 0 that gate passes an empty set, and detectSemantic's fallback to
+  // the whole cluster is written as `trunk.size() < min_trunk_voxels` and so
+  // does not fire either, leaving trunk genuinely empty. 0 is the right value
+  // for the entropy of nothing: it contributes no deficit of its own, and the
+  // empty cluster is rejected on radius or coverage instead. (2026-09-18)
+  const float mean_entropy =
+      trunk.empty() ? 0.0f
+                    : entropy_sum / static_cast<float>(trunk.size());
 
   // --- Vertical completeness (secondary) --- gaps between base and canopy
   // (e.g. mid-trunk occluded) show up as empty height bins.
-  std::vector<char> z_hit(cfg.n_height_bins, 0);
+  // Normalised locally for the reasons given at n_az above — empty vector, an
+  // index of -1 written into it, and a 0/0 NaN that inverts under_informed and
+  // poisons the sort comparator.
+  const int n_z = std::max(cfg.n_height_bins, 1);
+  std::vector<char> z_hit(n_z, 0);
   const float z_span = std::max(height, 1e-3f);
   for (int idx : members) {
-    int b = static_cast<int>((voxels[idx].pos.z() - base_z) / z_span *
-                             cfg.n_height_bins);
+    int b = static_cast<int>((voxels[idx].pos.z() - base_z) / z_span * n_z);
     if (b < 0) b = 0;
-    if (b >= cfg.n_height_bins) b = cfg.n_height_bins - 1;
+    if (b >= n_z) b = n_z - 1;
     z_hit[b] = 1;
   }
   int z_filled = 0;
   for (char h : z_hit) z_filled += h ? 1 : 0;
-  const float vertical = static_cast<float>(z_filled) / cfg.n_height_bins;
+  const float vertical = static_cast<float>(z_filled) / static_cast<float>(n_z);
 
   const float deficit = infoDeficit(cfg, coverage, mean_entropy, vertical);
 
@@ -465,7 +566,8 @@ std::vector<TreeDetection> detectSemantic(const TreeDetectorConfig& cfg,
   //    recovers a single dominant axis. Geometric mode's stem-slice clustering
   //    does not share this limitation.)
   const auto clusters =
-      clusterVoxels(voxels, veg, cfg.voxel_size, connectionRadius(cfg));
+      clusterVoxels(voxels, veg, cfg.voxel_size, connectionRadius(cfg),
+                    connectionRadiusSqCells(cfg));
 
   // 3. Fit + score each cluster.
   for (const auto& members : clusters) {
@@ -605,7 +707,8 @@ std::vector<TreeDetection> detectGeometric(const TreeDetectorConfig& cfg,
   //    its length. The verticality gate is what rejects walls, fallen logs and
   //    ground ribbons — their principal axis is horizontal.
   const auto clusters =
-      clusterVoxels(voxels, stem_sel, cfg.voxel_size, connectionRadius(cfg));
+      clusterVoxels(voxels, stem_sel, cfg.voxel_size, connectionRadius(cfg),
+                    connectionRadiusSqCells(cfg));
   const float cos_tilt = std::cos(cfg.max_tilt_deg *
                                   static_cast<float>(M_PI) / 180.0f);
   struct Stem {
@@ -671,7 +774,8 @@ std::vector<TreeDetection> detectGeometric(const TreeDetectorConfig& cfg,
   //    dropped rather than attached; vertical completeness still reads gaps
   //    that lie inside the connected extent.
   const auto comps =
-      clusterVoxels(voxels, above, cfg.voxel_size, connectionRadius(cfg));
+      clusterVoxels(voxels, above, cfg.voxel_size, connectionRadius(cfg),
+                    connectionRadiusSqCells(cfg));
   std::unordered_map<int, int> vox_comp;  // voxel index -> component id
   vox_comp.reserve(above.size() * 2);
   for (size_t c = 0; c < comps.size(); ++c)
@@ -811,6 +915,15 @@ std::vector<TreeDetection> TreeDetector::detect(
 
   // Neediest first: the node emits the top under-informed trees and logs the
   // rest. Stable tie-break on center keeps the order deterministic.
+  //
+  // This comparator is only a strict weak ordering because info_deficit is
+  // guaranteed finite, and that guarantee is not local to it — it is held up by
+  // normEntropy()'s non-finite screen and by the n_az / n_z / trunk.empty()
+  // denominators in fitAndScore(). A single NaN deficit makes every comparison
+  // against it false, the ordering stops being strict-weak, and std::sort is
+  // then undefined behaviour rather than merely misordered. Anything that
+  // introduces a new term into infoDeficit() has to carry its own screen for
+  // this to keep holding. (2026-09-18)
   std::sort(out.begin(), out.end(),
             [](const TreeDetection& a, const TreeDetection& b) {
               if (a.info_deficit != b.info_deficit)

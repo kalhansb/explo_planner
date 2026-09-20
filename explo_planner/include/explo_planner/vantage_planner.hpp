@@ -23,6 +23,10 @@ namespace explo_planner {
 
 class MapCache;
 
+/// As with FovConfig: the node sets every field from parameters, so these are
+/// unit-test placeholders rather than the deployed geometry. `fov_min_range`
+/// and `fov_max_range` in particular are copied from the live FovConfig at
+/// construction (explo_planner_node.cpp), not taken from here.
 struct VantageConfig {
   int   n_vantages      = 3;       ///< Viewpoints per target (3 => 120° apart).
   float standoff_m      = 2.0f;    ///< Standoff added to the trunk radius (m).

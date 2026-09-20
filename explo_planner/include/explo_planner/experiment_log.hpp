@@ -113,6 +113,7 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <utility>  // std::pair, used by params_
 #include <vector>
 
 #include <rclcpp/logger.hpp>
@@ -149,7 +150,13 @@ struct StepEvent {
   /// makes it meaningful.
   double x = 0.0, y = 0.0, z = 0.0, yaw = 0.0;
   const char* phase = "explore";          ///< "explore" / "exploit"
-  int    peers_live       = 0;            ///< peers heard within one claim TTL
+  /// accountedPeerCount: peers heard within one TTL on EITHER the claim table
+  /// or TeamWorld, PLUS peers that announced `finished` (which has no TTL and
+  /// may have been relayed). Read "within one claim TTL" here until 2026-09-18;
+  /// that has been the narrower livePeerCount since generation 23 and this
+  /// field has never carried it. Same definition in every event that has a
+  /// `peers_live` — they are all written from the one wrapper.
+  int    peers_live       = 0;
   double plan_time_ms     = 0.0;
 };
 
@@ -184,13 +191,38 @@ struct ReconnectDispatchEvent {
   const char* reason = "";                ///< dispatch cause, e.g. "coverage-saturated"
   std::string peer;                       ///< teammate the manoeuvre is aimed at ("" = none)
   double peer_record_age_sec = -1.0;      ///< age of that peer's last-contact record
-  /// chase | anchor_return | meeting_point | hold | resume_exploring
+  /// chase | appointment | anchor_return | hold | resume_exploring
+  ///
+  /// `meeting_point` was a sixth value until generation 19 and is gone: it named
+  /// the midpoint construction, which was deleted. `appointment` replaced it and
+  /// is NOT a rename — the midpoint was computed privately by each robot, the
+  /// appointment is the cell the whole fleet committed to. Banked logs still
+  /// carry the old string, so the readers accept it; the node no longer writes
+  /// it. Any change here has to be made in sim/reconnect_value.py (ACTED) and
+  /// sim/manoeuvre_events.py (DEST) in the same edit, or the treated arm's main
+  /// manoeuvre silently reclassifies as the planner declining to act.
   const char* action = "hold";
   bool   have_dest = false;               ///< false -> destination fields are null
   double dest_x = 0.0, dest_y = 0.0;
   double budget_sec = -1.0;               ///< pursuit budget; -1 where not applicable
   std::string decline_reason;             ///< why a richer action was NOT taken ("" = none)
-  int    attempt = 0;                     ///< mid-run attempt index (0 for terminal)
+  /// How many mid-run CHASE attempts this robot has spent, this one included.
+  /// Not a dispatch index: `midrun_attempts_` is incremented only on the
+  /// gate-approved chase path, so a dispatch that spends no chase reports the
+  /// running total unchanged.
+  ///
+  /// 0 THEREFORE HAS TWO MEANINGS AND `attempt` ALONE CANNOT SEPARATE THEM.
+  /// Through v7 this said "0 for terminal", which is half the truth and the
+  /// dangerous half. The other producer of a 0 is an APPOINTMENT DEPARTURE:
+  /// the robot leaves for a meeting it agreed to earlier, which is a mid-run
+  /// manoeuvre (`terminal=false`, `trigger="midrun"`) that costs no chase
+  /// budget. Measured on the gen-22 smoke: hybrid wrote 13 such rows against 5
+  /// genuine chases, so `attempt >= 1` undercounts hybrid's mid-run
+  /// manoeuvres by 72% and `attempt == 0` does not mean terminal there at all.
+  /// Read `terminal` for terminality and `reason` for which manoeuvre it was
+  /// ("appointment-due" is the departure); use this field only for how much of
+  /// `reconnect_midrun_max_attempts` the cell has burned.
+  int    attempt = 0;
   int    peers_live = 0;
   int    expected_peers = 0;
   /// Info-gate diagnostics (mid-run dispatches only; -1 elsewhere): the
@@ -222,12 +254,24 @@ struct ReconnectDispatchEvent {
   /// It exists because peer_record_age_sec is NOT that quantity and scoring the
   /// gate against it silently tests a different inequality.
   /// team_last_complete_time_ is stamped on the 1 Hz heartbeat whenever
-  /// livePeerCount() reads the team complete, and a peer counts live until its
-  /// coordination claim expires — coord_claim_ttl_sec (5.0 s) after its last
-  /// beacon. So this runs BEHIND the peer's record age by the TTL, plus up to
-  /// one heartbeat period of quantization:
+  /// teamComplete(accountedPeerCount(), ...) reads the team complete. It said
+  /// livePeerCount() until 2026-09-18 and the heartbeat has called the wider
+  /// count since generation 23; see accountedPeerCount for the three channels.
+  /// A peer counts present until BOTH the coordination claim expires —
+  /// coord_claim_ttl_sec (5.0 s) after its last beacon — and TeamWorld's
+  /// `direct` ages out on TeamModel::direct_ttl_sec (5.0 s). So this still runs
+  /// BEHIND the peer's record age by the TTL, plus up to one heartbeat period
+  /// of quantization:
   ///
   ///     team_incomplete_sec ~= peer_record_age_sec - coord_claim_ttl_sec
+  ///
+  /// THE RELATION SURVIVES ONLY BECAUSE THE TWO TTLs ARE BOTH 5.0. Move either
+  /// and the lag becomes the max of them, not coord_claim_ttl_sec. And the
+  /// third channel voids it outright: a peer that announced `finished` counts
+  /// present with no TTL at all, so once any peer finishes this column stops
+  /// tracking that peer's record age entirely — which is correct for the gate
+  /// (a finished robot is not worth reconnecting to) and wrong for anyone
+  /// inverting the formula to recover a record age.
   ///
   /// Measured on g6pilot + g7r1: 6/6 dispatches, peer_record_age_sec minus this
   /// quantity fell in [3.24, 5.51] s, straddling the TTL as predicted. The
@@ -333,9 +377,52 @@ struct MissionCompleteEvent {
   double home_x = 0.0, home_y = 0.0;      ///< the recorded start pose driven to
   double final_x = 0.0, final_y = 0.0;    ///< where the robot actually stopped
   double dist_to_home_m = -1.0;           ///< XY distance between the two rows above
-  double homing_duration_sec = -1.0;      ///< SIM seconds spent in RETURN_HOME
+  /// SIM seconds of WALL time on the homing leg: last instant minus the
+  /// instant startReturnHome accepted, so it spans everything the leg spent,
+  /// including any proximity holds taken inside it.
+  ///
+  /// v8 CHANGED WHAT THIS MEASURES. Through v7 it was derived from
+  /// `state_enter_time_`, which the proximity-hold release deliberately
+  /// backdates by the drive time already spent so that the nav budget and the
+  /// `mission_return_max_sec` cap CONTINUE across a hold rather than
+  /// restarting. Correct for a budget, wrong for a report: it made this a
+  /// drive-only clock shipped beside a whole-leg `homing_distance_m`, so the
+  /// implied homing speed was overstated by exactly the held fraction — and
+  /// held time is arm-correlated, because the arms that regroup arrive home
+  /// together and the hold radius (5.0 m) is larger than the spacing between
+  /// homes (~3 m). Do not pool v7 and v8 homing durations.
+  ///
+  /// The BUDGET still runs off `state_enter_time_` and is unchanged. So this
+  /// may legitimately exceed `mission_return_max_sec` by up to
+  /// `homing_held_sec` without the cap having failed; subtract before
+  /// concluding an overrun.
+  double homing_duration_sec = -1.0;
   double homing_distance_m = -1.0;        ///< metres travelled while homing
+  /// SIM seconds of `homing_duration_sec` spent parked in PROXIMITY_HOLD —
+  /// commanded yields to a teammate, not the robot's own stall. New in v8.
+  /// `homing_duration_sec - homing_held_sec` recovers the v7 quantity, which
+  /// is also the interval the homing budget is charged against, and
+  /// `homing_distance_m / (homing_duration_sec - homing_held_sec)` is the
+  /// driving speed. 0.0 is the overwhelmingly common value and a measured one:
+  /// it is a difference of two run-cumulative counters, so a leg that took no
+  /// hold reports zero rather than nothing.
+  double homing_held_sec = 0.0;
   bool   latched = false;                 ///< had the coverage latch fired (vs step budget)
+  /// 1 = the first and, per this struct's contract, only `mission_complete` of
+  /// the run. Mirrors `ExplorationCompleteEvent::occurrence`, but for the
+  /// opposite reason: there a second occurrence is legitimate, here it is a
+  /// DEFECT. ts1b shipped 16 robot-runs carrying two `mission_complete` rows
+  /// (DONE -> RETURN_HOME re-entry, fixed by the guard at the top of
+  /// startReturnHome), and finding that took a 240-cell audit precisely because
+  /// the rows were indistinguishable from each other. With this field a
+  /// duplicate is one grep.
+  ///
+  /// Deliberately NOT a self-reporting PASS/FAIL: the node counts and writes,
+  /// the offline gate decides. A field that can only ever read 1 would be
+  /// another check that stopped checking, so the counter is incremented at the
+  /// call site on every emission, guard or no guard, and test_endpoint.cpp
+  /// proves it reaches 2 when handed two events.
+  int    occurrence = 1;
 };
 
 /// `run_end` payload. The logger appends its own health/accounting fields, the
@@ -386,6 +473,34 @@ struct RunEndEvent {
   /// scan the event stream. The logger writes "" as null.
   std::string mission_home_result;
   double mission_home_sim_sec = -1.0;         ///< sim stamp of the resolution, -1 = none
+  /// Mission-return requests refused after the return had already resolved
+  /// (ExploPlannerNode::mission_return_done_). 0 in a healthy run. Reported
+  /// because "the guard never had to fire" and "the guard is inert" are
+  /// different claims and a run that records neither cannot tell them apart:
+  /// through generation 8 the re-entry was real, happened 16 times in ts1b,
+  /// and left no field anywhere saying so.
+  int    mission_return_reentries = 0;
+
+  /// Mid-run reconnect dispatches spent this run, against
+  /// `reconnect_midrun_max_attempts` (default 6). SCHEMA 8 (2026-09-18).
+  ///
+  /// THE CAP IS A DOSE TERM AND THIS IS THE ONLY PLACE IT BECOMES VISIBLE. The
+  /// counter is run-lifetime with no reset and no refund — a successful mid-run
+  /// reconnection costs an attempt exactly like a failed one — so once it
+  /// reaches the cap the robot silently reverts to terminal-only reconnection
+  /// for the remainder of the run. That is a weaker treatment, and it arrives
+  /// sooner in the arms and rungs that produce more outages (pursuit and
+  /// hybrid's chase half; N=4 before N=2). Without this field, a cell that ran
+  /// half its length under the reduced treatment is indistinguishable from one
+  /// that never came close, and the difference would land in the arm means as
+  /// noise attributed to the mechanism.
+  ///
+  /// READ IT AGAINST THE CAP, NOT AS A COUNT OF ANYTHING GOOD. A high value is
+  /// not "the mechanism worked hard" — dispatch does not imply reconnection —
+  /// it is "this cell was closest to losing the mechanism". `> cap` is
+  /// possible by one: the exhaustion warning increments once more so it logs
+  /// exactly once.
+  int    midrun_attempts_used = 0;
 };
 
 /// `cell_census` payload: one sample of the coarse cell world's status
@@ -561,7 +676,27 @@ struct TeamExchangeEvent {
   bool one_way = false;
   /// IN_COMMS only because someone else is bridging.
   bool via_relay = false;
+  /// How long since the last MUTUAL direct contact with this peer, measured
+  /// after the tick. Legitimately ~0 while the link is up — that is the link
+  /// being up — and the interesting readings are the non-zero ones, which come
+  /// from a sender heard one-way: the message arrived, the handshake did not.
   double last_direct_age_sec = -1.0;
+  /// v8 CHANGED WHAT THIS MEASURES, from a quantity that was always 0.0 to one
+  /// that is rarely 0.0. It is now the age of our knowledge of this peer at the
+  /// instant the message landed and BEFORE it was believed — the receiver-side
+  /// inter-arrival gap, i.e. the length of the silence this message ended.
+  ///
+  /// v7 read it from the model in the second pass, after observe() had already
+  /// stamped the sender's last_known_sec with this same tick time. Since a row
+  /// only ever exists for a sender, the subtraction was t - t: it read 0.0 on
+  /// 757,677 of 757,677 rows in the banked campaigns, which is not a finding
+  /// about comms but the absence of a measurement. Do not pool v7 and v8 on
+  /// this field, and do not read a v7 zero as "no gap".
+  ///
+  /// -1.0 means never heard from, which is distinct from 0.0 (heard on the
+  /// immediately preceding drain). Not the same question as
+  /// last_direct_age_sec above: gossip and one-way receipt both refresh this
+  /// one, so a peer can have a small gap here and a large one there.
   double last_known_age_sec = -1.0;
   /// Peers (excluding self) the model currently calls LOST_COMMS.
   int peers_lost = 0;
@@ -597,6 +732,31 @@ struct AllocationEvent {
   // logged the same value and the remaining disagreements are the allocator's.
   unsigned int shared_hash = 0;
   unsigned int grid_hash = 0;
+  /// R3 / §3.6. `shared_hash` cannot serve as the "same problem" join key it
+  /// was being used as: it covers cell STATUSES, while the problem also
+  /// contains a vehicle set (not part of the world at all) and a cost matrix
+  /// (never exchanged — `mergeWire` reconciles status and `known_by` and never
+  /// touches `edges_`). Equal `shared_hash` therefore does not imply the same
+  /// problem, so every analysis that restricted to equal `shared_hash` and
+  /// called the remainder "the allocator's disagreements" was attributing a
+  /// world difference to the solver. This follows from what the hash covers;
+  /// it needs no measurement to support it, and the "4.5% at N=2 / 23% at N=4"
+  /// figures this comment used to quote are withdrawn as unreproducible (see
+  /// global_allocator.hpp, the `alloc_hash` doc comment).
+  ///
+  /// `alloc_hash` digests the problem as solved: the vehicle tuples sorted by
+  /// id, the candidate ids, and `edge_hash`. Join on THIS. Two robots with the
+  /// same `alloc_hash` and different tours have a determinism bug; two with
+  /// different `alloc_hash` were never solving the same problem.
+  ///
+  /// 0 means no problem was formed (the world was unconfigured), which is not
+  /// agreement — skip refused solves rather than matching zeros.
+  unsigned int alloc_hash = 0;
+  /// The traversability half of `alloc_hash`, logged separately so a
+  /// disagreement can be attributed to the cost matrix rather than to the
+  /// fleet or the candidate set. This is the channel that does NOT shrink when
+  /// the link comes back up, and until now it had no detector at all.
+  unsigned int edge_hash = 0;
   /// Vehicles that survived into the problem, and how many candidate cells it
   /// had. Both are needed to read an empty tour: no vehicles, no candidates
   /// and "the mask took them all" are three different empty tours.
@@ -644,9 +804,16 @@ struct AllocationEvent {
   /// least one frontier candidate fell outside the focus neighbourhood. False
   /// means the filter was a no-op this tick and `picked_rank` proves nothing.
   bool reordered = false;
-  /// Consecutive ticks the current focus cell has produced no admissible
-  /// candidate, and the cells the staleness rule demoted to COVERED on this
-  /// tick (comma-separated ids; empty for none).
+  /// How many solves IN A ROW that held the current focus cell as focus have
+  /// produced no admissible candidate from its neighbourhood.
+  ///
+  /// NOT consecutive ticks, which is what this said through v7 — the node's
+  /// counter is indexed by cell id and is only touched on a tick where that
+  /// cell is the focus, so it survives arbitrarily many intervening ticks
+  /// spent on a different focus, and it never decays. Ticks that selected
+  /// nothing at all (global starvation) neither advance nor reset it. So a
+  /// large value here bounds nothing about elapsed time; pair it with `step`
+  /// if you need that. Reading only changed, not the field.
   int focus_skips = 0;
   std::string demoted;
 };
@@ -707,16 +874,32 @@ struct ReconnectGateEvent {
 };
 
 /// `rendezvous_agreed` payload: one appointment, and everything needed to
-/// check offline that the peer derived the same one (§3.5).
+/// check offline that every robot is holding the same one (§3.5).
 ///
-/// The name is inherited from the v2 design, where agreement was a PROTOCOL
-/// and this event marked the moment it converged. Under v4 there is no
-/// protocol: agreement is a consequence of both robots running identical
-/// arithmetic over a converged world, so this event records a DERIVATION, and
-/// the fields exist to make the claim falsifiable rather than to narrate a
-/// handshake. `shared_hash` is the join key — restrict to outages where both
-/// robots logged the same value and any (cell, t_meet) disagreement that
-/// remains is the scheduler's, not the comms model's.
+/// THE NAME IS NOW LITERAL, AND IT WAS NOT BEFORE. Under v2 agreement was a
+/// protocol; under v3/v4 the claim was that no protocol was needed, because
+/// both robots ran identical deterministic arithmetic and would therefore land
+/// on the same appointment by construction. The arithmetic was fine. The
+/// premise that they fed it the same inputs was not — each solved over its own
+/// privately merged map — and measured across the banked ts3 cells the two
+/// ends picked the same cell in 21 of 64 separated pairs, with a median
+/// t_meet disagreement of 91 s at N=2 and 125 s at N=3.
+///
+/// So under v5 there IS a protocol again: fleet id 0 derives the (cell,
+/// interval, t_meet) triple, publishes it on TeamWorld, and everyone else
+/// adopts those three integers verbatim and echoes them until the whole team is
+/// seen holding the same triple. This event records an ADOPTION, not a
+/// derivation,
+/// and `from_agreed` / `peers_on_pair` / `proposer_id` are what make that
+/// checkable per row.
+///
+/// DO NOT JOIN ON `shared_hash`. That was the v4 join key, on the theory that
+/// an equal hash meant a shared world and any residual disagreement was the
+/// scheduler's fault. It is not a complete witness: nine ts3 pairs disagreed
+/// on the appointment with IDENTICAL `shared_hash`, and the candidate COUNT
+/// differed in 5 of 19. Join on the outage and compare `cell` + `interval_sec`
+/// directly — under v5 they are exchanged integers, so equality is the whole
+/// question and it needs no proxy.
 ///
 /// Emitted on every arming attempt including the refusals, for the same reason
 /// `reconnect_gate` logs its suppressions: an appointment that was never armed
@@ -736,41 +919,294 @@ struct RendezvousAgreedEvent {
 
   /// The appointment. cell -1 with a non-empty `refused` is the refusal shape.
   int    cell        = -1;
+  /// THIS ROBOT'S DEPARTURE INSTANT, mission-elapsed seconds: the first agreed
+  /// occurrence at or after bare `t_now_sec` (nextAgreedOccurrence; the floor
+  /// was `t_now_sec + rendezvous_depart_delay_sec` through v8, and that
+  /// per-robot notice is what forked the ts4 N=3 cell — see the v9 note). The
+  /// OCCURRENCE GRID is agreed; WHICH occurrence this robot keeps follows from
+  /// its own arming instant, so on v9 this MATCHES the peers' whenever every
+  /// robot armed before the agreed instant — the expected case — and differs
+  /// by whole intervals only when one armed after it had genuinely passed.
+  ///
+  /// Equality across rows is still NOT the agreement test, for the v6 reason:
+  /// a late-armer's roll is the mechanism working, not the protocol failing.
+  /// Agreement is `cell` + `interval_sec` (see the join note above).
+  ///
+  /// What the column is still worth: `t_meet_sec - t_now_sec` lands in
+  /// [shortfall, shortfall + `interval_sec`), where the shortfall is however
+  /// far THIS robot's drive to the cell overruns `rendezvous_max_lateness_sec`
+  /// and is zero for a robot that can be punctual (arrivalShortfallSec). It was
+  /// [0, `interval_sec`) on v9, when a robot kept the nearest rung whether or
+  /// not it could get there; a v9 reader applying that upper edge fails every
+  /// honest v10 roll, which is the whole reason the version moved. The
+  /// shortfall is not logged, so the checkable bound is the LOWER edge alone —
+  /// a negative lead is still a row the arming cannot produce. And the SPREAD
+  /// of `t_now_sec` across a cell's robots is the direct measurement of how
+  /// staggered the armings were, which is what the shared instant then has to
+  /// tolerate.
   double t_meet_sec  = -1.0;
   double t_now_sec   = -1.0;
-  /// Uncapped max-over-robots arrival, in seconds. Differs from
-  /// (t_meet_sec - t_now_sec) exactly when `capped` is true, and the difference
-  /// IS how late the slowest robot will be.
+  /// THE COMMITTED `t_meet` THIS ROW ROLLED FROM, unrolled: the integer off the
+  /// wire, before nextAgreedOccurrence advanced it to the occurrence this robot
+  /// keeps. With `cell` and `interval_sec` it is the whole triple, so equality
+  /// across rows is the exact test of whether two robots hold the same
+  /// agreement — which `t_meet_sec` alone stopped being at generation 29.
+  ///
+  /// IT EXISTS BECAUSE THERE IS MORE THAN ONE AGREEMENT PER RUN NOW. Through
+  /// v9 a run held at most two triples (the provisional and the one upgrade),
+  /// the second of which stood to the end, so a cell's armings all folded onto
+  /// one lattice and the base could be recovered as their minimum. Generation
+  /// 29 re-agrees the next place and time at every meeting kept, each new base
+  /// being `mission_elapsed + interval` at an arbitrary instant, so successive
+  /// generations of ONE cell sit on lattices that do not share a phase. A
+  /// reader folding by the minimum reads that phase difference as a protocol
+  /// failure — a false accusation on the healthiest possible run, one that met
+  /// often enough to re-agree. Group by this column first, then fold.
+  double agreed_base_sec = -1.0;
+  /// THE AGREED QUANTITY: the integer the proposer put on the wire, so two
+  /// robots in one outage must log it identically and any difference is a
+  /// protocol failure, not a rounding one.
+  ///
+  /// IT IS THE RECURRENCE PERIOD `t_meet_sec` IS DERIVED FROM: the meeting
+  /// repeats every `interval_sec` and each robot keeps the first occurrence at
+  /// or after its own departure floor (nextAgreedOccurrence). That was true
+  /// through v6, was not on generations 19-22, and is true again on generation
+  /// 23. It is also the agreement evidence this gate scores and the provenance
+  /// for the argmin, saying which cell was chosen under what reachability
+  /// assumption. See RendezvousPlan::interval_ms for the reachability floor
+  /// that sets it.
+  ///
+  /// SO THE MODULO COMPARISON IS THE CROSS-ROBOT TEST AGAIN, and it was
+  /// withdrawn here for generations 19-22 because there were no periods to
+  /// fold by. Two robots holding the committed triple log `t_meet_sec` values
+  /// that differ by a WHOLE MULTIPLE of `interval_sec`; a remainder is a
+  /// protocol failure. It is a real test rather than a way to launder one only
+  /// because `interval_sec` itself must match exactly first — check that, then
+  /// the remainder, and check `t_meet_sec` against `t_now_sec` on the SAME row
+  /// for the departure window's lower edge.
+  ///
+  /// FOLD AGAINST `agreed_base_sec`, NOT AGAINST THE SMALLEST `t_meet_sec` IN
+  /// THE CELL. Since generation 29 one cell can carry several agreements and
+  /// their lattices need share no phase, so the minimum is a base only when the
+  /// run happened to re-agree nothing. See that field for the rest.
   double interval_sec = -1.0;
+  /// True when the findability cap pulled `interval_sec` in below what the
+  /// tours imply. (It read "the recurrence period" until 2026-09-18; there is
+  /// no recurrence, and the cap now bounds the furthest robot's drive against
+  /// the barrier's wait — see RendezvousScheduler::Config::max_interval_ms.)
+  ///
+  /// A TRUE HERE MEANS `interval_sec` UNDERSTATES THE DRIVE. Read
+  /// `tour_interval_sec` on the same row for the uncapped tour term.
+  ///
+  /// ONLY MEANINGFUL ON A PROPOSER ROW, and only there because the wire carries
+  /// the three integers and nothing else: a follower has no cap verdict to
+  /// report and writes false. False on a follower is therefore "not known",
+  /// not "the cap did not fire" — take the value from the proposer's row for
+  /// the outage. (The same wire economy is why the derived fields of
+  /// RendezvousPlan — this one, `penalty_mm`, the counts — carry sentinels on
+  /// the node's `appointment_`, which is that struct reused as a carrier for
+  /// the adopted triple rather than the output of a local solve.)
   bool   capped       = false;
+
+  /// True when the LATTICE FLOOR set `interval_sec` — the agreed spacing is
+  /// `rendezvous_interval_sec` (or this robot's marked-up drive, whichever is
+  /// larger) rather than what the tours asked for.
+  ///
+  /// THE ONE COLUMN THAT SAYS WHICH TERM CHOSE THE TIMETABLE, and since
+  /// generation 29 it is normally true: the campaign runs a 300 s lattice
+  /// against tour terms measured in tens of seconds, so the objective's ask
+  /// is almost always overruled. Do not reach for `capped` to answer this —
+  /// that one asks whether the cap cut the TOUR term, and a cap sitting above
+  /// the tours and below the floor reads false while still being overruled.
+  /// `floored` false on a campaign row is the interesting case: something
+  /// made a robot's drive longer than five minutes.
+  ///
+  /// Proposer only, like the rest of this block; false on a follower means
+  /// "did not solve", not "the floor lost".
+  bool   floored      = false;
+
+  /// What the OBJECTIVE asked for, before the floor and the cap touched it —
+  /// the furthest robot's marked-up drive to the winning cell. The quantity
+  /// `interval_sec` used to be and, at a 300 s lattice, usually is not: with
+  /// `floored` true these two differ by the whole policy margin, and it is
+  /// this one that measures how far apart the team actually is.
+  ///
+  /// -1 where no solve produced it (a follower row, or any row predating
+  /// generation 29), which is distinguishable from a real 0.
+  double tour_interval_sec = -1.0;
 
   /// The objective's value at the winner, in the allocator's quantised unit.
   /// 0 means the meeting cost the team nothing — somebody was already driving
   /// there. A large value against a small candidate count is the signature of
   /// a scheduler with nothing good to choose from.
+  ///
+  /// PROPOSER ONLY. This block describes the argmin, and only fleet id 0 runs
+  /// one. A follower writes -1 in every count below — a value no real search
+  /// can produce, so it cannot be mistaken for "nothing was admissible", which
+  /// is what the struct's natural 0 default would have said. Filter on
+  /// `proposer_id == robot` before aggregating any of them.
   long long penalty_mm = -1;
-  /// True when the last-contact midpoint won. Read together with `candidates`:
+  /// True when the scheduler's FLOOR cell won the argmin — the team agreed to
+  /// meet somewhere no tour goes. The floor is the centroid of the team's own
+  /// vehicle cells at proposal time, NOT the last-contact midpoint: that one
+  /// was removed on 2026-09-16 and does not exist at proposal time at all, so
+  /// any floor_won rate quoted from before then is measuring a different
+  /// destination and does not carry over. Read together with `candidates`:
   /// the floor winning against ten candidates is a verdict, the floor winning
-  /// against one is the absence of one.
+  /// against one is the absence of one. Proposer only; a follower writes false
+  /// because no sentinel exists in a bool, so false here means "did not
+  /// search" on any row where `proposer_id != robot`.
   bool floor_won = false;
-  int  candidates = 0;
-  int  rejected_unreachable = 0;
-  int  rejected_excluded    = 0;
+  int  candidates = -1;
+  int  rejected_unreachable = -1;
+  int  rejected_excluded    = -1;
 
-  /// This robot's own travel estimate to the winner and the departure deadline
-  /// derived from it, both in mission-elapsed seconds. Deliberately per-robot
-  /// and NOT expected to match the peer's: staggered departures with coincident
-  /// arrivals is the design, so two equal deadlines in a pair would be evidence
-  /// the mechanism is not doing what it claims.
+  /// This robot's own travel estimate to the winner, in mission-elapsed
+  /// seconds, or -1 where its frozen cell graph contains no route to the cell.
+  /// Deliberately per-robot and NOT expected to match the peer's.
+  ///
+  /// IT IS NOW A DIAGNOSTIC, NOT AN INPUT (schema 7). It used to feed a
+  /// per-robot departure deadline — leave when 1.2x your own drive remains, so
+  /// the far robot leaves first and the arrivals coincide — which was reported
+  /// alongside it as `depart_sec`. That column is GONE rather than zeroed,
+  /// because every robot now departs at `t_meet_sec` exactly — departure is a
+  /// bare `now >= t_meet_ms` — and a second column holding the same number
+  /// would be read as a second quantity. What travel_sec still answers is "how
+  /// far was this robot from the meeting when it armed", which is the covariate
+  /// the late/no-show outcomes want.
   double travel_sec  = -1.0;
-  double depart_sec  = -1.0;
 
   /// Non-empty when no appointment could be derived. Distinguishes "no meeting
   /// was scheduled" from "a meeting was scheduled and nothing came of it".
   std::string refused;
-  /// Cells already written off by a no-show, comma-separated. Grows within one
-  /// outage; empty on the first attempt.
-  std::string excluded;
+
+  // --- the agreement itself (gen 10) --------------------------------------
+  //
+  // Before gen 10 each robot DERIVED the appointment privately and the log had
+  // no way to say whether the two ends had landed on the same one; the answer,
+  // measured after the fact across ts3, was 21 of 64 pairs. These fields make
+  // it a first-class, per-row fact rather than something reconstructed by
+  // joining two files and hoping.
+
+  /// Fleet id of the robot that derived the pair. Constant (0) by design.
+  /// Compare it with the row's own robot to read the rest: on the proposer,
+  /// `penalty_mm` / `floor_won` / `candidates` / `rejected_*` describe the
+  /// argmin that chose the cell; on a follower they are sentinels, because a
+  /// follower does not solve anything — it echoes.
+  int proposer_id = -1;
+
+  /// The appointment came from a pair the whole team was seen holding, rather
+  /// than from a local solve. False in a refusal row.
+  bool from_agreed = false;
+
+  /// The committed triple was the CENTROID PLACEHOLDER: the argmin had exactly
+  /// one admissible cell, because the allocator had not produced a tour when the
+  /// team was last mutually whole, so the meeting point is where the team was
+  /// standing rather than anywhere it chose. False in a refusal row.
+  ///
+  /// EVERY ROBOT WRITES THE TRUTH HERE, unlike `candidates` and the rest of the
+  /// argmin block, which are proposer-only sentinels. The flag travels on the
+  /// wire beside the three integers precisely so a follower can tell a permitted
+  /// upgrade from a protocol violation, and that makes it the ONE thing a
+  /// follower row can say about how the meeting point was chosen.
+  ///
+  /// WHY IT IS WORTH A COLUMN. A campaign in which every cell committed a
+  /// placeholder is a valid rendezvous campaign that never exercised the
+  /// scheduler's argmin — the arm measured "meet where we started", which is a
+  /// different mechanism from the one the arm name implies, and before this
+  /// column nothing in the banked data could distinguish the two. Aggregate it
+  /// per cell before reading any meeting-point result.
+  bool agreed_provisional = false;
+
+  /// Mission-elapsed seconds of the SEPARATION this appointment is anchored
+  /// on — the last instant the team read mutually complete on this robot.
+  ///
+  /// NO LONGER AN INPUT TO `t_meet_sec` (2026-09-17). It used to be the whole
+  /// origin: t_meet was this plus the agreed interval, so two robots agreeing
+  /// perfectly on the interval still disagreed on t_meet by exactly their
+  /// disagreement about when contact was lost. That term was small at N=2
+  /// (0.84 s measured) and large at N>=3 (21 s across three robots in the ts4
+  /// cell), because the team coming apart is not one event when there is more
+  /// than one link.
+  ///
+  /// WHAT REPLACED IT IS THE AGREED RECURRENCE, NOT A LOCAL COUNTDOWN. A
+  /// countdown stood here briefly and this paragraph described it; since
+  /// generation 23 t_meet_sec is nextAgreedOccurrence over the committed
+  /// (t_meet_ms, interval_ms), floored since generation 25 at this robot's
+  /// own BARE now (through v8 the floor added rendezvous_depart_delay_sec,
+  /// and that per-robot term re-manufactured different meetings — the ts4
+  /// N=3 fork in the v9 note). The anchor no longer shifts the meeting, and
+  /// every robot arming before the agreed instant keeps it outright. So this
+  /// column stays a DIAGNOSTIC and its spread across a cell's robots still
+  /// measures the detection-spread error directly; what that error can now
+  /// cost is waiting at the agreed cell, and a different meeting only when a
+  /// robot arms after the instant has genuinely passed.
+  ///
+  /// -1.0 when this robot never saw mutual contact. That is now reachable on an
+  /// ARMED row — arming stopped requiring an anchor when it stopped using one —
+  /// so the sentinel is not confined to refusal rows.
+  double anchor_sec = -1.0;
+
+  /// Age of the agreement when it was armed: how long THIS EXACT TRIPLE had
+  /// been standing, confirmed by the whole team, before the separation froze
+  /// it. Stamped on change, not on re-confirmation, so it does not reset every
+  /// heartbeat. A large value is not a fault — the triple is deliberately
+  /// frozen at separation — but it bounds how stale the meeting cell can be.
+  ///
+  /// READ IT WITH `anchor_sec`, ALWAYS. This is `anchor_sec - (when the team
+  /// committed)`, so a NEGATIVE value is meaningful and is the late-commit
+  /// signature — the commit landed after the separation it is being measured
+  /// against. But -1.0 is also what this carries when there is no anchor at
+  /// all, and the two readings are indistinguishable in this column alone.
+  /// `anchor_sec < 0` disambiguates them and is the only thing that does.
+  double agreed_age_sec = -1.0;
+
+  /// How many peers were holding the committed pair when it was committed.
+  ///
+  /// SCHEMA 7 CHANGED WHAT LOW VALUES MEAN. Through schema 6 this was
+  /// structurally fleet-1 on every armed row, because the commit rule required
+  /// all N-1 echoes, so it was a manipulation check rather than a variable and
+  /// anything less meant the rule had been relaxed. It now depends on which
+  /// generation the row committed, and BOTH readings are correct:
+  ///
+  ///   agreed_provisional = 1   still fleet-1 by construction. The placeholder
+  ///                            is committed on the full echo round, which runs
+  ///                            while the team is co-located and whole.
+  ///   agreed_provisional = 0   anywhere in [0, fleet-1]. A final triple is
+  ///                            terminal and authored by one robot, so it
+  ///                            commits on first-hand evidence from the
+  ///                            proposer; the echoes only say who ELSE heard it.
+  ///
+  /// So read it WITH `agreed_provisional` or not at all. A low value on a final
+  /// row is the normal N>=3 shape, not a relaxed rule — see the commit rule in
+  /// maintainRendezvousProposal for the N=3 split that produced the change.
+  int peers_on_pair = 0;
+
+  /// THIS ROBOT'S OWN ROUTE TO THE AGREED CELL, in metres over its own frozen
+  /// cell graph, or -1 for "my map contains no route to it". Read only where
+  /// `from_agreed` is true; on a refusal row nothing was evaluated.
+  ///
+  /// It exists because `travel_sec` above CANNOT express this. That estimate
+  /// goes through GlobalAllocator::costMm, which deliberately falls back to
+  /// straight-line centroid distance when the graph says unreachable — right
+  /// for ranking a cell somebody will eventually clear, wrong for promising to
+  /// stand in it at a particular minute. So `travel_sec` is always finite, and
+  /// a robot that cannot get to the cell at all is invisible in it.
+  ///
+  /// That matters most on a FOLLOWER, which adopts the proposer's cell without
+  /// solving anything and so never tests reachability. Its appointment is kept
+  /// exactly — that is the point of the design — but if its own merge has no
+  /// route there it will not arrive, and the outcome row it writes is a plain
+  /// `no-show`, indistinguishable from a robot that simply ran out of time.
+  /// This column separates the two.
+  ///
+  /// NOT a refusal condition, and deliberately: the cell graph blocks edges
+  /// across UNKNOWN ground as well as occupied ground, so "no route" routinely
+  /// means "I have not explored the corridor yet" rather than "it cannot be
+  /// reached". Refusing on it would make followers abandon appointments they
+  /// could keep, most often in exactly the far-apart, much-unexplored case the
+  /// rendezvous arm exists to test. Measure it, do not act on it.
+  double own_route_m = -1.0;
 };
 
 /// `rendezvous_outcome` payload: how an armed appointment actually ended.
@@ -795,13 +1231,59 @@ struct RendezvousOutcomeEvent {
   ///   "no-show"       arrived, waited out the cap, nobody came
   ///   "unreachable"   the drive to the cell failed or timed out
   ///   "superseded"    abandoned because the manoeuvre ended another way
+  ///   "run-ended"     this robot's run ended underneath the appointment
+  ///                   (coverage latch teardown mid-drive or mid-wait). Added
+  ///                   in generation 21; before it, these were counted as
+  ///                   no-shows, which made the rendezvous arm's headline
+  ///                   failure count out of its successes.
+  ///   "unplaceable"   the agreed cell could not be turned into a position on
+  ///                   any grid this robot holds, so appointmentPoint()
+  ///                   returned the robot's own position and it never departed
+  ///                   for anywhere. Added 2026-09-18 for the same reason as
+  ///                   "run-ended": the own-position goal is reached on the
+  ///                   next tick, so this used to read as an arrived no-show,
+  ///                   i.e. as the PEERS failing to turn up. `arrived` is
+  ///                   forced false on this outcome.
+  ///
+  /// THE LAST TWO SIT ABOVE THE arrived/unreachable SPLIT in the classifier,
+  /// below "reconnected", because they answer a prior question: whether this
+  /// robot reached the cell is only meaningful once there was a cell to reach
+  /// and a run still going in which to reach it.
   std::string outcome;
   /// True when the robot reached the cell at all, whatever the outcome. A
   /// no-show with `arrived` false is a navigation failure wearing a
   /// coordination failure's name.
   bool arrived = false;
-  /// Seconds spent waiting at the cell.
+  /// Seconds spent AT the cell, measured from the arrival stamp to the close.
+  ///
+  /// ZERO IS NOT A READING OF ZERO. The one writer (closeAppointment) computes
+  /// it only when this robot actually arrived and has an arrival stamp, and
+  /// passes a flat 0.0 otherwise — the "superseded" close passes 0.0
+  /// unconditionally. So 0.0 means "never waited at all, usually because it
+  /// never got there", and it is `arrived` that tells the two apart. Filter on
+  /// `arrived` before averaging this column or the no-shows will drag the mean
+  /// toward zero.
+  ///
+  /// The -1.0 initialiser is a struct default that no emitted row carries;
+  /// do not read a -1 as a sentinel the writer chose.
   double waited_sec = -1.0;
+  /// Was the reunion WHOLE-TEAM DIRECT contact (every pair in range), as
+  /// opposed to merely complete (every peer reachable, relays counted)?
+  ///
+  /// SEPARATE FROM `outcome` SINCE SCHEMA 7 (2026-09-18) and the separation is
+  /// the point. `outcome` names what the barrier acted on, because the barrier
+  /// is what ended the manoeuvre; this names the stricter condition, which is
+  /// the one an analyst wants when asking whether the maps could actually merge
+  /// pairwise. They were the SAME field until schema 6, and at N>=3 they
+  /// disagree: a robot released by a relayed reunion recorded "no-show" for the
+  /// meeting that had just reconnected it. Reading `outcome` alone on a
+  /// schema-6 N>=3 file therefore counts successful meetings as failures --
+  /// those files are not repairable by re-reading, because only one of the two
+  /// facts was ever written.
+  ///
+  /// At N=2 the two coincide by construction (one pair, no relays) and this is
+  /// true on exactly the "reconnected" rows.
+  bool mutual = false;
 };
 
 // ==================================================================
@@ -860,6 +1342,23 @@ class ExperimentLog {
   /// list of what v4 accumulated is complete in one place, rather than being
   /// something a reader has to reconstruct by diffing structs.
   ///
+  /// The 2026-09 binary window (generation 9, ~/hmr_campaign/CODE_TODO.md)
+  /// amended v4 a third time, again with FIELDS only and on exactly the P6
+  /// precedent above — kEventKinds is byte-for-byte unchanged, no field moved,
+  /// nothing was removed, so the stamp does not move:
+  ///
+  ///     AllocationEvent::alloc_hash    R3 — the "same problem" join key
+  ///     AllocationEvent::edge_hash     R3 — its traversability half
+  ///     MissionCompleteEvent::occurrence  T5 — duplicate-endpoint detector
+  ///
+  /// Note what this means for a reader: a generation-9 file and a generation-8
+  /// file BOTH stamp 4, so the stamp cannot separate them and must not be asked
+  /// to. Generation is read from run_manifest.txt (tx/scenario/git rev), never
+  /// from this constant — the stamp answers "can my parser read this file", not
+  /// "may I pool these numbers", and generation 9 changes planner BEHAVIOUR
+  /// (D1's 360-degree FOV, R1's terminality fixes, R6's bounded dwell), so
+  /// pooling it with generation 8 is wrong however well the parse goes.
+  ///
   /// Vocabulary widening IS a schema change, on the precedent set by v3's
   /// home_watchdog widening: a reader with an exhaustive match on `event` now
   /// hits an unhandled case, and one that counts by kind silently undercounts.
@@ -870,7 +1369,215 @@ class ExperimentLog {
   /// pre-registered per-phase equivalence gate (see sim/equiv_gate.py): "no new
   /// kinds may appear at defaults" is one of its five run-invariant checks, and
   /// kEventKinds below is the declared universe it scores against.
-  static constexpr int kSchemaVersion = 4;
+  ///
+  /// v5: generation 10, the exact-rendezvous change. kEventKinds is unchanged —
+  /// no kind was added or removed — so this is NOT a vocabulary widening, and on
+  /// the P6 / generation-9 precedent the additive half would not have moved the
+  /// stamp. One REMOVAL does:
+  ///
+  ///   - `RendezvousAgreedEvent::excluded` REMOVED. Its source state (the
+  ///     node's per-outage no-show list) no longer exists: the appointment is
+  ///     now a pair agreed with the whole team BEFORE the separation and frozen
+  ///     for its duration, so there is no second arming inside an outage for a
+  ///     write-off to influence, and feeding a PRIVATE exclusion list into the
+  ///     derivation is precisely the class of private input that made gen 9's
+  ///     appointments disagree. Removed rather than left writing "" forever,
+  ///     which would read as "nothing has been written off yet" — a live
+  ///     mechanism with nothing to report — instead of "the mechanism is gone".
+  ///     This is the v3 `last_contact_age_sec` shape exactly: a reader that
+  ///     keys on it now gets a KeyError rather than a plausible wrong answer.
+  ///
+  /// Additive in the same generation, on RendezvousAgreedEvent: `proposer_id`,
+  /// `from_agreed`, `anchor_sec`, `agreed_age_sec`, `peers_on_pair`.
+  ///
+  /// Two v4 fields survive but are STRUCTURALLY INERT AS OF v5, and are kept
+  /// only because they are faithful mirrors of RendezvousPlan rather than node
+  /// state that has to be maintained: `capped` is false on every row (the
+  /// divergence cap is fed by a pairwise last-contact rate model that does not
+  /// exist at proposal time, when the team is connected, and does not
+  /// generalise past N=2 anyway), and `rejected_excluded` is 0 on every row
+  /// (the node passes an empty exclude set). Do not read either as evidence
+  /// about a v5 run; see ~/hmr_campaign/CODE_TODO.md, generation 10.
+  ///
+  /// `capped` IS LIVE AGAIN IN v6 and this paragraph no longer describes it —
+  /// see the field's own doc. It stayed false for a second reason the v5 text
+  /// did not know about: armAppointment copied five of RendezvousPlan's eight
+  /// diagnostics into the struct the row is logged from and silently dropped
+  /// `capped`, `floored` and `tour_interval_ms`, so even after the cap was
+  /// rewired to the findability bound the column could not have moved. Both
+  /// halves of `capped` were fixed in generation 17; the other two were copied
+  /// into the struct then but reached no column until generation 29 added
+  /// `floored` and `tour_interval_sec` to this event, so any row older than
+  /// that simply does not carry them. `rejected_excluded` is still inert.
+  ///
+  /// v6: generation 17, the agreed-triple change. kEventKinds is unchanged and
+  /// nothing was removed, so on the v5 reasoning this would not normally move
+  /// the stamp — the additive half alone does not. What moves it is that a v5
+  /// column CHANGED MEANING, which is the one thing a reader cannot detect:
+  ///
+  ///   - `RendezvousAgreedEvent::t_meet_sec` was, in v5, this robot's own
+  ///     mission clock at (its private view of the separation) + the agreed
+  ///     interval. It is now the AGREED instant, adopted verbatim off the wire,
+  ///     and it recurs. The column name, type and units are identical and the
+  ///     values are plausible under both readings, so a v5 analysis script run
+  ///     against a v6 file produces numbers rather than an error — and the
+  ///     numbers mean something else. That is the `checks-that-stopped-checking`
+  ///     shape and the stamp is the only thing that can refuse it.
+  ///
+  /// Additive in the same generation, on RendezvousAgreedEvent:
+  /// `agreed_provisional`. TeamWorld gained `rendezvous_provisional` and split
+  /// `rendezvous_time_sec` into `rendezvous_interval_ms` + `rendezvous_t_meet_ms`
+  /// in the same change, so v5 and v6 binaries cannot share a bus either — do
+  /// not pool a v6 campaign with any earlier one.
+  /// v7: generation 19 — the rendezvous arm stops being a recurring schedule.
+  /// Two changes, and the FIRST is a meaning change with no field movement,
+  /// which is the shape that gets read wrong:
+  ///
+  ///   - `rendezvous_outcome.outcome` now names what the BARRIER acted on
+  ///     (teamComplete over live peers) rather than whole-team direct contact.
+  ///     No field moved and no name changed, so a v6-era reader parses a v7
+  ///     file without error and silently compares two different quantities.
+  ///     Worse in the other direction: on v6 N>=3 files the label is simply
+  ///     WRONG — a relayed reunion was recorded as "no-show" — and those files
+  ///     cannot be repaired by re-reading, because the barrier's own verdict
+  ///     was never written down. Do not pool v6 and v7 rendezvous outcomes.
+  ///   - additive: `rendezvous_outcome.mutual` carries the strict predicate
+  ///     that `outcome` used to carry, so both facts now exist in one row.
+  ///
+  /// Also v7, and behavioural rather than schematic: `rendezvous_interval_ms`
+  /// and `rendezvous_t_meet_ms` are still agreed, echoed and logged, but
+  /// NOTHING READS THEM FOR TIMING any more. A v7 robot departs
+  /// `rendezvous_depart_delay_sec` after the team reads incomplete and waits at
+  /// the cell until the team is whole. An analysis that derives meeting times
+  /// from the interval is describing a schedule the binary no longer keeps.
+  ///
+  /// v8: generation 23 (2026-09-18). One MEANING change and several additive
+  /// fields, and as always the meaning change is the one that forces the stamp:
+  ///
+  ///   - `rendezvous_outcome.outcome` gains "unplaceable", and it is carved out
+  ///     of what v7 recorded as "no-show". A robot that could not place the
+  ///     agreed cell on any grid it holds had appointmentPoint() hand it its
+  ///     OWN position, reached that goal on the next tick, and so logged
+  ///     `no-show arrived=true` — the peers blamed for a departure that never
+  ///     happened. On v8 that row reads `unplaceable arrived=false`. No column
+  ///     moved, both files parse, and a v7-era no-show tally over a v8 file is
+  ///     comparing two different populations. Same shape as v7's own note, one
+  ///     branch over. Do not pool v7 and v8 rendezvous outcomes.
+  ///
+  ///   - `mission_complete.homing_duration_sec` becomes WALL time on the leg.
+  ///     v7 derived it from `state_enter_time_`, which the proximity-hold
+  ///     release backdates on purpose so the homing BUDGET continues across a
+  ///     hold — so v7's duration excluded held time while the
+  ///     `homing_distance_m` beside it did not, and distance/duration
+  ///     overstated homing speed by the held fraction. That bias is
+  ///     arm-correlated: robots that regroup arrive home together, and the
+  ///     5.0 m hold radius exceeds the ~3 m between homes. v8 measures both
+  ///     from the same instant and reports the held time separately, so
+  ///     `homing_duration_sec - homing_held_sec` recovers the v7 quantity
+  ///     exactly. Do not pool v7 and v8 homing durations.
+  ///
+  ///   - `team_exchange.last_known_age_sec` becomes the silence this message
+  ///     ended, read before the sender is believed. v7 read it after, so it
+  ///     was t - t and printed 0.0 on all 757,677 banked rows. This is the
+  ///     mildest of the three meaning changes to state and the sharpest to
+  ///     act on: the old column supports no conclusion at all, so anything
+  ///     resting on it is resting on nothing. Do not pool v7 and v8 here.
+  ///
+  /// Additive in v8, none of which change an existing column:
+  ///   - `run_end.midrun_attempts_used` — how much of the mid-run dispatch cap
+  ///     the cell spent. See the field doc: the cap is a dose term and this is
+  ///     the only place it is visible.
+  ///   - `mission_complete.homing_held_sec` — the held component carved out of
+  ///     the duration above, and the only way to tell a leg that legitimately
+  ///     outlasted `mission_return_max_sec` from one that overran it.
+  ///   - `goal_amnesty.source` — which suppression list granted the reprieve.
+  ///     Absent on a v7 file, where only one list could, so a missing key
+  ///     reads "failed" and never "unknown". See the field doc.
+  ///   - step CSV `plan_rej_visited`, appended LAST in the header, not next to
+  ///     `plan_rej_blacklist` where it belongs by meaning — inserting it there
+  ///     would shift FIVE columns under every positional reader of every
+  ///     banked run: `plan_rej_minpos`, `plan_stall_ticks`, `pursue_peer`,
+  ///     `pursue_quarry_live`, `team_complete`. (This said "eight" until
+  ///     2026-09-18; MetricsLogger::writeHeader is the only authority on the
+  ///     order, and five is what lies between the two names above. One would
+  ///     have been enough of an argument.) It is a SUBSET of
+  ///     `plan_rej_blacklist`, so the five original rejection columns still
+  ///     sum the way they always did.
+  ///
+  /// ALSO v8 AND BEHAVIOURAL on the planning side: the starvation amnesty now
+  /// runs in two tiers. v7 pushed only failed-goal rejections onto the
+  /// suppressed pool, so a tick whose every candidate fell inside
+  /// `visited_goal_radius_m` of somewhere reached in the last
+  /// `visited_goal_ttl_sec` found an empty pool, skipped the amnesty and
+  /// returned starved — at 10 Hz, up to ~1200 dead ticks waiting out a TTL,
+  /// and the campaign config turns that suppression ON (the compiled default
+  /// is off). v8 keeps a second pool and consumes it only when the failed tier
+  /// has nothing to offer, so every tick that used to produce a goal still
+  /// produces the SAME goal and only the ticks that used to stall change.
+  /// Rows with `source="visited"` are exactly those recovered ticks.
+  ///
+  /// ALSO v8 AND BEHAVIOURAL, i.e. no schema surface at all but a different
+  /// binary underneath: generation 23 changed the peer-liveness predicate that
+  /// nearly every reconnection decision reads (`accountedPeerCount` unions the
+  /// claim table, TeamWorld `direct` and `finished`, where v7 read the beacon
+  /// alone), the reconnect gate's value/cost pairing at N>=3, the mid-run
+  /// trigger's bookkeeping after a declined dispatch, and what rides on
+  /// `TeamWorld.my_tour` (v7 kept broadcasting the last allocator solve while
+  /// the robot was manoeuvring, homing or finished — a route it had abandoned,
+  /// arriving with no age field and anchored at the sender's live pose; v8
+  /// sends an empty tour outside the exploration loop, which the receive path
+  /// already treats as "no route" and degrades to the trail chase). None of
+  /// that renames a column; all of it changes what the columns describe. Do
+  /// not pool a generation-23 campaign with any earlier one on any
+  /// reconnection metric.
+  ///
+  /// v9: generation 25 (2026-09-18). No column moves; two meanings do, and one
+  /// vocabulary widens:
+  ///
+  ///   - `rendezvous_agreed.t_meet_sec` is floored at BARE `t_now_sec`
+  ///     (nextAgreedOccurrence), not `t_now_sec +
+  ///     rendezvous_depart_delay_sec`: the per-robot notice re-applied a
+  ///     shared lead time per arming, and the sum forked the ts4 N=3 cell
+  ///     across two occurrences. On v9, `t_meet_sec - t_now_sec` lands in
+  ///     [0, `interval_sec`) — a v8 reader checking the old
+  ///     [delay, delay + interval) window will fail every honest v9 row — and
+  ///     rows across one cell's robots are EXPECTED equal unless a robot armed
+  ///     after the instant had genuinely passed. `rendezvous_depart_delay_sec`
+  ///     still appears in the param rows but is inert; treat it as schema
+  ///     ballast, not a dose term.
+  ///   - `state_change` gains reason `return-team-settled` (RETURN_NAV ->
+  ///     RETURN_SYNC): an appointment walker whose team has settled for the
+  ///     confirm window joins the barrier from where it stands instead of
+  ///     driving out the last metres. Consequently `rendezvous_outcome`
+  ///     rows with `arrived=false` split into two populations — team-settled
+  ///     conversions and budget/watchdog strandings — distinguished by the
+  ///     preceding state_change reason, and an `arrived=false` reunion is no
+  ///     longer evidence of a navigation failure. Do not pool v8 and v9
+  ///     arrival rates.
+  ///
+  /// v10: generation 29 (2026-09-20). One column is added and two meanings move
+  /// under it, both on `rendezvous_agreed`:
+  ///
+  ///   - `agreed_base_sec` is NEW: the committed `t_meet` this row rolled from.
+  ///     It is the generation key. A run now holds one agreement per meeting
+  ///     kept rather than at most two for the whole run, because the team
+  ///     re-agrees the next place and time before it resumes exploring, and
+  ///     successive bases of one cell share no phase. Every cross-robot fold
+  ///     groups on this column FIRST; a v9 reader recovering the base as the
+  ///     smallest `t_meet_sec` in the cell reports the phase step between two
+  ///     healthy generations as a lattice violation.
+  ///   - `t_meet_sec` is floored at `t_now_sec` plus this robot's arrival
+  ///     SHORTFALL, not at bare `t_now_sec`: a robot whose drive to the cell
+  ///     cannot get it there within `rendezvous_max_lateness_sec` rolls to a
+  ///     rung it can keep instead of agreeing to arrive late
+  ///     (arrivalShortfallSec). So the lead lands in [shortfall, shortfall +
+  ///     `interval_sec`) and the v9 upper edge fails every honest roll. The
+  ///     shortfall is not logged; check the lower edge, which is unchanged.
+  ///   - ALSO BEHAVIOURAL, with no schema surface: `t_meet_sec` is an ARRIVAL
+  ///     instant rather than a departure one, and the barrier holds until the
+  ///     whole team is present rather than until a wait expires. Rendezvous and
+  ///     hybrid timings do not pool across the v9/v10 line on any metric.
+  static constexpr int kSchemaVersion = 10;
 
   /// Every `event` value this writer can emit, and the ONLY authority on that
   /// set. It exists because the equivalence gate has to answer "did a new kind
@@ -926,6 +1633,25 @@ class ExperimentLog {
   /// `run_start` has been emitted, i.e. t0 is latched and events are being
   /// written. False events are counted, not buffered (see startRun()).
   bool started() const { return started_; }
+  /// Duplicate `run_end` attempts that were suppressed. Exposed rather than
+  /// left internal because the warning it also raises goes to the ROS log,
+  /// which is prose a test cannot assert on and a script should not parse; this
+  /// is the same count as a value. Non-zero means the node reached a terminal
+  /// state twice and this run's endpoint metrics are suspect.
+  long long dupRunEnds() const { return dup_run_ends_; }
+  /// Duplicate `mission_complete` attempts that were suppressed. Same contract
+  /// as dupRunEnds(), and unlike that one it is ALSO written into the run_end
+  /// row (`mission_completes_suppressed`), because a mission_complete duplicate
+  /// necessarily arrives before run_end and so can still be reported in the
+  /// file rather than only in prose. Non-zero means something asked to end the
+  /// mission twice; the row count alone can no longer show that, which is
+  /// exactly why the counter exists.
+  long long dupMissionCompletes() const { return dup_mission_completes_; }
+  /// Events refused because `run_start` had not been emitted yet, and therefore
+  /// never written. Mirrors `events_dropped_before_start` on the run_end row;
+  /// exposed so the accounting is testable in the case where the DROPPED event
+  /// is itself a run_end and no row exists to report it.
+  long long droppedBeforeStart() const { return dropped_before_start_; }
   /// Absolute sim time of `run_start`, seconds. 0 before startRun().
   double t0Sec() const { return t0_sec_; }
 
@@ -955,6 +1681,15 @@ class ExperimentLog {
   // ----------------------------------------------------------------
   // Events. Every one is a no-op before startRun() (counted, and reported as
   // events_dropped_before_start in run_end) and after a failed open().
+  //
+  // THE COUNT IS PART OF THE CONTRACT, NOT A COURTESY. A new emitter that
+  // writes `if (!open_ || !started_) return;` without the increment does not
+  // merely fail to report — it makes the reported number say "nothing was
+  // lost" on a run that lost events, which is worse than no counter at all.
+  // Six of the v4 emitters (cell_census, team_exchange, allocation,
+  // reconnect_gate, rendezvous_agreed, rendezvous_outcome) shipped exactly
+  // that way and were fixed on 2026-09-18. The one deliberate exemption is the
+  // coverage-sample updater, which emits no event and carries its own note.
   // ----------------------------------------------------------------
   void logStep(const ExperimentContext& ctx, const StepEvent& e);
   /// `clock_anchor` — the sim/wall pair plus the real-time factor measured
@@ -1017,13 +1752,27 @@ class ExperimentLog {
   /// robot stopped being observed". `age_sec` is the transform's age at the
   /// moment of the transition (0 on recovery).
   void logPoseHealth(const ExperimentContext& ctx, bool lost, double age_sec);
-  /// The failed-goal blacklist suppressed EVERY candidate and the planner
-  /// re-attempted one anyway — non-retired first, least-recently-failed within
-  /// that. Expected to be absent in a healthy run; each occurrence is a
-  /// measurement of how close suppression came to starving the planner, and
-  /// `retired` says whether only confirmed traps were left to pick from.
+  /// A suppression list rejected EVERY candidate and the planner re-attempted
+  /// one anyway — non-retired first, least-recently-stamped within that.
+  /// Expected to be absent in a healthy run; each occurrence is a measurement
+  /// of how close suppression came to starving the planner, and `retired` says
+  /// whether only confirmed traps were left to pick from.
+  ///
+  /// `source` names WHICH list, and is v8. Two tiers run, in this order:
+  ///   "failed"   the failed-goal blacklist. The only tier that existed
+  ///              through v7, so an absent key on an old file means this one —
+  ///              do not read a missing `source` as unknown.
+  ///   "visited"  the recently-visited suppression (visited_goal_radius_m /
+  ///              visited_goal_ttl_sec). Reached ONLY when the failed tier had
+  ///              nothing to offer, i.e. on ticks that before v8 returned
+  ///              starved and drove the robot nowhere. A run with rows of this
+  ///              source is a run that used to stall for up to a full TTL.
+  /// `last_fail_age_sec` is dated against `source`'s own list, so it is an
+  /// age-since-visit on the visited tier, not an age-since-failure. `retired`
+  /// is structurally false there: visited_goals_ never retires a site.
   void logGoalAmnesty(const ExperimentContext& ctx, double x, double y,
-                      double last_fail_age_sec, bool retired);
+                      double last_fail_age_sec, bool retired,
+                      const char* source);
   /// A mission-return homing event. ONE event type covers two different things,
   /// so the vocabulary below is a contract the analysis depends on — do not
   /// widen it without updating the readers.
@@ -1187,6 +1936,30 @@ class ExperimentLog {
   bool   healthy_ = false;
   bool   started_ = false;
   bool   run_end_written_ = false;
+  /// Sim stamp of the run_end that WAS written, so the warning on a suppressed
+  /// second attempt can name both instants — "a duplicate happened" is much
+  /// less useful than "it happened 61 s after the first".
+  double run_end_sim_sec_ = -1.0;
+  bool   dup_run_end_reported_ = false;
+  /// Suppressed duplicate run_end attempts. Not logged in any row -- the row
+  /// is already written by the time the first one arrives, and a trailing
+  /// event would break both "run_end is the last line" and "the last line's
+  /// seq is events_written - 1". Reported instead by the destructor, which is
+  /// the last moment the total is known, into the ROS log the harness banks as
+  /// planner_<robot>.log; gate_g8 check 3n is the reader.
+  long long dup_run_ends_ = 0;
+  /// The mission_complete idempotence latch, same shape as run_end_written_
+  /// above. The node has its own once-per-run guard on the BEHAVIOUR (see
+  /// ExploPlannerNode::mission_return_done_); this one guards the FILE, so the
+  /// "exactly one mission_complete per robot-run" contract that every endpoint
+  /// analysis reads holds even if some future path reaches the emitter twice.
+  bool   mission_complete_written_ = false;
+  /// Sim stamp of the mission_complete that WAS written, so a suppressed
+  /// second attempt can name both instants rather than just its own.
+  double mission_complete_sim_sec_ = -1.0;
+  bool   dup_mission_complete_reported_ = false;
+  /// Suppressed duplicate mission_complete attempts. Written into run_end.
+  long long dup_mission_completes_ = 0;
   bool   write_error_reported_ = false;
   double t0_sec_ = 0.0;
   long long seq_ = 0;                      ///< monotonic event index, from 0
@@ -1205,6 +1978,13 @@ class ExperimentLog {
   /// Both are < 0 until an exploration_complete is emitted.
   double explore_done_last_sec_  = -1.0;
   double explore_done_first_sec_ = -1.0;
+  /// Has a `step` event arrived since the most recent exploration_complete?
+  /// This is the clearable half of the post_latch test in noteCoverage: the
+  /// two declaration stamps above are one-way (first_) or monotone (last_) and
+  /// neither can say that the robot went BACK to exploring in between, which a
+  /// reconnect manoeuvre delivering a merged map routinely causes. Set by
+  /// logStep, cleared by logExplorationComplete.
+  bool   explore_resumed_since_done_ = false;
 
   /// Clock-anchor state: t0's wall stamp and the previous anchor's pair, for
   /// the mean and instantaneous real-time factors.

@@ -28,7 +28,7 @@
 /// would break every existing config and violate the per-phase equivalence
 /// gate ("at defaults the binary is behaviourally identical to its parent").
 /// The requirement bites where it matters instead: any caller that needs ids
-/// asks `requireFor()` and gets a fatal, named config error if identity is
+/// asks `requireFleetIdentity()` and gets a fatal, named config error if identity is
 /// missing. Absent identity therefore cannot silently degrade a mechanism into
 /// doing nothing — it refuses to start.
 
@@ -50,6 +50,18 @@ inline constexpr int kMaxTeamSize = 8;
 inline uint32_t robotBit(int id) {
   if (id < 0 || id >= kMaxTeamSize) return 0u;
   return 1u << static_cast<unsigned>(id);
+}
+
+/// Mask naming every robot of a fleet of `size`, self included. Empty for a
+/// size outside the policy cap, so a mask built from an unvalidated size is
+/// empty — and therefore matches nothing — rather than naming robots that do
+/// not exist. `(mask & fleetMask(n)) == fleetMask(n)` is the test for "this
+/// robot reported direct contact with the WHOLE team", which is what makes a
+/// team-completeness question answerable from a peer's broadcast mask instead
+/// of only from our own links.
+inline uint32_t fleetMask(int size) {
+  if (size <= 0 || size > kMaxTeamSize) return 0u;
+  return (1u << static_cast<unsigned>(size)) - 1u;
 }
 
 /// Is robot `id` present in `mask`? False for out-of-range ids.

@@ -55,6 +55,28 @@ ExperimentLog::~ExperimentLog() {
   // No run_end here: it needs run totals only the node can supply, and a
   // destructor that logged a half-known ending would be worse than the missing
   // line an analysis can already detect from `seq` (see the header).
+  //
+  // dup_run_ends_ IS reported here, and this is the only place it can be. The
+  // suppression that produces it necessarily happens after the run_end row is
+  // on disk, so unlike dup_mission_completes_ it cannot ride out on a JSON
+  // field; and appending a trailing event instead would break two invariants
+  // the readers depend on -- run_end is the last line, and the last line's seq
+  // is events_written - 1. So it goes to the ROS log, which the harness banks
+  // as planner_<robot>.log, where gate_g8 check 3n greps for it. The header's
+  // promise that this counter is "kept so a future ... destructor message can
+  // report it" is what this is.
+  //
+  // Only the total: the first duplicate already raised its own warning naming
+  // both instants. What this adds is MULTIPLICITY, which that one-shot warning
+  // deliberately does not carry.
+  if (dup_run_ends_ > 0) {
+    RCLCPP_ERROR(logger_,
+        "ExperimentLog closing '%s' with %lld SUPPRESSED duplicate run_end "
+        "attempt(s). The node reached a terminal state %lld times; the file "
+        "holds the FIRST ending only, so this run's endpoint metrics describe "
+        "one of them and the run is not scoreable as it stands.",
+        path_.c_str(), dup_run_ends_, dup_run_ends_ + 1);
+  }
   if (file_.is_open()) file_.close();
 }
 
@@ -296,6 +318,11 @@ void ExperimentLog::startRun(const ExperimentContext& ctx,
 
 void ExperimentLog::logStep(const ExperimentContext& ctx, const StepEvent& e) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
+  // A step after a declaration means exploration RESUMED. See the post_latch
+  // block in noteCoverage for why this is the signal and why it is safe on the
+  // declaring tick. Set before the early return-free body so it holds for every
+  // step, and left alone before the first declaration where it means nothing.
+  if (explore_done_last_sec_ >= 0.0) explore_resumed_since_done_ = true;
   begin("step", ctx);
   num("unknown_fraction", e.unknown_fraction);
   text("coverage_source", e.coverage_source);
@@ -474,6 +501,9 @@ void ExperimentLog::logExplorationComplete(
   // not entitled to only one of them. See the member declarations.
   if (explore_done_first_sec_ < 0.0) explore_done_first_sec_ = ctx.sim_time_sec;
   explore_done_last_sec_ = ctx.sim_time_sec;
+  // A fresh declaration re-arms the post_latch window; the steps that led to
+  // it belong to the exploration that just ended, not to the one after it.
+  explore_resumed_since_done_ = false;
   begin("exploration_complete", ctx);
   num("explore_done_sim_sec", explore_done_last_sec_);
   num("explore_done_rel_sec", explore_done_last_sec_ - t0_sec_);
@@ -496,6 +526,36 @@ void ExperimentLog::logExplorationComplete(
 void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
                                        const MissionCompleteEvent& e) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
+  // Idempotence latch, the same construction as run_end_written_ below and for
+  // the same reason: a second mission_complete is a duplicate endpoint, and
+  // through generation 8 it made 16 ts1b robot-runs report a homing leg whose
+  // duration and distance restarted from zero. The node now refuses the
+  // re-entry that caused those (mission_return_done_), so this is the second
+  // line of defence, sitting at the layer that owns the FILE's contract.
+  //
+  // Suppressing it silently would be the trap. `occurrence` below was the only
+  // offline evidence a duplicate ever happened, and a latch that drops the row
+  // also drops the evidence — so the suppression is counted here and written
+  // into run_end as mission_completes_suppressed, and the first one warns. A
+  // reader cross-checking "one row, occurrence 1, zero suppressed" now gets
+  // three agreeing facts instead of one that the fix quietly emptied.
+  if (mission_complete_written_) {
+    if (!dup_mission_complete_reported_) {
+      dup_mission_complete_reported_ = true;
+      RCLCPP_WARN(logger_,
+          "mission_complete was already written at t_sim=%.3f; this second "
+          "attempt at t_sim=%.3f (result=%s, reason=%s, occurrence=%d) is "
+          "SUPPRESSED so the run keeps one endpoint. Reaching this means a "
+          "mission return resolved twice — treat this run's homing metrics as "
+          "suspect and check run_end.mission_return_reentries.",
+          mission_complete_sim_sec_, ctx.sim_time_sec,
+          e.result ? e.result : "", e.reason ? e.reason : "", e.occurrence);
+    }
+    ++dup_mission_completes_;
+    return;
+  }
+  mission_complete_written_  = true;
+  mission_complete_sim_sec_  = ctx.sim_time_sec;
   begin("mission_complete", ctx);
   text("result", e.result);
   text("reason", e.reason);
@@ -508,7 +568,17 @@ void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
   num("dist_to_home_m", e.dist_to_home_m);
   num("homing_duration_sec", e.homing_duration_sec);
   num("homing_distance_m", e.homing_distance_m);
+  // Unconditional, like occurrence below: a leg that took no proximity hold
+  // must read a measured 0.0, because this field is what separates a homing
+  // duration that legitimately exceeds mission_return_max_sec from one that
+  // overran, and a missing key cannot make that distinction. See the field doc.
+  num("homing_held_sec", e.homing_held_sec);
   boolean("latched", e.latched);
+  // 1 = the only mission_complete of the run, which is the contract. Anything
+  // above 1 is a DONE->RETURN_HOME re-entry and every row of that run's homing
+  // metrics is suspect. Written unconditionally so the count is evidence rather
+  // than an assertion the logger makes about itself.
+  integer("occurrence", e.occurrence);
   end();
 }
 
@@ -553,7 +623,7 @@ void ExperimentLog::logPoseHealth(const ExperimentContext& ctx, bool lost,
 
 void ExperimentLog::logGoalAmnesty(const ExperimentContext& ctx, double x,
                                    double y, double last_fail_age_sec,
-                                   bool retired) {
+                                   bool retired, const char* source) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("goal_amnesty", ctx);
   num("x", x);
@@ -564,6 +634,12 @@ void ExperimentLog::logGoalAmnesty(const ExperimentContext& ctx, double x,
   // hot goal, retired=true means nothing but confirmed traps were left, which
   // is a starvation signature and not a routine retry.
   boolean("retired", retired);
+  // Unconditional, and never empty: `retired` cannot stand in for the tier
+  // (the visited tier reads retired=false by construction), and the two tiers
+  // mean opposite things about the run's health — a "failed" row is the valve
+  // working, a "visited" row is a tick that would have stalled outright before
+  // v8. See the field doc.
+  text("source", source);
   end();
 }
 
@@ -605,8 +681,37 @@ void ExperimentLog::logHomeWatchdog(const ExperimentContext& ctx,
 
 void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
                               const RunEndEvent& e) {
-  if (!open_ || !started_ || run_end_written_) return;
+  // The three refusals are SEPARATED because they mean different things and two
+  // of them used to be silent. Collapsed into one `if`, a run_end that arrived
+  // before startRun went unrecorded — `events_dropped_before_start` counted
+  // every other event kind and this one alone escaped, so the logger's own
+  // accounting was inexact in the one place a reader would trust it.
+  if (!open_) return;
+  if (!started_) { ++dropped_before_start_; return; }
+  // A SECOND run_end is a duplicate endpoint, the same class of defect as the
+  // 16 ts1b robot-runs that carried two mission_complete rows (see
+  // MissionCompleteEvent::occurrence). Suppressing it is right — a second
+  // run_end would give the file two last lines and every "read the tail"
+  // consumer a coin flip — but suppressing it SILENTLY makes the guard a check
+  // that stopped checking: it would absorb a DONE re-entry indefinitely with
+  // nothing anywhere saying so. The row is already written and cannot carry a
+  // count, so the evidence goes to the ROS log, which the harness captures per
+  // robot. Once, not per call, because the caller may be a tick loop.
+  if (run_end_written_) {
+    if (!dup_run_end_reported_) {
+      dup_run_end_reported_ = true;
+      RCLCPP_WARN(logger_,
+          "run_end was already written at t_sim=%.3f; this second attempt at "
+          "t_sim=%.3f (reason=%s) is SUPPRESSED so the file keeps one last "
+          "line. A duplicate run_end means the node reached a terminal state "
+          "twice — treat this run's endpoint metrics as suspect.",
+          run_end_sim_sec_, ctx.sim_time_sec, e.reason ? e.reason : "");
+    }
+    ++dup_run_ends_;
+    return;
+  }
   run_end_written_ = true;
+  run_end_sim_sec_ = ctx.sim_time_sec;
   begin("run_end", ctx);
   text("reason", e.reason);
   integer("steps", e.steps);
@@ -678,6 +783,17 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
     key("mission_home_result"); line_ += "null";
     key("mission_home_sim_sec"); line_ += "null";
   }
+  // Duplicate-endpoint accounting, both directions. mission_return_reentries
+  // is the NODE refusing to start a second homing leg; mission_completes_
+  // suppressed is the LOGGER refusing to write a second row. Both are 0 in a
+  // healthy run, and both are written unconditionally so that 0 is a measured
+  // fact rather than the absence of a field.
+  integer("mission_return_reentries", e.mission_return_reentries);
+  integer("mission_completes_suppressed", dup_mission_completes_);
+  // Unconditional for the same reason as the two above: the mid-run attempt cap
+  // silently weakens the treatment once it binds, and a cell that never came
+  // close must be a measured 0, not a missing key. See the field's doc.
+  integer("midrun_attempts_used", e.midrun_attempts_used);
   integer("milestones_reached", milestonesReached());
   integer("milestones_total", static_cast<long long>(milestones_.size()));
   // Self-accounting. A file whose last line is a run_end with
@@ -728,13 +844,48 @@ void ExperimentLog::noteCoverage(const ExperimentContext& ctx,
     num("y", y);
     integer("rung", static_cast<long long>(i));
     integer("rungs_total", static_cast<long long>(milestones_.size()));
+    // C1: did this crossing happen after the robot declared exploration
+    // complete? A rung crossed post-declaration times post-stop map merging,
+    // not exploration, and whether a run reaches such a rung at all correlates
+    // with the arm -- so it is a selection artifact, not an endpoint. The
+    // ladder is now sized so this should always be false; recording it is how
+    // a future ladder/threshold mismatch announces itself instead of quietly
+    // contaminating a headline number.
+    // Keyed on the LAST declaration and on a flag that a resumed exploration
+    // clears -- not on explore_done_first_sec_, which is a one-way latch.
+    // Through generation 8 it was the latch, and that made the flag report
+    // `true` on genuine exploration: a robot that declares, is pulled into a
+    // reconnect manoeuvre, comes back with a merged map and explores on was
+    // still "post-latch" for the rest of the run. Resumption happens only
+    // where manoeuvres happen, so a flag added to detect an ARM-CORRELATED
+    // selection artifact was itself arm-correlated -- it would have attributed
+    // the reconnecting arms' late rungs to post-stop map merging and thrown
+    // away real coverage.
+    //
+    // explore_resumed_since_done_ is set by logStep, which is the right
+    // signal and needs nothing from the node: the step counter is frozen for
+    // the whole of a manoeuvre and for the whole homing leg, so a `step`
+    // event arriving after a declaration means this robot is exploring again.
+    // On the declaring tick doLogStep writes its step BEFORE routing into
+    // recordExplorationComplete, so the flag cannot be set spuriously by the
+    // very step that ended.
+    const bool post_latch =
+        explore_done_last_sec_ >= 0.0 && !explore_resumed_since_done_;
+    boolean("post_latch", post_latch);
+    // -1.0 is "not applicable", NOT a measured zero and not a negative
+    // interval: the robot had not declared, or it had declared and resumed.
+    // Same sentinel discipline as the field above it, and stated here because
+    // an undocumented -1 in a seconds column is unrecoverable once averaged.
+    // Measured from the LAST declaration for the same reason post_latch is.
+    num("sec_since_explore_done",
+        post_latch ? ctx.sim_time_sec - explore_done_last_sec_ : -1.0);
     end();
   }
 }
 
 void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
                                   const CellCensusEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("cell_census", ctx);
   integer("cells_total", e.cells_total);
   integer("unseen", e.unseen);
@@ -773,7 +924,7 @@ void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
 
 void ExperimentLog::logTeamExchange(const ExperimentContext& ctx,
                                     const TeamExchangeEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("team_exchange", ctx);
   text("peer", e.peer);
   integer("peer_id", e.peer_id);
@@ -811,11 +962,15 @@ void ExperimentLog::logTeamExchange(const ExperimentContext& ctx,
 
 void ExperimentLog::logAllocation(const ExperimentContext& ctx,
                                   const AllocationEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("allocation", ctx);
   // Decimal, like every other hash in this file: JSON has no hex literal.
   integer("shared_hash", static_cast<long long>(e.shared_hash));
   integer("grid_hash", static_cast<long long>(e.grid_hash));
+  // R3 / §3.6. Join two robots' allocation cycles on alloc_hash, NOT on
+  // shared_hash — see the struct comment for why the latter cannot bear it.
+  integer("alloc_hash", static_cast<long long>(e.alloc_hash));
+  integer("edge_hash", static_cast<long long>(e.edge_hash));
   integer("robots_in_problem", e.robots_in_problem);
   integer("candidates", e.candidates);
   integer("unassigned", e.unassigned);
@@ -836,7 +991,7 @@ void ExperimentLog::logAllocation(const ExperimentContext& ctx,
 
 void ExperimentLog::logReconnectGate(const ExperimentContext& ctx,
                                      const ReconnectGateEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("reconnect_gate", ctx);
   boolean("dispatched", e.dispatched);
   boolean("knowledge", e.knowledge);
@@ -857,7 +1012,7 @@ void ExperimentLog::logReconnectGate(const ExperimentContext& ctx,
 
 void ExperimentLog::logRendezvousAgreed(const ExperimentContext& ctx,
                                         const RendezvousAgreedEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("rendezvous_agreed", ctx);
   // Decimal, like every other hash in this file: JSON has no hex literal.
   integer("shared_hash", static_cast<long long>(e.shared_hash));
@@ -866,25 +1021,43 @@ void ExperimentLog::logRendezvousAgreed(const ExperimentContext& ctx,
   integer("cell", e.cell);
   num("t_meet_sec", e.t_meet_sec);
   num("t_now_sec", e.t_now_sec);
+  // The generation key. Written on refusal rows too, at its sentinel, for the
+  // reason the agreement block below states: an absent key and a sentinel one
+  // must not be the same thing to a reader counting agreements.
+  num("agreed_base_sec", e.agreed_base_sec);
   num("interval_sec", e.interval_sec);
   boolean("capped", e.capped);
+  boolean("floored", e.floored);
+  num("tour_interval_sec", e.tour_interval_sec);
   integer("penalty_mm", e.penalty_mm);
   boolean("floor_won", e.floor_won);
   integer("candidates", e.candidates);
   integer("rejected_unreachable", e.rejected_unreachable);
   integer("rejected_excluded", e.rejected_excluded);
   num("travel_sec", e.travel_sec);
-  num("depart_sec", e.depart_sec);
   // Always written, including as "": a reader counting refusals must not have
   // to treat an absent key and an empty one as the same thing.
   text("refused", e.refused);
-  text("excluded", e.excluded);
+  // --- the agreement (v5) ---------------------------------------------
+  // Written on refusal rows too, at their sentinels. A refusal that says
+  // "no pair was agreed" and a refusal that says "the pair was spent" are
+  // different mechanisms, and only these columns separate them.
+  integer("proposer_id", e.proposer_id);
+  boolean("from_agreed", e.from_agreed);
+  // The one column in the argmin block a FOLLOWER row can answer, because the
+  // flag rides the wire beside the three integers. See the field's doc: a cell
+  // whose rows are all true agreed a place without choosing one.
+  boolean("agreed_provisional", e.agreed_provisional);
+  num("anchor_sec", e.anchor_sec);
+  num("agreed_age_sec", e.agreed_age_sec);
+  integer("peers_on_pair", e.peers_on_pair);
+  num("own_route_m", e.own_route_m);
   end();
 }
 
 void ExperimentLog::logRendezvousOutcome(const ExperimentContext& ctx,
                                          const RendezvousOutcomeEvent& e) {
-  if (!open_ || !started_) return;
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
   begin("rendezvous_outcome", ctx);
   integer("cell", e.cell);
   num("t_meet_sec", e.t_meet_sec);
@@ -893,6 +1066,7 @@ void ExperimentLog::logRendezvousOutcome(const ExperimentContext& ctx,
   text("outcome", e.outcome);
   boolean("arrived", e.arrived);
   num("waited_sec", e.waited_sec);
+  boolean("mutual", e.mutual);
   end();
 }
 

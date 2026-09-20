@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
-"""Measure how far apart the two robots' copies of the merged map ended.
+"""Measure how far apart the robots' copies of the merged map ended.
 
-Prints one TAB-separated line (PASS/UNRUN <name> <detail>) into comms_gates.txt.
+Prints one TAB-separated line (PASS/INFO <name> <detail>) into comms_gates.txt.
 It REPORTS; it does not fail runs. Read on for why that changed.
+
+TWO THINGS ABOUT THE TOKEN AND THE TEAM SIZE, both fixed together because they
+were the same mistake in two places.
+
+It used to print UNRUN when it could not compute, and UNRUN is not a token a
+report-only check is allowed to emit. run_explo_sim_rviz.sh counts `^UNRUN`
+lines and scores the whole cell SUSPECT if any exist, and gate_g8.py hard-fails
+any cell whose manifest is not CLEAN — so a check that "does not fail runs"
+failed runs, through a counter it was never meant to reach. INFO is the token
+for "this report has nothing to report": visible in the file, ignored by the
+verdict, and — unlike PASS — never mistakable for a check that ran and was
+satisfied.
+
+It also used to demand EXACTLY TWO planner CSVs, which is how every N>=3 cell in
+ts1b acquired `UNRUN map_agree expected 2 planner_*.csv, found 3` and through it
+a SUSPECT verdict, and through THAT a gate_g8 hard failure on 100% of cells of a
+campaign whose maps were fine. The two-robot restriction was never inherent: the
+quantity is the SPREAD of one number (total_observed_voxels) across the team,
+and (max-min)/max is the same arithmetic for any N. At N=2 it is identical to
+the old |a-b|/max, so banked two-robot numbers are unchanged — verified by
+diffing the emitted line before and after on a banked cell.
 
 WHAT THIS IS NOT. It was written as a validity gate on the theory that three
 dense-world runs ending 1.5-1.8 % apart proved silent map loss -- specifically a
@@ -89,9 +110,28 @@ def at(s, times, t):
     return s[i][1] if i >= 0 else None
 
 
-def gap_pct(x, y):
-    hi = max(x, y)
-    return abs(x - y) / hi * 100.0 if hi > 0 else 0.0
+def gap_pct(values):
+    """Spread across the team as a percentage of the largest map.
+
+    (max - min) / max. At N=2 this is exactly the |a-b|/max this function used
+    to take as two positional arguments, so the number printed for a two-robot
+    cell is unchanged.
+
+    Why the extreme pair and not, say, the mean absolute deviation: the question
+    is "did any robot's copy fall behind", and one lagging robot in a team of
+    four is the whole finding. A mean would divide that robot's gap by four and
+    report a quarter of it, which is the direction that hides the defect.
+
+    `values` may hold None for robots with no sample at this instant; they are
+    dropped, and fewer than two survivors means there is nothing to compare, for
+    which the answer is None rather than 0.0. Zero is the value that means "the
+    maps agree perfectly", and it must not double as "there was no comparison".
+    """
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return None
+    hi, lo = max(vals), min(vals)
+    return (hi - lo) / hi * 100.0 if hi > 0 else 0.0
 
 
 def latch_time(outdir):
@@ -116,6 +156,33 @@ def latch_time(outdir):
     return t
 
 
+def roster(outdir):
+    """The team, taken from the EVENT LOGS rather than from the CSVs.
+
+    The spread is read off the extreme pair, and the docstring above defends
+    that choice on the grounds that "one lagging robot in a team of four is the
+    whole finding". Deriving the roster from the planner_*.csv files that were
+    FOUND makes exactly that robot unnameable: a planner that died before
+    writing its header leaves no file, the glob returns the survivors, and the
+    spread is computed over a subset with nothing on the line to say so.
+
+    Reproduced on ts1b_n4_mtare_hybrid_r40_ttl0_seed1 with two CSVs removed:
+    PASS over a 2-robot subset, peak 26.70% -> 5.52%, at-latch 2.77% -> 0.16%,
+    no dropped clause and no robot count anywhere in the output. `empty` does
+    not cover it -- that is exists-but-no-rows -- and len(paths) < 2 only
+    catches the collapse all the way down to one.
+
+    Every robot opens its event log at start-up, before any planning, so the
+    log existing is a weaker condition than the CSV existing and the roster is
+    the right side to take. Returns [] when there is no event log at all, which
+    is a THIRD state (roster unknown, not roster empty) and is reported as such
+    by the caller -- absence of the check is not a pass.
+    """
+    return sorted({os.path.basename(p)[:-len(".events.jsonl")]
+                   for p in glob.glob(os.path.join(outdir,
+                                                   "*.events.jsonl"))})
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("outdir", help="run directory holding planner_*.csv")
@@ -124,41 +191,80 @@ def main():
                     help="sampling step for the peak/trace, sim seconds")
     ap.add_argument("--start", type=float, default=200.0,
                     help="ignore before this sim time (both maps still filling)")
-    # Kept so existing callers that pass it keep working. Nothing is failed on
-    # it any more; see the module docstring.
-    ap.add_argument("--max-pct", type=float, default=None,
-                    help=argparse.SUPPRESS)
+    # NO --max-pct. It was accepted-and-ignored for one generation, which is
+    # the worst of the three options: the caller passed 0.5, the manifest
+    # banked `map_agree_max_pct=0.5`, and anyone reading either would conclude
+    # a 50% spread threshold had decided something. Nothing was ever failed on
+    # it. Removing it rather than keeping a SUPPRESSed no-op means a resurrected
+    # banked command line dies with "unrecognized arguments: --max-pct" instead
+    # of quietly agreeing that the threshold is live.
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.outdir, "planner_*.csv")))
-    if len(paths) != 2:
-        print(f"UNRUN\t{args.name}\texpected 2 planner_*.csv, found {len(paths)}")
-        return 2
-
     names = [os.path.basename(p)[len("planner_"):-len(".csv")] for p in paths]
-    a, b = (series(p) for p in paths)
-    if not a or not b:
-        empty = ",".join(n for n, s in zip(names, (a, b)) if not s)
-        print(f"UNRUN\t{args.name}\tno voxel counts logged for: {empty}")
-        return 2
+    # Roster first, so every message below can say what the team WAS rather
+    # than only what it found. See roster().
+    team = roster(args.outdir)
+    absent = [n for n in team if n not in set(names)]
+    if not team:
+        roster_note = (" (roster unknown: no *.events.jsonl here, so a robot "
+                       "whose planner_*.csv is entirely absent cannot be named "
+                       "— this is not a statement that none is)")
+    elif absent:
+        roster_note = (f" (team of {len(team)} per the event logs; NO "
+                       f"planner_*.csv at all for: {','.join(absent)} — the "
+                       f"numbers here cover a SUBSET of the team)")
+    else:
+        roster_note = f" (all {len(team)} robots of the team present)"
+    # Two is the FLOOR, not the shape. A spread needs at least two series; above
+    # that the arithmetic is the same. Returning 0 on the INFO paths as well as
+    # the PASS path is deliberate: this file is report-only, so a non-zero exit
+    # would be one more way for it to influence a verdict it has no business
+    # influencing (run_explo_sim_rviz.sh currently swallows it with `|| true`,
+    # and that `|| true` should not be what keeps the contract).
+    if len(paths) < 2:
+        print(f"INFO\t{args.name}\tfound {len(paths)} planner_*.csv; a map "
+              f"spread needs at least two robots to compare — nothing to "
+              f"report{roster_note}")
+        return 0
 
-    ta = [x[0] for x in a]
-    tb = [x[0] for x in b]
-    # Latest sim time BOTH robots reported, so neither is credited with world the
-    # other had no chance to log. In practice they stop within a few seconds.
-    t_end = min(ta[-1], tb[-1])
-    va, vb = at(a, ta, t_end), at(b, tb, t_end)
-    end = gap_pct(va, vb)
+    ser = [series(p) for p in paths]
+    empty = [n for n, x in zip(names, ser) if not x]
+    if len(names) - len(empty) < 2:
+        print(f"INFO\t{args.name}\tno voxel counts logged for: "
+              f"{','.join(empty)} — fewer than two comparable "
+              f"series{roster_note}")
+        return 0
+    # A robot with no rows at all is dropped and NAMED. Silently comparing the
+    # remaining two would print a clean spread for a team of four in which two
+    # robots logged nothing.
+    # Two different absences, kept apart because they mean different things: a
+    # robot that logged a header and no rows produced a planner that ran, and a
+    # robot with no file at all produced one that did not.
+    dropped = f" (dropped, no voxel counts: {','.join(empty)})" if empty else ""
+    dropped += roster_note
+    keep = [(n, x) for n, x in zip(names, ser) if x]
+    names = [n for n, _ in keep]
+    ser = [x for _, x in keep]
+
+    times = [[x[0] for x in sxx] for sxx in ser]
+    # Latest sim time EVERY robot reported, so none is credited with world the
+    # others had no chance to log. In practice they stop within a few seconds.
+    t_end = min(tt[-1] for tt in times)
+    vals = [at(sxx, tt, t_end) for sxx, tt in zip(ser, times)]
+    end = gap_pct(vals)
+    if end is None:
+        print(f"INFO\t{args.name}\tno common sample time across "
+              f"{len(names)} robot(s) — nothing to report{roster_note}")
+        return 0
 
     peak = end
     t_peak = t_end
     t = args.start
     while t <= t_end:
-        xa, xb = at(a, ta, t), at(b, tb, t)
-        if xa is not None and xb is not None:
-            g = gap_pct(xa, xb)
-            if g > peak:
-                peak, t_peak = g, t
+        g = gap_pct([at(sxx, tt, t) for sxx, tt in zip(ser, times)])
+        if g is not None and g > peak:
+            peak, t_peak = g, t
         t += args.step
 
     drained = "drained" if end <= peak * 0.5 else "still open"
@@ -166,14 +272,16 @@ def main():
     t_latch = latch_time(args.outdir)
     at_latch = ""
     if t_latch is not None and t_latch <= t_end:
-        la, lb = at(a, ta, t_latch), at(b, tb, t_latch)
-        if la is not None and lb is not None:
-            at_latch = (f", at-latch {gap_pct(la, lb):.2f}% at t={t_latch:.0f}s"
+        g = gap_pct([at(sxx, tt, t_latch) for sxx, tt in zip(ser, times)])
+        if g is not None:
+            at_latch = (f", at-latch {g:.2f}% at t={t_latch:.0f}s"
                         f" (gap when exploring stopped; `end` is after any"
                         f" mission-return regroup)")
-    print(f"PASS\t{args.name}\t{names[0]}={va:.0f} {names[1]}={vb:.0f} at t={t_end:.0f}s: "
+    counts = " ".join(f"{n}={v:.0f}" for n, v in zip(names, vals)
+                      if v is not None)
+    print(f"PASS\t{args.name}\t{len(names)} series {counts} at t={t_end:.0f}s: "
           f"end {end:.2f}%, peak {peak:.2f}% at t={t_peak:.0f}s ({drained})"
-          f"{at_latch} — "
+          f"{at_latch}{dropped} — "
           f"REPORT ONLY, not a validity gate: this tracks undrained backlog at "
           f"the stop instant, which scales with outage severity")
     return 0

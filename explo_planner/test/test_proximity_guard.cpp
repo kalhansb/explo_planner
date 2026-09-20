@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>  // std::numeric_limits, used by the NaN cases
+
 #include <rclcpp/rclcpp.hpp>
 
 #include "explo_planner/proximity_guard.hpp"
@@ -128,7 +130,8 @@ TEST(ProximityGuard, ClockRewindTreatedAsStale) {
 }
 
 // 9. A parked peer (unmoved past peer_static_sec) neither starts nor
-//    sustains a hold — it is the costmap's job, and holding deadlocks.
+//    sustains a hold — avoiding it is the navigator's obstacle grid's job, and
+//    holding deadlocks.
 TEST(ProximityGuard, ParkedPeerReleased) {
   ProximityGuard g(cfg(), "rama");
   // Same pose re-observed every second for 11 s (fresh data throughout).

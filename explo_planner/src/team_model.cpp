@@ -79,7 +79,7 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   const size_t n = static_cast<size_t>(size_);
   if (obs.last_heard_sec.size() > n || obs.gx.size() > n ||
       obs.gy.size() > n || obs.gz.size() > n ||
-      obs.have_gossip_pos.size() > n) {
+      obs.have_gossip_pos.size() > n || obs.finished_gossip.size() > n) {
     std::snprintf(buf, sizeof(buf),
                   "gossip arrays are longer than the fleet (%d): the sender "
                   "is running a different team definition", size_);
@@ -90,7 +90,36 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   Peer& sp = peers_[static_cast<size_t>(s)];
   sp.known          = true;
   sp.in_range_mask  = obs.in_range_mask;
+  // FIRST-HAND IS AUTHORITATIVE and is a plain assignment, so it can also
+  // CLEAR. The relay below can only ever set the bit, so this is the one site
+  // that can undo it -- which matters for the single case where the bit is not
+  // monotonic in reality rather than on the wire: a node that restarts mid-run
+  // (its mission clock returns to zero, the case the gossip block below also
+  // calls out) genuinely un-finishes, and the robot itself is the only witness
+  // worth believing. Peers that learned the old bit by relay keep it until they
+  // hear the restarted robot first-hand; they are then receiving from it
+  // directly, which is what peerAccounted keys on anyway.
   sp.finished       = obs.finished;
+  // team_incomplete IS FIRST-HAND ONLY, and it does not follow `finished` above
+  // into the relay. The two are not the same kind of statement. This one is a
+  // NON-MONOTONIC claim a robot makes ABOUT THE TEAM, and relaying it is the
+  // deadlock TeamWorld.msg warns about arriving by a different route -- C would
+  // re-announce A's break as though it were C's own read and A would then see
+  // its own bit come back, with nothing able to clear it. `finished` is a
+  // MONOTONIC claim a robot makes ABOUT ITSELF: it cannot contradict a
+  // first-hand copy, cannot arrive early, and has no path back to its
+  // originator, which is exactly why it is safe to relay and this is not.
+  sp.team_incomplete = obs.team_incomplete;
+  // First-hand only for the same reason as team_incomplete directly above: it is
+  // non-monotonic, so a relayed copy could hold an appointment barrier off an
+  // echo of itself.
+  sp.appointment_inbound = obs.appointment_inbound;
+  // Its one-hop report lands the same way: it is the sender's own statement
+  // about what the sender currently receives, stored under the sender so the
+  // reader believes it exactly while the sender itself is heard. The sender
+  // derives it from raw first-hand bits only (see TeamWorld.msg), so storing
+  // it here cannot start the echo the two comments above forbid.
+  sp.appointment_inbound_seen = obs.appointment_inbound_seen;
   sp.last_known_sec = now_sec;
   if (obs.have_position) {
     sp.have_position       = true;
@@ -162,6 +191,38 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
         }
       }
     }
+  }
+
+  // --- relayed `finished` ---------------------------------------------------
+  //
+  // A SEPARATE LOOP, AND DELIBERATELY NOT INSIDE THE ONE ABOVE. Every guard
+  // that block applies would suppress this bit exactly when it is needed. It
+  // skips a peer the sender never heard, skips one older than
+  // gossip_max_age_sec, and skips one whose reading is not strictly fresher
+  // than what we hold -- all of which are freshness rules, and a finished robot
+  // STOPS MOVING AND GOES QUIET, so its last-heard entry is the first thing to
+  // age out. Gating a monotonic fact on freshness would switch the relay off at
+  // the moment it starts to matter. There is no freshness to check: the bit
+  // only ever goes one way.
+  //
+  // PURE OR, NEVER CLEARS. A relayed false is "the sender has no evidence", not
+  // "that robot is still exploring" -- the sender may simply not have heard it
+  // either -- so false carries no information and must not overwrite a bit we
+  // already hold. Only the first-hand assignment above can clear.
+  //
+  // WHY IT EXISTS: without it, a robot that cannot hear a finished peer counts
+  // it missing forever (nothing ever clears the stale first-hand false), so it
+  // announces the team incomplete forever, and every robot that CAN hear the
+  // finished peer is held by that announcement at the unbounded appointment
+  // barrier. At N>=3 that hangs the run to the harness duration cap. See
+  // TeamWorld.msg/robot_finished for the full trace.
+  for (size_t k = 0; k < obs.finished_gossip.size(); ++k) {
+    const int r = static_cast<int>(k);
+    if (r == self_id_ || r == s) continue;   // we know ourselves; s is above
+    if (!obs.finished_gossip[k]) continue;
+    Peer& p = peers_[static_cast<size_t>(r)];
+    p.known    = true;
+    p.finished = true;
   }
   return std::string();
 }

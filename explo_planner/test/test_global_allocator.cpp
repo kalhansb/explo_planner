@@ -424,3 +424,206 @@ TEST(GlobalAllocatorPolish, NeverLengthensATour) {
   for (size_t i = 0; i < a.costs_mm.size(); ++i)
     EXPECT_LE(b.costs_mm[i], a.costs_mm[i]) << "robot " << i;
 }
+
+// ---------------------------------------------------------------------------
+// R3 / §3.6 — the problem digest
+//
+// These do not test the allocator's answer; they test that the thing that will
+// be used to decide "were these two robots even solving the same problem" can
+// actually tell the difference. Every one of them is a channel that
+// `shared_hash` is blind to, and each test below is the proof of one such
+// blind channel -- which is the whole claim. (This header used to add "and
+// that is why robots with equal `shared_hash` disagreed about the peer's focus
+// 23% of the time at N=4"; that figure is withdrawn as unreproducible. These
+// tests are the evidence, not a campaign statistic.)
+// ---------------------------------------------------------------------------
+
+/// Baseline: the same problem digests the same, twice, from two independently
+/// built worlds. Without this every test below could pass on a hash that is
+/// simply noise.
+TEST(AllocHash, EqualProblemsDigestEqual) {
+  CellWorld a = world5(0), b = world5(1);
+  for (int id : {2, 6, 10}) { setSelf(a, id, CellStatus::EXPLORING);
+                              setSelf(b, id, CellStatus::EXPLORING); }
+  GlobalAllocator::Config c;
+  const Allocation ra = GlobalAllocator::solve(a, pair2(0, 24), c);
+  const Allocation rb = GlobalAllocator::solve(b, pair2(0, 24), c);
+  EXPECT_NE(ra.alloc_hash, 0u) << "a formed problem must not digest to the "
+                                  "no-problem sentinel";
+  EXPECT_EQ(ra.alloc_hash, rb.alloc_hash);
+  EXPECT_EQ(ra.edge_hash, rb.edge_hash);
+}
+
+/// The vehicle set is not part of the world, so `shared_hash` cannot see it at
+/// all. Every field of it has to move the digest.
+TEST(AllocHash, EveryVehicleFieldMovesTheDigest) {
+  CellWorld w = world5(0);
+  for (int id : {2, 6, 10}) setSelf(w, id, CellStatus::EXPLORING);
+  GlobalAllocator::Config c;
+
+  const unsigned base = GlobalAllocator::solve(w, pair2(0, 24), c).alloc_hash;
+
+  // ...a different cell for one robot
+  EXPECT_NE(base, GlobalAllocator::solve(w, pair2(0, 23), c).alloc_hash);
+
+  // ...one robot out of comms
+  std::vector<AllocRobot> oc = pair2(0, 24);
+  oc[1].in_comms = false;
+  EXPECT_NE(base, GlobalAllocator::solve(w, oc, c).alloc_hash);
+
+  // ...one robot finished. The filter drops it, so the SOLVE is a one-vehicle
+  // problem either way — but "my peer has stopped" is precisely the
+  // disagreement that has to be visible, so the digest must still move.
+  std::vector<AllocRobot> fin = pair2(0, 24);
+  fin[1].finished = true;
+  EXPECT_NE(base, GlobalAllocator::solve(w, fin, c).alloc_hash);
+
+  // ...a different fleet id
+  std::vector<AllocRobot> rid = pair2(0, 24);
+  rid[1].id = 2;
+  EXPECT_NE(base, GlobalAllocator::solve(w, rid, c).alloc_hash);
+
+  // ...a robot present at all
+  std::vector<AllocRobot> solo{AllocRobot{0, 0, true, false}};
+  EXPECT_NE(base, GlobalAllocator::solve(w, solo, c).alloc_hash);
+}
+
+/// The caller's vector order is the caller's, and must not reach a value two
+/// processes compare. The solve already sorts; the digest has to as well.
+TEST(AllocHash, CallerVectorOrderDoesNotReachTheDigest) {
+  CellWorld w = world5(0);
+  for (int id : {2, 6, 10}) setSelf(w, id, CellStatus::EXPLORING);
+  GlobalAllocator::Config c;
+
+  std::vector<AllocRobot> fwd = pair2(0, 24);
+  std::vector<AllocRobot> rev{fwd[1], fwd[0]};
+  EXPECT_EQ(GlobalAllocator::solve(w, fwd, c).alloc_hash,
+            GlobalAllocator::solve(w, rev, c).alloc_hash);
+}
+
+/// The candidate set. This is the one channel `shared_hash` partly covers, and
+/// it is still folded in explicitly rather than leaned on: `shared_hash`
+/// normalises statuses, so it cannot distinguish a candidate set from a
+/// same-sized one over different ground.
+TEST(AllocHash, CandidateSetMovesTheDigest) {
+  CellWorld a = world5(0), b = world5(0);
+  for (int id : {2, 6, 10}) setSelf(a, id, CellStatus::EXPLORING);
+  for (int id : {2, 6, 11}) setSelf(b, id, CellStatus::EXPLORING);
+  GlobalAllocator::Config c;
+  EXPECT_NE(GlobalAllocator::solve(a, pair2(0, 24), c).alloc_hash,
+            GlobalAllocator::solve(b, pair2(0, 24), c).alloc_hash);
+}
+
+/// §3.6's headline case, and the reason `edge_hash` is logged separately: two
+/// worlds with IDENTICAL statuses, identical masks and an identical
+/// `sharedHash()` whose traversability differs. Nothing on the wire carries
+/// this and nothing ever detected it.
+TEST(AllocHash, TraversabilityDifferenceIsVisibleWhenSharedHashIsNot) {
+  CellWorld a = world5(0), b = world5(0);
+  for (int id : {2, 6, 10}) { setSelf(a, id, CellStatus::EXPLORING);
+                              setSelf(b, id, CellStatus::EXPLORING); }
+  ASSERT_EQ(a.sharedHash(), b.sharedHash())
+      << "fixture: the two worlds must agree on everything the wire carries";
+
+  // Both rebuild their adjacency; only b's local plan map says one pair of
+  // neighbouring cells is impassable. This is exactly the real mechanism —
+  // `rebuildEdges` is driven by each robot's OWN map and its result is never
+  // exchanged.
+  a.rebuildEdges(nullptr);
+  b.rebuildEdges([](float ax, float ay, float bx, float by) {
+    const bool pair = (ax == -20.0f && ay == -20.0f &&
+                       bx == -10.0f && by == -20.0f) ||
+                      (bx == -20.0f && by == -20.0f &&
+                       ax == -10.0f && ay == -20.0f);
+    return pair ? 1.0 : 0.0;   // 1.0 = fully blocked; 0.0 = clear
+  });
+  ASSERT_TRUE(a.edgeEnabled(0, 1));
+  ASSERT_FALSE(b.edgeEnabled(0, 1)) << "fixture: b's probe did not block";
+  EXPECT_EQ(a.sharedHash(), b.sharedHash())
+      << "the wire digest must STILL agree — that is the whole problem";
+
+  GlobalAllocator::Config c;
+  const Allocation ra = GlobalAllocator::solve(a, pair2(0, 24), c);
+  const Allocation rb = GlobalAllocator::solve(b, pair2(0, 24), c);
+  EXPECT_NE(ra.edge_hash, rb.edge_hash);
+  EXPECT_NE(ra.alloc_hash, rb.alloc_hash);
+}
+
+/// An unconfigured world forms no problem, and its zero must not be readable
+/// as agreement.
+TEST(AllocHash, UnconfiguredWorldDigestsToTheNoProblemSentinel) {
+  CellWorld w;  // never configured
+  const Allocation r =
+      GlobalAllocator::solve(w, pair2(0, 1), GlobalAllocator::Config{});
+  EXPECT_FALSE(r.refused.empty());
+  EXPECT_EQ(r.alloc_hash, 0u);
+  EXPECT_EQ(r.edge_hash, 0u);
+}
+
+/// A refused solve still had a problem, and has to carry its digest: "these
+/// two robots refused for different reasons" is only interpretable once you
+/// can establish they were refusing the same thing.
+TEST(AllocHash, RefusedSolveStillCarriesTheDigest) {
+  CellWorld w = world5(0);
+  for (int id = 0; id < w.size(); ++id) setSelf(w, id, CellStatus::EXPLORING);
+  GlobalAllocator::Config c;
+  c.max_candidates = 2;                       // force the truncation refusal
+  const Allocation r = GlobalAllocator::solve(w, pair2(0, 24), c);
+  ASSERT_FALSE(r.refused.empty()) << "fixture did not trigger a refusal";
+  EXPECT_NE(r.alloc_hash, 0u);
+}
+
+/// Config does not go into the digest as a struct, and does not stay out as a
+/// struct either. The line is whether a field changes the PROBLEM or only the
+/// approach taken to it, and both directions have to be asserted — an
+/// all-in-or-all-out rule is the thing this test replaced (2026-09-18), on both
+/// of the readings the digest is supposed to support:
+///
+///   "same value, different tours" => a determinism bug in the solver. Only
+///   sound if fields that change nothing but the tours are EXCLUDED, or the
+///   finding gets restated as "different problems" and lost.
+///
+///   "different values" => they were never solving the same problem. Only
+///   sound if fields that change the problem are INCLUDED, or two genuinely
+///   different problems agree on the key.
+TEST(AllocHash, SolverConfigSplitsOnWhatChangesTheProblem) {
+  CellWorld w = world5(0);
+  for (int id : {2, 6, 10, 14}) setSelf(w, id, CellStatus::EXPLORING);
+
+  GlobalAllocator::Config base;
+  const unsigned h =
+      GlobalAllocator::solve(w, pair2(0, 24), base).alloc_hash;
+  ASSERT_NE(h, 0u) << "fixture formed no problem; the rest proves nothing";
+
+  // 2-opt passes: same vehicles, same candidates, same feasible set, same
+  // refusal — a different answer to the SAME problem, which is exactly the
+  // case the digest exists to make visible. It must not move.
+  GlobalAllocator::Config polish0; polish0.polish_passes = 0;
+  GlobalAllocator::Config polish4; polish4.polish_passes = 4;
+  EXPECT_EQ(GlobalAllocator::solve(w, pair2(0, 24), polish0).alloc_hash,
+            GlobalAllocator::solve(w, pair2(0, 24), polish4).alloc_hash)
+      << "polish_passes reached the digest. Two robots that differ only in "
+         "2-opt effort are solving one problem and answering it differently; "
+         "with this in the key that reads as two problems and the solver "
+         "disagreement becomes unreportable.";
+
+  // The no-comms mask restricts which cells a disconnected robot may be given
+  // at all. It is also the one comparison the flag was ADDED for — masked
+  // versus unmasked over otherwise identical inputs — so if it does not move
+  // the digest, that comparison is precisely where the digest lies.
+  GlobalAllocator::Config masked; masked.comms_mask = true;
+  EXPECT_NE(h, GlobalAllocator::solve(w, pair2(0, 24), masked).alloc_hash)
+      << "a masked and an unmasked solve over identical inputs digest the "
+         "same; the reconnection-value counterfactual would join to itself.";
+
+  // The candidate cap decides refused versus solved. A refused solve carries
+  // its digest so that "we refused the same thing" is checkable; if the cap is
+  // invisible, a refusal and a success agree on the key and the cap — the
+  // entire difference — is the part that cannot be seen.
+  GlobalAllocator::Config capped; capped.max_candidates = 2;
+  const Allocation r = GlobalAllocator::solve(w, pair2(0, 24), capped);
+  ASSERT_FALSE(r.refused.empty()) << "fixture did not trigger the cap refusal";
+  EXPECT_NE(h, r.alloc_hash)
+      << "a solve refused on max_candidates carries the same digest as one "
+         "that succeeded under a laxer cap.";
+}

@@ -247,6 +247,31 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rendezvous_scheduler test/test_rendezvous_scheduler.cpp)
   target_link_libraries(test_rendezvous_scheduler explo_planner_lib)
 
+  # T5. The endpoint contract: the three events that decide when a run is over.
+  #
+  # It said "plus the departure arithmetic's edges" until 2026-09-18, and those
+  # nine tests were deleted with RendezvousScheduler::shouldDepart in generation
+  # 19 — departure is no longer a `remaining <= need` comparison, so there are
+  # no edges left to pin. See the GROUP A tombstone in test_endpoint.cpp, which
+  # records what they asserted and which one hazard outlived them.
+  #
+  # What remains is the logged rows (GROUP B) and two source scans of the node
+  # (GROUPS C and E). The split from test_experiment_log stands on the first of
+  # those alone: that file owns the writer, this one owns the ORDER and the
+  # once-per-run-ness of what the writer emits, which is the property every
+  # campaign's primary metric is a stamp on.
+  ament_add_gtest(test_endpoint test/test_endpoint.cpp)
+  target_link_libraries(test_endpoint explo_planner_lib)
+  # The once-per-run mission-return guard lives in explo_planner_node.cpp, which
+  # is NOT in explo_planner_lib's source list above, so nothing links it and no
+  # test can call it. The guard is still the load-bearing half of F1, so
+  # test_endpoint reads the node's SOURCE and asserts the latch is present and
+  # ordered — the same technique, and the same justification, as
+  # test_experiment_log reading the writer for kEventKinds. Source tree, not
+  # install tree: the claim is about the code being built.
+  target_compile_definitions(test_endpoint PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+
   ament_add_gtest(test_pursuit_predictor test/test_pursuit_predictor.cpp)
   target_link_libraries(test_pursuit_predictor explo_planner_lib)
 
@@ -261,6 +286,75 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_separation test/test_separation.cpp)
   target_link_libraries(test_separation explo_planner_lib)
+
+  # T9. Generation 20's rendezvous invariants. Every one of them lives in the
+  # node — the countdown's write-before-arm ordering, the five-site separation
+  # predicate, the appointment-manoeuvre latch's keying — so this is the same
+  # source-scan technique as test_endpoint's GROUP C, for the same reason and
+  # with the same stated limits. It links the library only for gtest's sake; it
+  # calls nothing from it.
+  ament_add_gtest(test_gen20_rendezvous test/test_gen20_rendezvous.cpp)
+  target_link_libraries(test_gen20_rendezvous explo_planner_lib)
+  target_compile_definitions(test_gen20_rendezvous PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+
+  # T10. Generation 21's at-the-rendezvous hold. Same source-scan technique as
+  # T9 and for the same reason (the node is not in the library's source list),
+  # but a separate target on purpose: three of four invariants are guards on
+  # paths in functions a reader of the hold never opens, and each is individually
+  # sufficient to reintroduce an asymmetric corruption of the primary endpoint.
+  ament_add_gtest(test_gen21_latched_hold test/test_gen21_latched_hold.cpp)
+  target_link_libraries(test_gen21_latched_hold explo_planner_lib)
+  target_compile_definitions(test_gen21_latched_hold PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+
+  # T11. Generation 22's pre-mission hold. Same source-scan technique as T9 and
+  # T10, and a separate target for the same reason: the hold is four edits in
+  # four places plus one invariant that is not an edit at all (heartbeatTick's
+  # handshake must keep running while a robot is held, or the hold is a 60 s
+  # cost in all four arms that buys nothing).
+  #
+  # THIS IS THE FIRST TEST THAT SCANS THE HARNESS, and the second compile
+  # definition is why it has to. mission_start_hold_sec defaults ON in the node,
+  # so "the harness forgot it" is not the risk; the risk is the harness passing
+  # it in the ARM-CONDITIONAL `EXTRA` array rather than the unconditional
+  # per-robot argv, which would apply the hold to rendezvous and hybrid only and
+  # turn a startup cost into an apparent treatment effect in exactly the two
+  # arms under test. That is a property of run_explo_sim_rviz.sh and of nothing
+  # in the C++, so the C++ cannot be where it is checked.
+  ament_add_gtest(test_gen22_start_hold test/test_gen22_start_hold.cpp)
+  target_link_libraries(test_gen22_start_hold explo_planner_lib)
+  target_compile_definitions(test_gen22_start_hold PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp"
+    EXPLO_PLANNER_SIM_SH="${CMAKE_CURRENT_SOURCE_DIR}/../sim/run_explo_sim_rviz.sh")
+
+  # T12. Generation 23's contagious arming: one robot's broken view of the team
+  # arms the whole team, in one hop, over a new TeamWorld field.
+  #
+  # THE FIRST OF THESE THAT IS HALF EXECUTABLE, and the split is deliberate.
+  # The wire field's storage semantics live in TeamModel, which IS in
+  # explo_planner_lib's source list, so "the bit attaches to its sender",
+  # "gossip never relays it" and "it has no TTL of its own" are CALLED rather
+  # than scanned — and those are the three whose failure is silent, because a
+  # relayed claim still produces a plausible-looking armed team. Everything
+  # downstream (the five agreement sites, the producer's own-read-not-armed-
+  # state rule, the finished-peer exemption) is in explo_planner_node.cpp,
+  # which is not in that list, so it carries the same source-scan limit as
+  # T9-T11. There is no glob in this file to blame for that — the list above is
+  # explicit — but do not read the limit as one line away from lifting: the
+  # node TU also defines main(), so a test that pulls any node symbol out of
+  # the archive collides with gtest_main's main(). Making the node testable
+  # means splitting main() off first, not editing this list.
+  #
+  # A separate target from T9-T11 for the usual reason and one more: generations
+  # 18 and 19 were BOTH the five-site rule broken, in opposite directions, and
+  # both reached a smoke run green. This target is the standing check that arm
+  # and release read one predicate, and it must stay runnable against a mutated
+  # node on its own.
+  ament_add_gtest(test_gen23_contagion test/test_gen23_contagion.cpp)
+  target_link_libraries(test_gen23_contagion explo_planner_lib)
+  target_compile_definitions(test_gen23_contagion PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
 endif()
 
 ament_package()

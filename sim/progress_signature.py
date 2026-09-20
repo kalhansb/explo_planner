@@ -4,7 +4,12 @@
 Two candidate explanations, with different consequences for the experiment:
 
   TAIL      one distribution, some runs unlucky. Then the endpoint is the median
-            and the sample sizes from replication.py apply.
+            and the usual completion-time sample sizes apply. (The power tool
+            this line used to name, replication.py, is gone; replication_sd.py
+            is the surviving one, and its n-per-arm is an order-of-magnitude
+            estimate off four pairs on a long-superseded binary. The standing
+            result is that ~30 cells/arm is the FLOOR for completion time, not
+            a clean 80% -- do not read it as sufficient without re-checking.)
   MODE      a distinct failure the short runs never enter. Then "fraction of runs
             that fail" is a separate, cheaper, and more operationally meaningful
             endpoint than the median -- and the failure itself may be fixable.

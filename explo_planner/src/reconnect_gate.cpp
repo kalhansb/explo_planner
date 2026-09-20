@@ -136,15 +136,18 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
   // if it visited all would suppress every multi-peer case on a cost the
   // dispatch would never pay. With N<=3 and one peer this is just the one.
   long long leg = -1;
+  int leg_peer_id = -1;
   for (const MissingPeer& p : live) {
     if (!world.grid().valid(p.cell)) continue;
     const long long d = GlobalAllocator::costMm(world, self_cell, p.cell);
-    if (leg < 0 || d < leg) leg = d;
+    if (leg < 0 || d < leg) { leg = d; leg_peer_id = p.id; }
   }
   if (leg < 0) {
     // We know someone is missing but not where. Pursuit's own fallback ladder
-    // handles that case (last-contact midpoint); the gate has no basis to
-    // price it and must not turn "I do not know" into "do not go".
+    // handles that case (explore on the fallback allowance, then hold in place
+    // and beacon — the last-contact midpoint it used to name was deleted on
+    // 2026-09-16); the gate has no basis to price it and must not turn "I do
+    // not know" into "do not go".
     v.refused  = "peer-position-unknown";
     v.dispatch = true;
     return v;
@@ -155,17 +158,65 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
   // Identical vehicle sets, identical world, ONE difference: whether the
   // missing peers can be given cells they have never heard of. That difference
   // is the whole measurement, which is why cfg.comms_mask arrives ignored.
+  //
+  // ONE PEER ON BOTH SIDES OF THE INEQUALITY (2026-09-18), and it is the peer
+  // `leg` was priced to. The value side used to unmask EVERY live missing peer
+  // while the cost side priced the drive to the nearest one, so the two halves
+  // of C_re described different manoeuvres: the robot paid to fetch one peer
+  // and was credited with the makespan saving of fetching all of them. At N=2
+  // the two coincide and nothing changes; at N>=3 it is a one-directional bias
+  // towards dispatch, and adding a peer with NOTHING to gain from the
+  // reconnection could flip a refusal into a dispatch purely by shortening the
+  // nearest leg. That is a defect against this file's own stated model — see
+  // the leg comment above, "the manoeuvre goes to one of them" — not a policy
+  // choice, so it is corrected here rather than parameterised.
+  //
+  // TWO MISMATCHES THIS DOES **NOT** CLOSE, both of which are design questions
+  // about the treatment rather than arithmetic errors, and both of which are
+  // written up in CODE_TODO rather than patched:
+  //   * the node's chase target is the FRESHEST-heard unaccounted peer
+  //     (missingPeerRecord), not the nearest one priced here, so `leg_mm` can
+  //     understate the drive the node actually commits to;
+  //   * a RENDEZVOUS appointment drive is not a trip to a peer at all — it
+  //     reconnects the whole team at an agreed cell — so for that arm the
+  //     single-peer model is the wrong shape in both terms, not just mis-aimed.
+  // Choosing what the gate should price in those two cases changes which
+  // dispatches happen in the arms under test, which is Kalhan's call.
   std::vector<AllocRobot> apart = robots;
   for (AllocRobot& r : apart) {
     for (const MissingPeer& p : live) {
       if (r.id == p.id) r.in_comms = false;
     }
   }
+  // `re` differs from `apart` in exactly one vehicle: the peer we priced the
+  // leg to becomes reachable again. Built from `apart`, not from `robots`,
+  // because `robots` carries whatever in_comms the caller happened to set for
+  // the OTHER missing peers — and in the mid-run trigger's vehicle set that is
+  // false for all of them, which is how the old `robots` solve managed to
+  // unmask everyone.
+  std::vector<AllocRobot> re = apart;
+  for (AllocRobot& r : re) {
+    if (r.id == leg_peer_id) r.in_comms = true;
+  }
 
+  // BOTH SOLVES NOW RUN WITH THE MASK ON (2026-09-18) and differ only in the
+  // vehicle set. The RE solve used to be `comms_mask = false` over the caller's
+  // unmodified `robots`, and that is the mechanism behind the defect above: the
+  // flag switches masking off wholesale (see GlobalAllocator, which skips the
+  // per-vehicle test entirely when it is clear), so no arrangement of in_comms
+  // bits could have expressed "exactly one peer comes back". Turning the flag
+  // on and restoring one bit expresses it directly, and it also makes the two
+  // solves genuinely identical in every other respect — which is what lets the
+  // difference of their makespans be read as the value of this manoeuvre.
+  //
+  // The old comment here claimed `robots` was "everyone reachable, nobody
+  // masked". The first half was not true of the vehicle set the mid-run trigger
+  // actually passes (its missing peers carry in_comms = false); it did not
+  // matter only because the second half made the first irrelevant.
   GlobalAllocator::Config no_cfg = cfg;
   no_cfg.comms_mask = true;
   GlobalAllocator::Config re_cfg = cfg;
-  re_cfg.comms_mask = false;
+  re_cfg.comms_mask = true;
 
   const Allocation no_plan = GlobalAllocator::solve(world, apart, no_cfg);
   if (!no_plan.refused.empty()) {
@@ -173,14 +224,19 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     v.dispatch = true;
     return v;
   }
-  // `robots` unmodified: everyone reachable, nobody masked.
-  const Allocation re_plan = GlobalAllocator::solve(world, robots, re_cfg);
+  const Allocation re_plan = GlobalAllocator::solve(world, re, re_cfg);
   if (!re_plan.refused.empty()) {
     v.refused  = "assume-comms-solve:" + re_plan.refused;
     v.dispatch = true;
     return v;
   }
 
+  // STRUCTURALLY ZERO, and kept only so the column does not change meaning
+  // mid-campaign. The mask exempts any in_comms vehicle from the known-by test,
+  // this robot is always built in_comms, and a vehicle exempt from the test can
+  // take any cell — so no_plan.unassigned cannot be non-empty while self is in
+  // the vehicle set. The column was meant to report comms-mask starvation and
+  // cannot; dead-column status is recorded in CODE_TODO with the rest.
   v.unassigned = static_cast<int>(no_plan.unassigned.size());
   v.c_no_mm    = makespanMm(no_plan);
   v.c_re_mm    = leg + makespanMm(re_plan);

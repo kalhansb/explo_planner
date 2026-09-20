@@ -345,6 +345,17 @@ uint32_t CellWorld::sharedHash() const {
   return f.h;
 }
 
+uint32_t CellWorld::edgeHash() const {
+  Fnv1a f;
+  f.i64(static_cast<int64_t>(edges_.size()));
+  // Byte-for-byte. edges_ is written as 0/1 everywhere in this file, but the
+  // digest does not assume that: a future writer storing a weight there would
+  // otherwise change the matrix without changing the hash, which is the exact
+  // failure mode this exists to catch.
+  for (uint8_t e : edges_) f.byte(e);
+  return f.h;
+}
+
 int CellWorld::neighbourhood9(int id, int* out) const {
   if (!grid_.valid(id) || out == nullptr) return 0;
   const int c0 = grid_.col(id), r0 = grid_.row(id);

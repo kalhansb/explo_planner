@@ -21,21 +21,31 @@ Why the log is the source of truth for firings, not the CSV `state` column.
     modes are supposed to be good at. Firings are parsed from the planner log,
     which emits one line per decision.
 
-Four kinds of firing, all of which must be recognised:
+Five kinds of firing, all of which must be recognised:
 
     chase          startPursuit armed a trail chase
-    meeting_point  hybrid's fallback after a declined or exhausted chase
+    appointment    the drive to the cell the whole fleet agreed on (gen >= 19)
+    meeting_point  HISTORICAL: hybrid's midpoint fallback, deleted in gen 19.
+                   Kept so banked logs stay re-analysable; a current run never
+                   emits it.
     anchor_return  rendezvous' return to the last-connected anchor
     hold           pure pursuit's park-and-beacon after a declined chase
+
+`appointment` and `anchor_return` are deliberately NOT one bucket. The anchor is
+the robot's own last-connected pose and nobody else is committed to it; the
+appointment is a place the whole team agreed on before it separated. They are
+the treated and the fallback legs of the same arm, and a tool that cannot tell
+them apart cannot say whether the treatment ran.
 
 Two traps this parser exists to avoid, both verified in the data:
 
     `Rendezvous: exploration ended [...] with full team present -> DONE` is a
-    NON-firing (the manoeuvre correctly declined, explo_planner_node.cpp:2877).
+    NON-firing (the manoeuvre correctly declined; the log line is
+    explo_planner_node.cpp:7689, "exploration ended [...] full team present").
     It pattern-matches any naive grep for "Rendezvous:" and inflates counts.
 
     `holdForTeam` logs `Rendezvous: waiting for team at the barrier` even in the
-    PURE PURSUIT arm (explo_planner_node.cpp:2866-2871). Classifying firings by
+    PURE PURSUIT arm (explo_planner_node.cpp:8585, in holdForTeam). Classifying by
     the word "Rendezvous" files pursuit's park-and-beacon under rendezvous. The
     arm comes from the manifest and the kind from the decision line, never from
     the barrier chatter.
@@ -55,18 +65,23 @@ is in radio range the whole time; it then "reconnects" almost instantly and
 flatters every speed statistic. Two independent checks, because either alone is
 circumstantial:
 
-    link_up_frac    fraction of the 10 s before the arm in which the emulator
-                    had the pair connected. 1.0 means the radio was carrying
-                    traffic throughout the window in which the robot decided
-                    its teammate was gone.
+    team_connected_frac_10s
+                    fraction of the 10 s before the arm in which the emulator's
+                    up-link GRAPH spanned the whole roster — every robot able to
+                    reach every other, directly or through a relay. 1.0 means
+                    the radio was carrying traffic team-wide throughout the
+                    window in which the robot decided its teammate was gone.
+                    At N=2 this is just "the pair was connected"; at N>=3 it is
+                    a graph verdict and NOT an average over pairs, for the
+                    reason set out at read_link().
     peer_suppressed the PEER's own log says its heartbeat was suppressed during
                     that window ("Heartbeat resumed after X s suppressed"). This
                     is read from the other robot's log, since a robot cannot
                     observe its own silence.
 
-Both true is a manoeuvre armed against a healthy, in-range teammate: a planner
-artifact, not a reconnection. Link up with no suppression found is unexplained
-and flagged separately rather than quietly counted as either.
+Both true is a manoeuvre armed against a healthy, reachable teammate: a planner
+artifact, not a reconnection. Team whole with no suppression found is
+unexplained and flagged separately rather than quietly counted as either.
 
 What is deliberately NOT computed here: divergence drained across the contact.
 Under the reliable relay any contact drains essentially the whole backlog, so
@@ -98,10 +113,23 @@ RE_CHASE = re.compile(
 RE_DECLINE = re.compile(
     r"Pursuit: record of '([^']+)' is (\d+)s old "
     r"\((?:max (\d+)s|goal stale)\)")
+# THREE DESTINATION SPELLINGS, TWO OF THEM HISTORICAL (2026-09-19).
+#
+# The node names the destination with `return_dest_label_`, which is the `what`
+# argument of startReturnTo. Generation 19 renamed the agreed-cell destination
+# from "meeting point" (the midpoint construction, now deleted) to "appointment"
+# — and this alternation was not updated, so on a gen-19 or gen-20 log the line
+# "-> returning to appointment" matched NOTHING. Every appointment dispatch in
+# the two arms this tool exists to compare was invisible: not miscounted, absent.
+# That is the `checks-that-stopped-checking` failure again, one file over.
+#
+# All three spellings stay so that banked runs remain re-analysable, and the
+# mapping to a `kind` is below at the one place that reads group 4.
+DEST = r"appointment|meeting point|last-connected anchor"
 RE_RETURN = re.compile(
     r"Rendezvous: (?:exploration ended|dispatched) \[([^\]]*)\], "
     r"team incomplete "
-    r"\((\d+)/(\d+) peers\) -> returning to (meeting point|last-connected anchor)")
+    r"\((\d+)/(\d+) peers\) -> returning to (" + DEST + r")")
 RE_HOLD = re.compile(r"Reconnect: holding for the team at the current pose")
 # Mid-run trigger context (2026-08-17). The dispatch marker precedes the
 # firing line and tags it; the resume/exhaustion lines are their own events.
@@ -138,7 +166,23 @@ MIDRUN_NON_DISPATCH = (
     "attempt budget exhausted",   # RE_MIDRUN_EXHAUSTED
     "gave up after",              # RE_MIDRUN_RESUME
     "standing down",              # the link-gate veto (not a firing)
+    "gate says stay",             # the info gate refusing: no attempt spent
+    "spent but no manoeuvre",     # RE_MIDRUN_ABORTED (attempt spent, no fire)
 )
+# The whitelist working as designed is still noise if nobody adds to it. These
+# two were raising the `!! NOT PARSED` banner on EVERY banked run — 603 and 24
+# lines across ts3/ts4 — and a banner that fires on every run is one the reader
+# learns to scroll past, which is how the thing it was built to catch gets
+# through. Both are node lines that explicitly say no manoeuvre started.
+#
+# The second one also has to CLEAR pending_midrun. The node logs the dispatch
+# line first and only then discovers dispatchReconnect() returned false, so the
+# mid-run flag is already set with no firing to consume it; left standing it
+# rides forward and stamps `midrun=1` on the next firing, which may be the
+# terminal one at mission end. That is a mid-run count that is too high in
+# exactly the arm that retries.
+RE_MIDRUN_ABORTED = re.compile(
+    r"Reconnect \(mid-run\): attempt \d+ spent but no manoeuvre started")
 RE_MIDRUN_RESUME = re.compile(
     r"Reconnect \(mid-run\): gave up after (\d+)s at the barrier")
 RE_MIDRUN_EXHAUSTED = re.compile(
@@ -151,9 +195,13 @@ RE_ESCALATE = re.compile(
 RE_REJOIN = re.compile(
     r"(?:Pursuit: (?:team reconnected|chased peer back in comms) mid-chase"
     r"|Rendezvous: team reconnected en route"
-    r"|Rendezvous: full team connected)")
-RE_ARRIVED = re.compile(r"Rendezvous: reached (last-connected anchor|meeting point)")
-RE_UNREACH = re.compile(r"Rendezvous: (meeting point|last-connected anchor) unreachable")
+    # The barrier-release line: its generation-27 text and, for banked
+    # pre-27 logs, the old form. Both prefixes cover the "holding" and
+    # "re-planning" variants of the line alike.
+    r"|Rendezvous: full team connected"
+    r"|Rendezvous: team reachable)")
+RE_ARRIVED = re.compile(r"Rendezvous: reached (" + DEST + r")")
+RE_UNREACH = re.compile(r"Rendezvous: (" + DEST + r") unreachable")
 RE_GIVEUP = re.compile(r"max_wait=[\d.]+s reached -> giving up and finishing")
 # The AUTHORITATIVE outcome, when the line carries one. Generation 8 puts the
 # planner's own classification into the ending line; the group is optional so
@@ -320,6 +368,12 @@ def parse_log(path, steps=None):
                                "silent": float(m2.group(1)),
                                "attempt": int(ma.group(1)) if ma else 0})
                 continue
+            if RE_MIDRUN_ABORTED.search(line):
+                # The dispatch line above already set the flag; nothing fired,
+                # so nothing may consume it. See the note at RE_MIDRUN_ABORTED.
+                pending_midrun = False
+                events.append({"w": w, "type": "midrun_aborted"})
+                continue
             if MIDRUN_LINE_MARKER in line and not any(
                     h in line for h in MIDRUN_NON_DISPATCH):
                 # Dispatch-shaped but unparsed: the logger's wording has moved
@@ -366,8 +420,17 @@ def parse_log(path, steps=None):
                 if m2.group(1) == "hold-escalate":
                     events.append({"w": w, "type": "escalate_leg"})
                     continue
-                kind = ("meeting_point" if m2.group(4) == "meeting point"
-                        else "anchor_return")
+                # THE THREE SPELLINGS, MAPPED ONCE. "appointment" is the
+                # generation-19 name for the agreed cell and it is a DIFFERENT
+                # kind from "anchor_return": the anchor is the robot's own
+                # last-connected pose, which no teammate is committed to, while
+                # the appointment is a place the whole fleet agreed on. Folding
+                # them together (which is what the old `else` did, since the
+                # gen-19 wording matched neither branch) reports the rendezvous
+                # treatment as a solo retreat.
+                kind = {"appointment":   "appointment",
+                        "meeting point": "meeting_point"}.get(
+                            m2.group(4), "anchor_return")
                 events.append({"w": w, "type": "fire", "kind": kind,
                                "reason": m2.group(1), "peer": "",
                                "stale": pending_decline["stale"] if pending_decline else None,
@@ -557,14 +620,55 @@ def delivery_rate(totals, w, window=20.0):
     return ((seg[-1][1] - seg[0][1]) / dt, (seg[-1][2] - seg[0][2]) / dt)
 
 
-def read_link(run_dir):
-    """[(t_sim, connected, distance_m, trees)] with the startup window masked.
+def read_link(run_dir, n_robots):
+    """([(t_sim, team_connected, max_distance_m, trees_on_that_link)], problem).
 
     Rows written before both poses have landed carry zeroed physics and read
     connected=0; counting them fabricates an outage at t=0 (section 5.3).
     path_loss_db == 0 is that signature.
+
+    PAIR IDENTITY, AND WHY THIS IS A GRAPH (2026-09-19)
+    ---------------------------------------------------
+    link_states.csv carries one row PER PAIR per tick. This function used to
+    throw the `i`/`j` columns away and return the rows in time order, so
+    link_up_fraction() averaged over all C(N,2) pairs and the <0.5 test below
+    was really "were most LINKS down", never "was the TEAM split".
+
+    The right question is the predicate the planner actually arms on. A robot
+    arms when teamComplete() is false — when some peer's intent is not arriving,
+    DIRECTLY OR RELAYED. The ground-truth analogue is connectivity of the
+    up-link graph, and one team-level series answers it for every robot at once:
+    if the graph spans the roster every robot reaches every peer, and if it does
+    not, the components partition the roster, so EVERY robot has a peer outside
+    its own component and no robot's team is complete. No index-to-name mapping
+    is needed (`i`/`j` are emulator indices, not robot names).
+
+    What that is worth, measured on the banked cells rather than argued:
+
+      N=2   one pair, so the fold is the identity.
+      N=3   the two rules coincide on any steady window — 3 nodes stay spanned
+            on any 2 of 3 edges, so "disconnected" and "most links down" are the
+            same condition. Re-scoring ts3_n3 moved 0.2% of windows (79.5% ->
+            79.7% split). The old answer was right here for the wrong reason.
+      N=4   they do NOT coincide, and this is where it bit. Isolating one robot
+            drops exactly 3 of 6 links: the old fold reads 0.50, fails the
+            strict `< 0.5` test, and files a robot that is alone in the forest
+            as "team whole, no suppression found". Re-scoring ts1b_n4 moves
+            61.0% -> 73.8% of windows to split: 2784 windows, 17% of the real
+            splits, had been credited to the wrong column.
+
+    Two rows for the same (t, pair) are last-write-wins: both cannot be the
+    state at one instant. That is rare and reported (12 rows in 77548 across 12
+    N=2 cells, 7 of them disagreeing), not assumed away — it is the one respect
+    in which a re-scored N=2 number can differ from its banked value.
+
+    A tick not carrying all C(N,2) pairs is UNKNOWN, not down — the masks above
+    drop rows individually — so it is skipped rather than scored. `problem` is
+    non-empty when something made the file unusable; it is reported, never
+    silently swallowed.
     """
-    out = []
+    by_t, seen_pairs, want = {}, set(), n_robots * (n_robots - 1) // 2
+    dup = 0
     try:
         with open(os.path.join(run_dir, "link_states.csv")) as fh:
             for r in csv.DictReader(fh):
@@ -573,14 +677,63 @@ def read_link(run_dir):
                     continue
                 t = _f(r, "t_sim")
                 c = _f(r, "connected")
+                i, j = _f(r, "i"), _f(r, "j")
                 if t is None or c is None:
                     continue
-                out.append((t, c > 0.5, _f(r, "distance_m", float("nan")),
-                            _f(r, "trees_on_link", float("nan"))))
+                if i is None or j is None:
+                    return [], ("link_states.csv has no i/j columns: this is a "
+                                "pre-generation-9 trace and the pair each row "
+                                "belongs to is unrecoverable. Refusing rather "
+                                "than folding %d links into one series."
+                                % want)
+                pair = (int(i), int(j)) if i <= j else (int(j), int(i))
+                seen_pairs.add(pair)
+                tick = by_t.setdefault(t, {})
+                dup += pair in tick
+                tick[pair] = (c > 0.5, _f(r, "distance_m", float("nan")),
+                              _f(r, "trees_on_link", float("nan")))
     except OSError:
-        return []
-    out.sort(key=lambda x: x[0])
-    return out
+        return [], ""
+
+    if by_t and len(seen_pairs) != want:
+        return [], ("link_states.csv carries %d distinct pair(s) but a %d-robot "
+                    "roster has %d. The emulator and the planner roster "
+                    "disagree about who is in this run, so no link quantity "
+                    "below can be attributed; refusing to score them."
+                    % (len(seen_pairs), n_robots, want))
+
+    out, partial = [], 0
+    for t in sorted(by_t):
+        pairs = by_t[t]
+        if len(pairs) != want:
+            partial += 1
+            continue
+        comp = {}                      # node -> its component id, merged in place
+        for (a, b), (up, _d, _tr) in pairs.items():
+            comp.setdefault(a, {a})
+            comp.setdefault(b, {b})
+            if not up or comp[a] is comp[b]:
+                continue
+            merged = comp[a] | comp[b]
+            for node in merged:
+                comp[node] = merged
+        spans = bool(comp) and len(next(iter(comp.values()))) == n_robots
+        far = max(pairs.values(), key=lambda v: (v[1] if v[1] == v[1] else -1.0))
+        out.append((t, spans, far[1], far[2]))
+
+    notes = []
+    if partial and out:
+        notes.append("%d of %d link tick(s) were missing at least one pair and "
+                     "were skipped, not scored as down."
+                     % (partial, partial + len(out)))
+    elif partial:
+        notes.append("every one of the %d link tick(s) was missing at least "
+                     "one pair, so there is no scoreable link series at all."
+                     % partial)
+    if dup:
+        notes.append("%d row(s) repeated a (t_sim, pair) already seen; the "
+                     "later row won." % dup)
+    return out, " ".join(notes)
 
 
 def link_at(link, t):
@@ -593,29 +746,19 @@ def link_at(link, t):
 
 
 def link_up_fraction(link, t, window=10.0):
-    """Share of the `window` seconds before t in which the pair was connected.
+    """Share of the `window` before t in which the team was mutually reachable.
 
     A single sample is the wrong test. The connect decision carries hysteresis
     (3-of-8 samples, ~0.6 s) and the heartbeat is 1 Hz, so a link that came up
     a moment ago has not yet delivered anything and a robot may legitimately
     still read its teammate as missing. A window asks the question that matters:
     had the radio been carrying traffic long enough for a beacon to arrive?
+
+    The per-sample value is read_link()'s graph verdict, so at N>=3 this is the
+    fraction of the window with the ROSTER SPANNED, not a pair average.
     """
     vals = [c for tt, c, _, _ in link if t - window <= tt <= t]
     return (sum(1 for c in vals if c) / len(vals)) if vals else None
-
-
-def next_rising_edge(link, t):
-    """First time after t at which the link comes up (down -> up)."""
-    prev = None
-    for row in link:
-        if row[0] < t:
-            prev = row
-            continue
-        if prev is not None and not prev[1] and row[1]:
-            return row[0]
-        prev = row
-    return None
 
 
 def dist_at(rows, t):
@@ -651,7 +794,7 @@ def analyse_run(run_dir):
         fires = [e for e in R["events"] if e["type"] == "fire"]
         if fires and R["episodes"]:
             R["match"] = align_episodes(fire_durations(R["events"]), R["episodes"])
-    link = read_link(run_dir)
+    link, link_note = read_link(run_dir, len(per_robot))
     relay = read_relay_totals(run_dir)
 
     def to_sim(w):
@@ -791,13 +934,18 @@ def analyse_run(run_dir):
                 "after_decline": int(bool(e.get("declined"))),
                 "staleness_s": e.get("stale"),
                 "t_arm_sim": t_arm,
-                "link_up_at_arm": ("" if lk is None else int(lk[1])),
-                "link_up_frac_10s": ("" if upf is None else round(upf, 2)),
+                # Renamed with the meaning, deliberately: these were
+                # link_up_*/separation_m_at_arm when they were one pair's
+                # numbers. They are now the team's (read_link), and a column
+                # that quietly changes what it measures under an unchanged name
+                # is how a banked table gets re-read as something it never said.
+                "team_connected_at_arm": ("" if lk is None else int(lk[1])),
+                "team_connected_frac_10s": ("" if upf is None else round(upf, 2)),
                 "delivered_per_s": ("" if dlv is None else round(dlv, 2)),
                 "dropped_per_s": ("" if drp is None else round(drp, 2)),
                 "peer_suppressed": peer_suppressed(robot, t_arm),
-                "separation_m_at_arm": ("" if lk is None else lk[2]),
-                "trees_on_link_at_arm": ("" if lk is None else lk[3]),
+                "max_separation_m_at_arm": ("" if lk is None else lk[2]),
+                "trees_on_farthest_link": ("" if lk is None else lk[3]),
                 "outcome": outcome,
                 "t_outcome_sim": t_out,
                 "dt_to_outcome_s": (None if (t_arm is None or t_out is None)
@@ -814,7 +962,8 @@ def analyse_run(run_dir):
                 for e in R["events"] if e["type"] == "midrun_unparsed"]
     return {
         "name": name, "events": out, "declines": declines, "no_fire": no_fire,
-        "midrun_unparsed": unparsed,
+        "midrun_unparsed": unparsed, "link_note": link_note,
+        "n_robots": len(per_robot),
         "fit": (slope, offset, n_off, resid),
         "usable": man.get("run_end_reason", "") != "",
         "gates": man.get("run_gates_verdict", ""),
@@ -825,10 +974,11 @@ def analyse_run(run_dir):
 
 FIELDS = ["run", "arm", "seed", "tx_power_dbm", "gates", "end_reason", "robot",
           "kind", "midrun", "after_decline", "staleness_s", "t_arm_sim",
-          "link_up_at_arm",
-          "link_up_frac_10s", "delivered_per_s", "dropped_per_s",
-          "peer_suppressed", "separation_m_at_arm",
-          "trees_on_link_at_arm", "outcome", "t_outcome_sim", "dt_to_outcome_s",
+          "team_connected_at_arm",
+          "team_connected_frac_10s", "delivered_per_s", "dropped_per_s",
+          "peer_suppressed", "max_separation_m_at_arm",
+          "trees_on_farthest_link", "outcome", "t_outcome_sim",
+          "dt_to_outcome_s",
           "manoeuvre_dur_s", "dist_travelled_m", "csv_visible"]
 
 
@@ -882,17 +1032,22 @@ def main():
         print("no manoeuvre firings found")
         return 0
 
-    print(f"{'run':<24}{'rob':<7}{'kind':<14}{'mid':>4}{'stale':>7}{'t_arm':>8}"
-          f"{'up10s':>7}{'supp':>5}{'sep_m':>7}{'trees':>6}{'outcome':>17}"
+    # The run column is sized from the data, not from a guess: the arm tokens
+    # grew with `_r20_ttl0` and a fixed 24 silently ran the run name into the
+    # robot name, which is unreadable in exactly the table used to adjudicate.
+    rw = max(3, min(44, max(len(e["run"]) for e in events))) + 1
+    print(f"{'run':<{rw}}{'rob':<7}{'kind':<14}{'mid':>4}{'stale':>7}{'t_arm':>8}"
+          f"{'cx10s':>7}{'supp':>5}{'maxsep':>7}{'trees':>6}{'outcome':>17}"
           f"{'dt':>7}{'dist':>7}{'csv':>4}")
-    print("-" * 125)
+    print("-" * (rw + 101))
     for e in events:
-        print(f"{e['run']:<24}{e['robot']:<7}{e['kind']:<14}"
+        print(f"{e['run']:<{rw}}{e['robot']:<7}{e['kind']:<14}"
               f"{e['midrun']:>4}"
               f"{fmt(e['staleness_s'], 0):>7}{fmt(e['t_arm_sim'], 0):>8}"
-              f"{fmt(e['link_up_frac_10s'], 2):>7}{fmt(e['peer_suppressed']):>5}"
-              f"{fmt(e['separation_m_at_arm']):>7}"
-              f"{fmt(e['trees_on_link_at_arm'], 2):>6}{e['outcome']:>17}"
+              f"{fmt(e['team_connected_frac_10s'], 2):>7}"
+              f"{fmt(e['peer_suppressed']):>5}"
+              f"{fmt(e['max_separation_m_at_arm']):>7}"
+              f"{fmt(e['trees_on_farthest_link'], 2):>6}{e['outcome']:>17}"
               f"{fmt(e['dt_to_outcome_s'], 0):>7}"
               f"{fmt(e['dist_travelled_m'], 0):>7}{e['csv_visible']:>4}")
 
@@ -935,42 +1090,48 @@ def main():
 
     # --- the validity check that matters most -----------------------------
     print("\n=== validity: was the teammate actually unreachable at arm time? ===")
-    known = [e for e in events if e["link_up_frac_10s"] != ""]
+    # A link series this script refused to score is not "no outages found". Say
+    # so above the counts, because the counts below cannot distinguish them.
+    for r in runs:
+        if r.get("link_note"):
+            print(f"  !! {r['name']} (N={r.get('n_robots', '?')}): "
+                  f"{r['link_note']}")
+    known = [e for e in events if e["team_connected_frac_10s"] != ""]
     print(f"firings with a resolvable arm time: {len(known)}/{len(events)}")
     genuine, artifact, unexplained = [], [], []
     for e in known:
-        if e["link_up_frac_10s"] < 0.5:
+        if e["team_connected_frac_10s"] < 0.5:
             genuine.append(e)
         elif e["peer_suppressed"] == 1:
             artifact.append(e)
         else:
             unexplained.append(e)
-    print(f"  genuine outage   (link down >50% of the 10 s before arming): "
+    print(f"  genuine outage   (team split >50% of the 10 s before arming): "
           f"{len(genuine)}")
-    print(f"  planner artifact (link up AND peer heartbeat suppressed):    "
+    print(f"  planner artifact (team whole AND peer heartbeat suppressed):  "
           f"{len(artifact)}")
-    print(f"  unexplained      (link up, no suppression found):            "
+    print(f"  unexplained      (team whole, no suppression found):          "
           f"{len(unexplained)}")
     for label, group in (("ARTIFACT", artifact), ("UNEXPLAINED", unexplained)):
         for e in group:
             print(f"    [{label}] {e['run']:<24}{e['robot']:<7}{e['kind']:<14}"
-                  f"up={fmt(e['link_up_frac_10s'], 2)} "
+                  f"cx={fmt(e['team_connected_frac_10s'], 2)} "
                   f"dlv={fmt(e['delivered_per_s'], 1)}/s "
-                  f"drp={fmt(e['dropped_per_s'], 1)}/s sep="
-                  f"{fmt(e['separation_m_at_arm'])} m  {e['outcome']} "
+                  f"drp={fmt(e['dropped_per_s'], 1)}/s maxsep="
+                  f"{fmt(e['max_separation_m_at_arm'])} m  {e['outcome']} "
                   f"dt={fmt(e['dt_to_outcome_s'], 0)}s")
     if artifact or unexplained:
-        print("  A firing with the link up armed against a teammate that was in"
-              "\n  range. The heartbeat is state-gated (3.8), so a planner busy in"
-              "\n  PLAN goes quiet and its teammate declares it missing under a"
+        print("  A firing with the team whole armed against a teammate that was"
+              "\n  reachable. The heartbeat is state-gated (3.8), so a planner busy"
+              "\n  in PLAN goes quiet and its teammate declares it missing over a"
               "\n  healthy link. These 'reconnect' almost instantly and flatter"
               "\n  every speed statistic; they are not reconnections.")
 
     if genuine:
         print("\n=== outcome by kind, GENUINE OUTAGES ONLY ===")
-        print("The table above pools real reconnections with firings against an"
-              "\nin-range teammate. This one keeps only firings where the link was"
-              "\ndown for most of the 10 s before arming. It is the honest one.")
+        print("The table above pools real reconnections with firings against a"
+              "\nreachable teammate. This one keeps only firings where the team was"
+              "\nsplit for most of the 10 s before arming. It is the honest one.")
         by_tx_g = {}
         for e in genuine:
             by_tx_g.setdefault(e["tx_power_dbm"], []).append(e)
@@ -1029,7 +1190,8 @@ def main():
             print(f"    {r['name']:<24} declined chases={r['declines']}  "
                   f"'full team present -> DONE'={r['no_fire']}")
     print("  'full team present -> DONE' is the manoeuvre correctly NOT firing"
-          "\n  (explo_planner_node.cpp:2877). It is not a manoeuvre.")
+          "\n  (explo_planner_node.cpp:7689, the 'full team present' log)."
+          " It is not a manoeuvre.")
 
     # --- the number the design question actually turns on -----------------
     deg_set = {id(e) for e in deg}

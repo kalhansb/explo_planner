@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read a generation-8 campaign against the pre-registered gate.
 
-Descends from gate_g6.py. Checks 1-14 are carried over unchanged in meaning;
+Descends from gate_g6.py, which no longer exists in this tree -- the lineage is
+history, not a file to consult. Checks 1-14 are carried over unchanged in meaning;
 15-20 are new and exist to prove that each generation-8 fix ACTUALLY PRODUCED
 its field in real data, rather than being present in source and inert at
 runtime ([[checks-that-stopped-checking]]).
@@ -24,8 +25,10 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
                                     (default "hybrid,off")
         GATE_CONTROL_ARMS           arms that run with the manoeuvre disabled
                                     (default "off")
-        GATE_SCHEMA_VERSION         event-log schema to require (default 4;
-                                    pass 3 to re-gate a banked gen-9 campaign)
+        GATE_SCHEMA_VERSION         event-log schema to require (default 10;
+                                    pass the banked generation's own number to
+                                    re-gate an older campaign, e.g. 5 for a
+                                    gen-16 one or 3 for a gen-9 one)
 Exit:   0  no hard failures, every population non-empty
         1  hard failures, or no cells for the tag
         2  the generation identity was never declared
@@ -37,6 +40,7 @@ as "everything passed", which is the exact failure this gate exists to catch.
 """
 import collections
 import csv
+import glob
 import json
 import os
 import re
@@ -54,7 +58,170 @@ if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1].startswith("-")):
     print(__doc__)
     sys.exit(0 if sys.argv[1] in ("-h", "--help") else 2)
 TAG = sys.argv[1] if len(sys.argv) > 1 else "g8r1"
-ROBOTS = ["atlas", "bestla"]
+# The two-robot default, kept ONLY as the last resort for a cell whose manifest
+# names no team. Every real cell now gets its roster from robots_of() below;
+# this constant is what a pre-team_robot_names cell falls back to, and it is
+# reported when it is used rather than applied silently.
+ROBOTS_FALLBACK = ["atlas", "bestla"]
+
+# Gates in comms_gates.txt that are READINGS, not thresholds: they describe the
+# run, they cannot condemn it. Used by check 2 only, and only to keep a line
+# such a gate was never entitled to write from failing the whole cell. Adding a
+# name here is a claim that the gate has no pass criterion — check the gate's
+# own header before doing it.
+REPORT_ONLY_GATES = frozenset({"map_agree"})
+
+
+def robots_of(m, d):
+    """This cell's roster, from its own manifest.
+
+    Returns (names, source). The gate used to iterate a module-level
+    ROBOTS = ["atlas", "bestla"] over every cell of every campaign, which is
+    wrong in both directions at N>=3: husky and skadi were never opened, so
+    checks 3b/3c/3e/3f/3g/18b/18c ran on two thirds of a three-robot team and
+    reported a pass over the third, and a campaign that renamed its robots
+    would hard-fail "no events" on cells that were perfectly good.
+
+    `robots=` is written by run_campaign.sh from the value actually launched, so
+    it is the witness. `team_robot_names` is the same list as the node saw it
+    and is used as the cross-check; a disagreement between the two is reported
+    by check 3k rather than resolved here.
+    """
+    raw = m.get("robots")
+    if raw:
+        names = [t.strip() for t in raw.split(",") if t.strip()]
+        if names:
+            return names, "manifest robots="
+    # Older manifests wrote only the node-side list, as a JSON array.
+    raw = m.get("team_robot_names")
+    if raw:
+        try:
+            names = [str(t) for t in json.loads(raw)]
+        except ValueError:
+            names = [t.strip().strip('"[] ') for t in raw.split(",")]
+        names = [n for n in names if n]
+        if names:
+            return names, "manifest team_robot_names="
+    # Last resort: whatever event logs are on disk. This is DELIBERATELY not
+    # the primary source -- deriving the roster from the files present makes
+    # "a robot's log is missing" unobservable, since the missing robot simply
+    # drops out of the expectation. It is used only when the manifest names no
+    # team at all, and the caller says so in its output.
+    found = sorted(os.path.basename(q)[:-len(".events.jsonl")]
+                   for q in glob.glob(os.path.join(d, "*.events.jsonl")))
+    if found:
+        return found, "event logs on disk (NOT a manifest expectation)"
+    return list(ROBOTS_FALLBACK), "hardcoded fallback"
+
+
+# Suffixes a cell directory may carry that the BINARY never stamps into
+# run_start's `arm`. run_campaign.sh strips each before setting RECONNECT_MODE,
+# so a directory carrying them holds a node that stamped the bare policy name,
+# and anything compared against run_start has to compare the stripped form.
+#
+# Two kinds, and the difference decides whether the suffix survives into the
+# cell's IDENTITY:
+#
+#   RUNTIME  — a switch that is not a design dimension of any campaign using it.
+#              Pooled away entirely: `arm` loses it, so cells with and without
+#              it count into the same bucket.
+#   DESIGN   — an independent variable. Stripped for the comparison against the
+#              binary (policy_arm) but KEPT in `arm`, because folding r10 and
+#              r40 into one bucket would leave check 21 unable to notice that
+#              half a design never ran, which is the precise failure check 21
+#              exists for. Each also gets a manifest cross-check (3i, 3k2), on
+#              the same argument as 3e one level down: the analysis reads the
+#              level off the directory name, so a launcher bug that runs the
+#              other level silently swaps the design's two columns.
+RUNTIME_SUFFIXES = ("_seek",)
+# (regex on the suffix, manifest key it must agree with, human name, unit)
+# The unit is carried here rather than written into the message, because one
+# message now serves every dimension and "TTL 120 m" is worse than no unit at
+# all.
+DESIGN_SUFFIXES = (
+    (re.compile(r"^(.*)_r([0-9]{1,3})$"), "coord_claim_radius_override",
+     "claim radius", "m"),
+    (re.compile(r"^(.*)_ttl([0-9]{1,4})$"), "alloc_peer_pos_max_age_sec",
+     "allocator peer-position TTL", "s"),
+)
+
+
+def parse_cell_name(cell, tag):
+    """Split a cell directory name into the three things the gate needs.
+
+    Returns (arm, policy_arm, claims, leftover) where
+
+      arm        the CELL's identity: what to count, what GATE_ARMS must have
+                 declared, which column of the design this is.
+      policy_arm what the BINARY can stamp: the reconnect policy alone, every
+                 suffix removed. Anything compared against run_start or against
+                 the m-tare vocabulary uses this.
+      claims     {manifest_key: (value_as_float, human_name, unit)} for each design
+                 suffix present, to be checked against the manifest.
+      leftover   the arm with every RECOGNISED suffix stripped, for the caller
+                 to sanity-check. Equal to policy_arm; returned separately so
+                 the caller need not re-derive it.
+
+    ONE FUNCTION, called once, because the previous inline version stripped
+    _seek and then matched _r<N> with a single anchored regex -- so a name
+    carrying BOTH a radius and a TTL, which is every ts1b cell
+    (`ts1b_n3_mtare_hybrid_r40_ttl0_seed1`), matched neither. The consequences
+    were not subtle: policy_arm came out as the whole middle token, check 3e
+    hard-failed "directory says mtare_hybrid_r40_ttl0 but params say
+    mtare_hybrid" on every cell, 3g declared the arm unstampable by any binary,
+    3i hard-failed "directory names no claim radius" against a manifest that
+    recorded 40.0, and check 21 found zero cells in either declared arm. 76 hard
+    failures on a campaign with nothing wrong with it. Stripping in a LOOP until
+    nothing matches makes suffix ORDER irrelevant, which is the property the
+    single-pass version lacked.
+    """
+    mid = cell[len(tag) + 1:] if cell.startswith(tag + "_") else cell
+    arm = mid.rsplit("_seed", 1)[0] if "_seed" in mid else mid
+    for suf in RUNTIME_SUFFIXES:
+        while arm.endswith(suf):
+            arm = arm[:-len(suf)]
+    claims = {}
+    policy_arm = arm
+    changed = True
+    while changed:
+        changed = False
+        for rx, key, human, unit in DESIGN_SUFFIXES:
+            mm = rx.match(policy_arm)
+            if mm:
+                # First match wins per key: a name repeating a dimension is
+                # malformed, and quietly keeping the inner one would file the
+                # cell under a level it did not run.
+                claims.setdefault(key, (float(mm.group(2)), human, unit))
+                policy_arm = mm.group(1)
+                changed = True
+    return arm, policy_arm, claims, policy_arm
+
+
+def unrecognised_suffix(dir_policy, stamped):
+    """The one shape of 3e disagreement that is a GATE gap, not a run defect.
+
+    Returns the leftover token when the directory's policy is exactly the
+    binary's stamp plus a trailing `_<something>` this file does not know about,
+    and None otherwise.
+
+    The distinction matters because the two failures need opposite responses. A
+    directory reading `mtare_off` against a stamp of `mtare_hybrid` is an
+    assignment error and must stop the campaign. A directory reading
+    `mtare_hybrid_ttl0` against a stamp of `mtare_hybrid` is a correctly-run
+    cell carrying a knob added after this gate was last edited — the cells are
+    fine and the TABLE above is out of date. Reporting the second as a
+    provenance hard failure is how a gate teaches operators to ignore it.
+
+    Deliberately one-directional: a stamp LONGER than the directory name is not
+    a missing suffix, it is the binary claiming an arm the directory does not,
+    and that stays a hard failure.
+    """
+    if not dir_policy or not stamped:
+        return None
+    if dir_policy == stamped or not dir_policy.startswith(stamped + "_"):
+        return None
+    return dir_policy[len(stamped) + 1:]
+
 
 # ---------------------------------------------------------------------------
 # Declared identity of generation 8 (pre-registration section 32.14).
@@ -80,15 +247,27 @@ ROBOTS = ["atlas", "bestla"]
 #
 # That preserves the property that matters — the gate is told what to expect by
 # something it does not compute — while being physically possible. The
-# pre-registration records the same two values, and the identity file being
+# pre-registration records the same four values, and the identity file being
 # outside git is not a weakness here: it is written BEFORE the first cell runs
 # and any later edit is visible in its mtime against the campaign's own cells.
 #
 # Env overrides exist for the calibration harness, which must point the real
 # logic at synthetic cells of known identity.
 # ---------------------------------------------------------------------------
+# The simple_nav_3d binary that actually ran. Declared like the other four, but
+# REQUIRED only where the campaign can answer -- see the self-calibrating block
+# after cell enumeration for why it is not simply added to EXPECT above.
+NAV_BIN_KEY = "sha256_simple_nav_planner_node"
+# Its three siblings. They move as a unit with it, so a hash that moves for one
+# and not the others is a partial install; that is checked per-cell and needs no
+# declaration, because the defect is internal disagreement, not a wrong value.
+NAV_BIN_SIBLINGS = ("sha256_simple_nav_costmap_node",
+                    "sha256_simple_nav_controller_node",
+                    "sha256_simple_nav_navigator_node")
+
+
 def _declared_identity():
-    """The two build-dependent identity fields, from env or the identity file."""
+    """The build-dependent identity fields, from env or the identity file."""
     out = {}
     path = os.environ.get("GATE_IDENTITY",
                           os.path.join(ROOT, f"{TAG}.identity.txt"))
@@ -107,20 +286,84 @@ def _declared_identity():
                 out[k.strip()] = v.strip()
     # Env wins, so the calibration can override a real identity file if one
     # happens to exist in its synthetic root.
-    for k in ("git_explo_planner", "sha256_explo_planner_node"):
+    for k in ("git_explo_planner", "git_simple_nav_3d", "git_scovox",
+              "sha256_explo_planner_node", NAV_BIN_KEY):
         if os.environ.get(f"GATE_EXPECT_{k}"):
             out[k] = os.environ[f"GATE_EXPECT_{k}"]
     return out
 
 
 _decl = _declared_identity()
+# ALL FOUR are declared, none is a literal. git_simple_nav_3d and git_scovox
+# used to be hardcoded here ("c9f83a7" and "078d3f7"), which was invisible for as
+# long as the gate was only ever pointed at generation-8 cells, where those revs
+# were in fact correct. The moment simple_nav_3d changed -- which it does in
+# generation 9, for D2/D2b -- EVERY cell hard-failed check 3 on a non-defect, and
+# nothing in the identity file or the environment could clear it. An operator
+# facing a gate that cannot be satisfied does one of two things, and both are
+# worse than the bug: abort a good campaign, or learn to skim past check-3 lines.
+# Check 3 is the one that catches real cross-generation pooling, so teaching the
+# reader to ignore it is the expensive failure. A pin that only a source edit can
+# move is a pin that gets moved under time pressure, months later, by someone who
+# just wants the gate to go green -- which is exactly how the eight guards in
+# `checks-that-stopped-checking` went inert while still printing PASSes.
 EXPECT = {
     "git_explo_planner": _decl.get("git_explo_planner", "FILL_ME"),
-    "git_simple_nav_3d": "c9f83a7",
-    "git_scovox": "078d3f7",
+    "git_simple_nav_3d": _decl.get("git_simple_nav_3d", "FILL_ME"),
+    "git_scovox": _decl.get("git_scovox", "FILL_ME"),
     "sha256_explo_planner_node": _decl.get("sha256_explo_planner_node",
                                            "FILL_ME"),
 }
+
+# Deliberately NOT folded into EXPECT here. EXPECT's members are unconditional,
+# and this one is conditional on the campaign carrying the key at all; it joins
+# EXPECT below, once the cells have been read.
+EXPECT_NAV = _decl.get(NAV_BIN_KEY)
+
+# ==================================================================
+# check 3l: the configuration that must not vary silently
+# ==================================================================
+# The sensor model and the candidate generator. None of these is an arm's
+# treatment in any campaign this gate scores, so variation in them is not a
+# design -- it is a stale installed shared_params.yaml, a -p override that
+# reached some cells and not others, or two invocations pooled.
+#
+# It needs its own check because the existing provenance cannot see it.
+# sha256_shared_params moves if the yaml changes, but it is in no EXPECT set
+# and nothing compares it; and it says the file differed, never WHICH value
+# differed -- the same complaint the harness itself writes three times over the
+# *_in_params keys. git_explo_planner does not move for a params change at all.
+#
+# CFG_HARD are campaign-wide constants. CFG_SOFT have been independent
+# variables before (cr2 varied the claim radius by arm), so between-arm
+# variation in them is a legitimate design and is reported, not failed --
+# but WITHIN one arm they are still constants, and that half stays hard.
+CFG_HARD = ("fov_hfov", "fov_vfov", "fov_h_rays", "fov_v_rays",
+            "fov_min_range", "fov_max_range", "fov_is_omnidirectional",
+            "candidate_n_yaw", "candidate_enable_polar")
+CFG_SOFT = ("exploitation_enabled", "coord_claim_radius_m")
+CFG_KEYS = CFG_HARD + CFG_SOFT
+
+
+def cfg_val(v):
+    """Canonical text for a config value, so FORMAT is never a finding.
+
+    96 and 96.0 are the same ray count, and true and True are the same flag.
+    Comparing json.dumps output directly would have reported both pairs as a
+    campaign that mixes two sensor models -- an unsatisfiable hard failure on a
+    correct campaign, which is the exact trap check 3 had for git_simple_nav_3d
+    and the exact precedent the radio-regime check already records ("the harness
+    writes 30.0, an older manifest may say 30, and they are the same radio").
+
+    bool FIRST: in Python bool is a subclass of int, so a value-ordered test
+    renders True as "1" and silently makes a flag indistinguishable from a
+    count of one.
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(float(v))
+    return json.dumps(v)
 
 DONE_UNKNOWN_FRACTION = 0.640
 # The event-log schema this gate scores against (check 3d). Overridable for the
@@ -138,7 +381,43 @@ DONE_UNKNOWN_FRACTION = 0.640
 # but "the same behaviour" is a claim for equiv_gate.py to prove per phase, not
 # something this file may assume. Here the stamp stays what it has always been:
 # a one-field tripwire on mixing generations in one campaign directory.
-SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "4"))
+#
+# Bumped to 5 on 2026-09-16 (generation 10), when the rendezvous appointment
+# stopped being derived independently on each robot and became a (cell,
+# interval) pair exchanged over TeamWorld and committed by unanimity. Unlike the
+# v4 bump this one is BEHAVIOURAL and not default-off: the rendezvous and hybrid
+# arms of a v5 campaign are running a different mechanism from the same-named
+# arms of a v4 one. The pin must move with the binary — check 3d is an exact
+# equality, so a stale pin here rejects every cell of the current generation
+# while the calibrator, which pins the gate's env to its own constant, goes on
+# reporting PASS against a schema nothing writes.
+#
+# THE HISTORY ABOVE STOPPED AT v5 UNTIL 2026-09-18 while the pin below read 8,
+# which is the exact failure this block was written to prevent, committed in the
+# block itself. The three missing bumps:
+#
+#   v6 (generation 17) — MEANING-ONLY. `RendezvousAgreedEvent::t_meet_sec` went
+#     from "the next meeting instant" to the phase offset of a repeating
+#     interval. Same field, same type, same name, different quantity. Nothing
+#     rejects a v6 file read as v5; it just answers a different question.
+#   v7 (generation 19) — MEANING-ONLY. A new `rendezvous_outcome` label, so the
+#     set of values a reader must switch on grew without the key changing.
+#   v8 (generation 23, today) — three meaning changes and three additive
+#     fields. See the block comment on the schema constant in experiment_log.hpp
+#     (`kSchemaVersion`), which is the authority; do not re-derive the list here
+#     and do not let the two drift again.
+#
+# v9 (generation 25, 2026-09-18) moved the same day as the header — MEANING-
+# ONLY: the arming floor behind `t_meet_sec` went from now-plus-notice to bare
+# now, and arrived=false outcome rows split into barrier conversions vs
+# strandings. kSchemaVersion in experiment_log.hpp remains the authority.
+#
+# A MEANING-ONLY BUMP IS STILL A BUMP, and those are the ones that get skipped:
+# nothing fails to parse, so the pressure to record them is entirely absent, and
+# a reader pooling v6 with v5 gets numbers rather than an error. The pin exists
+# to make that pooling impossible inside one campaign directory. It cannot do
+# that job if the reason for a version is only in the commit that raised it.
+SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "10"))
 # Generation-9 treatment configuration (check 3f). Overridable so the check can
 # be calibrated against a known-answer case — a gate that has never been shown
 # to FAIL on a bad input is not evidence of anything, which is the lesson the
@@ -167,6 +446,40 @@ GEN9_PARAMS_REQUIRED = os.environ.get("GATE_GEN9_PARAMS", "1") != "0"
 LINK_GATE_LIVE_REQUIRED = (
     GEN9_PARAMS_REQUIRED
     and os.environ.get("GATE_LINK_GATE_LIVE", "1") != "0")
+
+# check 3m: the ENDPOINT is declared exactly once
+#
+# Generation 8 shipped a DONE -> RETURN_HOME re-entry: a run that had already
+# homed could be sent home a second time by the late coverage latch, because the
+# only guard tested `state_ == State::RETURN_HOME` and the second request
+# arrives from DONE. On ts1b that produced 16 robot-runs carrying two
+# mission_complete rows — 1/3/12 at N=2/3/4, all in the treatment arm and none
+# in any control. Two rows is two homing budgets, a refilled escape ladder, and
+# homing_duration_sec/homing_distance_m restarting from zero on the second one.
+#
+# Generation 9 closes it in two places and this check reads both:
+#
+#   * the node latch (mission_return_done_) refuses the second homing LEG. What
+#     it refused rides out on run_end.mission_return_reentries, which this check
+#     does NOT require to be zero — a late coverage latch legitimately asks, and
+#     the refusal is the fix working.
+#   * the writer latch (ExperimentLog::logMissionComplete) refuses the second
+#     ROW, counting it into run_end.mission_completes_suppressed. That one MUST
+#     be zero: with one call site inside finishMissionReturn and the node latch
+#     in front of it, a suppressed row means finishMissionReturn re-entered
+#     without passing startReturnHome — a path the node guard cannot see.
+#
+# Requiring the fields to EXIST is the other half, and the more important one.
+# Generations 8 and 9 both stamp schema_version 4, so check 3d cannot separate
+# THOSE two, and a zero read off a field that was never written is the exact
+# shape of a check that stopped checking. (Generation 10 stamps 5 and IS
+# separable by the stamp; this argument is about the 8/9 pair only, which is
+# what GATE_ENDPOINT_FIELDS=0 exists for.)
+# GATE_ENDPOINT_FIELDS=0 scores a banked pre-generation-9
+# campaign on its own terms; it relaxes only the existence requirement, and the
+# "at most one row" rule below still runs, because that one is readable on every
+# generation ever written.
+ENDPOINT_FIELDS_REQUIRED = os.environ.get("GATE_ENDPOINT_FIELDS", "1") != "0"
 
 
 # The radio regime (check 3j). Three manifest fields decide what "the link
@@ -280,14 +593,26 @@ CONTROL_ARMS = frozenset(
 # reconnect config from the `off` cells, which fails loudly, but
 # GATE_CONTROL_ARMS=off with GATE_ARMS naming no `off` arm fails silently — the
 # exemption sits there unused while the campaign has no control at all.
-_orphan_controls = CONTROL_ARMS - set(EXPECT_ARMS)
+#
+# Matched at BOTH levels, because control-ness is a property of the reconnect
+# policy and GATE_ARMS carries full cell identities: a two-factor campaign whose
+# arms are `mtare_off_r40_ttl0` and `mtare_hybrid_r40_ttl0` has a control, and
+# `GATE_CONTROL_ARMS=mtare_off` names it correctly. Refusing that spelling would
+# force the operator to repeat every design suffix in a second variable, where a
+# copy that drifts from the first is silent. The typo protection is unchanged:
+# a token matching neither an expected arm nor the policy of one still exempts
+# nothing and still aborts.
+_expect_policies = {a: parse_cell_name(a, TAG)[1] for a in EXPECT_ARMS}
+_control_targets = set(EXPECT_ARMS) | set(_expect_policies.values())
+_orphan_controls = CONTROL_ARMS - _control_targets
 if _orphan_controls:
     sys.stderr.write(
         f"FATAL: GATE_CONTROL_ARMS names {sorted(_orphan_controls)}, which "
-        f"is not in GATE_ARMS {list(EXPECT_ARMS)}. A control arm that is not "
-        f"an expected arm exempts nothing.\n")
+        f"matches neither an arm in GATE_ARMS {list(EXPECT_ARMS)} nor the "
+        f"reconnect policy of one ({sorted(set(_expect_policies.values()))}). "
+        f"A control arm that is not an expected arm exempts nothing.\n")
     sys.exit(2)
-if not (CONTROL_ARMS & set(EXPECT_ARMS)):
+if not (CONTROL_ARMS & _control_targets):
     sys.stderr.write(
         f"FATAL: none of the expected arms {list(EXPECT_ARMS)} is a control "
         f"arm. Every arm would be scored as treated and the campaign has no "
@@ -428,7 +753,7 @@ def recovery_pairing(path):
 
 if "FILL_ME" in EXPECT.values():
     missing = sorted(k for k, v in EXPECT.items() if v == "FILL_ME")
-    print("REFUSING TO RUN: the generation-8 identity is not declared.\n"
+    print("REFUSING TO RUN: the binary identity is not declared.\n"
           "  A gate that does not know which binary it is gating cannot fail\n"
           "  check 3, and would pass a campaign built from anything.\n"
           f"  Undeclared: {', '.join(missing)}\n"
@@ -467,6 +792,56 @@ if not cells:
     sys.exit(1)
 
 # ==================================================================
+# D2 witness: the simple_nav_3d BINARY (check 3, extra key)
+# ==================================================================
+# The four keys in EXPECT pin one binary and three SOURCE trees. Generation 9
+# puts a behavioural change -- D2, the goal-snap append -- in a binary that none
+# of them covers. git_simple_nav_3d moves with the source tree, so it moves
+# whether or not colcon ran; a source rev cannot witness a rebuild. That left
+# D2's one failure mode (edited, not rebuilt: the node on the wire is still
+# generation 8 while every provenance field says generation 9) invisible to
+# every check in this file.
+#
+# The requirement is self-calibrating rather than unconditional, and that is the
+# load-bearing part. Cells banked before the harness emitted the key cannot
+# answer, and a key that hard-fails 80 good cells with no way to clear it is a
+# key that gets deleted by the next person under time pressure -- which is the
+# bug this gate just had for git_simple_nav_3d, and the shape of every guard in
+# `checks-that-stopped-checking`. So ask the campaign which case it is:
+#
+#   key in NO cell    -> the campaign predates it. One INFO line saying D2 is
+#                        unwitnessed here. Not a failure, and not silence.
+#   key in SOME cells -> the harness changed mid-campaign. Hard-fail the cells
+#                        that lack it; a split provenance is a real defect
+#                        ([[commit-mid-campaign-splits-provenance]]).
+#   key in EVERY cell, undeclared -> refuse. The campaign CAN answer and the
+#                        operator has not said what the answer should be, which
+#                        is exactly the FILL_ME case for the other four.
+_nav_present = [c for c in cells
+                if manifest(os.path.join(ROOT, c)).get(NAV_BIN_KEY)]
+NAV_WITNESS_NOTE = None
+if not _nav_present:
+    NAV_WITNESS_NOTE = (
+        f"INFO: no cell carries {NAV_BIN_KEY}, so this campaign predates the "
+        f"nav-binary witness. Check 3 pins the explo_planner binary and three "
+        f"source revisions; it CANNOT tell whether simple_nav_3d was rebuilt, "
+        f"so any D2 (goal-snap) behaviour claimed from these cells rests on "
+        f"the operator's word, not on this gate.")
+elif EXPECT_NAV is None:
+    print(f"REFUSING TO RUN: {len(_nav_present)}/{len(cells)} cells record "
+          f"{NAV_BIN_KEY},\n"
+          "  so this campaign CAN say which simple_nav_3d binary ran and the\n"
+          "  declaration does not. D2 (the goal-snap append) lives in that\n"
+          "  binary and in no other provenance field here: git_simple_nav_3d\n"
+          "  moves with the source tree whether or not colcon ran.\n"
+          f"  Undeclared: {NAV_BIN_KEY}\n"
+          f"  Write it to {os.path.join(ROOT, TAG + '.identity.txt')} as a\n"
+          f"  key=value line, or set GATE_EXPECT_{NAV_BIN_KEY}.")
+    sys.exit(2)
+else:
+    EXPECT[NAV_BIN_KEY] = EXPECT_NAV
+
+# ==================================================================
 # The M-TARE feature vector each arm token is DEFINED to carry (check 3g).
 # ==================================================================
 # Until P5 this was a single boolean — every feature ON for an `mtare_*` arm,
@@ -487,23 +862,48 @@ if not cells:
 # separated by reconnect_mode / reconnect_enabled, which check 3e already
 # compares against the directory name; this table is about the stack, not the
 # mode.
+#
+# P6 ADDED A SIXTH FEATURE AND TWO ARM NAMES, and the table has to carry both
+# or it rejects the campaign it exists to certify. `pursuit_predictor` selects
+# how a chase is AIMED — `trail` drives at the peer's last declared goal,
+# `mdp` at a modelled intercept — so `mtare_hybrid` and `mtare_hybrid_mdp` are
+# two treatments, exactly as `mtare_pursuit` and `mtare_hybrid` are. The node
+# stamps the suffix itself (explo_planner_node.cpp: `if (pursuit_predictor_mdp_)
+# arm += "_mdp"`), so the directory name and the stamp agree and check 3e is
+# silent — which is precisely why this table not knowing the token is
+# dangerous rather than noisy: without the two `_mdp` rows every cell of the
+# two chasing arms hard-failed 3g as "not an arm any binary can stamp", and
+# the four-arm ts4 design is half `_mdp`.
+#
+# The suffix is a FEATURE here and not merely a name, for the same reason
+# every other row is a vector: `mtare_hybrid_mdp` carrying pursuit_predictor=
+# trail is the treatment arm silently running its own control, and nothing
+# else in this gate looks at that param.
 MTARE_ARM_STACK = {
     "mtare_off": {
         "cell_world_enable": True, "team_world_hz>0": True,
         "global_alloc_enable": True, "reconnect_gate=info": False,
-        "rendezvous_schedule_enable": False},
+        "rendezvous_schedule_enable": False, "pursuit_predictor=mdp": False},
     "mtare_pursuit": {
         "cell_world_enable": True, "team_world_hz>0": True,
         "global_alloc_enable": True, "reconnect_gate=info": True,
-        "rendezvous_schedule_enable": False},
+        "rendezvous_schedule_enable": False, "pursuit_predictor=mdp": False},
+    "mtare_pursuit_mdp": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": True,
+        "rendezvous_schedule_enable": False, "pursuit_predictor=mdp": True},
     "mtare_rendezvous": {
         "cell_world_enable": True, "team_world_hz>0": True,
         "global_alloc_enable": True, "reconnect_gate=info": True,
-        "rendezvous_schedule_enable": True},
+        "rendezvous_schedule_enable": True, "pursuit_predictor=mdp": False},
     "mtare_hybrid": {
         "cell_world_enable": True, "team_world_hz>0": True,
         "global_alloc_enable": True, "reconnect_gate=info": True,
-        "rendezvous_schedule_enable": True},
+        "rendezvous_schedule_enable": True, "pursuit_predictor=mdp": False},
+    "mtare_hybrid_mdp": {
+        "cell_world_enable": True, "team_world_hz>0": True,
+        "global_alloc_enable": True, "reconnect_gate=info": True,
+        "rendezvous_schedule_enable": True, "pursuit_predictor=mdp": True},
 }
 # Which m-tare arm tokens a PRE-P5 binary could have stamped. Only one: the
 # three factorial names did not exist, and the runner refused every route to
@@ -512,17 +912,27 @@ MTARE_ARM_STACK = {
 # seeing one of them on a pre-P5 cell means the directory was renamed after the
 # fact, not that the binary ran that arm.
 MTARE_ARMS_PRE_P5 = {"mtare_hybrid"}
+# And which a P5-but-pre-P6 binary could: everything except the two `_mdp`
+# names, which did not exist until the predictor did. Derived from the table
+# rather than written out, so adding a row cannot leave this list behind.
+MTARE_ARMS_PRE_P6 = {a for a in MTARE_ARM_STACK if not a.endswith("_mdp")}
 
 
-def mtare_expect(arm, gen_p5):
+def mtare_expect(arm, gen_p5, gen_p6):
     """The feature vector `arm` is defined to carry, or None if a binary of
     this generation cannot stamp that arm at all.
 
-    `gen_p5` selects the vocabulary AND the vector width: a pre-P5 binary emits
-    no rendezvous_schedule_enable, so asking about it would compare against a
-    key the observed vector does not have."""
+    `gen_p5`/`gen_p6` select the vocabulary AND the vector width: a pre-P5
+    binary emits no rendezvous_schedule_enable and a pre-P6 one no
+    pursuit_predictor, so asking about either would compare against a key the
+    observed vector does not have. Handled by generation for the reason spelt
+    out at check 3g: dropping the key outright would certify a P6 `_mdp` cell
+    that ran the trail, and hard-failing its absence would make the gate unable
+    to score any campaign banked before P6."""
     if arm.startswith("mtare_"):
         if not gen_p5 and arm not in MTARE_ARMS_PRE_P5:
+            return None
+        if not gen_p6 and arm not in MTARE_ARMS_PRE_P6:
             return None
         want = MTARE_ARM_STACK.get(arm)
         if want is None:
@@ -534,9 +944,11 @@ def mtare_expect(arm, gen_p5):
         # comparison: a control cell that somehow ran the allocator is a
         # treated cell sitting in the control column, and no amount of care in
         # the treated arm compensates for that.
-        want = {k: False for k in MTARE_ARM_STACK["mtare_hybrid"]}
+        want = {k: False for k in MTARE_ARM_STACK["mtare_hybrid_mdp"]}
     if not gen_p5:
         want.pop("rendezvous_schedule_enable", None)
+    if not gen_p6:
+        want.pop("pursuit_predictor=mdp", None)
     return want
 
 
@@ -545,6 +957,11 @@ agg_recovery_entries = 0
 rows = []
 nav_fail_by_arm = collections.Counter()
 cells_by_arm = collections.Counter()
+# The same cells counted by reconnect POLICY, with design suffixes stripped.
+# Only check 21 reads it, and only to tell a genuinely malformed campaign apart
+# from a correct one whose GATE_ARMS declaration predates a second factor.
+cells_by_policy = collections.Counter()
+policy_of_arm = {}
 comms_regime_by_cell = {}
 
 # Populations for the new checks. Counted so an empty one can be reported as
@@ -552,6 +969,21 @@ comms_regime_by_cell = {}
 n_csv_rows = n_hw_fire = n_hw_escape = n_reconnect_end = 0
 n_navfail_rows = n_peer_rows = n_runend_rows = n_midrun = 0
 n_disp_rows = n_runstart_rows = n_console_logs = 0
+# check 3m's two populations, counted separately because they answer different
+# questions: how many robot-runs had their mission_complete ROW COUNT checked
+# (every generation can be), and how many carried the generation-9 run_end
+# counters at all (only generation 9 can be). A campaign where the second is 0
+# while the first is large is a pre-generation-9 binary wearing a generation-9
+# manifest, and it must read as UNRESOLVED rather than as a pass.
+n_3m_rowcount = n_3m_fields = 0
+# Check 3n's population: robot-runs whose planner_<robot>.log could be read at
+# all. The duplicate-run_end counter has NO path into the jsonl (see the block
+# at check 3n for why), so a missing planner log is not a partial reading —
+# it is the check not running, and it has to say so.
+n_3n_plogs = 0
+# Robot-runs where the once-per-run latch actually refused something, listed
+# rather than counted so the report can name them. Non-empty is HEALTH.
+n_3m_reentry_runs = []
 # Check 3f runs on the treated arms only, so its population is not cells_by_arm
 # and an off-only campaign leaves it at zero legitimately. Both are reported.
 # Counted in ROBOT-RUNS, like the other run_start populations, because that is
@@ -568,85 +1000,141 @@ n_3g_treated = n_3g_control = 0
 # just the counts.
 n_3g_gen_p5 = n_3g_gen_pre = 0
 _gen_cells_p5, _gen_cells_pre = set(), set()
+# The same populations one phase further out. P6 is a SECOND generation
+# boundary and needs its own witness rather than riding on P5's: a binary can
+# have the scheduler and not the predictor (every cell banked between P5 and
+# P6 is one), so `rendezvous_schedule_enable` present says nothing about
+# whether `mtare_hybrid` on this cell means the trail chase or the modelled
+# one — which is the same pooling 3h refuses at P5, one name further down.
+n_3g_gen_p6 = n_3g_gen_pre6 = 0
+_gen_cells_p6, _gen_cells_pre6 = set(), set()
+# check 3l. The sensor/candidate configuration, collected per robot-run and
+# asserted campaign-wide below. value -> {(cell, arm, robot)}, per param.
+_cfg_seen = collections.defaultdict(lambda: collections.defaultdict(set))
 _live_reported = {}
 
 for c in cells:
     d = os.path.join(ROOT, c)
     m = manifest(d)
-    # Parse the arm out of the flat cell name <TAG>_<arm>_seed<N> rather than
-    # asking "is 'hybrid' in it, else off". That binary form silently relabels
-    # every OTHER arm as the control: a _pursuit_ or _rendezvous_ cell landed in
-    # the `off` bucket, where check 3e then compared run_start's arm=pursuit
-    # against a directory reading of "off" and hard-failed a correct run — or,
-    # worse, where a genuinely-off cell and a pursuit cell get pooled in the
-    # per-arm counts. Unrecognised shapes fall back to the whole middle token,
-    # which check 3e then catches against the node's own answer.
+    # Cell identity. ONE parser, because a name can carry several suffixes and
+    # their ORDER is not fixed: `ts1b_n3_mtare_hybrid_r40_ttl0_seed1` and
+    # `at2_mtare_hybrid_ttl180_r40_seed2` are the same two design dimensions
+    # written the other way round. See parse_cell_name() for what the previous
+    # single-pass regex did to both of them (76 hard failures on a clean
+    # campaign).
     #
-    # The trailing _seek is a RUNTIME switch, not an arm. run_campaign.sh strips
-    # it before setting RECONNECT_MODE (see its cell_mode/cell_seek block), so a
-    # <TAG>_hybrid_seek_seed<N> directory holds a node that stamped arm=hybrid.
-    # Reading the directory literally invents an arm the node never reports:
-    # check 3e then hard-fails "directory says hybrid_seek, params say hybrid"
-    # on a perfectly good cell, check 21 finds an unexpected arm, and check 3f
-    # would run the treated-arm assertions over an off_seek control. Such cells
-    # are banked (ds1_hybrid_seek_seed1..4), so this is not hypothetical.
-    #
-    # The trailing _r<N> is cr2's MinPos claim radius, and it is handled
-    # DIFFERENTLY from _seek on purpose. run_campaign.sh strips it before
-    # setting RECONNECT_MODE exactly as it strips _seek, so the node likewise
-    # stamps arm=mtare_hybrid in a _mtare_hybrid_r10_ directory and every
-    # comparison against the node's own answer has to use the stripped form.
-    # But it is NOT pooled away into the arm the way _seek is: in cr2 the radius
-    # is the independent variable, the thing the campaign contrasts, so folding
-    # r10 and r40 into one bucket would leave check 21 unable to notice that
-    # half the design never ran — the precise failure check 21 exists for.
-    #
-    # Hence two names. `arm` is the CELL's identity: what to count, what
-    # GATE_ARMS must have declared, which column of the design this is.
-    # `policy_arm` is what the BINARY can stamp: the reconnect policy alone,
-    # with every runtime switch removed. Anything comparing against run_start or
-    # against the m-tare vocabulary uses policy_arm; everything else uses arm.
-    _mid = c[len(TAG) + 1:]
-    arm = _mid.rsplit("_seed", 1)[0] if "_seed" in _mid else _mid
-    if arm.endswith("_seek"):
-        arm = arm[:-len("_seek")]
-    _rm = re.match(r"^(.*)_r([0-9]{1,3})$", arm)
-    policy_arm = _rm.group(1) if _rm else arm
-    dir_claim_r = f"{float(_rm.group(2)):.1f}" if _rm else None
+    # Two names, and the distinction is load-bearing. `arm` is the CELL's
+    # identity: what to count, what GATE_ARMS must have declared, which column
+    # of the design this is. `policy_arm` is what the BINARY can stamp: the
+    # reconnect policy alone, every runtime and design suffix removed, because
+    # run_campaign.sh strips them before setting RECONNECT_MODE and the node
+    # therefore stamps the bare policy name. Anything compared against
+    # run_start or against the m-tare vocabulary uses policy_arm; everything
+    # else uses arm. Comparing the full directory identity against the node's
+    # stamp would hard-fail every correctly-run cr2, at2 and ts1b cell; what
+    # the suffixes themselves claim is not dropped, it is held against the
+    # manifest by check 3i below.
+    arm, policy_arm, dir_claims, _leftover = parse_cell_name(c, TAG)
     cells_by_arm[arm] += 1
+    cells_by_policy[policy_arm] += 1
+    policy_of_arm[arm] = policy_arm
     row = {"cell": c, "arm": arm}
 
-    # 3i. the claim radius the directory NAME advertises must be the one the
-    # run actually used. Same argument as 3e one level down: the analysis reads
-    # r10 vs r40 off the directory, so a launcher bug or a leaked COORD_CLAIM_R
-    # that runs 10 m inside an _r40_ directory silently swaps cr2's two levels
-    # and every downstream number is attributed to the wrong one. The manifest
-    # is written at launch from the value actually passed, so it is the witness.
+    # Control-ness is a property of the reconnect POLICY, not of a design
+    # level: `mtare_off_r40_ttl0` is the control column of a two-factor design,
+    # and a claim radius does not make it a treated cell. Testing membership on
+    # the full identity alone would have read every suffixed control cell as
+    # treated — check 3e would then demand reconnect_enabled=True of a correct
+    # `off` run and hard-fail it, and check 3g would run the treated-arm stack
+    # assertions over the control. Either spelling may be declared in
+    # GATE_CONTROL_ARMS; the full identity is tried first so a design that
+    # deliberately controls only ONE level of a factor can still say so.
+    is_control = arm in CONTROL_ARMS or policy_arm in CONTROL_ARMS
+
+    # This cell's roster, from its own manifest rather than a module constant.
+    # See robots_of(): iterating a hardcoded pair over an N>=3 campaign checked
+    # two thirds of each team and reported a pass over the rest.
+    cell_robots, roster_src = robots_of(m, d)
+    row["n_robots"] = len(cell_robots)
+    row["roster"] = ",".join(cell_robots)
+    if roster_src == "hardcoded fallback":
+        unresolved.append(
+            f"{c}: manifest names no team (no robots=, no team_robot_names), "
+            f"so the roster fell back to the hardcoded {ROBOTS_FALLBACK}. "
+            f"Every per-robot check below ran over that guess; if the cell had "
+            f"a third robot, nothing here looked at it")
+    elif roster_src.startswith("event logs"):
+        unresolved.append(
+            f"{c}: manifest names no team, so the roster was read off the "
+            f"*.events.jsonl files present ({','.join(cell_robots)}). A robot "
+            f"whose log is missing entirely is invisible to that reading — it "
+            f"drops out of the expectation instead of failing check 3a")
+
+    # 3k. the two roster witnesses must agree. run_campaign.sh writes `robots=`
+    # from the value it launched; the node writes team_robot_names from the
+    # list it was configured with. They are independent, so a disagreement
+    # means one of the two is describing a team that did not run, and the
+    # per-robot checks below are iterating the wrong set either way.
+    _m_robots = [t.strip() for t in (m.get("robots") or "").split(",")
+                 if t.strip()]
+    _m_team = m.get("team_robot_names")
+    if _m_robots and _m_team:
+        try:
+            _team = [str(t) for t in json.loads(_m_team)]
+        except ValueError:
+            _team = [t.strip().strip('"[] ') for t in _m_team.split(",")]
+        _team = [t for t in _team if t]
+        if _team and sorted(_team) != sorted(_m_robots):
+            hard_fail.append(
+                f"{c}: check 3k — the manifest's two rosters disagree: "
+                f"robots={_m_robots} but team_robot_names={_team}. One of them "
+                f"names a team that did not run")
+
+    # 3i. EVERY DESIGN LEVEL THE DIRECTORY NAME ADVERTISES MUST BE THE ONE THE
+    # RUN ACTUALLY USED.
+    #
+    # Same argument as 3e one level down. The analysis reads r10-vs-r40 and
+    # ttl0-vs-ttl180 off the directory, so a launcher bug or a leaked
+    # COORD_CLAIM_R that runs 10 m inside an _r40_ directory silently swaps the
+    # design's two columns and every downstream number is attributed to the
+    # wrong level. The manifest is written at launch from the value actually
+    # passed, so it is the witness.
+    #
+    # Iterated over DESIGN_SUFFIXES rather than written out once for the claim
+    # radius, so adding a dimension to that table adds its check with it. The
+    # hand-written version covered the radius only, which is why ts1b's _ttl0
+    # — a level that is the DEFAULT since 2026-09-05 and is therefore written
+    # on almost every new cell — went unchecked.
     #
     # An absent key is only forgiven when the directory claims nothing either:
     # a campaign predating the override wrote no such line and its unsuffixed
     # cells really did run the yaml default. A suffixed directory with no line
     # to check it against is unverifiable, and unverifiable is not a pass.
-    _man_claim_r = m.get("coord_claim_radius_override")
-    row["claim_r"] = _man_claim_r if _man_claim_r is not None else "-"
-    if dir_claim_r is None:
-        if _man_claim_r not in (None, "none"):
+    _levels = []
+    for _rx, _key, _human, _unit in DESIGN_SUFFIXES:
+        _claim = dir_claims.get(_key)
+        _man = m.get(_key)
+        _lvl = f"{_claim[0]:g} {_unit}" if _claim is not None else None
+        if _lvl:
+            _levels.append(f"{_human}={_lvl}")
+        if _claim is None:
+            if _man not in (None, "none"):
+                hard_fail.append(
+                    f"{c}: check 3i — directory names no {_human} but the "
+                    f"manifest says {_key}={_man!r}. The cell ran a pinned "
+                    f"value under a name that promises the yaml default")
+        elif _man is None:
             hard_fail.append(
-                f"{c}: check 3i — directory names no claim radius but the "
-                f"manifest says coord_claim_radius_override={_man_claim_r!r}. "
-                f"The cell ran a pinned radius under a name that promises the "
-                f"yaml default")
-    elif _man_claim_r is None:
-        hard_fail.append(
-            f"{c}: check 3i — directory says the claim radius was "
-            f"{dir_claim_r} m, but the manifest records no "
-            f"coord_claim_radius_override at all, so nothing here can confirm "
-            f"it. Score this campaign with a harness that writes the key")
-    elif _man_claim_r == "none" or float(_man_claim_r) != float(dir_claim_r):
-        hard_fail.append(
-            f"{c}: check 3i — directory says claim radius {dir_claim_r} m but "
-            f"the manifest says coord_claim_radius_override={_man_claim_r!r}. "
-            f"The cell is filed under a level it did not run")
+                f"{c}: check 3i — directory says the {_human} was "
+                f"{_lvl}, but the manifest records no {_key} at all, so "
+                f"nothing here can confirm it. Score this campaign with a "
+                f"harness that writes the key")
+        elif _man == "none" or float(_man) != _claim[0]:
+            hard_fail.append(
+                f"{c}: check 3i — directory says {_human} {_lvl} but "
+                f"the manifest says {_key}={_man!r}. The cell is filed under a "
+                f"level it did not run")
+    row["levels"] = "; ".join(_levels) if _levels else "-"
 
     # 3j, first half: record this cell's radio regime. Compared campaign-wide
     # after the loop rather than cell-by-cell, because the failure is a
@@ -663,28 +1151,99 @@ for c in cells:
         hard_fail.append(f"{c}: run_end_reason={reason} (not all_done)")
 
     # 2. harness comms gates
+    #
+    # NOT relaxed: anything other than CLEAN is a hard failure, because the
+    # verdict is the harness's own statement that it could not certify the run.
+    # The one exception is narrow and provable, and it exists because a check
+    # that documents itself as report-only was failing whole campaigns.
+    #
+    # run_explo_sim_rviz.sh derives SUSPECT from `grep -c "^UNRUN"` over
+    # comms_gates.txt, with no notion of which gate wrote the line. map_agree is
+    # a REPORT-ONLY reading — it has no pass threshold and its own header says
+    # so — but until 2026-09-15 it emitted UNRUN whenever it could not compute
+    # (which, being hardcoded to two planner CSVs, was EVERY N>=3 cell). One
+    # informational line it was never entitled to write therefore turned into
+    # SUSPECT, and SUSPECT turned into a hard failure here: every cell of every
+    # N>=3 campaign, rejected for a gate that does not gate.
+    #
+    # So a SUSPECT is re-read against the file it came from. If it holds UNRUN
+    # lines and EVERY one of them names a report-only gate, the cell is
+    # UNRESOLVED — not a pass, because the harness still declined to certify it
+    # and an operator must look; not a hard failure, because nothing that can
+    # invalidate a run is among the reasons. Any other shape stays a hard
+    # failure, including a SUSPECT with no UNRUN lines at all: that is the
+    # "watcher never reported" path, where the missing line is the outage gate
+    # itself and absence of failures is emphatically not a pass.
     verdict = m.get("run_gates_verdict", "MISSING")
     row["verdict"] = verdict
     if verdict != "CLEAN":
-        hard_fail.append(f"{c}: run_gates_verdict={verdict}")
+        _unrun = []
+        for _ln in read_lines(os.path.join(d, "comms_gates.txt")):
+            if _ln.startswith("UNRUN"):
+                _f = _ln.split("\t")
+                _unrun.append(_f[1].strip() if len(_f) > 1 else "?")
+        if (verdict == "SUSPECT" and _unrun
+                and all(g in REPORT_ONLY_GATES for g in _unrun)):
+            unresolved.append(
+                f"{c}: check 2 — run_gates_verdict=SUSPECT, but every UNRUN "
+                f"line in comms_gates.txt names a report-only gate "
+                f"({', '.join(sorted(set(_unrun)))}), which has no pass "
+                f"threshold and cannot invalidate a run. Not scored as a "
+                f"failure; read the file before using this cell")
+        else:
+            hard_fail.append(
+                f"{c}: run_gates_verdict={verdict}"
+                + (f" (UNRUN: {', '.join(sorted(set(_unrun)))})" if _unrun
+                   else " (no UNRUN lines — the run-time watcher never "
+                        "reported, so the outage gate itself is missing)"))
 
     # 3. provenance: manifest must match the declared generation
     for k, v in EXPECT.items():
         if m.get(k) != v:
             hard_fail.append(f"{c}: {k}={m.get(k)} expected {v}")
 
+    # 3a'. the nav binary, two ways the EXPECT loop above cannot cover.
+    #
+    # First: split provenance. EXPECT only carries NAV_BIN_KEY when EVERY cell
+    # has it, so a campaign where only some do would otherwise drop the check
+    # for the cells that lack it -- silently, and on exactly the cells whose
+    # provenance is in question. A harness that changed mid-campaign splits the
+    # run into two generations ([[commit-mid-campaign-splits-provenance]]).
+    if _nav_present and not m.get(NAV_BIN_KEY):
+        hard_fail.append(
+            f"{c}: no {NAV_BIN_KEY} in the manifest, but "
+            f"{len(_nav_present)}/{len(cells)} sibling cells have one — the "
+            f"harness changed mid-campaign, so this cell cannot be pooled "
+            f"with them")
+
+    # Second: a partial install. The four nav executables are built and
+    # installed as a unit; the campaign-wide value is pinned by declaration,
+    # but internal disagreement is a defect on its own terms and needs no
+    # declaration to detect. "missing" means the executable was not there when
+    # the manifest was written, which for a run that produced nav logs means
+    # the install tree and the running node had already diverged.
+    _nav_missing = sorted(k for k in (NAV_BIN_KEY,) + NAV_BIN_SIBLINGS
+                          if m.get(k) == "missing")
+    if _nav_missing:
+        hard_fail.append(
+            f"{c}: {', '.join(_nav_missing)}=missing — the simple_nav_3d "
+            f"install tree was incomplete when this cell ran")
+
     lat, arrived, unknowns, navfails, poseloss = 0, 0, [], 0, 0
-    for r in ROBOTS:
+    for r in cell_robots:
         ev = events(d, r)
         if not ev:
-            hard_fail.append(f"{c}/{r}: no events")
+            hard_fail.append(
+                f"{c}/{r}: no events (roster from {roster_src}: "
+                f"{','.join(cell_robots)})")
             continue
         plog = read_lines(os.path.join(d, f"planner_{r}.log"))
 
         # 3b/3c. baked rev and arm identity
         #
         # git_rev is NOT a top-level key of run_start. The node writes it with
-        # addParamStr (explo_planner_node.cpp:2520), so it lands in
+        # addParamStr (explo_planner_node.cpp:3493, the EXPLO_PLANNER_GIT_REV
+        # branch; :3495 is the "unknown" fallback), so it lands in
         # run_start.params.git_rev. Reading it at the top level yielded "" on
         # every real cell, and `anything.startswith("")` is True, so BOTH this
         # check and the -dirty witness below passed unconditionally — verified
@@ -705,6 +1264,15 @@ for c in cells:
         else:
             n_runstart_rows += 1
             pr = start[0].get("params", {})
+            # 3l. Collect the configuration this robot-run actually resolved.
+            # Read from run_start.params and not from the yaml, because the
+            # yaml is a request: -p overrides beat it, and the "0 means auto"
+            # knobs are rewritten at construction (coord_claim_radius_m=0.0
+            # resolves to fov_max_range, which this generation doubles). The
+            # node logs these AFTER resolution, so this is the outcome.
+            for _k in CFG_KEYS:
+                if _k in pr:
+                    _cfg_seen[_k][cfg_val(pr[_k])].add((c, arm, r))
             raw_rev = str(pr.get("git_rev", ""))
             rev = raw_rev.replace("-dirty", "")
             if not raw_rev:
@@ -718,7 +1286,7 @@ for c in cells:
             if "-dirty" in raw_rev:
                 hard_fail.append(f"{c}/{r}: check 3c — JSONL git_rev is -dirty")
             # 3d. the schema stamp. The identity in section 32.14 pinned schema
-            # 3, the binary writes it (experiment_log.cpp:265) and every reader
+            # 3, the binary writes it (experiment_log.cpp:287) and every reader
             # downstream keys off it, but nothing here read it — so the one
             # field that catches a generation mix at a glance was unchecked.
             # The pin now lives in SCHEMA_VERSION above, where an operator
@@ -752,12 +1320,26 @@ for c in cells:
             # full directory identity here would hard-fail every correctly-run
             # cr2 cell. What the suffix itself claims is not dropped — check 3i
             # above holds it against the manifest.
-            want_rdv = arm not in CONTROL_ARMS
-            if pr.get("arm") is not None and pr.get("arm") != policy_arm:
+            want_rdv = not is_control
+            _stamp = pr.get("arm")
+            _unrec = unrecognised_suffix(policy_arm, _stamp)
+            _lookup_arm = _stamp if _unrec else policy_arm
+            if _stamp is not None and _stamp != policy_arm and not _unrec:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — directory says arm={arm} "
                     + (f"(policy {policy_arm}) " if policy_arm != arm else "")
-                    + f"but run_start params say arm={pr.get('arm')!r}")
+                    + f"but run_start params say arm={_stamp!r}")
+            elif _unrec:
+                unresolved.append(
+                    f"{c}/{r}: check 3e — directory says arm={arm}, the binary "
+                    f"stamped arm={_stamp!r}, and the difference is the single "
+                    f"trailing token _{_unrec} that this gate does not know. "
+                    f"That is a gap in THIS FILE, not evidence about the run: "
+                    f"add _{_unrec} to RUNTIME_SUFFIXES if it is a switch no "
+                    f"campaign contrasts, or to DESIGN_SUFFIXES with the "
+                    f"manifest key that witnesses it if it is an independent "
+                    f"variable. Until then the cell's level of that knob is "
+                    f"unchecked and check 21 cannot see whether both levels ran")
             if have_rdv is not None and bool(have_rdv) != want_rdv:
                 hard_fail.append(
                     f"{c}/{r}: check 3e — arm={arm} but reconnect_enabled="
@@ -818,6 +1400,38 @@ for c in cells:
             else:
                 n_3g_gen_pre += 1
                 _gen_cells_pre.add(c)
+            # P6's discriminator, read the same way and for the same reason.
+            # `pursuit_predictor` is emitted unconditionally by any binary that
+            # has one, so its absence dates the cell rather than defaulting it
+            # — and defaulting it to `trail` is exactly the wrong reflex here,
+            # because that is the value a P6 `_mdp` cell must NOT have.
+            _p6_raw = pr.get("pursuit_predictor")
+            _gen_p6 = _p6_raw is not None
+            if _gen_p6:
+                n_3g_gen_p6 += 1
+                _gen_cells_p6.add(c)
+            else:
+                n_3g_gen_pre6 += 1
+                _gen_cells_pre6.add(c)
+            # The node refuses to start on any third spelling (it throws), so a
+            # value outside the pair cannot have come from a run — it means
+            # this param dump is not what the binary wrote, and every feature
+            # read out of it is suspect, not just this one.
+            if _gen_p6 and _p6_raw not in ("trail", "mdp"):
+                hard_fail.append(
+                    f"{c}/{r}: check 3g — pursuit_predictor={_p6_raw!r} is "
+                    f"neither 'trail' nor 'mdp'. The node throws on any other "
+                    f"value, so this run_start was not written by a run of it")
+            # Pre-P5 implies pre-P6: the predictor shipped after the scheduler
+            # and no binary has ever had one without the other. A cell claiming
+            # otherwise is a dump assembled from two sources, which invalidates
+            # the dating both checks rest on.
+            if _gen_p6 and not _gen_p5:
+                hard_fail.append(
+                    f"{c}/{r}: check 3g — run_start carries pursuit_predictor "
+                    f"(P6) but no rendezvous_schedule_enable (pre-P5). No "
+                    f"binary was ever built that way, so this param dump does "
+                    f"not date to any single generation")
             if _mt_absent:
                 # The node emits all four unconditionally, so absence is not a
                 # default — it is a cell written by a binary predating the
@@ -851,19 +1465,38 @@ for c in cells:
                     }
                     if _gen_p5:
                         _feat["rendezvous_schedule_enable"] = bool(_p5_raw)
+                    if _gen_p6:
+                        # Compared against the string, not truthiness: this
+                        # param is a NAME (`trail` or `mdp`) and both spellings
+                        # are non-empty, so bool() would read every cell as the
+                        # model arm.
+                        _feat["pursuit_predictor=mdp"] = (_p6_raw == "mdp")
                     # policy_arm again: MTARE_ARM_STACK is keyed by the reconnect
                     # policy vocabulary, which has no room for a per-cell knob
                     # suffix. A radius does not change which m-tare features the
                     # arm promises, so mtare_hybrid_r10 must be looked up as
                     # mtare_hybrid or the whole stack assertion is skipped in
                     # favour of a spurious "not an arm this binary can stamp".
-                    _want = mtare_expect(policy_arm, _gen_p5)
+                    #
+                    # _lookup_arm, not policy_arm, so a cell carrying a suffix
+                    # this file has not learnt yet is still held to its stack:
+                    # 3e has already reported the unknown token as UNRESOLVED,
+                    # and falling back to the binary's own stamp checks the
+                    # five features against the arm the binary says it ran
+                    # rather than skipping the assertion entirely.
+                    _want = mtare_expect(_lookup_arm, _gen_p5, _gen_p6)
                     if _want is None:
+                        if not _gen_p5:
+                            _gen_name, _known = "pre-P5", MTARE_ARMS_PRE_P5
+                        elif not _gen_p6:
+                            _gen_name, _known = "P5-but-pre-P6", MTARE_ARMS_PRE_P6
+                        else:
+                            _gen_name, _known = "P6-or-later", set(MTARE_ARM_STACK)
                         hard_fail.append(
-                            f"{c}/{r}: check 3g — arm={policy_arm} is not an arm a "
-                            f"{'P5-or-later' if _gen_p5 else 'pre-P5'} binary "
+                            f"{c}/{r}: check 3g — arm={_lookup_arm} is not an arm a "
+                            f"{_gen_name} binary "
                             f"can stamp (known: "
-                            f"{sorted(MTARE_ARM_STACK if _gen_p5 else MTARE_ARMS_PRE_P5)}"
+                            f"{sorted(_known)}"
                             f"). The directory name and the binary disagree "
                             f"about which experiment this is")
                     else:
@@ -901,7 +1534,7 @@ for c in cells:
             # pursuit, rendezvous, a future one — reaches the same trigger and
             # has the same way of being configured out of existence. Naming the
             # one arm would have exempted the rest by accident.
-            if arm not in CONTROL_ARMS:
+            if not is_control:
                 n_3f_runs += 1
 
                 def _num(key):
@@ -1058,6 +1691,111 @@ for c in cells:
         else:
             arrived += 1
 
+        # 3m. the endpoint is declared EXACTLY once — see the pin block above
+        # for the generation-8 defect this exists for.
+        n_3m_rowcount += 1
+        if len(mc) > 1:
+            hard_fail.append(
+                f"{c}/{r}: check 3m — {len(mc)} mission_complete rows, "
+                f"expected at most 1. The writer latch added in generation 9 "
+                f"makes a second row impossible, so this robot-run came from "
+                f"an older binary than the manifest claims, or the latch was "
+                f"removed. Its homing_duration_sec/homing_distance_m restart "
+                f"from zero on the second row and its run contains two homing "
+                f"budgets")
+        _end = [e for e in ev if e.get("event") == "run_end"]
+        _sup = _end[-1].get("mission_completes_suppressed") if _end else None
+        _ree = _end[-1].get("mission_return_reentries") if _end else None
+        if _sup is None or _ree is None:
+            # Absence is reported, never inferred as zero. Both fields are
+            # written unconditionally by logRunEnd, so one present and the
+            # other missing is itself a finding — hence the is-None test on
+            # each rather than on the pair.
+            if ENDPOINT_FIELDS_REQUIRED:
+                hard_fail.append(
+                    f"{c}/{r}: check 3m — run_end carries no "
+                    f"{'mission_completes_suppressed' if _sup is None else ''}"
+                    f"{'/' if _sup is None and _ree is None else ''}"
+                    f"{'mission_return_reentries' if _ree is None else ''}. "
+                    f"Generations 8 and 9 both stamp schema_version 4, so "
+                    f"between those two their absence is the only witness "
+                    f"that this is a pre-generation-9 binary. Score a banked "
+                    f"campaign with GATE_ENDPOINT_FIELDS=0")
+        else:
+            n_3m_fields += 1
+            if int(_sup) > 0:
+                hard_fail.append(
+                    f"{c}/{r}: check 3m — run_end says "
+                    f"mission_completes_suppressed={_sup}. logMissionComplete "
+                    f"has ONE call site (finishMissionReturn) and the "
+                    f"mission_return_done_ latch stands in front of it, so a "
+                    f"suppressed row means finishMissionReturn re-entered "
+                    f"WITHOUT passing startReturnHome — a path the node guard "
+                    f"cannot see. The kept row describes the FIRST attempt "
+                    f"while the run contains two")
+            # mission_return_reentries is NOT failed on. The late coverage
+            # latch legitimately asks to home a second time and the latch
+            # refusing it is the fix working, so a non-zero value here is
+            # evidence of health, not of a defect. It is collected for the
+            # population report instead, where a campaign-wide zero can be seen
+            # and questioned.
+            if int(_ree) > 0:
+                n_3m_reentry_runs.append(f"{c}/{r}={_ree}")
+
+        # 3n. run_end is written exactly once — the OTHER half of the endpoint,
+        # and the only one that cannot be read from the jsonl.
+        #
+        # Why this check lives in the planner log rather than beside 3m's two
+        # run_end counters. `dup_run_ends_` can only become non-zero AFTER the
+        # first run_end row is already on disk, so a `dup_run_ends` field
+        # written beside mission_completes_suppressed would read 0 on every run
+        # ever, including the runs it exists to catch — a field observed only
+        # at zero because it is structurally unable to be anything else. And
+        # appending a trailing `run_end_duplicate` event is worse than useless:
+        # it breaks "run_end is the last line" and the
+        # last-line-seq == events_written-1 invariant, and event_log.py's
+        # `complete = (written == len(evs))` would then mark the run TRUNCATED
+        # and drop the cell — destroying the evidence in the act of recording
+        # it.
+        #
+        # So the witness is the planner's own stderr and this is its reader.
+        # TWO markers, written by different code at different times: the WARN
+        # fires during the run on the first suppressed attempt
+        # (experiment_log.cpp:692), the destructor ERROR fires at close with
+        # the total (experiment_log.cpp:73). Either alone is the finding, and
+        # both are matched because the destructor runs during rclcpp teardown
+        # and its output is the less certain of the two to reach the file.
+        #
+        # THE BASE RATE, so a clean reading is not over-read. The suppression
+        # is new in generation 9; under generation 8 a second terminal state
+        # would have written a second run_end ROW, and across the whole bank —
+        # 3342 robot-runs, every campaign — there are ZERO files with more than
+        # one. So this failure mode has never once been observed, and a future
+        # "0 duplicates" is consistent with a working guard AND with a guard
+        # that could never have fired. What the check actually buys is that the
+        # generation-9 suppression, which makes the event invisible in the
+        # jsonl for the first time, cannot make it invisible everywhere.
+        _plog_path = os.path.join(d, f"planner_{r}.log")
+        if not os.path.exists(_plog_path):
+            unresolved.append(
+                f"check 3n: {c}/{r} — no planner_{r}.log, so the duplicate "
+                f"run_end check did not run on this robot-run. The counter has "
+                f"no path into the jsonl, so there is no fallback reading")
+        else:
+            n_3n_plogs += 1
+            _dup = [ln for ln in plog
+                    if "run_end was already written" in ln
+                    or "SUPPRESSED duplicate run_end" in ln]
+            if _dup:
+                hard_fail.append(
+                    f"{c}/{r}: check 3n — the planner log reports a SUPPRESSED "
+                    f"duplicate run_end. The node reached a terminal state "
+                    f"twice and the file keeps the FIRST ending only, so this "
+                    f"run's completion stamp, milestones_reached and every "
+                    f"other endpoint metric describe one of two endings and "
+                    f"the run is not scoreable as it stands: "
+                    f"{_dup[0].strip()[:220]}")
+
         # 6 / 18. nav_goal_failed carries the fired inequality, and it HOLDS
         nf = [e for e in ev if e.get("event") == "nav_goal_failed"]
         navfails += len(nf)
@@ -1136,7 +1874,8 @@ for c in cells:
         # earlier version of this check demanded team_incomplete_sec on every
         # peer_lost/peer_seen row, which no binary has ever written: PeerEvent
         # has no such member and the only writer is logReconnectDispatch
-        # (experiment_log.cpp:436). Run against a real cell it produced 34 hard
+        # (experiment_log.cpp:463, inside the reconnect_dispatch block at
+        # :431-478). Run against a real cell it produced 34 hard
         # failures on clean data, and it survived calibration only because the
         # fixture manufactured the field the binary does not write — the
         # fixture asserting the gate's belief instead of the binary's output.
@@ -1247,18 +1986,28 @@ for c in cells:
     rows.append(row)
 
 print(f"=== {TAG}: {len(cells)} cells ({dict(cells_by_arm)}) ===\n")
-hdr = (f"{'cell':34} {'end':10} {'verdict':8} {'t_sim':>6} {'lat':>3} {'arr':>3} "
-       f"{'nf':>3} {'pl':>3}  unknown")
+# Width from the data, not a literal. A fixed 34 was two characters short of
+# `ts1b_n3_mtare_hybrid_r40_ttl0_seed1` — every row of every two-factor campaign
+# overflowed its column and pushed the rest of the line out of alignment, which
+# is how a table stops being read.
+_cw = max([len("cell")] + [len(r["cell"]) for r in rows])
+hdr = (f"{'cell':{_cw}} {'end':10} {'verdict':8} {'t_sim':>6} {'N':>2} "
+       f"{'lat':>3} {'arr':>3} {'nf':>3} {'pl':>3}  unknown")
 print(hdr)
 print("-" * len(hdr))
 for r in rows:
-    print(f"{r['cell']:34} {r['end']:10} {r['verdict']:8} {r['t_sim']:>6} "
+    print(f"{r['cell']:{_cw}} {r['end']:10} {r['verdict']:8} {r['t_sim']:>6} "
+          f"{r.get('n_robots', '?'):>2} "
           f"{r['latched']:>3} {r['arrived']:>3} {r['navfail']:>3} {r['poseloss']:>3}  "
           f"{r['unknown']}")
 
 print("\narm identity: " + ", ".join(
     sorted({f"{r['arm']}: mode_req={r.get('mode_req')} rdv={r.get('rdv')}" for r in rows})))
 print(f"nav_goal_failed by arm: {dict(nav_fail_by_arm)}")
+# Report-only, and therefore INFO and not UNRUN: it states what this gate did
+# NOT check, which is a different thing from a check that failed to run.
+if NAV_WITNESS_NOTE:
+    print("\n" + NAV_WITNESS_NOTE)
 
 # ==================================================================
 # 3h. ONE BINARY GENERATION PER CAMPAIGN.
@@ -1277,6 +2026,13 @@ print(f"nav_goal_failed by arm: {dict(nav_fail_by_arm)}")
 # to the midpoint" on one side of P5 and "chase, falling back to the agreed
 # cell" on the other. Analysed together they are one arm run twice with two
 # different treatments in it.
+#
+# P6 IS A SECOND SUCH BOUNDARY AND IS CHECKED SEPARATELY, not folded into the
+# first. The two are not the same question: every cell banked between the two
+# phases emits rendezvous_schedule_enable and no pursuit_predictor, so it is
+# uniform by the P5 test while `mtare_hybrid` on it means the trail chase and
+# `mtare_hybrid` on a P6 cell means the modelled one. Pooling those is the
+# identical failure one name further down, and the P5 test cannot see it.
 if n_3g_gen_p5 and n_3g_gen_pre:
     hard_fail.append(
         f"check 3h — this campaign mixes binary generations: "
@@ -1290,6 +2046,96 @@ elif n_3g_gen_p5 or n_3g_gen_pre:
     print(f"binary generation: "
           f"{'P5+' if n_3g_gen_p5 else 'pre-P5'} "
           f"({n_3g_gen_p5 or n_3g_gen_pre} robot-runs, uniform)")
+if n_3g_gen_p6 and n_3g_gen_pre6:
+    hard_fail.append(
+        f"check 3h — this campaign mixes binary generations at the P6 "
+        f"boundary: {n_3g_gen_p6} robot-run(s) in {len(_gen_cells_p6)} cell(s) "
+        f"emit pursuit_predictor (P6 or later) and {n_3g_gen_pre6} in "
+        f"{len(_gen_cells_pre6)} cell(s) do not (pre-P6). `mtare_pursuit` and "
+        f"`mtare_hybrid` name a trail chase on one side of that line and are "
+        f"ambiguous between trail and model on the other. "
+        f"pre-P6 e.g. {sorted(_gen_cells_pre6)[:3]}, "
+        f"P6+ e.g. {sorted(_gen_cells_p6)[:3]}")
+elif n_3g_gen_p6 or n_3g_gen_pre6:
+    print(f"binary generation (predictor): "
+          f"{'P6+' if n_3g_gen_p6 else 'pre-P6'} "
+          f"({n_3g_gen_p6 or n_3g_gen_pre6} robot-runs, uniform)")
+
+# ==================================================================
+# 3l. ONE SENSOR AND CANDIDATE CONFIGURATION PER CAMPAIGN.
+# ==================================================================
+# Same shape as 3h and 3j, one layer further down: 3h refuses to pool two
+# binaries, 3j two radios, this refuses to pool two sensor models. The
+# generation-9 lidar FOV change (full azimuth, 96 rays, 20 m) is a params-file
+# change, and a params-file change moves NO field this gate previously read --
+# git_explo_planner does not move for it, and sha256_shared_params moves but is
+# compared to nothing. A stale installed yaml therefore produced a cell that ran
+# the generation-8 sensor under a manifest that said generation 9 everywhere.
+#
+# And it prints the configuration whether or not it varies, because the reason
+# this check exists is that "D1 was in effect" was an assumption with no witness
+# in the run record. An operator reading a green gate should be able to see the
+# FOV the campaign actually ran, not infer it from the yaml in the source tree.
+_cfg_split_hard, _cfg_split_soft, _cfg_uniform = [], [], []
+for _k in CFG_KEYS:
+    _vals = _cfg_seen.get(_k)
+    if not _vals:
+        # Absent from every run_start. Not a failure on its own -- a banked
+        # campaign predates the key -- but emphatically not a pass either, so
+        # it is named in the INFO block below rather than skipped in silence.
+        _cfg_uniform.append(f"{_k}=<not recorded>")
+        continue
+    if len(_vals) == 1:
+        _cfg_uniform.append(f"{_k}={next(iter(_vals))}")
+        continue
+    # Split. Which kind?
+    _by_arm = collections.defaultdict(set)
+    for _v, _where in _vals.items():
+        for (_c, _a, _r) in _where:
+            _by_arm[_a].add(_v)
+    _within = sorted(a for a, vs in _by_arm.items() if len(vs) > 1)
+    _detail = "; ".join(
+        f"{_v} in {len(_w)} robot-run(s) e.g. {sorted(_w)[0][0]}"
+        for _v, _w in sorted(_vals.items()))
+    if _within or _k in CFG_HARD:
+        _cfg_split_hard.append(
+            f"check 3l — {_k} is not constant across this campaign: {_detail}."
+            + (f" It varies WITHIN arm(s) {_within}, which is never a design: "
+               f"cells of one arm ran different configurations."
+               if _within else
+               " This is a sensor/candidate parameter, not a treatment, so "
+               "arms differing in it are not comparable on any endpoint."))
+    else:
+        _cfg_split_soft.append(
+            f"check 3l — {_k} differs BETWEEN arms ({_detail}), which is a "
+            f"legitimate design if it is this campaign's independent variable "
+            f"and a confound if it is not. Not scored as a failure; confirm "
+            f"against the campaign's intent before pooling")
+hard_fail.extend(_cfg_split_hard)
+unresolved.extend(_cfg_split_soft)
+print("\nconfiguration (check 3l, from run_start after resolution):")
+for _line in _cfg_uniform:
+    print(f"  {_line}")
+
+# The params file is the other half of what the node ran, and until now the
+# gate never looked at it. Within an arm it is a constant; between arms it can
+# legitimately differ, because varying a yaml-only knob per arm inside one
+# invocation is done by giving the arm its own params file
+# ([[per-cell-knobs-ride-the-arm-suffix]]).
+_ph = collections.defaultdict(set)
+for _c in cells:
+    _v = manifest(os.path.join(ROOT, _c)).get("sha256_shared_params")
+    if _v:
+        _ph[parse_cell_name(_c, TAG)[0]].add(_v)
+_ph_split = sorted(a for a, vs in _ph.items() if len(vs) > 1)
+if _ph_split:
+    hard_fail.append(
+        f"check 3l — sha256_shared_params is not constant within arm(s) "
+        f"{_ph_split}: cells of one arm ran different params files")
+elif _ph:
+    _allv = {v for vs in _ph.values() for v in vs}
+    print(f"  sha256_shared_params={sorted(_allv)}"
+          + ("" if len(_allv) == 1 else "  <- differs between arms"))
 
 # ==================================================================
 # 3j. ONE RADIO REGIME PER CAMPAIGN, AND IT MUST BE THE DECLARED ONE.
@@ -1355,11 +2201,15 @@ for label, n, check in (
         ("reconnect_dispatch rows",     n_disp_rows,     "19"),
         ("run_end rows",                n_runend_rows,   "19"),
         ("run_start rows",              n_runstart_rows, "3b"),
+        ("mission_complete row counts", n_3m_rowcount,   "3m"),
+        ("endpoint-counter witnesses",  n_3m_fields,     "3m"),
+        ("planner logs read",           n_3n_plogs,      "3n"),
         ("treated-arm run_start rows",  n_3f_runs,       "3f"),
         ("link-gate live witnesses",    n_3f_live_checked, "3f"),
         ("m-tare features certified ON", n_3g_treated,   "3g"),
         ("m-tare features certified OFF", n_3g_control,  "3g"),
         ("binary-generation witnesses", n_3g_gen_p5 + n_3g_gen_pre, "3h"),
+        ("predictor-gen witnesses",     n_3g_gen_p6 + n_3g_gen_pre6, "3h"),
         ("radio-regime manifests",      len(comms_regime_by_cell), "3j"),
         ("console logs present",        n_console_logs,   "9"),
         ("mid-run reconnect lines",     n_midrun,        "20")):
@@ -1373,6 +2223,15 @@ for label, n, check in (
                 "/GATE_LINK_GATE_LIVE")
         print(f"  check {check:>2}  {label:28} {n:6d}{mark}")
         continue
+    # Same exemption, same reasoning, for 3m's generation-9 half: an operator
+    # re-scoring a banked campaign switched it off on purpose. The row-count
+    # half above has NO exemption, because every generation ever written can be
+    # asked how many mission_complete rows it holds.
+    if not n and label == "endpoint-counter witnesses" \
+            and not ENDPOINT_FIELDS_REQUIRED:
+        print(f"  check {check:>2}  {label:28} {n:6d}"
+              f"   <- sub-check disabled by GATE_ENDPOINT_FIELDS")
+        continue
     # 3g's two populations are exempt only when the PRE-REGISTRATION says the
     # arm does not exist. A hybrid-vs-off campaign has no m-tare arm and must
     # not be marked unresolved for the absence of one; an all-m-tare campaign
@@ -1385,11 +2244,66 @@ for label, n, check in (
         _exempt = (not _any_mtare) if label.endswith("ON") else _all_mtare
         if _exempt:
             print(f"  check {check:>2}  {label:28} {n:6d}"
-                  f"   <- no such arm in GATE_ARMS {list(EXPECT_ARMS)}")
+                  f"   <- GATE_ARMS {list(EXPECT_ARMS)} declares no "
+                  f"{'m-tare' if label.endswith('ON') else 'non-m-tare'} arm, "
+                  f"so this population cannot exist")
             continue
     print(f"  check {check:>2}  {label:28} {n:6d}{mark}")
     if not n:
         unresolved.append(f"check {check}: {label} — zero rows, nothing was tested")
+
+# check 3m, the mixture half. NOT relaxable by GATE_ENDPOINT_FIELDS, because
+# the flag says "this campaign predates the fields" and a campaign where SOME
+# robot-runs carry them and some do not is not that campaign — it is two binary
+# generations inside one directory, which is never a design. Found by the
+# negative control for the relaxation itself: with the flag set and the fields
+# stripped from one arm only, the gate reported a non-zero witness count and
+# read as though everything had been checked.
+if n_3m_fields and n_3m_fields < n_3m_rowcount:
+    hard_fail.append(
+        f"check 3m — {n_3m_fields} of {n_3m_rowcount} robot-runs carry the "
+        f"generation-9 endpoint counters and {n_3m_rowcount - n_3m_fields} do "
+        f"not, so this campaign MIXES binary generations. GATE_ENDPOINT_FIELDS "
+        f"does not relax this: it declares a campaign to predate the fields, "
+        f"and this one does not predate them uniformly")
+
+# check 3m, the health half. Printed unconditionally — including the zero case,
+# in words — because a guard that reports only when it fires is
+# indistinguishable from a guard that was compiled out. The fix is not FAILED
+# on a zero: a campaign of short runs may genuinely never latch coverage after
+# homing. It is reported so the zero has to be looked at rather than inferred.
+if n_3m_fields:
+    if n_3m_reentry_runs:
+        print(f"\ncheck 3m — the once-per-run mission-return latch REFUSED a "
+              f"later homing request in {len(n_3m_reentry_runs)} of "
+              f"{n_3m_fields} robot-runs (this is the fix working, not a "
+              f"fault):")
+        for _w in n_3m_reentry_runs[:12]:
+            print(f"    {_w}")
+        if len(n_3m_reentry_runs) > 12:
+            print(f"    ... and {len(n_3m_reentry_runs) - 12} more")
+    else:
+        print(f"\ncheck 3m — the once-per-run mission-return latch refused "
+              f"nothing across {n_3m_fields} robot-runs. The field IS present, "
+              f"so this is a measured zero and not an absent check; on ts1b "
+              f"the generation-8 defect it guards showed up in 16 robot-runs, "
+              f"so a campaign-wide zero is worth confirming rather than "
+              f"assuming.")
+
+# check 3n, printed unconditionally for the same reason 3m's health half is: a
+# check whose healthy output is an empty list is indistinguishable from a check
+# that did not run. The denominator is stated, never inferred.
+_n_3n_dups = len([h for h in hard_fail if "check 3n" in h])
+if _n_3n_dups:
+    print(f"\ncheck 3n — {_n_3n_dups} of {n_3n_plogs} robot-runs wrote a "
+          f"duplicate run_end (listed in the hard failures above).")
+else:
+    print(f"\ncheck 3n — no duplicate run_end in {n_3n_plogs} robot-run(s). "
+          f"This is a measured zero: the planner logs were read and searched "
+          f"for both markers. Robot-runs with no planner log are listed as "
+          f"UNRESOLVED rather than counted here. Base rate is 0 in 3342 banked "
+          f"robot-runs, so a zero here confirms nothing new — it only keeps "
+          f"the generation-9 suppression from hiding the event entirely.")
 
 print(f"\ngate E aggregate '-> recovery:' entries: {agg_recovery_entries}")
 if agg_recovery_entries == 0:
@@ -1418,11 +2332,37 @@ if _malformed:
     hard_fail.append(
         f"check 21 — {len(_malformed)} director(y/ies) under {TAG}_ do not "
         f"parse as <TAG>_<arm>_seed<N>: {sorted(_malformed)}")
+# Classified by the same rule the cell loop uses (identity or policy), so the
+# printed split cannot disagree with the split the checks actually applied.
+_declared_control = [a for a in EXPECT_ARMS
+                     if a in CONTROL_ARMS or _expect_policies[a] in CONTROL_ARMS]
 print(f"\narms expected: {list(EXPECT_ARMS)} "
-      f"(control: {sorted(CONTROL_ARMS)}, treated: "
-      f"{[a for a in EXPECT_ARMS if a not in CONTROL_ARMS]})")
+      f"(control: {_declared_control} from GATE_CONTROL_ARMS="
+      f"{sorted(CONTROL_ARMS)}, treated: "
+      f"{[a for a in EXPECT_ARMS if a not in _declared_control]})")
 print(f"campaign shape: {dict(cells_by_arm)} "
       f"(pre-registered {EXPECT_CELLS_PER_ARM} per arm)")
+# One specific disagreement deserves its own sentence, because the generic
+# messages below describe it as a launcher bug when it is a declaration that is
+# one factor short. If the declared list matches the campaign's reconnect
+# POLICIES exactly, and the only difference is that every directory carries a
+# design suffix on top of them, then no cell is mislabelled: GATE_ARMS was
+# written for a one-factor design and the campaign ran a two-factor one. It
+# stays a hard failure — the count check is exactly what notices that only one
+# level of the new factor ran, and it cannot notice that at the policy level.
+if (set(cells_by_arm) != set(EXPECT_ARMS)
+        and set(cells_by_policy) == set(EXPECT_ARMS)
+        and any(a != p for a, p in policy_of_arm.items())):
+    hard_fail.append(
+        f"check 21 — GATE_ARMS names the reconnect policies "
+        f"{sorted(EXPECT_ARMS)}, which match this campaign exactly, but every "
+        f"cell directory carries a design suffix on top of them "
+        f"({', '.join(sorted(cells_by_arm))}). The cells are not mislabelled "
+        f"and the campaign is not malformed — the DECLARATION is one factor "
+        f"short. Re-declare GATE_ARMS with the full cell identities so this "
+        f"check can see whether BOTH levels of that factor ran; that is the "
+        f"failure it exists for, and it is invisible at the policy level. The "
+        f"arm lines below are consequences of this one")
 for a in EXPECT_ARMS:
     if cells_by_arm.get(a, 0) != EXPECT_CELLS_PER_ARM:
         hard_fail.append(

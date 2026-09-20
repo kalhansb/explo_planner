@@ -169,12 +169,18 @@ public:
     /// holding no voxel at all, and in any world where some columns can never
     /// be observed — outside the ingest z band, under canopy, permanently
     /// occluded — the measure has a floor well above zero that no amount of
-    /// exploring removes. `done_unknown_fraction` ships at 0.05 and the sim
-    /// harness overrides it to 0.64 for precisely this reason; the pair below
-    /// is overridden by the same harness for the same reason.
+    /// exploring removes. `done_unknown_fraction` COMPILES IN at 0.05 (the
+    /// dp() fallback in the node) and is 0.64 everywhere it is actually
+    /// configured — shared_params.yaml:348 and the sim harness both — for
+    /// precisely this reason; the pair below is overridden by that harness for
+    /// the same reason.
     ///
-    /// The defaults are the SATURATING-MAP values: they assume, as the shipped
-    /// `done_unknown_fraction: 0.05` does, a map in which a swept cell really
+    /// Say "compiled default", not "shipped": the shipped yaml has read 0.64
+    /// since the C4 calibration, and 0.05 is 13x tighter than the ~0.486
+    /// achievable floor, i.e. a criterion no run in this world can ever meet.
+    ///
+    /// The defaults are the SATURATING-MAP values: they assume, as the 0.05
+    /// compiled fallback does, a map in which a swept cell really
     /// does approach zero unknown. Ship-elsewhere and they are wrong, in a
     /// direction that is loud rather than silent — every cell pins at
     /// EXPLORING, which is what a floor above the threshold looks like.
@@ -356,6 +362,29 @@ public:
   ///     bookkeeping about provenance.
   /// What is left is exactly the state the exchange is supposed to make agree.
   uint32_t sharedHash() const;
+
+  /// FNV-1a over the traversability matrix `edges_`, plus its side length.
+  ///
+  /// R3 / §3.6. This is the OTHER half of what two robots have to agree on for
+  /// "solve-same-take-own" to be arithmetic rather than hope, and it is the
+  /// half nothing could see. `sharedHash()` deliberately covers only the
+  /// statuses — the state the exchange is supposed to make agree. The cost
+  /// matrix is NOT exchanged: `mergeWire` reconciles status and `known_by` and
+  /// never touches `edges_`, so two robots can hold identical statuses,
+  /// identical masks and an identical `sharedHash()` while every `costMm()`
+  /// between them differs, and every tour with it. Unlike the pose-staleness
+  /// channel this does not shrink when the link comes back up.
+  ///
+  /// So this is a DETECTOR, not a fix, and it must stay one: nothing consumes
+  /// it, nothing gates on it, and it must never be put on the wire on the
+  /// strength of an argument. Measure how often it differs first — a
+  /// disagreement rate near zero would mean the whole concern is theoretical,
+  /// and that is a result worth having before spending a binary generation.
+  ///
+  /// Size is folded in first for the same reason as in sharedHash(): two grids
+  /// of different size are not comparable at all, so their digests must not be
+  /// able to collide by accident.
+  uint32_t edgeHash() const;
 
   /// What one mergeWire() call did. Every refusal has its own counter because
   /// "the merge changed nothing" has several causes with opposite meanings: a

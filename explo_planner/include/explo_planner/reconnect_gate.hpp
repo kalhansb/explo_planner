@@ -90,11 +90,17 @@ struct GateVerdict {
   long long c_re_mm = -1;
   long long leg_mm  = -1;
 
-  /// Cells no vehicle could legally take under the no-comms mask. Expected to
-  /// be 0 — the deciding robot is always in comms with itself and therefore
-  /// unmasked, so it can absorb anything — and reported because a nonzero value
-  /// would mean C_no is understating the cost of staying apart, which biases
-  /// the gate towards suppression in exactly the case it should fire.
+  /// Cells no vehicle could legally take under the no-comms mask.
+  ///
+  /// STRUCTURALLY ZERO, AND THEREFORE A DEAD COLUMN. It was meant to report
+  /// comms-mask starvation, and it cannot: the deciding robot is always built
+  /// in_comms, the mask exempts an in_comms vehicle from the known-by test
+  /// entirely, and an exempt vehicle can absorb any cell. So it is not merely
+  /// "expected to be 0" (which this said until 2026-09-18, alongside a reading
+  /// of what a nonzero value would mean) — nonzero is unreachable while self is
+  /// in the vehicle set, which it always is. Kept only so the column does not
+  /// change meaning mid-campaign; listed with the other dead columns in
+  /// CODE_TODO.
   int unassigned = 0;
 
   /// Non-empty when the arithmetic could not be evaluated. `dispatch` is then
@@ -107,11 +113,18 @@ struct GateVerdict {
 /// `robots` is the full vehicle set as doPlan would build it for the allocator,
 /// including the missing peers themselves — the value gate needs them present
 /// in both solves, differing only in whether they are reachable. `missing` is
-/// the subset the trigger is considering going out to fetch.
+/// the set of peers the trigger is considering, i.e. the CANDIDATES; the gate
+/// picks exactly one of them — the nearest it can locate — and prices and
+/// values a manoeuvre that fetches that one. It is not a set of peers that all
+/// get fetched, and at N >= 3 the distinction is the difference between a
+/// correct verdict and a one-directional bias towards dispatch.
 ///
 /// `cfg` supplies the allocator's polish/candidate limits; its `comms_mask`
-/// field is IGNORED and set per solve, because the mask being on for one solve
-/// and off for the other is the entire measurement.
+/// field is IGNORED. Both solves run with the mask ON (2026-09-18) and differ
+/// only in the vehicle set: in the "stay apart" solve every missing candidate
+/// is out of comms, and in the "reconnect" solve the one chosen peer is back.
+/// Switching the flag off for the second solve — which is what this used to do
+/// — unmasks the whole fleet at once and cannot express a single reconnection.
 GateVerdict evaluateReconnectGate(const CellWorld& world,
                                   const std::vector<AllocRobot>& robots,
                                   const std::vector<MissingPeer>& missing,

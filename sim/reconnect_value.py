@@ -14,10 +14,13 @@ Two pairing bugs a first cut got wrong, both worth stating because the numbers
 look plausible either way:
 
   * Chase cost must come from PURSUE intervals, NOT from dispatch->reconnect_end.
-    A DECLINED dispatch (resume_exploring / meeting_point) never enters PURSUE,
-    and pairing each dispatch with "the next end event" makes four declines in
-    p12_pursuit_seed1 all match one distant end, reporting 1390 s of chasing for
-    a robot that never chased.
+    A dispatch whose action is `resume_exploring` never enters PURSUE -- it is
+    the planner declining to start a manoeuvre -- and pairing each dispatch with
+    "the next end event" makes four declines in p12_pursuit_seed1 all match one
+    distant end, reporting 1390 s of chasing for a robot that never chased.
+    (`hold` does not enter PURSUE either, but for an unrelated reason: it is a
+    leaf of a manoeuvre already under way. See timing_table's ACTED for the full
+    classification -- this bullet is about the pairing, not the taxonomy.)
   * Benefit must be keyed on the RESTORATION, not the dispatch. Several
     dispatches can precede one reconnection; charging the same merge to each
     triple-counted the gain.
@@ -79,13 +82,50 @@ def roster(d):
 
     Manifest first (P7 writes `robots=`), event-log filenames otherwise, so
     cells recorded before that key existed still read.
+
+    AND THEN THE REPLACEMENT REPRODUCED THE FAILURE THE PARAGRAPH ABOVE
+    DESCRIBES. The launcher writes the key COMMA-separated --
+    `echo "robots=$(echo $ROBOTS | tr ' ' ',')"`, run_explo_sim_rviz.sh:2750 --
+    and this read it with a whitespace `.split()`, which does not split it at
+    all: `robots=atlas,bestla` came back as the single name "atlas,bestla".
+    That name is truthy, so the filename fallback never ran; it matches no
+    event log, so every scan read nothing, every classification list came back
+    empty and every outage printed `silent`. The same wrong-answer-shaped exit
+    0, on every cell rather than only on unusually-named ones, from the fix.
+
+    Split on commas AND whitespace so both spellings read, and then CHECK: a
+    roster whose names match no event log is not a roster, and saying so is the
+    difference between this failing and it going round a third time.
     """
-    r = manifest(d).get("robots", "").split()
-    if r:
-        return tuple(r)
-    return tuple(sorted(
+    raw = manifest(d).get("robots", "").replace(",", " ").split()
+    from_logs = tuple(sorted(
         os.path.basename(f)[: -len(".events.jsonl")]
         for f in glob.glob(os.path.join(d, "*.events.jsonl"))))
+    if not raw:
+        return from_logs
+    r = tuple(raw)
+    # The manifest is the authority on WHO RAN, so a name it lists with no log
+    # is reported, not quietly swapped out: an event log missing for one robot
+    # of three is a truncated cell, and falling back to the two that do have
+    # logs would analyse it as a two-robot run. Only a roster with NO usable
+    # names at all falls back, because at that point the manifest has told us
+    # nothing we can use.
+    missing = [x for x in r
+               if not os.path.exists(os.path.join(d, f"{x}.events.jsonl"))]
+    if missing and len(missing) == len(r):
+        sys.stderr.write(
+            f"  !! {os.path.basename(d)}: manifest robots={','.join(r)} but none "
+            f"of them has an event log; falling back to the {len(from_logs)} "
+            f"log filename(s) found. If this prints, the manifest's spelling of "
+            f"the roster and this parser have diverged again.\n")
+        return from_logs or r
+    if missing:
+        sys.stderr.write(
+            f"  !! {os.path.basename(d)}: manifest lists {len(r)} robot(s) and "
+            f"{len(missing)} of them ({', '.join(missing)}) has no event log. "
+            f"Every scan below reads nothing for those, so their outages will "
+            f"print `silent` whatever the planner did.\n")
+    return r
 
 
 def events(d, rob):
@@ -305,10 +345,19 @@ def timing_table(cells):
 
     Outages are classified by WHAT THE PLANNER DID during them, four ways:
 
-      acted     a manoeuvre was armed -- action chase, meeting_point or
-                anchor_return. `hold` and `resume_exploring` are excluded:
-                the first is a leaf of a manoeuvre already under way and the
-                second is the planner declining to start one.
+      acted     a manoeuvre was armed -- action chase, appointment,
+                anchor_return, or the historical meeting_point. `hold` and
+                `resume_exploring` are excluded: the first is a leaf of a
+                manoeuvre already under way and the second is the planner
+                declining to start one.
+
+                `appointment` IS THE GENERATION-19 NAME and it is the action
+                the rendezvous arm spends almost all of its manoeuvre time in.
+                Omitting it from the tuple below does not drop those outages --
+                it moves them into `declined`, i.e. it reports the treated arm's
+                central mechanism as the planner declining to act. Any new
+                action string has to be classified here deliberately; the
+                membership test fails OPEN into `declined`, silently.
       gated     no manoeuvre, but the §3.6 gate evaluated and refused
                 (reconnect_gate with dispatched false). Only possible in an
                 info-gated arm; structurally zero everywhere else.
@@ -333,7 +382,22 @@ def timing_table(cells):
     print(f"{'cell':<24} {'arm':<11} {'t_done':>7} {'disc_s':>7} {'disc%':>6} "
           f"{'n_out':>5} {'med_out':>8} {'acted':>10} {'gated':>10} "
           f"{'declined':>10} {'silent':>10}")
-    ACTED = ("chase", "meeting_point", "anchor_return")
+    # "meeting_point" is retained for banked pre-generation-19 logs only; the
+    # midpoint construction it named no longer exists.
+    ACTED = ("chase", "appointment", "anchor_return", "meeting_point")
+    # A NEW ACTION STRING MUST NOT BE ABSORBED SILENTLY. Membership in ACTED
+    # fails open into `declined`, which is the direction that flatters the
+    # untreated arm, so an unrecognised action is announced once per run rather
+    # than binned. This is the check that would have caught `appointment`
+    # arriving as an unclassified string in the first place.
+    KNOWN = set(ACTED) | {"hold", "resume_exploring"}
+    unknown = sorted({e.get("action") for c in cells for rob in c["roster"]
+                      for e in c["robots"][rob]["_disp"]} - KNOWN - {None})
+    if unknown:
+        print("  !! UNCLASSIFIED dispatch action(s): %s -- these are being "
+              "counted as `declined`, which reads as the planner choosing not "
+              "to reconnect. Classify them in ACTED/KNOWN in reconnect_value.py."
+              % ", ".join(unknown))
     for c in cells:
         T = float(c["t_complete"] or 0)
         if not T:

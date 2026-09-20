@@ -283,7 +283,7 @@ CellState[] cells
 uint16[]  my_tour                # cell ids of sender's current global route
 bool      finished               # exploration latched done on sender's map
 int32     rendezvous_cell_id     # -1 = no proposal
-float32   rendezvous_time_sec    # mission-elapsed seconds (§3.5)
+int32     rendezvous_interval_ms # seconds-after-separation, NOT a time (§3.5)
 geometry_msgs/Point[] robot_positions   # gossip: last known position per robot
 float32[] robot_last_heard_sec          # gossip: mission-elapsed last direct contact per robot
 ```
@@ -445,17 +445,38 @@ pay to reach.
   robots): meet sooner when the maps are diverging fast enough that the
   exchange is worth more than the tours alone imply. That model is already
   symmetric in the two robots, so both cap identically.
-- **Agreement needs no protocol.** §3.4 already guarantees tours are
-  bit-identical *across processes* (integer-mm quantisation, total
-  tie-break order, no clock/random/address-derived value). A rendezvous
-  derived purely from the allocation output is therefore bit-identical too.
-  There is no proposal, no echo, no lowest-id adoption, no freeze/chatter
-  control, and no convergence bound to unit-test — agreement is a
-  consequence of identical arithmetic over a shared world, exactly the
-  argument `global_allocator.hpp` already makes for allocation itself.
-  **This deletes the entire v2/v3 agreement protocol**, which was the bulk
-  of P5's cost, and removes the flapping failure mode the chatter control
-  existed to suppress.
+- ~~**Agreement needs no protocol.**~~ **FALSIFIED IN GEN 9; THE PROTOCOL IS
+  BACK (gen 10).** The v4 claim was that §3.4 guarantees tours are
+  bit-identical *across processes* (integer-mm quantisation, total tie-break
+  order, no clock/random/address-derived value), so a rendezvous derived
+  purely from the allocation output would be bit-identical too, and agreement
+  would be a consequence of identical arithmetic over a shared world.
+
+  **The arithmetic held. The shared world did not.** Every determinism property
+  above is still true and still enforced; what was false was the premise that
+  the two robots feed the solver the same inputs. They do not — each merges its
+  own map, and a merge is a function of what the radio happened to deliver.
+  Measured on the banked ts3 n2+n3 cells: **21 of 64** separated pairs picked
+  the same cell, median `t_meet` disagreement **91 s at N=2 and 125 s at N=3**
+  (max 496 s), and **0 of 7** triples agreed at N=3. Nine pairs disagreed with
+  *identical* `shared_hash`, and the candidate count differed in 5 of 19 — so
+  the hash was never a complete witness of a shared world either.
+
+  Gen 10 replaces it with an explicit **propose / echo / commit** handshake:
+  fleet id 0 derives a `(cell, interval_ms)` pair, publishes it on `TeamWorld`,
+  followers adopt the two integers verbatim and echo them, and a robot commits
+  only when every peer is fresh (within `coord_claim_ttl_sec`) and holding the
+  identical pair. It runs **only while the team reads complete** and freezes
+  the instant it does not, so what an outage inherits is always a pair that was
+  agreed before the separation. The *interval* rather than a time is the second
+  half: each robot converts it with its own reading of the separation instant,
+  and those readings agree to a median of 0.00 s where the arming instants
+  agreed to 91–125 s.
+
+  The honest residual is the two-generals limit: exact agreement at an
+  arbitrary cut is impossible, and the exposed window here is one `TeamWorld`
+  period against `rendezvous_proposal_period_sec` (~1 s in 30 at the
+  defaults). That is stated rather than engineered away.
 - **Clock.** The countdown runs on **mission-elapsed time**, never absolute
   stamps: field clocks drift hours apart (the 2026-07-06 bunker/curt bags
   were 4531 s apart while recording simultaneously). Robots start their
@@ -529,8 +550,12 @@ Defects that our spec above is written against:
    practice. Only `SyncNextRendezvous` retains `i < self_id`, and it
    ascends and breaks on first match, so it adopts the **lowest**-id
    in-comms peer — determinism a convergence argument would need, and which
-   "any peer" would not give. We avoid the whole question: agreement by
-   identical arithmetic (above) has no adoption step.
+   "any peer" would not give. Gen 10 answers it the same way and for the same
+   reason: adoption is from the **lowest fleet id** (`kRendezvousProposerId`,
+   constant 0), which is total and needs no election. (The v4 text here claimed
+   we avoided the question entirely because identical arithmetic had no
+   adoption step. That claim died with the premise — see the falsification
+   above.)
 3. **Agreement is exact integer equality on both fields**, no tolerance and
    no versioning, over `ExplorationInfo.global_cell_ids` — a field named
    for something else, with the pair framed by `-2`/`-1` sentinels
@@ -729,6 +754,23 @@ the telemetry-consumer updates**: `sim/gate_g8.py` pins `schema_version == 3`
 as part of the pre-registered gate identity, and `sim/event_log.py` reads
 schema 3 — both must be updated for v4 *with their known-answer
 recalibration re-run* (a deliberate schema regression must still fail).
+(The schema is now at **v8**; this said v5 until 2026-09-18. The authority is
+`kSchemaVersion` in `experiment_log.hpp` — read it there, not here. Since v4:
+**v5** gen 10 removed `RendezvousAgreedEvent::excluded` with the no-show
+write-off list, and a *removed* field is a reader break, so it bumps; **v6**
+gen 17 and **v7** gen 19 were meaning-only bumps with identical shapes
+(`RendezvousAgreedEvent::t_meet_sec` changed what it measures, then a
+`rendezvous_outcome` label changed what it means); **v8** gen 23 is one meaning
+change plus three additive fields — `outcome` gains `"unplaceable"`,
+`mission_complete.homing_duration_sec` becomes WALL time and
+`team_exchange.last_known_age_sec` becomes the silence the message ended,
+alongside `run_end.midrun_attempts_used`, `mission_complete.homing_held_sec`,
+`goal_amnesty.source`, and step-CSV `plan_rej_visited` appended LAST.
+A meaning-only bump still bumps: it breaks readers exactly as hard, and more
+quietly. The same three consumers — `gate_g8.py`, `gate_g8_calib.py`,
+`event_log.py` — are re-pinned on every one of these and the calibrator re-run
+to ALL PASS. Check 3d is an exact equality, so a stale pin hard-fails every
+cell of a new-generation campaign, which is the gate working.)
 Until that lands, g8's schema check is *expected* to fail on any v4 run —
 that is the gate working, not noise, and loosening the pin instead of
 recalibrating is the checks-that-stopped-checking failure mode this plan

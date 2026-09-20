@@ -84,12 +84,33 @@ void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m) {
     // Out-of-bounds source — leave every cell at kInfCost.
     return;
   }
-  if (blocked_[idx(sx, sy)]) {
-    // Source on top of an inflated cell. The robot is allowed to be there
-    // (it actually is — the inflation includes the robot footprint), so
-    // start the flood from cost 0 anyway. We just don't relax through any
-    // *other* blocked cell.
+  // Seeding the source at cost 0 is conditional, and it used to be
+  // unconditional, which made this class lie on exactly the input it is
+  // supposed to be defensive about. build() marks EVERY cell blocked when the
+  // planning_map is malformed (see the data.size() != n guard there), so the
+  // flood is empty by construction — but the seed was still written, and it was
+  // then the ONLY finite cost in the grid: reachable(robot_pose) answered true
+  // and reachedCellCount() answered 1 on a map where nothing whatsoever is
+  // reachable. A reachability structure may answer "no"; it must never answer
+  // "yes" off a map it has already rejected. (2026-09-18)
+  //
+  // The test is NOT simply "is the source cell traversable", because a blocked
+  // source is a legitimate and routine state: the map is inflated by the body
+  // radius, so a robot in a dense stand genuinely stands on an inflated cell,
+  // and the flood must still start from there — the relaxation below already
+  // refuses to pass through any *other* blocked cell, so starting on inflation
+  // does not let a path run through it. The honest question is whether the
+  // flood has anywhere at all to go: seed when the source is itself traversable
+  // OR when at least one of its eight neighbours is. A malformed map fails both
+  // and leaves the whole grid at kInfCost; the robot-in-inflation case passes
+  // the second and is unchanged.
+  bool can_seed = !blocked_[idx(sx, sy)];
+  for (int k = 0; !can_seed && k < 8; ++k) {
+    const int nx = sx + kDx[k];
+    const int ny = sy + kDy[k];
+    if (inBounds(nx, ny) && !blocked_[idx(nx, ny)]) can_seed = true;
   }
+  if (!can_seed) return;
   cost_[idx(sx, sy)] = 0.0f;
 
   // Effective radius cap. Negative / zero / NaN means "no bound" — genuinely

@@ -11,13 +11,22 @@ namespace explo_planner {
 
 class MapCache;
 
+/// NOT a sensor model. Every field below is overwritten from parameters by
+/// explo_planner_node before the evaluator is constructed, so these values
+/// never reach a run; the deployed sensor lives in `shared_params.yaml`
+/// (`fov_*`) and is traceable to the SDF. They are deliberately left at the
+/// old narrow-camera numbers so that the unit tests, which construct a
+/// FovConfig and set only the fields they are exercising, keep testing the
+/// directional geometry they were written for. Do not "correct" them to the
+/// deployed values: that would create a second place for the sensor model to
+/// drift, and would silently change what ten tests assert.
 struct FovConfig {
-  float hfov      = 1.047f;   ///< Horizontal FOV (radians), 60 deg
-  float vfov      = 0.785f;   ///< Vertical FOV (radians)
+  float hfov      = 1.047f;   ///< Horizontal FOV (radians). Test placeholder.
+  float vfov      = 0.785f;   ///< Vertical FOV (radians). Test placeholder.
   float min_range  = 0.3f;    ///< Minimum sensor range (m)
-  float max_range  = 10.0f;   ///< Maximum sensor range (m)
-  int   h_rays     = 16;      ///< Horizontal ray samples
-  int   v_rays     = 12;      ///< Vertical ray samples
+  float max_range  = 10.0f;   ///< Maximum sensor range (m). Test placeholder.
+  int   h_rays     = 16;      ///< Horizontal ray samples. Test placeholder.
+  int   v_rays     = 12;      ///< Vertical ray samples. Test placeholder.
   float occ_stop   = 0.7f;    ///< Stop ray at voxels above this p_occ
 
   /// XYZ ROI bounds.  Rays are clipped at the ROI boundary so the

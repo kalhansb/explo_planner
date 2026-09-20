@@ -283,7 +283,13 @@ echo "=== the launcher's own validation blocks (the M-TARE knobs) ==="
 # anywhere else dies at the scenario-installed check for a reason that has
 # nothing to do with the guard under test. Every BLOCK case would still see a
 # non-zero exit, and this whole section would pass while testing nothing.
-PRELUDE_ANCHOR='^unset _mtare_stamped _arm_core _arm_expect$'
+# Moved past the arm-stamp guard 2026-09-16, to the end of the _rzv_needed
+# block that now follows it. Cutting at the arm-stamp unset would have left the
+# `a mode that is nothing without the schedule` refusal outside the probe
+# entirely -- so the bare-default ALLOW case below would have certified a
+# default that the real launcher refuses one line later, which is the exact
+# shape of a check that has stopped checking.
+PRELUDE_ANCHOR='^unset _rzv_needed$'
 PRELUDE_END=$(grep -n "$PRELUDE_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
 PROBE="$(dirname "$LAUNCHER")/.prelude_probe.$$.sh"
 trap 'rm -rf "$TMP"; rm -f "$PROBE"' EXIT
@@ -292,7 +298,7 @@ cases=$((cases+1))
 if [ -n "$PRELUDE_END" ]; then
   echo "  PASS  the prelude anchor is present (launcher line $PRELUDE_END)"
 else
-  echo "  FAIL  '$PRELUDE_ANCHOR' is not in the launcher -- the arm-stamp guard"
+  echo "  FAIL  '$PRELUDE_ANCHOR' is not in the launcher -- the schedule-needed"
   echo "        was renamed or removed, and every case below would be vacuous"
   fails=$((fails+1))
 fi
@@ -313,7 +319,7 @@ if [ -n "$PRELUDE_END" ]; then
   # fail every BLOCK case for the wrong reason and pass every ALLOW one.
   for _need in "FATAL: CELL_WORLD" "FATAL: TEAM_WORLD=" "FATAL: TEAM_WORLD_HZ" \
                "FATAL: RENDEZVOUS_SCHEDULE" "FATAL: PURSUIT_PREDICTOR" \
-               "the arm name and the arm"; do
+               "the arm name and the arm" "has no runnable configuration"; do
     cases=$((cases+1))
     if grep -qF "$_need" "$PROBE"; then
       echo "  PASS  the cut carries the guard: $_need"
@@ -363,13 +369,40 @@ if [ -n "$PRELUDE_END" ]; then
   }
 
   # The two controls that give every refusal below its meaning. If the first
-  # ever fails, the launcher is refusing off-arm cells; if the second fails,
+  # ever fails, the launcher is refusing a bare invocation; if the second fails,
   # the mtare_hybrid arm does not exist and the campaign has no treatment.
-  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 pp=trail rm=hybrid' \
-     "shipped defaults resolve with every M-TARE knob off"
+  #
+  # The first used to assert `every M-TARE knob off`, because RECONNECT_MODE
+  # defaulted to plain `hybrid`. That default was UNRUNNABLE from the day the
+  # schedule-needed refusal landed -- plain hybrid with rs=0 is refused there,
+  # and with rs=1 it is refused by the arm-stamp guard -- so the default moved
+  # to mtare_hybrid and this case moved with it. The two now assert the same
+  # vector by two routes, which is the point: the default and the token that
+  # names it must not drift apart.
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
+     "shipped defaults resolve to the mtare_hybrid stack"
   lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
      "RECONNECT_MODE=mtare_hybrid expands to the whole P1-P5 stack" \
      RECONNECT_MODE=mtare_hybrid
+  # An all-knobs-off vector still has to resolve, or the launcher is refusing
+  # off-arm cells -- that is what the old bare-default case was really buying.
+  # `off` is one of the two plain tokens that survive, so it carries the job.
+  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 pp=trail rm=off' \
+     "an all-knobs-off vector still resolves" \
+     RECONNECT_MODE=off
+
+  # The two plain tokens that CANNOT run, asserted in both directions so the
+  # dead end is a property under test rather than a comment. Either refusal
+  # going quiet means a cell can be filed under a name the node will not stamp.
+  lg BLOCK "has no runnable configuration" \
+     "plain hybrid at its default is refused (it would behave as pursuit)" \
+     RECONNECT_MODE=hybrid
+  lg BLOCK "has no runnable configuration" \
+     "plain rendezvous at its default is refused (it would behave as off)" \
+     CELL_WORLD=1 TEAM_WORLD=1 RECONNECT_MODE=rendezvous
+  lg BLOCK "FATAL: the arm name and the arm" \
+     "and turning the schedule ON under a plain token is the other refusal" \
+     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=rendezvous
 
   # The other three cells of the doc §3.6.1 factorial. Each expands to a
   # DIFFERENT vector, and the two that differ from mtare_hybrid are the point
@@ -391,12 +424,18 @@ if [ -n "$PRELUDE_END" ]; then
   # A typo in a 0/1 knob reads as OFF, and an off treatment knob is invisible:
   # the run completes, the manifest records the value it was handed, and the
   # cell is analysed as treated. Only the launcher can catch this.
+  #
+  # RECONNECT_MODE=pursuit on both, so the arm stack is EMPTY and the 0/1
+  # validity check is what the case actually reaches. Under an mtare_* token
+  # (which the default now is) the stack's own contradiction check fires first
+  # and reports the same input as a different mistake -- still a refusal, but
+  # not the one this case is calibrating.
   lg BLOCK "FATAL: CELL_WORLD='true'" \
      "CELL_WORLD=true is refused, not silently read as off" \
-     CELL_WORLD=true
+     CELL_WORLD=true RECONNECT_MODE=pursuit
   lg BLOCK "FATAL: TEAM_WORLD='yes'" \
      "TEAM_WORLD=yes is refused, not silently read as off" \
-     CELL_WORLD=1 TEAM_WORLD=yes
+     CELL_WORLD=1 TEAM_WORLD=yes RECONNECT_MODE=pursuit
 
   # TEAM_WORLD_HZ is the exchange's on/off switch as well as its rate: the node
   # builds no publisher and no timer at <=0, so these three would each have
@@ -410,9 +449,12 @@ if [ -n "$PRELUDE_END" ]; then
   lg BLOCK "FATAL: TEAM_WORLD_HZ='<empty: rejected by flt>'" \
      "flt's empty return for nan is refused, not passed to ros2 as a bare -p" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=nan
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 pp=trail rm=hybrid' \
+  # RECONNECT_MODE=pursuit, explicitly: this case is about TEAM_WORLD_HZ, and
+  # leaving the mode at its default would make it also assert the default's
+  # whole stack and fail the day that changes for an unrelated reason.
+  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 pp=trail rm=pursuit' \
      "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
-     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2
+     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2 RECONNECT_MODE=pursuit
 
   # The node reconstitutes the arm itself, prefixing `mtare_` when
   # global_alloc_enable_ || reconnect_gate_info_ || rendezvous_schedule_enable_.
@@ -455,9 +497,12 @@ if [ -n "$PRELUDE_END" ]; then
   # The P6 knob. It is the SIXTH thing that flips the node's `mtare_` prefix, so
   # it needs the same three-way coverage the fifth got: the typo, the arm-stamp
   # direction, and the preconditions.
+  # RECONNECT_MODE=pursuit for the same reason as the two 0/1 typo cases above:
+  # every mtare_* token pins PURSUIT_PREDICTOR, so under the default the arm
+  # stack refuses 'MDP' as a contradiction before the spelling check sees it.
   lg BLOCK "FATAL: PURSUIT_PREDICTOR='MDP'" \
      "a mis-cased PURSUIT_PREDICTOR is refused, not read as trail" \
-     PURSUIT_PREDICTOR=MDP
+     PURSUIT_PREDICTOR=MDP RECONNECT_MODE=pursuit
   lg BLOCK "FATAL: the arm name and the arm" \
      "PURSUIT_PREDICTOR=mdp under the plain hybrid name is refused" \
      CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 PURSUIT_PREDICTOR=mdp \
@@ -712,11 +757,26 @@ unset _stderr
 # stated at the -u list: each one is either stripped there, or assigned
 # explicitly on the same launch line. A knob that is neither is one the guard
 # scores at its default while the cell runs on the ambient shell's value.
-_launch_line=$(sed -n '/^  env -u LINK_GATE/,/run_explo_sim_rviz.sh"/p' "$CS")
+# Anchored on `env ` and not on `env -u LINK_GATE`, because the launch line
+# grew a derived sweep in front of the literal strips on 2026-09-18 and the
+# tighter anchor then matched nothing: sed returned an empty range, every knob
+# below was "neither stripped nor assigned", and fifteen guards that were in
+# fact intact reported FAIL. An extraction that can silently select nothing is
+# the same defect as a gate that can silently examine nothing, so the emptiness
+# of BOTH halves is now an explicit case rather than a fifteen-way symptom.
+_launch_line=$(sed -n '/^  env /,/run_explo_sim_rviz.sh"/p' "$CS")
 _knobs=$(grep -oE 'env_val [A-Z_][A-Z0-9_]*' "$CS" | awk '{print $2}' | sort -u)
 if [ -z "$_knobs" ]; then
   echo "  FAIL  found no env_val knobs to check -- this loop has stopped checking"
   fails=$((fails+1)); cases=$((cases+1))
+fi
+cases=$((cases+1))
+if [ -z "$_launch_line" ]; then
+  echo "  FAIL  the per-cell launch line could not be extracted from run_campaign.sh;"
+  echo "        every knob below would read as unprotected whatever the launcher does"
+  fails=$((fails+1))
+else
+  echo "  PASS  the per-cell launch line was located ($(printf '%s\n' "$_launch_line" | wc -l) lines)"
 fi
 for _u in $_knobs; do
   cases=$((cases+1))
@@ -730,6 +790,203 @@ for _u in $_knobs; do
   fi
 done
 unset _u _knobs _launch_line
+
+echo
+echo "=== the ambient-knob sweep derived from the runner ==="
+# The section above asserts an invariant over the knobs run_campaign.sh MODELS.
+# That is roughly twenty names. run_explo_sim_rviz.sh reads about a hundred and
+# ten, all as `${NAME:-default}`, and until 2026-09-18 the other ninety reached
+# every cell straight from the launching shell: `env` without -i inherits, the
+# strip list had never heard of them, the resume guard does not compare them,
+# and for most of them run_manifest.txt does not record them either. So an
+# `export RDV_DEPART_DELAY=30` left in a terminal retuned every cell of a
+# multi-day matrix with nothing anywhere able to say it had.
+#
+# RDV_DEPART_DELAY is not a hypothetical: through generation 24 it was the
+# 100 s in "after 100s after one robot disconnect, all robots go to the
+# rendezvous point" — the treatment itself in two of ts4's four arms. Since
+# generation 25 it is inert in the binary but still logged, so a leak now
+# forges the param rows rather than the behaviour.
+#
+# The sweep is derived from the runner rather than listed, so these cases check
+# the DERIVATION -- reproduced here from the same source, which is the only way
+# to notice the scan silently matching nothing.
+_keep=$(sed -n 's/^RUNNER_ENV_KEEP="\(.*\)"$/\1/p' "$CS" | head -1)
+# THE SCANNER IS EXTRACTED, NOT REPRODUCED, and that distinction was found the
+# hard way. The first draft of this section pasted a copy of the awk program
+# here; two mutations of the launcher's real scanner -- dropping the bare
+# `${X-default}` form, and letting commented-out knobs through -- then passed
+# every case below, because the thing under test was a second copy that had not
+# been mutated. A calibrator holding its own copy of the code it certifies is
+# the same defect as the hand-maintained knob list this whole section replaced,
+# and it fails the same way: silently, while printing PASS.
+_awkprog=$(sed -n '/^RUNNER_STRIP=\$(awk -v keep=/,/^'"'"' "\$HERE\/run_explo_sim_rviz.sh")$/p' "$CS" \
+           | sed '1d;$d')
+_scan() {  # $1 = file to scan; prints one name per line
+  # The launcher's program emits a single ` -u NAME -u NAME` line for the env
+  # command; split it back apart rather than keeping a print-one-per-line
+  # variant here, so the FORMAT the launch line consumes is what gets checked.
+  awk -v keep=" $_keep " "$_awkprog" "$1" \
+    | tr ' ' '\n' | grep -v '^-u$' | grep -v '^$'
+}
+_runner="$(dirname "$CS")/run_explo_sim_rviz.sh"
+
+cases=$((cases+1))
+if printf '%s\n' "$_awkprog" | grep -q 'match(line'; then
+  echo "  PASS  the launcher's own scanner was extracted ($(printf '%s\n' "$_awkprog" | wc -l) lines)"
+else
+  echo "  FAIL  could not extract the scanner from run_campaign.sh -- every case"
+  echo "        below would be running an empty awk program and calling it a PASS"
+  fails=$((fails+1))
+fi
+_derived=$(_scan "$_runner" | sort)
+_nd=$(printf '%s\n' "$_derived" | grep -c '[A-Z]' || true)
+
+cases=$((cases+1))
+if [ -z "$_keep" ]; then
+  echo "  FAIL  RUNNER_ENV_KEEP could not be read out of run_campaign.sh -- these"
+  echo "        cases are scanning with an empty keep list and prove nothing"
+  fails=$((fails+1))
+elif [ "$_nd" -ge 60 ]; then
+  echo "  PASS  the sweep derives $_nd ambient knobs from the runner"
+else
+  echo "  FAIL  the sweep derives only $_nd knob(s); the runner reads ~110, so the"
+  echo "        scan is broken and the launcher's own tripwire (<10) would not"
+  echo "        have caught a partial break either"
+  fails=$((fails+1))
+fi
+
+# The six that finding #24 was about, named individually. A count alone passes
+# while the one knob that matters is the one that got away.
+for _k in RDV_MAX_WAIT RDV_DEPART_DELAY RDV_SETTLE RDV_APPT_WAIT \
+          RDV_LATCHED_HOLD START_HOLD; do
+  cases=$((cases+1))
+  if printf '%s\n' "$_derived" | grep -qx -- "$_k"; then
+    echo "  PASS  ambient $_k is stripped from every cell"
+  else
+    echo "  FAIL  ambient $_k still reaches every cell -- it is a rendezvous knob"
+    echo "        and two of ts4's four arms ARE the rendezvous"
+    fails=$((fails+1))
+  fi
+done
+
+# The KEEP list, both directions. A name in KEEP must be exempt (or the exemption
+# is decorative) AND must actually be read by the runner (or it is a typo, and a
+# typo in KEEP does not fail loudly -- it strips the variable it was written to
+# protect).
+for _k in $_keep; do
+  cases=$((cases+1))
+  if printf '%s\n' "$_derived" | grep -qx -- "$_k"; then
+    echo "  FAIL  $_k is in RUNNER_ENV_KEEP and is stripped anyway"
+    fails=$((fails+1))
+  elif ! grep -q "\${$_k[:]\?[-=]" "$_runner"; then
+    echo "  FAIL  $_k is exempted but the runner never reads it -- a dead or"
+    echo "        misspelled KEEP entry, and the misspelling is the dangerous one"
+    fails=$((fails+1))
+  else
+    echo "  PASS  infrastructure knob $_k is read by the runner and exempt"
+  fi
+done
+
+# The scanner itself, against a fixture whose answer is known by construction --
+# because every case above is derived from the same file the launcher derives
+# from, so a scanner that matched the WRONG thing consistently would agree with
+# itself everywhere.
+cat > "$TMP/fixture.sh" <<'FIXEOF'
+NEW_KNOB="${NEW_KNOB:-7}"
+ASSIGN_FORM="${ASSIGN_FORM:=7}"
+BARE_FORM="${BARE_FORM-7}"
+# COMMENTED_KNOB="${COMMENTED_KNOB:-7}"
+PLAIN_READ="$NOT_A_DEFAULTED_READ"
+lower_case="${lower_case:-7}"
+FIXEOF
+_fx=$(_scan "$TMP/fixture.sh" | sort | tr '\n' ' ')
+cases=$((cases+1))
+if [ "$_fx" = "ASSIGN_FORM BARE_FORM NEW_KNOB " ]; then
+  echo "  PASS  the scanner finds all three default forms, and skips comments,"
+  echo "        undefaulted reads and lower-case names"
+else
+  echo "  FAIL  the scanner returned [$_fx]; expected exactly the three defaulted"
+  echo "        upper-case names. A comment or a plain \$VAR read leaking in means"
+  echo "        the strip list carries names nothing configures; a missing form"
+  echo "        means knobs of that shape still reach every cell"
+  fails=$((fails+1))
+fi
+
+cases=$((cases+1))
+: > "$TMP/empty.sh"
+if [ -z "$(_scan "$TMP/empty.sh")" ]; then
+  echo "  PASS  a source with no knobs derives nothing, so the launcher's"
+  echo "        tripwire is reachable rather than decorative"
+else
+  echo "  FAIL  the scanner invents names from an empty file"
+  fails=$((fails+1))
+fi
+
+# And the tripwire's own threshold, read back rather than assumed. The case
+# above establishes that a broken scan reaches zero; this one establishes that
+# zero is refused. `-lt 0` can never fire and `-lt 200` would refuse every real
+# campaign, and both edits look equally innocuous in a diff -- which is how a
+# threshold is the quietest place for a guard to die.
+cases=$((cases+1))
+_thr=$(sed -n 's/^if \[ "${_nstrip:-0}" -lt \([0-9]*\) \]; then$/\1/p' "$CS" | head -1)
+if [ -z "$_thr" ]; then
+  echo "  FAIL  the launcher's derived-knob tripwire could not be found at all"
+  fails=$((fails+1))
+elif [ "$_thr" -gt 0 ] && [ "$_thr" -lt "$_nd" ]; then
+  echo "  PASS  the tripwire refuses below $_thr, between zero and the $_nd real knobs"
+else
+  echo "  FAIL  the tripwire threshold is $_thr against $_nd real knobs: at 0 it can"
+  echo "        never fire, at or above $_nd it refuses every legitimate campaign"
+  fails=$((fails+1))
+fi
+
+# The sweep must be WIRED, not merely computed. A derivation that is never
+# referenced on the launch line is the same nothing as no derivation, and it
+# reads as a fix in every diff.
+# The OUTPUT FORM, which every other case here is deliberately blind to: _scan
+# splits the `-u` flags off before comparing names, so a scanner that emitted
+# bare names would satisfy all of them. It would also turn the launch line into
+# `env RDV_APPT_WAIT OUTDIR=... runner`, where env runs the first name as the
+# command. That fails loudly at the first cell rather than silently -- but it is
+# the launcher's own `<10` tripwire that makes it loud, by counting exactly the
+# `-u` tokens asserted here, so this is the case that keeps that tripwire honest.
+cases=$((cases+1))
+_nflag=$(awk -v keep=" $_keep " "$_awkprog" "$_runner" | tr ' ' '\n' | grep -c '^-u$' || true)
+if [ "${_nflag:-0}" -ge 10 ]; then
+  echo "  PASS  the derivation emits $_nflag -u flags, the form env and the"
+  echo "        launcher's own tripwire both count"
+else
+  echo "  FAIL  the derivation emits ${_nflag:-0} -u flag(s); the launch line would"
+  echo "        read the first derived name as the command to run"
+  fails=$((fails+1))
+fi
+
+cases=$((cases+1))
+if sed -n '/^  env /,/run_explo_sim_rviz.sh"/p' "$CS" | grep -q '\$RUNNER_STRIP'; then
+  echo "  PASS  the launch line expands \$RUNNER_STRIP"
+else
+  echo "  FAIL  \$RUNNER_STRIP is derived and never used on the launch line"
+  fails=$((fails+1))
+fi
+
+# And the half that makes over-stripping safe: --env must still beat the strip.
+# If it did not, this whole sweep would be a hundred silently-ignored knobs
+# rather than a hundred neutralised ones.
+cases=$((cases+1))
+_got=$(RDV_DEPART_DELAY=ambient env -u RDV_DEPART_DELAY RDV_DEPART_DELAY=explicit \
+       sh -c 'echo "${RDV_DEPART_DELAY:-DEFAULT}"')
+_amb=$(RDV_DEPART_DELAY=ambient env -u RDV_DEPART_DELAY \
+       sh -c 'echo "${RDV_DEPART_DELAY:-DEFAULT}"')
+if [ "$_got" = "explicit" ] && [ "$_amb" = "DEFAULT" ]; then
+  echo "  PASS  env applies -u before assignments: --env still wins, ambient does not"
+else
+  echo "  FAIL  env precedence is not what the sweep assumes (assigned=[$_got]"
+  echo "        stripped=[$_amb]) -- --env may no longer reach the cell"
+  fails=$((fails+1))
+fi
+unset _keep _runner _derived _nd _k _fx _got _amb _awkprog _nflag _thr
+unset -f _scan
 
 echo
 echo "=== the resume guard: a banked cell must have run THIS experiment ==="
@@ -762,10 +1019,20 @@ echo "=== the resume guard: a banked cell must have run THIS experiment ==="
 RG_ARM=mtare_hybrid
 # Agrees with the reference campaign below on every key the guard reads. Each
 # case overwrites, or deletes, exactly one line.
+#
+# run_gates_verdict IS `CLEAN`, WHICH IS A TOKEN THE HARNESS CAN ACTUALLY WRITE.
+# It said `VALID` until 2026-09-18, and nothing in run_explo_sim_rviz.sh has ever
+# emitted that word: the teardown writes exactly one of CLEAN, SUSPECT or
+# INVALID. The reference manifest was therefore a manifest no cell could have,
+# which cost nothing while the resume guard asked only "is this literally
+# =INVALID", and became thirteen simultaneous failures the moment it started
+# distinguishing CLEAN from everything else. A fixture that cannot be produced
+# by the thing it stands in for is a fixture that will one day disagree with it
+# for a reason that has nothing to do with the case being tested.
 rg_manifest() {
   cat <<'EOF'
 run_end_reason=all_done
-run_gates_verdict=VALID
+run_gates_verdict=CLEAN
 mission_return_enabled=true
 scenario=flatforest_dense_2robot_lidar.yaml
 duration_s=3000
@@ -786,8 +1053,33 @@ alloc_peer_pos_max_age_sec=none
 separation_weight=0
 separation_radius_m=20
 separation_max_age_sec=10
+link_gate=1
+link_gate_effective=1
+done_seek_enabled=false
+reconnect_midrun_silence_sec=90
+team_world_hz=1.0
 EOF
 }
+# The five keys above the EOF joined the guard in the C2/C3 pass and were not
+# added here at the time, which put SIXTEEN of the cases below into permanent
+# ABORT: every SKIP case failed on `link_gate=<absent>` long before reaching the
+# key it was written to exercise. The suite exited non-zero either way, so the
+# 16 reds read as one known breakage rather than as sixteen assertions that had
+# stopped asserting anything -- the cases pinning the FLOAT-formatting branch
+# (20 vs 20.0, padded values, the nan/awk trap) were the expensive ones to lose,
+# because that branch is the one that aborts a CORRECT resume.
+#
+# Values are the reference campaign's, i.e. what a no---env `--arms mtare_hybrid
+# --seeds 1` invocation predicts: LINK_GATE defaults to 1 in the launcher and
+# run_campaign mirrors that when --env carries no LINK_GATE, --comms defaults to
+# 1 so the effective veto is live too, MIDRUN_SILENCE and TEAM_WORLD_HZ mirror
+# the launcher's 90 and 1.0, and done_seek is off (the campaign spells it 0, the
+# runner writes the ROS bool).
+#
+# n_robots is deliberately NOT here. Its check is a consistency test across the
+# banked cells of a tag, and it skips a manifest that does not carry the key --
+# so an absent one is a case in its own right rather than a hole, and every rg()
+# case banks exactly one cell anyway.
 # rg WANT "label" ARM KEY VALUE
 #   KEY=""          -> the manifest is left agreeing
 #   VALUE="<none>"  -> the key is DELETED, i.e. a manifest predating it
@@ -813,6 +1105,13 @@ rg() {
     [ "$_rc" = 0 ] && _got=PRINTED-BUT-RAN || _got=ABORT
   elif echo "$_out" | grep -q "SKIP rg_${_arm}_seed1 (already complete)"; then
     _got=SKIP
+  elif echo "$_out" | grep -q "SKIP rg_${_arm}_seed1 (complete, but run_gates_verdict="; then
+    # BANKED BUT NOT CERTIFIED. Its own outcome name, because it is neither of
+    # the two the guard used to have: the cell IS skipped (so it is not ABORT
+    # and not LAUNCHED) but it is skipped with a verdict gate_g8 will hard-fail,
+    # and folding it into SKIP would make the loud path and the silent path
+    # indistinguishable here — which is the exact defect being calibrated.
+    _got=SKIP-DIRTY
   elif echo "$_out" | grep -q "MB free under"; then
     _got=LAUNCHED          # the guard passed the cell through to be re-run
   else
@@ -937,7 +1236,76 @@ rg ABORT "separation_radius_m=nan agrees with 20 under a bare +0" \
 # must not start aborting a correct resume. Whitespace is the realistic way to
 # acquire one, and this is the case that would fail if the trim were dropped.
 rg SKIP  "separation_radius_m= 20.0 (padded) still resumes"   "$RG_ARM" separation_radius_m " 20.0 "
-unset _want _lbl _arm _key _val _root _cell _out _rc _got RG_ARM
+
+# --- the verdict itself, which the resume guard used to read one bit of ------
+# The guard's test was `grep -q '^run_gates_verdict=INVALID'`, so of the four
+# states a banked cell can be in it distinguished exactly one. SUSPECT and a
+# missing key both landed in the `else` and printed `SKIP (already complete)` --
+# the same line a certified cell gets -- and gate_g8, which is the only thing
+# that reads the verdict, is run by hand after the campaign. A bank full of
+# uncertifiable cells therefore announced itself for the first time at analysis
+# time, with every hour of sim already spent.
+#
+# These cases pin the three directions separately, because "it still skips" and
+# "it says why" are different properties and only one of them was broken.
+rg SKIP-DIRTY "a banked SUSPECT cell still skips, but says so"  "$RG_ARM" run_gates_verdict SUSPECT
+rg SKIP-DIRTY "a banked cell with no verdict at all says so"    "$RG_ARM" run_gates_verdict "<none>"
+rg SKIP-DIRTY "a verdict token nothing emits is not read as CLEAN" "$RG_ARM" run_gates_verdict VALID
+# LAUNCHED, not SKIP-DIRTY: INVALID keeps its old behaviour of falling through
+# to a re-run (the disk guard then stops it, which is what LAUNCHED names here).
+# The new branch must not have swallowed the one verdict that was already acted
+# on — an INVALID cell that started merely being reported instead of redone
+# would be a silent loss of the only automatic remedy this driver has.
+rg LAUNCHED   "INVALID still redoes the cell, not just reports it" "$RG_ARM" run_gates_verdict INVALID
+
+# REDO_SUSPECT=1 IS THE OPT-IN, AND IT HAS TO BE TESTED IN BOTH DIRECTIONS.
+# The env var is the operator's way of saying "re-roll the uncertified cells",
+# and a knob that silently does nothing is worse than no knob: it converts a
+# deliberate decision into a no-op that looks like it was honoured. Run inline
+# rather than through rg(), which has no env hook.
+#
+# LAUNCHED is the wanted outcome — the cell is passed through to be re-run and
+# stopped immediately afterwards by the absurd MIN_FREE_MB, which is the same
+# trick every case above uses to avoid starting a 3000 s gazebo run.
+for _rs in 1 0; do
+  cases=$((cases+1))
+  _root="$TMP/resume_redo_$_rs"; _cell="$_root/rg_${RG_ARM}_seed1"
+  mkdir -p "$_cell"
+  rg_manifest | sed 's/^run_gates_verdict=.*/run_gates_verdict=SUSPECT/' \
+    > "$_cell/run_manifest.txt"
+  _out=$(REDO_SUSPECT=$_rs MIN_FREE_MB=999999999999 timeout 60 "$CS" \
+           --root "$_root" --tag rg --duration 3000 \
+           --scenario flatforest_dense_2robot_lidar.yaml \
+           --arms "$RG_ARM" --seeds 1 2>&1)
+  if echo "$_out" | grep -q "MB free under"; then _got=LAUNCHED
+  elif echo "$_out" | grep -q "SKIP rg_${RG_ARM}_seed1 (complete, but"; then _got=SKIP-DIRTY
+  else _got=OTHER; fi
+  [ "$_rs" = 1 ] && _want=LAUNCHED || _want=SKIP-DIRTY
+  if [ "$_got" = "$_want" ]; then
+    echo "  PASS  REDO_SUSPECT=$_rs on a SUSPECT bank ($_got)"
+  else
+    echo "  FAIL  REDO_SUSPECT=$_rs on a SUSPECT bank: want $_want got $_got"
+    echo "$_out" | grep -E "FATAL|ABORT|SKIP|REDO|free under" | sed 's/^/          | /'
+    fails=$((fails+1))
+  fi
+done
+# REDO_SUSPECT must NOT re-roll a CLEAN cell. Without this the knob reads as
+# "re-run everything", which would silently discard a finished campaign.
+cases=$((cases+1))
+_root="$TMP/resume_redo_clean"; _cell="$_root/rg_${RG_ARM}_seed1"
+mkdir -p "$_cell"; rg_manifest > "$_cell/run_manifest.txt"
+_out=$(REDO_SUSPECT=1 MIN_FREE_MB=999999999999 timeout 60 "$CS" \
+         --root "$_root" --tag rg --duration 3000 \
+         --scenario flatforest_dense_2robot_lidar.yaml \
+         --arms "$RG_ARM" --seeds 1 2>&1)
+if echo "$_out" | grep -q "SKIP rg_${RG_ARM}_seed1 (already complete)"; then
+  echo "  PASS  REDO_SUSPECT=1 leaves a CLEAN cell banked (SKIP)"
+else
+  echo "  FAIL  REDO_SUSPECT=1 re-rolled a CLEAN cell"
+  echo "$_out" | grep -E "FATAL|ABORT|SKIP|REDO|free under" | sed 's/^/          | /'
+  fails=$((fails+1))
+fi
+unset _want _lbl _arm _key _val _root _cell _out _rc _got _rs RG_ARM
 
 echo
 echo "=== the resume guard's copies of the launcher defaults must still be true ==="

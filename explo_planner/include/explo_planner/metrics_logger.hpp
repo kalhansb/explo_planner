@@ -180,9 +180,21 @@ struct StepMetrics {
 
   // ---- Last planning attempt: why the candidates were thrown away ----
   //
-  // These are the ONLY columns in this struct that are populated on a timer row
-  // as well as a LOG_STEP row, and they have to be, because of what they are
-  // for. A robot whose every candidate is rejected never completes a step, so
+  // These are populated on a timer row as well as a LOG_STEP row, and they have
+  // to be, because of what they are for.
+  //
+  // THEY ARE NOT THE ONLY ONES, which is what this said until 2026-09-18. The
+  // authority is ExploPlannerNode::fillCommonMetrics — read it, do not count
+  // from here — and everything it touches is on every row: step, sim_time_sec,
+  // distance_traveled, coord_active_peers, prox_hold_count, prox_hold_total_sec,
+  // phase and state unconditionally, plus unknown_fraction and coverage_source,
+  // plus reconnect_elapsed_sec / reconnect_range_to_goal_m / team_complete /
+  // pursue_peer / pursue_quarry_live under their own state guards. What is
+  // special about the plan_rej_* family is not that it is alone in surviving a
+  // timer row, it is that it was MOVED there deliberately (see below) after a
+  // stall proved unreadable; the rest were always common.
+  //
+  // A robot whose every candidate is rejected never completes a step, so
   // it emits no LOG_STEP row at all — the run keeps producing timer rows with
   // state == "PLAN" and every plan-attribution column zero by construction. In
   // at1 seed 2 that is 60 rows across a 1094 s stall saying only "still in
@@ -217,20 +229,92 @@ struct StepMetrics {
   //                      planning map. Seed 2's second-largest cause and the
   //                      one with no column at all before this.
   //   plan_rej_unreach   rejected by the cost-grid flood
-  //   plan_rej_blacklist rejected by visited_goals_ or failed_goals_
+  //   plan_rej_blacklist rejected by visited_goals_ or failed_goals_ — the
+  //                      UNION, unchanged since it was added, so it stays
+  //                      comparable across schema versions
+  //   plan_rej_visited   the visited_goals_ half of that union, broken out in
+  //                      v8. The two halves get different treatment at the
+  //                      starvation amnesty (failed first, visited only as a
+  //                      last resort) and they mean different things — a
+  //                      visited rejection is this robot's own fresh trail, a
+  //                      failed one is a goal nav could not reach. The union
+  //                      alone could not say which one starved a tick.
+  //                      plan_rej_blacklist - plan_rej_visited recovers the
+  //                      failed-only count. -1 on a pre-v8 file, which is not
+  //                      zero.
   //   plan_rej_minpos    rejected by a peer's MinPos claim
   //   plan_stall_ticks   consecutive ticks on which EVERY candidate was
   //                      rejected, 0 on a tick that selected a goal. This is
   //                      the starvation length, and it is the column that
   //                      turns "the robot sat in PLAN" into "the robot could
   //                      not plan for N ticks and here is why".
+  //
+  // THIS LIST IS STRUCT ORDER, AND STRUCT ORDER IS NOT CSV ORDER. plan_rej_visited
+  // is declared here where it belongs by meaning, next to the union it splits,
+  // but the CSV header appends it LAST of all columns — writeHeader in
+  // metrics_logger.cpp is the only authority on position. Every other field in
+  // this block happens to agree; this one does not, and a positional reader
+  // built by counting down this list would read plan_rej_minpos as visited and
+  // shift everything after it. Read the header line. It is written on every
+  // file for exactly this reason.
   int    plan_cand_total          = -1;
   int    plan_rej_close           = -1;
   int    plan_rej_map             = -1;
   int    plan_rej_unreach         = -1;
   int    plan_rej_blacklist       = -1;
+  int    plan_rej_visited         = -1;
   int    plan_rej_minpos          = -1;
   int    plan_stall_ticks         = -1;
+
+  // ---- R5: who the chase was against, and what the team looked like ----
+  //
+  // §3.4 is a DISAGREEMENT BETWEEN TWO PREDICATES, and neither of them was
+  // observable. The pursuit release fires on
+  //     teamComplete(active, expected) || quarry_heard
+  // while the outcome classifier writes "reconnected" only on
+  //     teamComplete(live, expected)
+  // so a chase released because its own quarry came back is labelled
+  // `abandoned` whenever some OTHER peer is still missing. At N=4 pursuit that
+  // produced 155 abandoned / 18 gave_up / 0 reconnected across 173 chases: the
+  // arm's headline success metric reads 0% by construction, and nothing in any
+  // artifact could show that the chases had in fact succeeded.
+  //
+  // These three columns make the two predicates separately readable on every
+  // row, so the next campaign can re-derive the outcome from data instead of
+  // trusting the label:
+  //   pursue_peer         the quarry's robot id, "" when not pursuing
+  //   pursue_quarry_live  1 / 0 quarry heard this tick; -1 = not pursuing
+  //   team_complete       1 / 0 teamComplete(live, expected); -1 = the
+  //                       question was not asked (no coordination table, or
+  //                       rendezvous_expected_peers is the 0 "inert" default).
+  //                       NOT a measured 0: teamComplete() itself answers
+  //                       false for an unconfigured team, so writing its
+  //                       verdict unconditionally would turn "nobody asked"
+  //                       into "the team was incomplete" and average as one.
+  // "Pursuing" here means the CHASE is live, which is not the same as the
+  // planner state being PURSUE: a proximity hold taken mid-chase parks the
+  // robot in PROXIMITY_HOLD without ending the chase (the node refunds the held
+  // time to the pursuit budget for exactly that reason). Both of the first two
+  // columns are written on those rows too. They were not, once, and the rows
+  // lost were the closing seconds of chases — concentrated where the §3.4 case
+  // lives, and asymmetric by robot id because right-of-way is lexicographic.
+  // A row with pursue_quarry_live=1 and team_complete=0 at the end of a chase
+  // IS the §3.4 case, and is now countable.
+  //
+  // NOTE ON `target_id`: the deferred item that prompted this asked to "write
+  // target_id". It is deliberately NOT reused. target_id means "active exploit
+  // target" and reads -1 for every archived row because exploitation is off;
+  // putting a peer identity there would make one column mean two incompatible
+  // things depending on a different column's value, and every script that
+  // already reads target_id would silently start answering a question it was
+  // not asked. Same rule as LegacyRejectionColumnsAreUnchanged: old columns
+  // keep their old meaning, new meanings get new names.
+  //
+  // -1 is "not pursuing", not a measured false — the same sentinel discipline
+  // as the plan_* block, and for the same reason.
+  std::string pursue_peer        = "";
+  int    pursue_quarry_live      = -1;
+  int    team_complete           = -1;
 };
 
 class MetricsLogger {
@@ -240,11 +324,46 @@ public:
 
   void logStep(const StepMetrics& m);
 
+  /// Has every write so far actually reached the file?
+  ///
+  /// The constructor refuses a CSV it cannot OPEN, which covers the whole
+  /// misconfiguration family (missing directory, read-only mount, bad
+  /// permissions). It cannot cover the failures that happen after the open
+  /// succeeds, and those are the ones a campaign actually hits: a disk that
+  /// fills mid-run leaves a truncated planner_atlas.csv, and an output path
+  /// pointed at a pseudo-file that accepts an open and rejects every write
+  /// (MetricsLogger("/dev/full") is the reproducer) logs ~3000 steps that all
+  /// vanish. std::ofstream reports both by latching a bit and then silently
+  /// discarding every subsequent `<<`, so without this the run completes, the
+  /// node logs "Step N logged" for every step, and nothing anywhere says the
+  /// data is gone.
+  ///
+  /// This class has no logger handle and deliberately does not acquire one --
+  /// it is the pure CSV writer and keeping it ROS-free is what lets the schema
+  /// tests run without a graph -- and it does NOT throw from logStep(), because
+  /// the per-step path runs inside a planner tick where an exception would take
+  /// the run down harder than the lost metrics do. So the failure is recorded
+  /// here instead, STICKILY (first failure only; a per-step report would emit
+  /// one line per tick for the rest of the run), and THE CALLER IS EXPECTED TO
+  /// SURFACE IT: poll ok() alongside the step log and push error() out through
+  /// the node's own logger, or a truncated CSV is still silent.
+  bool ok() const { return error_.empty(); }
+
+  /// Description of the first write failure, or empty while ok(). Sticky: it
+  /// records the failure that broke the file, not the most recent one.
+  const std::string& error() const { return error_; }
+
 private:
+  std::string path_;
   std::ofstream file_;
   bool header_written_ = false;
+  std::string error_;
 
   void writeHeader();
+
+  /// Latch the first stream failure seen after a write. `where` names the write
+  /// ("header" / "row") so the message says which one lost data.
+  void noteStreamState(const char* where);
 };
 
 } // namespace explo_planner

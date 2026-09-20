@@ -29,9 +29,13 @@
 ///      status where it means to key on freshness will chase a position that
 ///      does not exist and never notice. So this unit reports the two
 ///      SEPARATELY and names them differently — `inComms()` for the dispatch
-///      decision, `lastHeardAgeSec()` / `positionAgeSec()` for every consumer
+///      decision, `positionAgeSec()` / `lastDirectAgeSec()` for every consumer
 ///      that needs the peer's actual data — and there is no accessor that
-///      quietly conflates them.
+///      quietly conflates them. (`lastKnownAgeSec()` exists too and is NOT the
+///      freshness accessor a reader wants here; see the warning on its
+///      declaration. There has never been a `lastHeardAgeSec()`, which this
+///      paragraph named until 2026-09-17 — a paragraph about not confusing two
+///      quantities was sending readers to a third that does not exist.)
 ///
 /// Everything here is measured in MISSION-ELAPSED seconds on the LOCAL clock.
 /// Nothing times anything off a peer's header stamp: field robots' clocks have
@@ -124,8 +128,53 @@ public:
     /// a chase, a separation term — must key on this field.
     double   position_sec = -1.0;
 
-    /// The peer's own claim that it has latched exploration done.
+    /// The peer's run is over (TeamWorld/finished). MONOTONIC and STICKY: set
+    /// first-hand from the peer's own message, or by relay from a third robot
+    /// that heard it, and never cleared by either. The publisher latches the
+    /// bit, so false here means "no evidence", not "still exploring".
+    ///
+    /// It is relayed — unlike `team_incomplete` below — because it is a
+    /// monotonic statement a robot makes about ITSELF, so a relayed copy can
+    /// neither contradict a first-hand one nor echo back to its originator.
+    /// Without the relay, a robot that cannot hear the finished peer keeps
+    /// counting it missing forever and holds the whole team at the unbounded
+    /// appointment barrier; see TeamWorld.msg/robot_finished.
     bool     finished = false;
+
+    /// The peer's own FIRST-HAND answer to "is the team whole?", as it sent it
+    /// (TeamWorld/team_incomplete). NOT its derived armed state — see the
+    /// field's own documentation in TeamWorld.msg for why announcing the armed
+    /// state instead deadlocks.
+    ///
+    /// Stale-safe in one direction only, which is the useful one: this is
+    /// whatever the peer last said, with no TTL of its own, so a consumer must
+    /// pair it with `direct || heard_one_way` to mean "a peer we are receiving
+    /// from RIGHT NOW says the team is broken". Both flags are required, not
+    /// `direct` alone: one-way contact (we receive from the peer, it cannot
+    /// hear us) is exactly the case this exists to catch — the peer's own read
+    /// is broken, it is announcing so, and it has no other way to tell us.
+    bool     team_incomplete = false;
+
+    /// The peer is in a rendezvous appointment manoeuvre and has not stopped
+    /// driving yet (TeamWorld/appointment_inbound). First-hand only, like
+    /// team_incomplete, and its reader pairs it with `direct || heard_one_way`
+    /// for the same reason: it carries no TTL of its own.
+    ///
+    /// It clears when the DRIVE ends — arrival, nav budget, or no-progress —
+    /// and not when the cell is reached, so a peer whose destination turned out
+    /// unreachable stops holding the barrier instead of hanging it. That bound
+    /// is also why it needs no finished exemption; see TeamWorld.msg.
+    bool     appointment_inbound = false;
+
+    /// The peer reports that some robot IT receives first-hand is still
+    /// driving to the agreed cell (TeamWorld/appointment_inbound_seen): the
+    /// one-hop companion to the bit above, added with the generation-27
+    /// closure door. The sender derives it from raw first-hand
+    /// appointment_inbound bits only, never from other robots' copies of this
+    /// field, so it cannot echo (see TeamWorld.msg). Same reader contract as
+    /// the bit above: pair with `direct || heard_one_way`, no TTL of its own.
+    bool     appointment_inbound_seen = false;
+
     /// The peer's last reported direct-contact mask, as it sent it.
     uint32_t in_range_mask = 0;
   };
@@ -149,6 +198,15 @@ public:
     int      sender_id = -1;
     uint32_t in_range_mask = 0;   ///< the sender's direct contacts, incl. itself
     bool     finished = false;
+    /// The sender's own first-hand "the team is not whole" bit. Copied through
+    /// verbatim; see Peer::team_incomplete.
+    bool     team_incomplete = false;
+    /// The sender's own "I am still driving to the agreed cell" bit. Copied
+    /// through verbatim; see Peer::appointment_inbound.
+    bool     appointment_inbound = false;
+    /// The sender's one-hop "a peer I receive first-hand is still driving"
+    /// report. Copied through verbatim; see Peer::appointment_inbound_seen.
+    bool     appointment_inbound_seen = false;
     bool     have_position = false;
     double   x = 0.0, y = 0.0, z = 0.0;
 
@@ -158,6 +216,13 @@ public:
     std::vector<double> last_heard_sec;   ///< on the SENDER's mission clock
     std::vector<double> gx, gy, gz;       ///< last known position per robot
     std::vector<uint8_t> have_gossip_pos;
+
+    /// Relayed `finished`, indexed by fleet id. Merged as a pure OR that never
+    /// clears, and — unlike everything else in this block — NOT age-gated: a
+    /// finished robot goes quiet, so its last-heard entry ages out of
+    /// gossip_max_age_sec exactly when the bit matters. A monotonic fact has no
+    /// freshness to check. See Peer::finished and TeamWorld.msg/robot_finished.
+    std::vector<uint8_t> finished_gossip;
   };
 
   /// Fold in one received message. `now_sec` is the LOCAL mission-elapsed time

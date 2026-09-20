@@ -133,3 +133,46 @@ TEST(PlanMapQuery, UnknownFractionRoiClippingAndMiss) {
   auto empty = makeGrid(0, 0, 1.0f);
   EXPECT_EQ(unknownFractionInRoi(empty, {0.0f, 1.0f, 0.0f, 1.0f}), -1.0);
 }
+
+// A grid whose METADATA claims more cells than data[] actually holds.
+//
+// nav_msgs ties nothing together: info.width/info.height are a separate claim
+// from data.size(), and every bounds test in this file is written against the
+// former. A publisher that fills in the header and then sends a short (or
+// empty) vector therefore produces a grid that passes every index check and
+// still reads off the end — a 1140x1140 map carrying 1140 bytes segfaulted the
+// planner under AddressSanitizer.
+//
+// Both functions must degrade to their existing "cannot be measured" answer
+// rather than to a fabricated one. That direction matters for
+// unknownFractionInRoi in particular: its output feeds the DONE criterion, so
+// inventing a fraction would end a run, while -1.0 is already read as "no
+// reading this tick".
+TEST(PlanMapQuery, ShortDataBufferIsNoDataNotAnOverread) {
+  auto g = makeGrid(10, 10, 1.0f, -5.0f, -5.0f);
+  setCell(g, 3, 4, 42);
+  // Baseline: intact buffer, the cell reads back.
+  ASSERT_EQ(planMapCellAt(g, cellCenter(g, 3, 4)), 42);
+  ASSERT_NEAR(unknownFractionInRoi(g, {-5.0f, 5.0f, -5.0f, 5.0f}), 0.0, 1e-9);
+
+  // Truncate the payload; leave info.width/info.height claiming 100 cells.
+  g.data.resize(10);
+  ASSERT_EQ(g.info.width * g.info.height, 100u);
+
+  EXPECT_EQ(planMapCellAt(g, cellCenter(g, 3, 4)), kCellNoData);
+  // Index 9 IS inside the surviving 10 bytes — the guard must reject on the
+  // buffer disagreeing, not on the individual index happening to be unsafe,
+  // or it only catches the mismatch at cells it would have crashed on anyway.
+  EXPECT_EQ(planMapCellAt(g, cellCenter(g, 9, 0)), kCellNoData);
+  EXPECT_FALSE(isCellFree(g, cellCenter(g, 3, 4)));
+  EXPECT_TRUE(isCellOccupied(g, cellCenter(g, 3, 4)));  // conservative
+  EXPECT_EQ(unknownFractionInRoi(g, {-5.0f, 5.0f, -5.0f, 5.0f}), -1.0);
+
+  // An oversized buffer is just as much a disagreement as a short one: the
+  // metadata is what the ROI loop trusts, so a grid that does not match it is
+  // not a grid this file can read, whichever direction it differs in.
+  auto big = makeGrid(10, 10, 1.0f);
+  big.data.resize(200);
+  EXPECT_EQ(planMapCellAt(big, cellCenter(big, 3, 4)), kCellNoData);
+  EXPECT_EQ(unknownFractionInRoi(big, {0.0f, 10.0f, 0.0f, 10.0f}), -1.0);
+}

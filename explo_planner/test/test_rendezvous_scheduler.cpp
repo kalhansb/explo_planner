@@ -40,8 +40,7 @@ CellWorld world5(int self = 0) {
 RendezvousScheduler::Config sched0() {
   RendezvousScheduler::Config c;
   c.speed_mm_s = 1000;          // 1 m/s: one metre is one second, exactly
-  c.depart_safety_milli = 1000; // 1.0x, so departure arithmetic is readable
-  c.depart_margin_ms = 0;
+  c.depart_safety_milli = 1000; // 1.0x, so the floor arithmetic is readable
   c.max_interval_ms = 0;        // uncapped
   return c;
 }
@@ -219,14 +218,25 @@ TEST(RendezvousFloor, AFloorAlreadyOnATourIsNotDoubleCounted) {
 // (c) THE GATE TEST: both robots derive the same appointment, through the wire
 // ---------------------------------------------------------------------------
 
-/// P5 gate (c), and the entire agreement argument. There is no proposal, no
-/// echo and no adoption anywhere in this design; agreement is supposed to be a
+/// P5 gate (c). READ THE SCOPE CHANGE FIRST.
+///
+/// This test used to carry the ENTIRE agreement argument: the v4 design had no
+/// proposal, no echo and no adoption, and agreement was supposed to be a
 /// CONSEQUENCE of both robots running identical arithmetic over a shared world.
-/// That claim is only worth what this test proves, and it must be proved HERE
-/// rather than inherited from the allocator's own determinism test — the
-/// scheduler adds an argmin, an insertion search and a time conversion, any of
-/// which could reintroduce a cross-process difference the allocator does not
-/// have.
+/// Gen 10 falsified that — not the arithmetic, which this test still confirms,
+/// but the premise that the two robots feed it the same inputs. In the field
+/// each merges its own map and 21 of 64 separated pairs picked the same cell.
+/// Agreement is now an explicit propose/echo/commit handshake in the node (see
+/// rendezvous_scheduler.hpp's header and the node's P5 state block), and this
+/// file does not test it — the handshake has no presence in this library.
+///
+/// What the test still proves, and why it is still worth running: that the
+/// SEARCH is a pure function of the world, so a proposal is auditable offline
+/// and a disagreement can be attributed to divergent inputs rather than to the
+/// solver. It must be proved HERE rather than inherited from the allocator's
+/// own determinism test — the scheduler adds an argmin, an insertion search and
+/// a time conversion, any of which could reintroduce a cross-process difference
+/// the allocator does not have.
 ///
 /// So: two worlds built from opposite viewpoints, reconciled ONLY by exchanging
 /// wire messages, and the vehicle set handed in reversed on one side to prove
@@ -283,64 +293,28 @@ TEST(RendezvousCrossPerspective, IdenticalAppointmentFromBothSides) {
 }
 
 // ---------------------------------------------------------------------------
-// (d) the departure rule: staggered departures, coincident arrivals
+// (d) the departure rule is GONE (generation 19)
+//
+// Four tests stood here pinning RendezvousScheduler::shouldDepart: departures
+// staggered by each robot's own travel so the ARRIVALS coincided, the safety
+// factor and margin moving only the departure, an overdue deadline departing
+// immediately, and -1 inputs refusing rather than reading as overdue. They are
+// deleted with the function. Generation 29 restored the BEHAVIOUR they
+// described — staggered departures, coincident arrivals — but not in this
+// class: it is ExploPlannerNode::appointmentDue, aiming at an instant the team
+// agreed rather than at a deadline each robot derived.
+//
+// WHAT TOOK ITS PLACE, and where its tests are. A robot whose reconnect
+// trigger fires signs up to the first occurrence of the committed
+// (t_meet, interval) it can still arrive at within rendezvous_max_lateness_sec,
+// leaves in time to be there, and waits until the team is whole. The properties
+// that replace these tests — that every robot's t_meet is nextAgreedOccurrence
+// of the ONE committed pair, that the floor only ever rises above bare now by a
+// robot's own shortfall, and that the residual spread is absorbed by an
+// unbounded barrier — are node-level, and the expressions are pinned in
+// test_gen20_rendezvous.cpp
+// (Gen23AgreedSchedule.TheDeadlineIsTheAgreedOccurrenceNotACountdown).
 // ---------------------------------------------------------------------------
-
-/// P5 gate (d). The property, stated as an equation rather than a vibe: with
-/// safety 1.0 and no margin, each robot departs at exactly t_meet - travel and
-/// therefore ARRIVES AT t_meet, whatever its distance. Nothing about the
-/// trigger is synchronised; the shared quantity is t_meet alone.
-///
-/// This is the test mTARE does not have, on the comparison it commented out
-/// (rendezvous_manager.cpp:141-142). Its robots depart AT zero, so each is late
-/// by its own travel time — a lateness that differs per robot and therefore
-/// cannot be absorbed by any single interval constant.
-TEST(RendezvousDeparture, StaggersDeparturesSoArrivalsCoincide) {
-  const RendezvousScheduler::Config c = sched0();
-  const long long t_meet = 100'000;
-  const long long near_ms = 10'000, far_ms = 30'000;
-
-  // Far robot leaves at 70 s, near robot at 90 s; both arrive at 100 s.
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(t_meet, 69'999, far_ms, c));
-  EXPECT_TRUE (RendezvousScheduler::shouldDepart(t_meet, 70'000, far_ms, c));
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(t_meet, 89'999, near_ms, c));
-  EXPECT_TRUE (RendezvousScheduler::shouldDepart(t_meet, 90'000, near_ms, c));
-
-  // And the far robot is still exploring while the near one is not yet due —
-  // the interval in which exactly one of them is driving to the meeting.
-  EXPECT_TRUE (RendezvousScheduler::shouldDepart(t_meet, 80'000, far_ms, c));
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(t_meet, 80'000, near_ms, c));
-}
-
-/// The safety factor buys slack by leaving EARLIER, never by moving the
-/// meeting. 1.2x a 30 s drive is 36 s of countdown.
-TEST(RendezvousDeparture, SafetyFactorAndMarginOnlyMoveTheDeparture) {
-  RendezvousScheduler::Config c = sched0();
-  c.depart_safety_milli = 1200;
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(100'000, 63'999, 30'000, c));
-  EXPECT_TRUE (RendezvousScheduler::shouldDepart(100'000, 64'000, 30'000, c));
-
-  c.depart_safety_milli = 1000;
-  c.depart_margin_ms = 5'000;
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(100'000, 64'999, 30'000, c));
-  EXPECT_TRUE (RendezvousScheduler::shouldDepart(100'000, 65'000, 30'000, c));
-}
-
-/// An overdue appointment departs NOW rather than waiting for the next one. A
-/// robot that was busy through its own deadline — mid-hop, held at a proximity
-/// stop — must still go; the peer is on its way regardless.
-TEST(RendezvousDeparture, AnOverdueAppointmentDepartsImmediately) {
-  const RendezvousScheduler::Config c = sched0();
-  EXPECT_TRUE(RendezvousScheduler::shouldDepart(100'000, 150'000, 30'000, c));
-}
-
-/// No appointment and no usable travel estimate are both "do not depart", not
-/// "depart now". A -1 that read as overdue would send a robot to cell -1.
-TEST(RendezvousDeparture, RefusesWithoutAnAppointmentOrATravelEstimate) {
-  const RendezvousScheduler::Config c = sched0();
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(-1, 50'000, 10'000, c));
-  EXPECT_FALSE(RendezvousScheduler::shouldDepart(100'000, 50'000, -1, c));
-}
 
 TEST(RendezvousTravel, IsIntegerAndRefusesANonPositiveSpeed) {
   EXPECT_EQ(RendezvousScheduler::travelMs(20'000, 1'000), 20'000);
@@ -412,6 +386,17 @@ TEST(RendezvousAdmissibility, TheFloorSurvivesAnUnreachableVerdict) {
 
 // ---------------------------------------------------------------------------
 // (f) no-show: the anti-deadlock rule
+//
+// THE NODE NO LONGER DRIVES ANY OF THIS. deriveRendezvousProposal hard-clears
+// cfg.exclude before every solve, so `rejected_excluded` is 0 on every row a
+// gen-10 campaign will produce. The write-off list was PER ROBOT, and a
+// per-robot input to a value the whole team must share is the exact mistake
+// gen 9 made everywhere else. Anti-deadlock is now the wait cap and the
+// one-appointment-per-outage rule, neither of which needs anyone's consent.
+//
+// These stay because the library feature stays and an untested live code path
+// is worse than a tested unused one. Do not read a green run here as evidence
+// about a campaign — nothing in a campaign reaches them.
 // ---------------------------------------------------------------------------
 
 /// P5 gate (f), the direct regression for §3.5.1 edge 5 — mTARE waits at its
@@ -479,34 +464,163 @@ TEST(RendezvousNoShow, ExhaustingTheToursWithNoFloorRefusesRatherThanReturningMi
 }
 
 // ---------------------------------------------------------------------------
-// The divergence cap
+// The interval: the reachability floor and the findability cap
+//
+// THE INTERVAL IS THE RECURRENCE PERIOD AGAIN (generation 23, after generations
+// 19-22 in which it was not). Every assertion below is unchanged and still
+// correct — solve()'s arithmetic never moved — but WHAT THE NUMBERS MEAN has
+// moved twice, and this banner has stated the wrong one before. A robot drives
+// to the agreed cell for the first occurrence of `t_meet_ms + k*interval_ms`
+// it can still arrive at (nextAgreedOccurrence; floored at t_now plus that
+// robot's own shortfall, zero for a robot that can make the nearest one) and
+// waits there until the team is whole. `interval_ms` is that period, and it is also the agreed,
+// exchanged, compared integer, read as "how long the furthest robot needs to
+// get there".
+//
+// The two bounds survive with it, and both still bite:
+//
+//   floor: the furthest robot's DIRECT drive, so the integer is a journey
+//          somebody can actually make. Without it the objective's own winner —
+//          the cheapest space-time near-miss — reports a grid step, 28.284 s in
+//          the ts4 smoke, for a meeting that is nothing of the sort.
+//   cap:   the barrier's own wait: "the last robot to set off can still arrive
+//          before the ones already waiting give up". With the occurrences back
+//          and the floor making the interval the furthest robot's direct drive,
+//          that is also the older reading — "a robot that misses occurrence k
+//          is under one period behind peers still standing there at k".
+//
+// The floor outranks the cap. Both are fed by the node, so unlike the
+// map-divergence cap these replaced, both are live on campaign rows.
 // ---------------------------------------------------------------------------
 
-/// The cap pulls the meeting earlier when the maps are separating faster than
-/// the tours imply. It is symmetric in the two robots — it comes from the
-/// node's rate_sum model, which sums both robots' map-growth rates — so both
-/// ends cap to the same value, which is the only reason capping is admissible
-/// at all under agreement-by-construction.
+/// The fixture for the two cap tests, built so the TOUR TERM IS WELL ABOVE THE
+/// DIRECT DRIVE — which most fixtures are not, because a tour that goes
+/// straight to the meeting has a prefix equal to the direct distance and the
+/// floor then lands exactly on the tour term.
 ///
-/// The cost is that the slower robot is structurally late by the difference,
-/// and `capped` says so rather than hiding it: a run where this is always true
-/// is one where the cap, not the objective, is choosing the meeting time.
-TEST(RendezvousCap, PullsTheMeetingEarlierAndAdvertisesThatItDid) {
+/// Robot 0 at cell 0 (-20,-20) with tour {20, 2}: it drives 40 m north to cell
+/// 20 (-20,20) first and only then 44.72 m down to cell 2 (0,-20), reaching the
+/// meeting at 84.72 m. Robot 1 at cell 4 (20,-20) has no tour, so it inserts
+/// cell 2 at its direct 20 m.
+///
+///   tour term   = max(84.72, 20)     = 84.72 s at 1 m/s
+///   direct term = max(0->2, 4->2) = max(20, 20) = 20 s
+///
+/// Cells 20 and 2 both cost zero penalty (robot 0 already holds both and robot
+/// 1's makespan stays under its), so the tie breaks to the lower id — cell 2.
+Allocation detourTours(const CellWorld& w, const std::vector<AllocRobot>& r) {
+  return tours2(w, r, {20, 2}, {});
+}
+
+/// The cap pulls the interval in to the barrier's wait, and `capped` says it
+/// did. The tour term stays readable in `tour_interval_ms`, which is the only
+/// place the objective's own answer survives — and the difference between the
+/// two is exactly how much of the slowest robot's journey the capped integer no
+/// longer accounts for, recoverable from the plan alone. Read them together
+/// before drawing any distance conclusion from `interval_ms`.
+TEST(RendezvousCap, PullsTheIntervalInAndAdvertisesThatItDid) {
   CellWorld w = world5(0);
   const auto robots = pair2(0, 4);
-  const Allocation a = tours2(w, robots, {1, 2}, {3});
+  const Allocation a = detourTours(w, robots);
 
   RendezvousScheduler::Config c = sched0();
-  c.max_interval_ms = 8'000;
+  c.max_interval_ms = 40'000;
   const RendezvousPlan p =
       RendezvousScheduler::solve(w, robots, a, -1, 1'000, c);
 
   ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.cell, 2);
   EXPECT_TRUE(p.capped);
-  EXPECT_EQ(p.interval_ms, 20'000) << "the uncapped interval stays readable";
-  EXPECT_EQ(p.t_meet_ms, 9'000);
-  // How late the slowest robot will be, recoverable from the plan alone.
-  EXPECT_EQ(p.interval_ms - (p.t_meet_ms - 1'000), 12'000);
+  EXPECT_FALSE(p.floored) << "40 s cap is above the 20 s floor";
+  EXPECT_NEAR(static_cast<double>(p.tour_interval_ms), 84'721.0, 2.0)
+      << "the objective's own answer stays readable";
+  EXPECT_EQ(p.interval_ms, 40'000);
+  // solve() writes the two together: t_meet = mission_elapsed + interval, one
+  // assignment site. The NODE does not preserve this identity — arming
+  // recomputes t_meet as the first AGREED OCCURRENCE the robot can reach
+  // (nextAgreedOccurrence), which is t_meet + k*interval for some k >= 0 rather
+  // than mission_elapsed + interval — so the identity is a property of a solve
+  // result only.
+  EXPECT_EQ(p.t_meet_ms, 41'000) << "derive time + interval";
+  // The part of the slowest robot's journey the capped integer drops.
+  EXPECT_NEAR(static_cast<double>(p.tour_interval_ms - p.interval_ms),
+              44'721.0, 2.0);
+}
+
+/// THE FLOOR OUTRANKS THE CAP. A cap below the furthest robot's drive asks the
+/// interval to claim a journey shorter than the one that has to be made; the
+/// number would shrink and the drive would not. It stops at the floor instead.
+///
+/// BOTH FLAGS ARE TRUE HERE, and that pair is the whole point of the test.
+/// `capped` is true because the cap did pull the interval in from the tours'
+/// 84.72 s; it just did not get the 5 s it asked for. `floored` is true because
+/// the floor is what refused it. Both true — equivalently `interval_ms` above
+/// the cap — is the shape that says the findability inequality is broken: the
+/// furthest robot cannot reach the cell before the barrier gives up on it, and
+/// the node warns when it sees it rather than leaving it to an analysis.
+///
+/// A derivation that reported NEITHER flag here shipped briefly on 2026-09-18
+/// and this test is what caught it. Do not "fix" a failure of these two
+/// assertions by relaxing them: a plan that says nothing bound, in the one
+/// configuration where two things bound, is a silent null.
+TEST(RendezvousCap, CannotCutBelowTheReachabilityFloor) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = detourTours(w, robots);
+
+  RendezvousScheduler::Config c = sched0();
+  c.max_interval_ms = 5'000;           // below the 20 s direct drive
+  const RendezvousPlan p =
+      RendezvousScheduler::solve(w, robots, a, -1, 1'000, c);
+
+  ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.interval_ms, 20'000) << "the direct drive, not the 5 s cap";
+  EXPECT_GT(p.interval_ms, c.max_interval_ms) << "the broken-inequality shape";
+  EXPECT_TRUE(p.capped) << "the cap cut from the tours' 84.72 s";
+  EXPECT_TRUE(p.floored) << "and the reachability floor is what refused it";
+  EXPECT_EQ(p.t_meet_ms, 21'000);
+}
+
+/// A CAP EXACTLY ON THE TOUR TERM CUT NOTHING, AND MUST NOT SAY IT DID.
+///
+/// The boundary between the two readings of `capped`, and the only mutant the
+/// rest of this group did not kill: `max_interval_ms < tour_interval_ms` versus
+/// `<=`. They differ on exactly one input and it is not a contrived one.
+///
+/// It matters because `capped` is a scored column. A run whose cap happens to
+/// sit on the tour term would report the cap as having chosen the meeting time
+/// when the objective chose it, and the diagnostic that exists to say "the cap,
+/// not the objective, is picking the schedule" would say so falsely. Equality
+/// is reachable rather than measure-zero because the node feeds the cap from a
+/// configured round number — `rendezvous_appointment_wait_sec` since generation
+/// 29 — while the tour term is a quantised grid distance at a nominal speed.
+///
+/// The cap is read back off a first solve rather than hardcoded, so the test
+/// stays on the boundary if the fixture's distances ever change.
+TEST(RendezvousCap, ACapExactlyOnTheTourTermIsNotACut) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = detourTours(w, robots);
+
+  RendezvousScheduler::Config c = sched0();
+  c.max_interval_ms = 0;                       // uncapped: learn the tour term
+  const RendezvousPlan base =
+      RendezvousScheduler::solve(w, robots, a, -1, 1'000, c);
+  ASSERT_TRUE(base.valid()) << base.refused;
+  ASSERT_GT(base.tour_interval_ms, 0);
+  ASSERT_FALSE(base.capped) << "an uncapped solve cannot be capped";
+
+  c.max_interval_ms = base.tour_interval_ms;   // exactly on the boundary
+  const RendezvousPlan p =
+      RendezvousScheduler::solve(w, robots, a, -1, 1'000, c);
+
+  ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.interval_ms, base.interval_ms)
+      << "a cap equal to the tour term changes nothing about the answer";
+  EXPECT_FALSE(p.capped)
+      << "the cap is equal to the tour term, so it cut nothing — reporting it "
+         "as a cut credits the cap with a schedule the objective chose";
+  EXPECT_FALSE(p.floored) << "the floor is below the tour term in this fixture";
 }
 
 TEST(RendezvousCap, DoesNothingWhenTheToursAlreadyMeetSooner) {
@@ -523,6 +637,177 @@ TEST(RendezvousCap, DoesNothingWhenTheToursAlreadyMeetSooner) {
   EXPECT_FALSE(p.capped);
   EXPECT_EQ(p.t_meet_ms, 20'000);
 }
+
+/// THE REACHABILITY FLOOR, on the fixture the objective is happiest with. Both
+/// robots are one cell from the meeting on their own tours, so the tour term is
+/// a single grid step — and the direct drive is that same step, so the floor
+/// binds only once `depart_safety_milli` marks it up. At 1.5x the 20 s drive
+/// becomes a 30 s period.
+///
+/// This is the safety factor doing its stated job at the schedule level rather
+/// than only at the departure test: an occurrence exactly one nominal drive
+/// apart leaves no room for the difference between a straight line on the cell
+/// graph and what a robot actually does through trees.
+TEST(RendezvousFloorInterval, DirectDriveWithSafetyRaisesThePeriod) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = tours2(w, robots, {1, 2}, {3});
+
+  RendezvousScheduler::Config c = sched0();
+  c.depart_safety_milli = 1500;
+  const RendezvousPlan p = RendezvousScheduler::solve(w, robots, a, -1, 0, c);
+
+  ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.cell, 2);
+  EXPECT_EQ(p.tour_interval_ms, 20'000);
+  EXPECT_TRUE(p.floored);
+  EXPECT_EQ(p.interval_ms, 30'000) << "1.5 x the 20 m direct drive";
+  EXPECT_EQ(p.t_meet_ms, 30'000);
+}
+
+/// `min_interval_ms` is the other half of the floor and it is a max, not a
+/// sum: a configured minimum below the drive changes nothing.
+TEST(RendezvousFloorInterval, MinIntervalIsAFloorNotAnAddend) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = tours2(w, robots, {1, 2}, {3});
+
+  RendezvousScheduler::Config c = sched0();
+  c.min_interval_ms = 5'000;           // under the 20 s drive
+  const RendezvousPlan below = RendezvousScheduler::solve(w, robots, a, -1, 0, c);
+  ASSERT_TRUE(below.valid()) << below.refused;
+  EXPECT_EQ(below.interval_ms, 20'000);
+  EXPECT_FALSE(below.floored);
+
+  c.min_interval_ms = 45'000;          // over it
+  const RendezvousPlan above = RendezvousScheduler::solve(w, robots, a, -1, 0, c);
+  ASSERT_TRUE(above.valid()) << above.refused;
+  EXPECT_EQ(above.tour_interval_ms, 20'000) << "the tour term is untouched";
+  EXPECT_TRUE(above.floored);
+  EXPECT_EQ(above.interval_ms, 45'000);
+}
+
+/// THE CAMPAIGN'S OWN CONFIGURATION, as two numbers rather than as a claim in a
+/// comment: a 300 s lattice (`rendezvous_interval_sec`) against an unbounded
+/// barrier wait (`rendezvous_appointment_wait_sec` = 0, the directive's "be
+/// there until all robots are connected").
+///
+/// Generation 29 exists because of what the spacing does downstream. A robot
+/// signs up to the first rung it can reach inside its lateness budget, and
+/// hybrid chases only while its appointment is not yet due — so the chase
+/// window is roughly `interval_ms` minus that budget. On the banked generation-
+/// 28 armings the derived lattice was 30 s and the budget 60 s, which is a
+/// NEGATIVE window on 180 of 211 armings: hybrid armed and never chased once.
+/// The two assertions below are what make the 60 s budget affordable, and they
+/// are about the returned INTERVAL, not about the knob, because it is the
+/// interval the departure test reads.
+///
+/// `capped` false is a contract, not an observation. The node announces it at
+/// startup precisely so a reader finds a constant column and knows it was
+/// configured rather than broken — see the rendezvous_appointment_wait_sec
+/// INFO in ExploPlannerNode's parameter block.
+TEST(RendezvousFloorInterval, TheCampaignLatticeHoldsAndTheUncappedBarrierNeverBinds) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = tours2(w, robots, {1, 2}, {3});
+
+  RendezvousScheduler::Config c = sched0();
+  c.min_interval_ms = 300'000;   // RDV_INTERVAL=300
+  c.max_interval_ms = 0;         // RDV_APPT_WAIT=0, wait forever
+  const RendezvousPlan p = RendezvousScheduler::solve(w, robots, a, -1, 0, c);
+
+  ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.interval_ms, 300'000)
+      << "the 300 s lattice did not survive the solve, so the rung spacing a "
+         "late robot rolls to — and hybrid's chase window — is whatever the "
+         "tours happened to ask for";
+  EXPECT_GE(p.interval_ms - 60'000, 240'000)
+      << "the WIDEST hybrid's chase window can be at the campaign's 60 s "
+         "lateness budget — a supremum, not a floor: the window is the gap "
+         "from the arming instant to the next rung less min(lead, budget), so "
+         "an arming that lands just short of a rung gets none of it";
+  EXPECT_TRUE(p.floored) << "the lattice is what raised it above the tours";
+  EXPECT_FALSE(p.capped)
+      << "max_interval_ms=0 is uncapped; a true `capped` here would mean the "
+         "0 sentinel had started being read as a 0 ms cap";
+  EXPECT_EQ(p.t_meet_ms, 300'000) << "mission_elapsed 0 + one interval";
+}
+
+/// A BARRIER WAIT SHORTER THAN THE LATTICE IS OVERRULED SILENTLY, AND `capped`
+/// IS NOT THE PLACE THAT SAYS SO.
+///
+/// This is not hypothetical arithmetic: it is what the campaign configuration
+/// produces the moment anyone sets RDV_APPT_WAIT to a finite value without also
+/// lowering RDV_INTERVAL below it. The floor outranks the cap, so the answer is
+/// a flat 300 s and the broken findability inequality — the furthest robot
+/// needs longer to arrive than the barrier will wait — holds on every derive.
+///
+/// The trap this pins is which signal notices. `capped` asks a narrower
+/// question than its name suggests: did the cap CUT THE OBJECTIVE'S OWN ASK.
+/// Here the tours asked for 20 s, the cap is 240 s, so the cap cut nothing and
+/// the flag is false — correctly, by the definition the solver's own comment
+/// spends sixty lines establishing, and the alternative reading is the one that
+/// was removed for making `capped` unable to separate "the cap bound" from "the
+/// floor did". So an analyst tallying `capped` over a campaign misconfigured
+/// exactly this way finds a column of zeroes and concludes the barrier was
+/// never overrun.
+///
+/// What DOES notice is the comparison the node's findability WARN makes
+/// directly, `interval_ms > max_interval_ms`, asserted below so that the
+/// predicate keeps meaning what the WARN reads it to mean.
+TEST(RendezvousCap, ABarrierWaitUnderTheLatticeIsOverruledAndCappedDoesNotSaySo) {
+  CellWorld w = world5(0);
+  const auto robots = pair2(0, 4);
+  const Allocation a = tours2(w, robots, {1, 2}, {3});
+
+  RendezvousScheduler::Config c = sched0();
+  c.min_interval_ms = 300'000;
+  c.max_interval_ms = 240'000;   // below the lattice
+  const RendezvousPlan p = RendezvousScheduler::solve(w, robots, a, -1, 0, c);
+
+  ASSERT_TRUE(p.valid()) << p.refused;
+  EXPECT_EQ(p.interval_ms, 300'000)
+      << "the floor no longer outranks the cap, so a 240 s barrier now cuts "
+         "the lattice down to a spacing the furthest robot cannot drive";
+  EXPECT_GT(p.interval_ms, c.max_interval_ms)
+      << "the shape the node's findability WARN fires on";
+  EXPECT_TRUE(p.floored) << "the lattice is what raised it above the tours";
+  EXPECT_FALSE(p.capped)
+      << "`capped` has gone back to meaning \"the cap was not the answer\" "
+         "rather than \"the cap cut the ask\". Under that reading it is true "
+         "here AND true whenever the floor alone bound, which is the "
+         "conflation that made the flag unable to separate the two";
+}
+
+// ---------------------------------------------------------------------------
+// occurrenceAtOrAfter is GONE (generation 19); the schedule is not
+//
+// Five tests stood here pinning RendezvousScheduler::occurrenceAtOrAfter — a
+// future phase returned as-is, at-or-after rather than strictly-after, a phase
+// long past rolling forward, two robots straddling a boundary landing EXACTLY
+// one period apart, and a non-positive period returning the phase.
+//
+// The fourth one is why the whole thing is deleted rather than kept for a rainy
+// day. It pinned the property the barrier was designed around: "the gap two
+// robots have to bridge is exactly one period, which the barrier's wait
+// covers." That is true of the function and was false of the system, because
+// nothing bounded the arming spread to one period. The N=3 smoke armed at
+// 16.1 / 52.5 / 67.4 s against a 30 s period — 1.7 periods — and the three
+// robots selected three different occurrences off byte-identical integers.
+//
+// A green unit test for an arithmetic identity, sitting under a comment
+// asserting a system property the arithmetic cannot deliver, is worse than no
+// test: it reads as coverage of the thing that broke.
+//
+// GENERATION 23 TAKES THE ARITHMETIC BACK AND LEAVES THE CLAIM BEHIND. The
+// roll-forward lives in planner_util as nextAgreedOccurrence, and the barrier
+// it feeds is unbounded (rendezvous_appointment_wait_sec = 0), so two robots
+// on different occurrences now cost each other WAITING at the agreed cell
+// rather than a missed reunion. Its tests say that under their own names, in
+// test_planner_util.cpp — including
+// NextAgreedOccurrence.TwoRobotsOnOneAgreementDifferByWholeIntervals, which
+// pins the honest version of the property the fourth deleted test overstated.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Refusals — every one of them a stated answer, none of them a silent -1
@@ -613,4 +898,253 @@ TEST(RendezvousRefusal, EmptyToursWithAFloorStillPlans) {
   EXPECT_TRUE(p.floor_won);
   EXPECT_EQ(p.penalty_mm, 20'000) << "0 m makespan -> 20 m makespan";
   EXPECT_EQ(p.interval_ms, 20'000);
+}
+
+// ---------------------------------------------------------------------------
+// The handshake: adopt/upgrade/conflict, and the peer latch.
+//
+// These pin the two decisions that killed the N>=3 rendezvous arm. Both lived
+// inside the ROS node until 2026-09-17 and neither could be exercised without
+// running a 600 s cell, which is how both survived three code reviews.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using Adopt = RendezvousHandshake::Adopt;
+
+/// `due` defaults to false so that every case below which does not name it is
+/// asking the pre-generation-29 question: what happens to a robot that is NOT
+/// waiting to be told the next place and time. That is still the overwhelming
+/// majority of ticks, and the refusals it must produce are unchanged.
+Adopt adopt(bool pv, bool pp, bool hv, bool hp, bool eq, bool due = false) {
+  return RendezvousHandshake::adopt(pv, pp, hv, hp, eq, due);
+}
+
+/// A stand-in for the node's private RendezvousProposal, with the two
+/// operations the latch template needs. Deliberately its own type: if the test
+/// used the node's struct it could not be a unit test, and if the template
+/// silently required more than this it would be depending on something the
+/// caller is not obliged to provide.
+struct Triple {
+  int  cell = -1;
+  int  when = -1;
+  bool valid() const { return cell >= 0 && when >= 0; }
+  bool operator==(const Triple& o) const {
+    return cell == o.cell && when == o.when;
+  }
+};
+
+}  // namespace
+
+TEST(RendezvousHandshakeAdopt, AnInvalidProposalIsNeverActedOn) {
+  // Silence is not a withdrawal, and it is not a conflict either. Every
+  // combination of what THIS robot holds must come back kIgnore, because a
+  // proposer that has said nothing has not contradicted anything.
+  for (int bits = 0; bits < 8; ++bits) {
+    const bool pp = bits & 1, hv = bits & 2, hp = bits & 4;
+    EXPECT_EQ(adopt(/*peer_valid=*/false, pp, hv, hp, /*eq=*/false),
+              Adopt::kIgnore) << "bits=" << bits;
+    EXPECT_EQ(adopt(/*peer_valid=*/false, pp, hv, hp, /*eq=*/true),
+              Adopt::kIgnore) << "bits=" << bits;
+  }
+}
+
+TEST(RendezvousHandshakeAdopt, HoldingNothingTakesWhateverIsOffered) {
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, /*held=*/false, false, false),
+            Adopt::kTake);
+  // Including a provisional one. Taking the placeholder is the POINT of the
+  // bootstrap: a team that waits for a tour-informed proposal has no
+  // appointment at all during the window where it is about to need one.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/true, /*held=*/false, false, false),
+            Adopt::kTake);
+}
+
+TEST(RendezvousHandshakeAdopt, TheOneUpgradeFiresAndOnlyInThatDirection) {
+  // P -> R: the upgrade.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/true, false),
+            Adopt::kUpgrade);
+  // R -> P would be a proposer walking backwards onto the centroid. It is a
+  // conflict, never an adoption, whether or not a replacement was asked for:
+  // the answer to "tell me the next meeting" is not a placeholder.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/true, true, /*held_prov=*/false, false),
+            Adopt::kConflict);
+  EXPECT_EQ(adopt(true, /*peer_prov=*/true, true, /*held_prov=*/false, false,
+                  /*due=*/true), Adopt::kConflict);
+  // P -> P is the centroid being republished as a different cell, which the
+  // derive gate is supposed to make impossible. If it happens the published
+  // meeting place would follow the team's centroid around; refuse it.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/true, true, /*held_prov=*/true, false),
+            Adopt::kConflict);
+  // R -> R is a second real generation, and UNASKED-FOR it is still the shape
+  // that once put one robot on cell 56 and its partner on cell 57.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/false, false),
+            Adopt::kConflict);
+}
+
+TEST(RendezvousHandshakeAdopt, TheReplacementLandsOnlyWhenItWasAskedFor) {
+  // GENERATION 29. The team kept the meeting, the maps merged, and the rule's
+  // last clause is that the next place and time are agreed before anyone
+  // resumes exploring. On a follower that arrives as R -> R', which the shape
+  // above refuses — so without the request flag the re-agreement could not land
+  // on anyone but the proposer, the commit gate would never see unanimity, and
+  // both appointment arms would re-meet at the t=0 cell for the whole run while
+  // every follower logged an ERROR.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/false,
+                  /*eq=*/false, /*due=*/true), Adopt::kReagree);
+
+  // EQUALITY STILL OUTRANKS IT, and this is the case that makes the flag safe
+  // to leave set across ticks. The proposer republishes on every heartbeat, so
+  // between the request and the answer there are many ticks where the numbers
+  // still match. Answering those would spend the request on nothing and leave
+  // the robot holding the old meeting with no outstanding ask.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/false,
+                  /*eq=*/true, /*due=*/true), Adopt::kIgnore);
+
+  // The upgrade still outranks it too: a robot owed a replacement that is also
+  // still on the placeholder takes the upgrade path, which clears the
+  // provisional flag. kReagree would leave that flag stale.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/true,
+                  /*eq=*/false, /*due=*/true), Adopt::kUpgrade);
+}
+
+TEST(RendezvousHandshakeAdopt, TheUpgradeOutranksEqualityOfTheIntegers) {
+  // The proposer re-derived and landed on the same three integers, this time
+  // with something to choose between. The team does not move, but the run
+  // stops being a placeholder run — and since that is the difference between
+  // "measured the scheduler" and "measured meet-at-the-centroid", the flag has
+  // to clear. kIgnore here would leave this robot reporting the wrong
+  // mechanism forever after.
+  EXPECT_EQ(adopt(true, /*peer_prov=*/false, true, /*held_prov=*/true,
+                  /*eq=*/true), Adopt::kUpgrade);
+}
+
+TEST(RendezvousHandshakeAdopt, RepublishingWhatWeAlreadyHoldIsANoOp) {
+  // The overwhelmingly common case: the proposer re-sends its triple on every
+  // heartbeat for the whole run. Neither flag state may turn that into a
+  // conflict, or the log fills with ERRORs on a healthy run.
+  EXPECT_EQ(adopt(true, false, true, false, /*eq=*/true), Adopt::kIgnore);
+  EXPECT_EQ(adopt(true, true,  true, true,  /*eq=*/true), Adopt::kIgnore);
+}
+
+TEST(RendezvousHandshakeAdopt, EveryInputCombinationHasExactlyOneAnswer) {
+  // Exhaustive over all 32 inputs. Not for coverage — for the property that
+  // the function is TOTAL. The version this replaced was an `if` with an
+  // `else if` and no `else`, and the case it silently dropped (hold a
+  // placeholder, peer offers a final one, follower side) was the upgrade
+  // itself: it fell through both branches and did nothing at all.
+  int taken = 0, upgraded = 0, conflicts = 0, ignored = 0, reagreed = 0;
+  for (int bits = 0; bits < 64; ++bits) {
+    const bool pv = bits & 1, pp = bits & 2, hv = bits & 4,
+               hp = bits & 8, eq = bits & 16, due = bits & 32;
+    switch (adopt(pv, pp, hv, hp, eq, due)) {
+      case Adopt::kTake:     ++taken;     break;
+      case Adopt::kUpgrade:  ++upgraded;  break;
+      case Adopt::kConflict: ++conflicts; break;
+      case Adopt::kIgnore:   ++ignored;   break;
+      case Adopt::kReagree:  ++reagreed;  break;
+    }
+  }
+  EXPECT_EQ(taken + upgraded + conflicts + ignored + reagreed, 64);
+  // 32 with peer_valid=false (nothing on offer, whatever we hold and whatever
+  // we are waiting for), plus the 3 (pp, hp) combinations that already match
+  // and are not the upgrade, at either value of `due`.
+  EXPECT_EQ(ignored, 38);
+  // Peer valid, hold nothing: pp x hp x eq x due. hp is meaningless when
+  // held_valid is false and the function must not care — it is still 16 inputs
+  // and they must all take the offer. `due` cannot matter either: a robot
+  // holding nothing has no meeting to have kept.
+  EXPECT_EQ(taken, 16);
+  // Peer valid and final, hold the placeholder, either value of eq and of due.
+  EXPECT_EQ(upgraded, 4);
+  // EXACTLY ONE INPUT re-agrees, and that narrowness is the point: peer final,
+  // holding a final we do not already match, and owed a replacement. Every
+  // neighbouring input is a refusal or a no-op.
+  EXPECT_EQ(reagreed, 1);
+  // R->P at either value of due, P->P at either, and R->R unasked-for.
+  EXPECT_EQ(conflicts, 5);
+}
+
+TEST(RendezvousHandshakeLatch, AMatchingEchoIsRecorded) {
+  const Triple held{7, 100};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(Triple{7, 100}, held, latched);
+  EXPECT_TRUE(latched == held);
+}
+
+TEST(RendezvousHandshakeLatch, TheRecordSurvivesTheSilenceItWasMadeFor) {
+  // The whole reason the latch exists: at N>=3 the echoes do not coincide, so
+  // a record has to outlive the tick it was made on. Repeating the same
+  // message must not disturb it either.
+  const Triple held{7, 100};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(Triple{7, 100}, held, latched);
+  for (int i = 0; i < 5; ++i)
+    RendezvousHandshake::updatePeerLatch(Triple{7, 100}, held, latched);
+  EXPECT_TRUE(latched == held);
+}
+
+TEST(RendezvousHandshakeLatch, AnUpgradeAwayClearsTheRecordRatherThanKeepingIt) {
+  // THE FALSE-COMMIT BUG, pinned. The peer echoed our placeholder, then
+  // upgraded off it. The old code dropped a record only on pair -> empty, so
+  // this stale record stood, was counted toward fleet-1, and produced a
+  // "Rendezvous AGREED by all" for a triple the peer no longer held — an
+  // appointment it would never attend, followed by a no-show logged against a
+  // robot that was never on that schedule.
+  const Triple held{7, 100};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(Triple{7, 100}, held, latched);
+  ASSERT_TRUE(latched == held);
+  RendezvousHandshake::updatePeerLatch(Triple{9, 240}, held, latched);
+  EXPECT_FALSE(latched.valid())
+      << "a peer that has moved on must not still count toward the commit";
+}
+
+TEST(RendezvousHandshakeLatch, WalkingBackToNothingAlsoClearsIt) {
+  const Triple held{7, 100};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(Triple{7, 100}, held, latched);
+  ASSERT_TRUE(latched == held);
+  RendezvousHandshake::updatePeerLatch(Triple{}, held, latched);
+  EXPECT_FALSE(latched.valid());
+}
+
+TEST(RendezvousHandshakeLatch, AnEchoOfSomethingElseIsNeverRecorded) {
+  // A peer publishing a triple that is not ours gives no evidence about ours.
+  const Triple held{7, 100};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(Triple{9, 240}, held, latched);
+  EXPECT_FALSE(latched.valid());
+}
+
+TEST(RendezvousHandshakeLatch, OurOwnUpgradeStrandsThePeerRecordsHarmlessly) {
+  // The other direction of the same race, and it is guarded DIFFERENTLY — the
+  // distinction is worth a test because getting it backwards is how the false
+  // commit happened in the first place.
+  //
+  // When the PEER moves on, the record is cleared, because nothing downstream
+  // would otherwise notice (test above). When THIS robot moves on, the record
+  // is deliberately left alone: it is still a true statement about the peer,
+  // the peer has not contradicted it, and there is no message to clear it with
+  // — the peers are still happily republishing the placeholder. What stops it
+  // counting is that the commit rule compares each record against what this
+  // robot CURRENTLY holds, so a record naming a superseded triple simply is not
+  // equal to anything the commit is asking about.
+  //
+  // This test pins that property, because it is the one the safety of leaving
+  // the record alone rests on. If the commit rule is ever relaxed to counting
+  // valid records instead of matching ones, this is what fails.
+  const Triple placeholder{9, 240};
+  Triple latched;
+  RendezvousHandshake::updatePeerLatch(placeholder, placeholder, latched);
+  ASSERT_TRUE(latched == placeholder);
+
+  const Triple upgraded{7, 100};
+  RendezvousHandshake::updatePeerLatch(placeholder, upgraded, latched);
+  EXPECT_FALSE(latched == upgraded)
+      << "a record against a triple this robot has superseded must not be "
+         "equal to the one it now holds, or it would count toward the commit";
+
+  // ...and it re-records the moment that peer echoes the new one.
+  RendezvousHandshake::updatePeerLatch(upgraded, upgraded, latched);
+  EXPECT_TRUE(latched == upgraded);
 }

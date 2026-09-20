@@ -74,13 +74,30 @@ TWO CONTROLS, read first. Neither is an endpoint.
                       radio outage in this output. Every other difference in
                       the table is then suspect.
 
-n=3 vs n=3 CANNOT PRODUCE A SIGNIFICANT RESULT. The exact permutation null over
-C(6,3)=20 splits pairs each split with its complement, so the smallest
-attainable two-sided p is 2/20 = 0.10. The p column is printed to show which
-metrics are even at that floor; it is not evidence of significance and must not
-be reported as such. What n=3 can support is SEPARATION -- whether the two
-groups' values overlap at all -- which is why that column exists and is listed
-first. A clean split at n=3 is a reason to run more seeds, not a result.
+AT SMALL n THE p COLUMN IS ARITHMETIC, NOT EVIDENCE. The exact permutation null
+over C(6,3)=20 splits pairs each split with its complement, so at n=3 vs n=3 no
+row can go below 2/20 = 0.10 and NOTHING in the table can reach 0.05 whatever
+the data say. 0.10 is the best case, not the usual one: the null is built from
+|median difference|, and relabellings that tie the most extreme difference count
+against the floor too, so the floors actually printed at 3 vs 3 run 0.2 upward.
+A row whose values are all identical -- `deconflict rej frac` on a campaign with
+no deconfliction -- has every relabelling tied and a floor of exactly 1.0, which
+is the honest reading of a p-value computed over one distinct number.
+What n=3 can support is SEPARATION -- whether
+the two groups' values overlap at all -- which is why that column exists and is
+listed first. A clean split at n=3 is a reason to run more seeds, not a result.
+
+That was written as a flat statement about this script for as long as it existed,
+and then the footer printed "nothing here can be significant" on every run to
+match -- including the runs where it was false. n=3 is where the script started,
+not a size it enforces: pointed at a 29-per-arm campaign the floor is ~1e-5 and a
+p of 0.001 means what it says. Worse, the floor was computed by materialising
+C(nx+ny, nx) tuples, which at 20 vs 20 is 1.4e11 of them -- the script could not
+FINISH on a campaign large enough for the sentence to be wrong, so the two
+defects covered for each other. The floor is now computed per row from the values
+that row actually used (censoring and unreadable logs shrink the groups per
+metric, so the nominal group size is not it), and the footer reports what it
+found instead of asserting a conclusion.
 
 THE p COLUMN IS modes_compare's. Exact by enumeration at the small n this file
 was written for -- the 2/20 floor above is a fact about that enumeration -- and
@@ -93,7 +110,6 @@ at all. See modes_compare_calib.py for the known-answer cases.
 import argparse
 import csv
 import glob
-import itertools
 import os
 import statistics as st
 import sys
@@ -160,12 +176,38 @@ def _at(rows, t):
 
 
 def load_run(run_dir):
+    """One cell, or a dict carrying `unusable` and the reason it is.
+
+    THIS WHOLE FILE IS PAIRWISE BY CONSTRUCTION and that is not a bug to be
+    fixed here. Every endpoint below is a two-robot quantity -- `divergence` is
+    |u_a - u_b|, `laggard_lag` is second-minus-first, `min_pair_dist` is the
+    distance between a and b -- so an N=3 cell has no single value for any of
+    them, and a sensible N-robot version would have to choose between all C(N,2)
+    pairs, the worst pair, and the mean pair. That is a design decision with
+    different answers for different questions, not a loop to bolt on.
+
+    What IS fixed here is the reporting. This used to `return None` for a cell
+    with anything other than two planner CSVs, the caller dropped every None,
+    and an N=3 campaign printed "FATAL: no usable runs" -- which reads as "your
+    logs are broken" when the truth is "this tool does not answer this question
+    for this team size". A silent drop and a refusal are different facts, and the
+    one that costs a day of diagnosis is the silent drop.
+    """
+    name = os.path.basename(run_dir.rstrip("/"))
     paths = sorted(glob.glob(os.path.join(run_dir, "planner_*.csv")))
     if len(paths) != 2:
-        return None
+        return dict(name=name, unusable=(
+            f"{len(paths)} planner CSV(s); comms_metrics is pairwise by "
+            f"construction (divergence, laggard_lag and min_pair_dist are all "
+            f"two-robot quantities) and cannot summarise this cell. Use "
+            f"event_log.py for its endpoints."))
     a, b = _rows(paths[0]), _rows(paths[1])
     if not a or not b:
-        return None
+        empty = [os.path.basename(q) for q, r in ((paths[0], a), (paths[1], b))
+                 if not r]
+        return dict(name=name, unusable=(
+            f"no data rows in {','.join(empty)} — the planner wrote a header "
+            f"and nothing else, so the run produced no samples to read"))
     reason = ""
     man = os.path.join(run_dir, "run_manifest.txt")
     end_t = None
@@ -471,13 +513,58 @@ def main():
                     help="coverage level for the matched-on-coverage endpoints "
                          "(default: the deepest level EVERY run reaches)")
     ap.add_argument("--step", type=float, default=100.0)
+    # THE FLAG THE ERROR MESSAGE ALREADY TOLD PEOPLE TO PASS. load_run() calls
+    # event_log.summarise_run(), and when that refuses a cell for being below
+    # the schema floor it relays the reader's own text verbatim: "Pass
+    # --min-schema 4 to read it deliberately." This script did not have a
+    # --min-schema, so the instruction it printed was unactionable -- the
+    # operator did exactly what the output said and got
+    # `unrecognized arguments: --min-schema 4`. On every banked campaign below
+    # the current schema (which today is every campaign but one), that meant
+    # t_done_team / t_explore / t_mission came back blank with no way to
+    # recover them from here.
+    #
+    # Exposed rather than removed from the message, because the refusal is
+    # right: pooling cells from an older binary generation is the thing the
+    # floor exists to prevent, and the flag makes reading them a deliberate act
+    # with a warning attached rather than a silent default.
+    ap.add_argument("--min-schema", type=int, default=None,
+                    help="lower the event-log schema floor (default: the "
+                         "reader's own, currently the shipped kSchemaVersion). "
+                         "Pooling generations is on you.")
     args = ap.parse_args()
+
+    if args.min_schema is not None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import event_log
+        if args.min_schema > event_log.MIN_SCHEMA:
+            print(f"warning: --min-schema {args.min_schema} RAISES the floor "
+                  f"above the reader's default {event_log.MIN_SCHEMA}. That "
+                  f"refuses cells the reader would have accepted; it does not "
+                  f"pool anything.")
+        elif args.min_schema < event_log.MIN_SCHEMA:
+            print(f"warning: reading event logs at schema >= "
+                  f"{args.min_schema} instead of the default "
+                  f"{event_log.MIN_SCHEMA}. Cells from more than one binary "
+                  f"generation can now enter the same comparison, and this "
+                  f"script cannot tell them apart — check run_manifest.txt.")
+        event_log.MIN_SCHEMA = args.min_schema
 
     groups = {}
     for label, pats in ((args.label_a, args.a), (args.label_b, args.b)):
-        runs = [r for r in (load_run(d) for d in expand(pats)) if r]
+        loaded = [load_run(d) for d in expand(pats)]
+        runs = [r for r in loaded if r and "unusable" not in r]
+        # Name every dropped cell and say why. A count of survivors with no list
+        # of casualties is the shape of a check that stopped checking: 12 of 40
+        # cells silently absent looks exactly like 12 cells.
+        for r in loaded:
+            if r and "unusable" in r:
+                print(f"SKIP {label} {r['name']}: {r['unusable']}")
         if not runs:
             print(f"FATAL: no usable runs for {label}: {pats}")
+            print("       (see the SKIP lines above for why each cell was "
+                  "dropped — 'no usable runs' is not by itself evidence that "
+                  "the data is bad)")
             return 2
         groups[label] = runs
 
@@ -552,6 +639,12 @@ def main():
           f"{'delta':>11}{'sep':>9}{'perm p':>9}  note")
     print("-" * 106)
     verdict = []
+    # Per row, because the groups are not the same size from row to row. A run
+    # whose event log would not load has None for t_done_team and drops out of
+    # those rows only; a censored run drops out of others. The footer used to
+    # compute one floor from len(groups[...]) and print it as though it applied
+    # to the whole table.
+    floors = []
     for key, label, direction, note in METRICS:
         xs = [vals[(args.label_a, r["name"])][key] for r in groups[args.label_a]
               if vals.get((args.label_a, r["name"])) and vals[(args.label_a, r["name"])][key] is not None]
@@ -575,6 +668,12 @@ def main():
         # certainty in a column the docstring above spends a paragraph warning
         # people not to over-read. A trailing '~' marks the sampled rows.
         pstr = mc.fmt_p(p) + ("~" if perm_sampled(xs, ys) else "")
+        # mc.perm_floor, not a closed form: 2/C(2n,n) is only right for EQUAL
+        # groups, and these are routinely unequal by the time the per-metric
+        # None-filtering above has run. It re-enters mc.perm_all, which is
+        # memoised on (xs, ys), so this is the same enumeration the p came from
+        # rather than a second one.
+        floors.append((label, len(xs), len(ys), mc.perm_floor(xs, ys)))
         print(f"{label:<22}{direction:<16}{ma:>11.4f}{mb:>11.4f}{mb - ma:>11.4f}"
               f"{sep:>9}{pstr:>9}  {note}{'' if not note else ' '}"
               f"{'' if abs(rel) != abs(rel) else f'({rel:+.0f}%)'}  {rng}")
@@ -609,11 +708,37 @@ def main():
             print(f"  their laggard never reached the criterion, so their lag is a "
                   f"LOWER BOUND and {label}'s median lag is a lower bound too. "
                   f"These are the worst cases for the condition, not missing data.")
-    p_floor = 2.0 / len(list(itertools.combinations(
-        range(len(groups[args.label_a]) + len(groups[args.label_b])),
-        len(groups[args.label_a]))))
-    print(f"permutation p floor at this n is {p_floor:.3f} — nothing here can be "
-          f"significant; read the sep column.")
+    # What the floors actually came out at, rather than the conclusion this
+    # line used to print unconditionally. Three cases, and the old text was only
+    # ever right about the first.
+    if not floors:
+        print(f"permutation p floor: not computed — no metric had two usable "
+              f"values on both sides, so every p above is blank and the sep "
+              f"column is all there is.")
+    else:
+        blocked = [(lab, nx, ny, f) for lab, nx, ny, f in floors if f >= 0.05]
+        worst = max(f for _, _, _, f in floors)
+        best = min(f for _, _, _, f in floors)
+        if len(blocked) == len(floors):
+            print(f"permutation p floor is {best:.3g}–{worst:.3g} across the "
+                  f"{len(floors)} comparable row(s) — EVERY row is at or above "
+                  f"0.05, so nothing here can be significant whatever the data "
+                  f"say; read the sep column.")
+        elif blocked:
+            print(f"permutation p floor spans {best:.3g}–{worst:.3g} across the "
+                  f"{len(floors)} comparable row(s). {len(blocked)} of them "
+                  f"CANNOT reach 0.05 at the group sizes that row had, so their "
+                  f"p is arithmetic and not evidence — read sep for those:")
+            for lab, nx, ny, f in blocked:
+                print(f"    {lab}: floor {f:.3g} at n={nx} vs {ny}")
+            print(f"  The rest have a floor below 0.05 and their p means what "
+                  f"it says, subject to {len(floors)} comparisons in one table.")
+        else:
+            print(f"permutation p floor is {best:.3g}–{worst:.3g} across the "
+                  f"{len(floors)} comparable row(s) — all below 0.05, so n is "
+                  f"not what limits significance here. Read p, but read it as "
+                  f"{len(floors)} comparisons in one table: 0.05 family-wise is "
+                  f"about {0.05 / len(floors):.3g} per row.")
     if not verdict:
         print(f"NO metric separates {args.label_a} from {args.label_b} at this n.")
     else:

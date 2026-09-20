@@ -33,8 +33,18 @@ public:
 
   /// Resample the cost grid from a fresh planning_map.
   ///
-  /// `obstacle_threshold` matches the planner's existing isCellFree threshold:
-  /// values >= threshold and unknown (-1) cells are treated as impassable.
+  /// `obstacle_threshold` matches the planner's existing isCellFree threshold.
+  /// A cell is impassable iff it is KNOWN and at or above the threshold, i.e.
+  /// `v >= 0 && v >= obstacle_threshold` (`cost_grid.cpp:61-66`).
+  ///
+  /// UNKNOWN (-1) IS TRAVERSABLE. This is deliberate and is the opposite of
+  /// what this comment used to claim. The flood's job is to find free pockets
+  /// sealed off by *known* obstacles; it is not a free-space test. Blocking
+  /// unknown would make every frontier a wall and the reachability filter
+  /// would reject exactly the candidates exploration exists to reach. The
+  /// per-candidate `isCellFree()` check in the node is what refuses to stand
+  /// a robot on an unknown cell — the two filters have different jobs and
+  /// must not be "made consistent".
   /// Origin / resolution / dims are captured from the OccupancyGrid so the
   /// caller can convert candidate world XY to grid coords without keeping a
   /// pointer to the original message.
@@ -47,9 +57,14 @@ public:
   /// shortest-path distance from the source exceeds `radius_cap_m` are not
   /// touched and keep the sentinel kInfCost.
   ///
-  /// Setting `radius_cap_m <= 0` (or any value larger than the grid diagonal)
-  /// effectively runs an unbounded flood. The bound is what makes this
-  /// <1 ms per PLAN tick on the live system.
+  /// Setting `radius_cap_m <= 0` (or NaN) runs a genuinely unbounded flood —
+  /// the cap becomes +inf. THE GRID DIAGONAL IS NOT AN EQUIVALENT BOUND: these
+  /// are *walked* Dijkstra distances, which routinely exceed the straight-line
+  /// diagonal around serpentine corridors and U-shaped obstacles, so a cap set
+  /// at the diagonal still leaves reachable cells at kInfCost and callers still
+  /// read them as unreachable. That was a real defect; see the note at the cap
+  /// computation in cost_grid.cpp. The bound is what makes this <1 ms per PLAN
+  /// tick on the live system.
   ///
   /// Diagonal moves cost sqrt(2) * resolution; orthogonal cost 1 * resolution.
   /// Out-of-bounds source returns cleanly: every cell stays at kInfCost.
@@ -94,7 +109,12 @@ private:
 
   /// Obstacle layer sampled from the OccupancyGrid at build() time.
   /// blocked_[gy * dims_x_ + gx] == true for cells that the flood will not
-  /// enter (occupied / inflated / unknown).
+  /// enter: KNOWN cells at or above `obstacle_threshold` (occupied or
+  /// inflated). Unknown (-1) cells are NOT blocked — see build() above.
+  /// The one exception is a malformed message whose `data.size()` disagrees
+  /// with `dims_x_ * dims_y_`, where every cell is marked blocked so the
+  /// flood is empty and the caller degrades to "nothing reachable" instead
+  /// of indexing past the end of the array.
   std::vector<uint8_t> blocked_;
 
   int dims_x_ = 0;

@@ -47,11 +47,16 @@
 #   DWELL_SYNC=0 ./run_explo_sim_rviz.sh    # A/B: drop the vantage-ring
 #                                           # rendezvous barrier (first robot to
 #                                           # arrive dwells alone) — see below
-#   RECONNECT_MODE=rendezvous ./run_explo_sim_rviz.sh
-#                                           # A/B: reconnection manoeuvre at
-#                                           # exploration exhaustion
-#                                           # (rendezvous | pursuit | hybrid)
-#                                           # — see below
+#   RECONNECT_MODE=mtare_rendezvous ./run_explo_sim_rviz.sh
+#                                           # A/B: reconnection manoeuvre when a
+#                                           # teammate goes out of comms. The
+#                                           # runnable arm tokens are mtare_off |
+#                                           # mtare_pursuit | mtare_rendezvous |
+#                                           # mtare_hybrid (+ the two _mdp ones),
+#                                           # plus plain `pursuit` and `off`.
+#                                           # Plain `rendezvous`/`hybrid` are
+#                                           # vocabulary only and cannot run —
+#                                           # see the RECONNECT_MODE block below
 #   CELL_WORLD=1 ./run_explo_sim_rviz.sh    # + the coarse M-TARE cell layer:
 #                                           # cell_census events in the jsonl
 #                                           # and a colour-coded grid in RViz.
@@ -272,7 +277,29 @@ EXPLOIT="${EXPLOIT:-1}"
 #
 # Six tokens, not eight, and NOT a 2x2x2: chase-on is a precondition of the
 # predictor, so the third factor is only defined on half the design.
-RECONNECT_MODE="${RECONNECT_MODE:-hybrid}"
+#
+# THE DEFAULT IS AN mtare_ TOKEN, and it has to be (2026-09-16). The plain
+# `rendezvous` and `hybrid` tokens cannot produce a run at all any more, in
+# either direction:
+#
+#   RENDEZVOUS_SCHEDULE=0 — the node throws at construction. Both arms ARE the
+#     agreed meeting, so without the scheduler rendezvous degrades to `off` and
+#     hybrid to `pursuit`; see explo_planner_node.cpp, the reconnect_mode /
+#     rendezvous_schedule_enable interlock. The `_rzv_needed` block below is the
+#     copy that fires before Gazebo starts.
+#   RENDEZVOUS_SCHEDULE=1 — the arm-stamp guard below refuses. The node builds
+#     its own arm name and prefixes `mtare_` when ANY of four knobs is on, and
+#     the scheduler is one of the four. So a scheduled run under a plain name
+#     stamps `mtare_hybrid` into run_start while every directory and index says
+#     `hybrid`.
+#
+# The two together leave the plain tokens with an empty configuration space.
+# They stay in the vocabulary because they are still the RECONNECT_MODE the
+# node is passed (MODE_ARG strips the prefix) and because the guard calibration
+# uses them as its plain-token vehicle — but nothing can run one, so nothing may
+# default to one. `hybrid` was the default until today, which meant a bare
+# `./run_explo_sim_rviz.sh` exited 2.
+RECONNECT_MODE="${RECONNECT_MODE:-mtare_hybrid}"
 case "$RECONNECT_MODE" in
   rendezvous|pursuit|hybrid|off) ;;
   mtare_off|mtare_pursuit|mtare_rendezvous|mtare_hybrid) ;;
@@ -329,10 +356,27 @@ fi
 unset _arm_stack
 
 # MinPos claim radius override (campaign cr2). Empty = pass no parameter at all,
-# which leaves the node on the yaml value; coord_claim_radius_m: 0.0 there means
-# "auto", and the node resolves it to fov_max_range (10 m) at
-# explo_planner_node.cpp:2992. Every campaign up to and including mt2 ran that
-# way, so an unset COORD_CLAIM_R reproduces them exactly.
+# which leaves the node on the yaml value -- and that value is now PINNED.
+# shared_params.yaml ships `coord_claim_radius_m: 10.0` (search that key; it is
+# near the coord_claim_ttl_sec line), so the node's "0 means auto" branch --
+# `if (coord_claim_radius_m_ <= 0.0) { coord_claim_radius_m_ = fcfg.max_range; }`
+# in explo_planner_node.cpp, in the auto-resolve block just after the FOV config
+# is built -- does NOT run. An unset COORD_CLAIM_R is a 10 m disc, which is the
+# same 10 m every campaign up to and including mt2 got back when auto was still
+# resolving it. Generation 9 is comparable to those cells on claim radius, and
+# the pin is exactly what makes that true: D1 moved fov_max_range 10.0 -> 20.0,
+# and had the yaml still said 0.0 the disc would have silently doubled with the
+# sensor model. AUTO is a POINTER, not a number -- that is why it is gone.
+#
+# Two ways to break this, both of which look like housekeeping:
+#   - "restoring" the 0.0/auto spelling in the yaml, which re-couples the claim
+#     disc to fov_max_range and hands generation 9 a 20 m disc nobody asked for;
+#   - setting COORD_CLAIM_R=10 so the manifest "says" 10. That writes
+#     coord_claim_radius_override=10, which is how a cr2 TREATMENT cell is
+#     identified, so an untreated cell would be filed as a treated one.
+# For what the node actually used, read coord_claim_radius_m_in_params (the
+# resolved yaml value, echoed below); coord_claim_radius_override only records
+# whether this harness passed -p at all.
 #
 # Declared HERE, below the _arm_stack block, so it is not one of the knobs an
 # arm token pins -- the radius is deliberately orthogonal to the arm. It is set
@@ -341,8 +385,11 @@ unset _arm_stack
 # suffix and no arm-token guard below has to learn about it.
 #
 # Validated rather than passed through, and NOT merely for tidiness: this value
-# is the bound the receiver clamps every peer-advertised claim to
-# (coordination.cpp:56-57, fed from our own resolved radius at :3211), so a
+# is the bound the receiver clamps every peer-advertised claim to. The clamp
+# itself is Coordination::onIntent (coordination.cpp:56-57); the bound it clamps
+# against is our own resolved radius, handed to the Coordination ctor at
+# explo_planner_node.cpp:3738-3741 as coord_claim_radius_m_, which :3440-3441
+# has already resolved from the 0 = auto spelling to fov_max_range. So a
 # garbage value does not fail loudly -- it silently changes how much of the
 # candidate set a peer can veto. A non-finite spelling would reach the node as a
 # double and disarm MinPos in one direction or veto everything in the other.
@@ -358,7 +405,8 @@ if [ -n "$COORD_CLAIM_R" ]; then
   esac
   # Reject 0 and anything that rounds to it. Zero is not "no override" here --
   # the node reads <= 0 as AUTO, so `-p coord_claim_radius_m:=0.0` would quietly
-  # resolve back to fov_max_range and produce a cell named _r0 that ran at 10 m.
+  # resolve back to fov_max_range and produce a cell named _r0 that ran at the
+  # sensor range (20 m since D1) instead.
   # Leave COORD_CLAIM_R unset for the yaml default; that path passes no -p.
   if [ "$(awk -v v="$COORD_CLAIM_R" 'BEGIN{print (v+0 > 0.0) ? 1 : 0}')" != "1" ]; then
     echo "FATAL: COORD_CLAIM_R='$COORD_CLAIM_R' must be > 0. The node reads a" >&2
@@ -433,7 +481,25 @@ RECONNECT_CONFIRM="$(flt "${RECONNECT_CONFIRM:-3.0}")"
 # the full table and the walked numbers.
 MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-90}")"
 # Barrier give-up for mid-run attempts (terminal barriers keep RDV_MAX_WAIT).
-MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-240}")"
+#
+# 30, NOT THE NODE DEFAULT'S 240 (2026-09-20, Kalhan). What this bounds is a
+# robot STANDING STILL at the end of a failed mid-run manoeuvre — at a chase's
+# predicted intercept, or wherever holdForTeam stopped it — waiting for a peer
+# to walk into range. The node's own explore-fallback comment calls that
+# strictly dominated ("a moving robot can still regain the link; a parked one
+# can only be found"), and at 240 it was a twelfth of a cell spent on the
+# dominated option. Comfortably above RECONNECT_RELEASE_CONFIRM (3 s), so a
+# peer that does arrive still registers.
+#
+# WHAT IT COSTS: MIDRUN_MAX_ATTEMPTS is consumed faster. The re-arm cycle is
+# this cap plus MIDRUN_SILENCE, so 120 s rather than 330, and a robot alone for
+# a long stretch can spend all 6 attempts by roughly t+720 s and explore
+# unassisted for the rest of the cell. That is the same trade in the same
+# direction, which is why it is priced here rather than compensated for.
+#
+# Terminal barriers keep RDV_MAX_WAIT untouched: a robot there has no
+# exploration left to go back to, so the dominance argument does not apply.
+MIDRUN_MAX_WAIT="$(flt "${MIDRUN_MAX_WAIT:-30}")"
 MIDRUN_MAX_ATTEMPTS="${MIDRUN_MAX_ATTEMPTS:-6}"
 # --- Post-latch coast (2026-08-27) -----------------------------------------
 # 56 of 88 banked reconnect_end events are a robot that crossed the coverage
@@ -473,9 +539,10 @@ DONE_SEEK_MAX="$(flt "${DONE_SEEK_MAX:-600}")"
 # reproduces every banked run bit-for-bit.
 MISSION_RETURN="${MISSION_RETURN:-0}"
 if [ "$MISSION_RETURN" = "1" ]; then MISSION_RETURN_ARG="true"; else MISSION_RETURN_ARG="false"; fi
-# Arrival tolerance. Its own knob (not RECONNECT_ARRIVE_TOL=4.0) because the
-# two homes are only 3 m apart — the manoeuvre tolerance would accept the
-# partner's home as an arrival.
+# Arrival tolerance. Its own knob (not RECONNECT_ARRIVE_TOL) because home
+# arrival is position semantics while the manoeuvre tolerance is sized for
+# connectivity — at its historical 4.0 it accepted the partner's home 3 m
+# away as an arrival, and nothing ties the two sizes together.
 MISSION_HOME_TOL="$(flt "${MISSION_HOME_TOL:-1.0}")"
 # Overall cap on the homing leg. The field guarantee that a mission-return run
 # still ends: on expiry the robot parks where it is and the run ends with
@@ -538,8 +605,19 @@ MIDRUN_MAX_SILENCE="$(flt "${MIDRUN_MAX_SILENCE:-$MIDRUN_SILENCE}")"
 # to reject. The planner warns at startup if this is set at or below the TTL.
 RECONNECT_RELEASE_CONFIRM="$(flt "${RECONNECT_RELEASE_CONFIRM:-6}")"
 # Arrival tolerance for a manoeuvre destination (m), and the ceiling on one
-# manoeuvre drive leg (s). See shared_params.yaml for the sizing argument.
-RECONNECT_ARRIVE_TOL="$(flt "${RECONNECT_ARRIVE_TOL:-4.0}")"
+# manoeuvre drive leg (s). shared_params.yaml carries the original 4.0 sizing
+# argument and why it no longer holds here.
+#
+# 1.5 since 2026-09-18: the 4.0 argument assumed a link that carried 8 m with
+# room to spare, which the pre-2026-09 radio did. Under 70 dB trunks + 30 m
+# horizon it does not: in ts4_smoke24_n2/rendezvous both robots stopped on
+# the 4 m ring on opposite sides (5.9 m apart, one trunk on the chord) and
+# the link's longest up-streak over the final 346 s was 2.0 s against a 6 s
+# release confirm — an appointment hold that is unbounded BY DESIGN parked
+# both robots from t~350 to the censor. At 1.5 the pair lands <= 3 m apart.
+# An obstructed exact point is not a budget burn: the 15 s / 0.2 m
+# no-progress window hands the leg to RETURN_SYNC from beside it.
+RECONNECT_ARRIVE_TOL="$(flt "${RECONNECT_ARRIVE_TOL:-1.5}")"
 RECONNECT_NAV_MAX="$(flt "${RECONNECT_NAV_MAX:-600}")"
 # Pursuit gates. The old 180 s staleness vetoed every chase in the dense world
 # (outage tail 861 s ~ staleness at a terminal trigger), so the chase was dead
@@ -566,6 +644,132 @@ PURSUIT_EXPLORE_MAX="${PURSUIT_EXPLORE_MAX:-6}"
 HOLD_ESCALATE="${HOLD_ESCALATE:-1}"
 HOLD_ESCALATE_ARG=$([ "$HOLD_ESCALATE" = "1" ] && echo true || echo false)
 HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
+# ---------------------------------------------------------------------------
+# THE COUNTDOWN (generation 19). These knobs ARE the rendezvous treatment
+# (minus RDV_DEPART_DELAY, inert since generation 25 — see its entry), and
+# until now they existed only as C++ defaults: not passed, not overridable, and
+# — the part that matters — not written into any manifest. A campaign's own
+# record could not say what treatment it had run, and `cell-provenance-in-
+# manifest` is the rule that says a cell must be readable from itself.
+#
+# They are passed EXPLICITLY even at their default values. A -p that is absent
+# and a -p that happens to match the header are indistinguishable in a banked
+# run, which is exactly the ambiguity the `ttl0-is-the-default` lesson was about.
+#
+#   RDV_DEPART_DELAY  INERT since generation 25: the arming floor is bare
+#                     t_now, because adding this per robot forked the ts4 N=3
+#                     cell across two occurrences (see the arming block in
+#                     explo_planner_node.cpp). Still passed and still in the
+#                     manifest so the param rows keep their schema across
+#                     generations; it decides nothing.
+#   RDV_MAX_LATE      generation 29. How late a robot may agree to BE. At
+#                     arming it picks the first rung of the agreed lattice it
+#                     can reach with at most this much lateness, then leaves
+#                     early enough to arrive. IT IS NOT A NOTICE PERIOD and it
+#                     is not RDV_DEPART_DELAY returning: it is subtracted from
+#                     the robot's own drive and CLAMPED AT ZERO, so a robot
+#                     that can make the nearest rung contributes nothing and
+#                     the team cannot fork across occurrences.
+#                     IT ALSO SIZES HYBRID'S CHASE WINDOW, and that is not a
+#                     side effect to discover later. A robot signed up to a
+#                     rung it is already N seconds late for must depart at
+#                     once, and hybrid only chases while the appointment is not
+#                     yet due — so RDV_INTERVAL minus this value is the WIDEST
+#                     the window can be, and the two knobs have to be read
+#                     together. It is a supremum and not a floor: the window is
+#                     the gap from the arming instant to the next rung, less
+#                     min(lead, this), and an outage that happens to arm just
+#                     before a rung gets no window at all. See
+#                     rendezvous_interval_sec_ in explo_planner_node.cpp for
+#                     the derivation.
+#                     Measured on the banked generation-28 armings, the lattice
+#                     the schedule actually derived was 30 s on 10 of the 16
+#                     distinct intervals seen, and against those a 60 s budget
+#                     left NO window at all on 180 of 211 armings: hybrid armed,
+#                     never chased, and was rendezvous wearing a different arm
+#                     label. RDV_INTERVAL=300 is what makes 60 affordable — it
+#                     takes that no-window share from roughly five armings in
+#                     six down to roughly one in five.
+#                     0 = be exactly on time or take the next rung, which
+#                     leaves hybrid's chase dose identical to generation 28.
+#   RDV_INTERVAL      generation 29. The SPACING OF THE TIMETABLE: the shortest
+#                     gap between two legal meeting instants, and so the floor
+#                     on the interval the scheduler derives. Meetings are not
+#                     periodic — they happen when the team comes apart — so this
+#                     is not a meeting rate; it is how far apart the rungs are
+#                     that a robot can sign up to, and therefore how much room a
+#                     late robot has to roll to the next one. Before generation
+#                     29 this was silently the same knob as the proposal period
+#                     (30 s), which also bounds how stale the snapshot the
+#                     punctuality estimate is costed against may be — so raising
+#                     the spacing used to age every drive estimate tenfold as a
+#                     side effect. They are separate knobs now; this one moves
+#                     the lattice and nothing else.
+#   RDV_SETTLE        seconds to hold at the cell AFTER the team is whole again,
+#                     so the map merge completes before anyone leaves. Not a
+#                     safety margin on the barrier — a separate, later hold.
+#   RDV_APPT_WAIT     cap on the barrier wait while keeping an appointment.
+#                     0 = WAIT FOREVER, which is the directive ("be there until
+#                     all robots are connected"), and is the default. A positive
+#                     value turns the rendezvous arm into something else; it
+#                     exists so that can be MEASURED, not so it can be tuned in.
+#   RDV_LATCHED_HOLD  cap on the AT-THE-RENDEZVOUS HOLD only: how long a robot
+#                     that finished exploring WHILE STANDING ON the agreed cell
+#                     keeps standing there. Separate from RDV_APPT_WAIT on
+#                     purpose. RDV_APPT_WAIT=0 (wait forever) is right for a
+#                     robot that still has exploring to trade against the wait;
+#                     a finished robot has none, so leaving that one unbounded
+#                     is a cell that runs to the wall clock with a robot
+#                     standing still and a censored completion time.
+#
+#                     IT MUST OUTLAST ONE ROLLED RUNG (2026-09-20). The hold is
+#                     measured from the LATCH, and a robot cannot latch before
+#                     it arrives, so the earliest teardown is arrival+cap. A
+#                     teammate that could not make this rung rolls to the next
+#                     one and arrives RDV_INTERVAL later, plus up to
+#                     RDV_MAX_LATE of its own permitted lateness. At the old
+#                     300 those two quantities were equal and the teardown
+#                     landed on the rolled robot's arrival instant — the
+#                     finished robot walking off the cell in the same moment
+#                     the robot it was waiting for drove onto it, which is the
+#                     one outcome "wait until all are there" exists to forbid.
+#                     420 = RDV_INTERVAL + RDV_MAX_LATE + 60 s of margin, so
+#                     one roll is always covered. It is deliberately NOT two
+#                     rolls: a robot that misses twice is not coming, and the
+#                     cell is better spent than held.
+#
+#                     RE-DERIVE THIS IF EITHER INPUT MOVES. The three knobs are
+#                     coupled and nothing in the node checks the relation.
+#   START_HOLD        seconds of PRE-MISSION HOLD, applied in EVERY ARM: no
+#                     robot plans or navigates until it has elapsed. The team
+#                     agrees its rendezvous place while it is still co-located,
+#                     because a fleet that disperses mid-agreement meets in two
+#                     places (ts4 smoke20 N=3 hybrid: the upgrade was authored
+#                     0.6 s after a peer went silent, and that peer drove to a
+#                     different cell and waited out the run). It is set for off
+#                     and pursuit too, which never run the protocol, so the dead
+#                     time is a constant that cancels in every between-arm
+#                     contrast instead of a handicap on two arms out of four.
+#                     0 disables it.
+#                     WHAT IT DOES NOT DO: it does not contain the provisional
+#                     -> final rendezvous UPGRADE. An edit confining the upgrade
+#                     to this window shipped on 2026-09-17 and was withdrawn the
+#                     same day -- the upgrade needs candidate cells, candidates
+#                     come from the allocator's tours, tours come from completed
+#                     exploration steps, and a held robot completes none, so the
+#                     confinement deleted the upgrade rather than scheduling it.
+#                     The 41-77 s sweep that argued for a 120 s window measured
+#                     that upgrade and no longer constrains this knob. 60 s is
+#                     about twelve retries of margin on a handshake that
+#                     normally completes on the first. See
+#                     mission_start_hold_sec_ in explo_planner_node.cpp.
+RDV_DEPART_DELAY="$(flt "${RDV_DEPART_DELAY:-100}")"
+RDV_MAX_LATE="$(flt "${RDV_MAX_LATE:-60}")"
+RDV_INTERVAL="$(flt "${RDV_INTERVAL:-300}")"
+RDV_SETTLE="$(flt "${RDV_SETTLE:-30}")"
+RDV_APPT_WAIT="$(flt "${RDV_APPT_WAIT:-0}")"
+RDV_LATCHED_HOLD="$(flt "${RDV_LATCHED_HOLD:-420}")"
+START_HOLD="$(flt "${START_HOLD:-60}")"
 # COMMS=1 puts the message-level radio emulator (hmr_comms_sim_node) between the
 # two robots, which is what turns the NOTE above from a caveat into a runnable
 # experiment: with it, "peer out of comms" is produced by distance through trees
@@ -938,7 +1142,11 @@ fi
 # RENDEZVOUS_SCHEDULE=1 arms the §3.5 appointment: when a reconnect is
 # dispatched, both robots derive the SAME (cell, t_meet) from the allocator's
 # own tours — the cheapest cell to insert into the tours they are already
-# driving — instead of steering to the geometric midpoint of the last contact.
+# driving. It used to say "instead of steering to the geometric midpoint of the
+# last contact"; the midpoint drives were deleted from every arm on 2026-09-16,
+# so with RENDEZVOUS_SCHEDULE=0 there is no meeting destination at all, not a
+# different one. Same correction as the sibling block below, which notes that
+# while stale it actively CONCEALED the rendezvous/hybrid silent null.
 # Agreement is by construction, not by protocol: the allocator is bit-identical
 # across processes, so anything derived from its output is too.
 #
@@ -994,6 +1202,9 @@ if [ "$RENDEZVOUS_SCHEDULE" = "1" ] && [ "$_rzv_pursuit" = "1" ]; then
   exit 2
 fi
 unset _rzv_pursuit
+# The CONVERSE of the two checks above — a mode that is nothing without the
+# schedule — lives further down, just past the arm-stamp guard, and the reason
+# it is down there rather than here is in the comment at its own site.
 # --- MDP interception (M-TARE evolution, P6) --------------------------------
 # PURSUIT_PREDICTOR=mdp aims the chase at where the peer is PREDICTED to be
 # when this robot can get there — the argmax over the peer's last directly
@@ -1104,6 +1315,65 @@ if [ "$_arm_expect" != "$RECONNECT_MODE" ]; then
   exit 2
 fi
 unset _mtare_stamped _arm_core _arm_expect
+# The converse of the two RENDEZVOUS_SCHEDULE checks above, added 2026-09-16 —
+# the one that was actually costing us. Those refuse the schedule where it
+# cannot fire; this refuses a MODE THAT IS NOTHING WITHOUT IT. `rendezvous` and
+# `hybrid` are defined by the agreed (place, time), so with
+# RENDEZVOUS_SCHEDULE=0 the planner arms no appointment and:
+#
+#   rendezvous -> dispatch returns false every time. The run behaves as the
+#                 `off` arm while sitting in a directory named rendezvous.
+#   hybrid     -> only the chase half survives. The run behaves as the
+#                 `pursuit` arm while sitting in a directory named hybrid.
+#
+# Both are worse than an inert knob: `off` and `pursuit` are OTHER ARMS OF THE
+# SAME EXPERIMENT, so the cell is not voided, it is silently relabelled, and the
+# contrast it lands in is the one it was supposed to be measured against. The
+# planner refuses the same pairing at construction; this is the copy that fires
+# before Gazebo starts.
+#
+# WHY IT SITS AFTER THE ARM-STAMP GUARD AND NOT WITH ITS TWO SIBLINGS. Up there
+# it SHADOWED that guard. `GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid` is a
+# name/stamp disagreement — a treated cell about to be filed in the control
+# column — and it also happens to have RENDEZVOUS_SCHEDULE=0, so whichever
+# check runs first is the one the operator sees. The name/stamp report is the
+# more useful of the two (it names the knob that did it and the token that
+# would be honest), and it is the one the guard calibration asserts, so it wins
+# the tie by running first. Nothing is lost by deferring: both are fatal, both
+# fire before anything is launched, and no configuration escapes by reaching
+# only one of them.
+#
+# The mtare_* tokens pin RENDEZVOUS_SCHEDULE through the arm stack and their
+# own contradiction check fires ~700 lines earlier, so what actually lands here
+# is the plain `rendezvous` / `hybrid` token at its default — which, with the
+# arm-stamp guard taking the RENDEZVOUS_SCHEDULE=1 side, is the whole reason
+# those two tokens cannot produce a run. See the RECONNECT_MODE default block.
+_rzv_needed=0
+case "$RECONNECT_MODE" in
+  rendezvous|hybrid|mtare_rendezvous|mtare_hybrid|mtare_hybrid_mdp) _rzv_needed=1 ;;
+esac
+if [ "$_rzv_needed" = "1" ] && [ "$RENDEZVOUS_SCHEDULE" != "1" ]; then
+  echo "FATAL: RECONNECT_MODE=$RECONNECT_MODE with RENDEZVOUS_SCHEDULE=0." >&2
+  echo "       This arm IS the agreed meeting (place AND time) and there is no" >&2
+  echo "       agreement to make without the scheduler. The cell would run to" >&2
+  echo "       completion looking healthy while behaving as the" >&2
+  case "$RECONNECT_MODE" in
+    *rendezvous) echo "       'off' arm." >&2 ;;
+    *)           echo "       'pursuit' arm." >&2 ;;
+  esac
+  # NOT "or set RENDEZVOUS_SCHEDULE=1" — that was the advice until 2026-09-16
+  # and under a plain token it produces a SECOND exit 2, from the arm-stamp
+  # guard above, because the scheduler is one of the four knobs that make the
+  # node stamp `mtare_`. The mtare_* token is the only fix.
+  case "$RECONNECT_MODE" in
+    mtare_*) echo "       The arm stack pins this; something overrode it." >&2 ;;
+    *)       echo "       Use RECONNECT_MODE=mtare_$RECONNECT_MODE — the plain" >&2
+             echo "       token has no runnable configuration (see the" >&2
+             echo "       RECONNECT_MODE default block)." >&2 ;;
+  esac
+  exit 2
+fi
+unset _rzv_needed
 # Link fading is a pure function of (seed, tick), so this alone selects the run's
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.
@@ -1360,8 +1630,11 @@ COST_CAP="$(flt "${COST_CAP:-$(awk "BEGIN{print 10*$ROI_HALF}")}")"
 # watches the STEP counter, and the steps were fine.
 #
 # Cause is in the planner's utility, not here — see candidate_min_goal_dist_m
-# in shared_params.yaml. 4.0 m sits well inside fov_max_range (10.0), so a hop
-# still lands deep in previously-seen space rather than jumping blind.
+# in shared_params.yaml. 4.0 m sits well inside fov_max_range (20.0 since D1,
+# 10.0 when this was measured), so a hop still lands deep in previously-seen
+# space rather than jumping blind. The margin only grew, so the correction
+# still holds -- but it was measured at the smaller range and has not been
+# re-measured at the larger one.
 #
 # This is a real scenario correction in the sense of plan §2: it changes what
 # every arm does, so it must be identical across arms and no run from before it
@@ -1746,13 +2019,125 @@ teardown() {
     # runs finished 1.5-1.8% apart with every other gate green: a KeepLast
     # reader overflowing on the reconnect burst discards the excess with no
     # error and no counter, and scovox_node's new-subscriber resnapshot cannot
-    # heal it because the emulator's DDS subscription never drops. Appended
-    # before the verdict is computed so a holed map counts as a FAIL like any
-    # other. `|| true` so a broken checker cannot abort the trap; it emits UNRUN
-    # on its own failure paths, which scores as SUSPECT rather than silent PASS.
-    if [ -x "$HERE/map_agreement.py" ]; then
+    # heal it because the emulator's DDS subscription never drops.
+    #
+    # THAT THEORY DID NOT SURVIVE and map_agreement.py is now REPORT ONLY — see
+    # its module docstring; the end-of-run gap turned out to measure undrained
+    # backlog, which scales with outage severity, so failing on it would discard
+    # exactly the cells where the comms treatment bit hardest. It therefore
+    # emits PASS or INFO and never FAIL or UNRUN, and it cannot move the verdict
+    # below. This comment used to say the opposite ("it emits UNRUN on its own
+    # failure paths, which scores as SUSPECT rather than silent PASS") and that
+    # was not merely stale: at N>=3 the checker's own two-robot assumption made
+    # it emit UNRUN on every cell, which scored every cell SUSPECT, which
+    # hard-failed every cell in gate_g8 — a report-only check failing a whole
+    # campaign through a counter it was never meant to reach.
+    #
+    # THE EXIT STATUS IS READ. This ended in a bare `|| true`, which was never a
+    # backstop: the script runs `set -u` without `set -e`, so nothing here could
+    # abort the trap, and `|| true` only destroyed the status. The checker exits
+    # 0 on its own INFO paths deliberately and says so in its own comment ("that
+    # `|| true` should not be what keeps the contract"), so a NON-ZERO exit here
+    # means it crashed before printing anything and the map-spread reading was
+    # not taken — indistinguishable, in the file, from a healthy run that had
+    # nothing to say. INFO and not UNRUN for the reason given three paragraphs
+    # down: this gate is report-only and UNRUN would hand it a verdict it is not
+    # entitled to cast.
+    # PRESENCE, NOT THE EXECUTE BIT. Same defect, same reasoning as the
+    # rendezvous block below: this tested -x and then invoked through `python3`
+    # regardless, so the bit could not affect whether the gate would WORK -- it
+    # could only skip a gate that would have succeeded. A lost execute bit (a
+    # fresh clone under a permissive umask, a copy through a filesystem that
+    # drops modes) silently disarmed the map-spread reading on every cell of a
+    # campaign, with nothing in comms_gates.txt to say it had not been taken.
+    #
+    # THE ABSENCE LINE IS INFO AND NOT UNRUN, DELIBERATELY. Everything argued at
+    # the top of this block applies to the missing-file path too: this gate is
+    # REPORT-ONLY, and UNRUN is counted a few lines below into NUNRUN, which
+    # scores the cell SUSPECT, which gate_g8 hard-fails. Emitting UNRUN here
+    # would reproduce exactly the failure this block already suffered once -- a
+    # report-only check failing a whole campaign through a counter it was never
+    # meant to reach -- and it would do it on the cells where the file is
+    # missing, i.e. all of them. Absence must be RECORDED without being handed a
+    # verdict the gate is not entitled to cast. The name matches map_agreement's
+    # own --name default so both paths occupy one gate name, not two.
+    if [ -f "$HERE/map_agreement.py" ]; then
       python3 "$HERE/map_agreement.py" "$OUTDIR" \
-        --max-pct "${MAP_AGREE_MAX_PCT:-0.5}" >> "$OUTDIR/comms_gates.txt" 2>&1 || true
+        >> "$OUTDIR/comms_gates.txt" 2>&1
+      MAP_RC=$?
+      if [ "$MAP_RC" != 0 ]; then
+        printf 'INFO\tmap_agree\t%s\n' \
+          "map_agreement.py exited $MAP_RC; it is contracted to exit 0 always, so it died before printing — the map-spread reading was NOT taken for this cell (its traceback is above in this file)" \
+          >> "$OUTDIR/comms_gates.txt"
+      fi
+    else
+      printf 'INFO\tmap_agree\tmap_agreement.py is missing from %s; the map-spread reading was NOT taken for this cell\n' \
+        "$HERE" >> "$OUTDIR/comms_gates.txt"
+    fi
+    # Did the SCHEDULED arm schedule anything? Unlike map_agreement.py this one
+    # IS a validity gate: it emits FAIL, and the count below turns that into
+    # run_gates_verdict=INVALID and a non-zero exit under GATES_STRICT.
+    #
+    # It exists because a rendezvous or hybrid cell that never commits a triple
+    # is indistinguishable, everywhere else in the pipeline, from one that did.
+    # The ts4 generation-15 smoke produced three such cells out of six: 600 s
+    # each, rc=0, every comms gate green, `run_gates_verdict=CLEAN`, and no
+    # agreement anywhere in the run. The arm suffix, the manifest and the
+    # campaign index all said "rendezvous" because all three record the REQUEST.
+    # Nothing recorded whether the treatment happened, so a campaign of untreated
+    # cells would have banked and read as a null result.
+    #
+    # Inert on the off and pursuit arms: the checker returns silently unless the
+    # manifest says rendezvous_schedule=1, so it adds no line and cannot move the
+    # verdict on an arm that is not supposed to schedule anything.
+    #
+    # Placed AFTER map_agreement.py and BEFORE the counters for the same reason
+    # that one is: the planner logs and the event files are only complete once
+    # the planners have been stopped, which the loop above has just done.
+    # PRESENCE, NOT THE EXECUTE BIT. This tested -x and then invoked through
+    # `python3` anyway, so the bit it tested could not affect whether the gate
+    # would run -- it could only skip a gate that would have worked. A lost
+    # execute bit (a fresh clone with a permissive umask, a copy through a
+    # filesystem that drops modes) would then have silently disarmed the
+    # rendezvous check on every cell, with nothing in comms_gates.txt to say so.
+    # An absent FILE is still worth an UNRUN line rather than silence, for the
+    # same reason the gate itself now emits one when its manifest key is gone.
+    #
+    # THE EXIT STATUS IS READ, AND THAT IS THE WHOLE POINT OF THIS BLOCK. It
+    # used to end in a bare `|| true`, which was not a backstop at all: this
+    # script runs `set -u` WITHOUT `set -e`, so nothing here could have aborted
+    # the trap in the first place, and the only thing `|| true` accomplished was
+    # to destroy the status. The checker's contract (see its docstring, "EXIT
+    # STATUS AND THE VERDICT") is that it exits 0 ALWAYS and writes exactly one
+    # `VERDICT\trendezvous_agreed\t...` line, so a NON-ZERO exit means it died
+    # before reaching emit() and wrote no verdict at all. Its traceback lands in
+    # comms_gates.txt matching neither ^FAIL nor ^UNRUN, so the counters below
+    # read a clean file and the cell banked CLEAN with no rendezvous evidence in
+    # it — which is precisely the outcome this gate exists to prevent, reached
+    # through the gate itself. A crashed validity gate is the definition of
+    # UNRUN, and the trap continues either way because there is no `set -e`.
+    if [ -f "$HERE/rendezvous_agreement.py" ]; then
+      python3 "$HERE/rendezvous_agreement.py" "$OUTDIR" \
+        >> "$OUTDIR/comms_gates.txt" 2>&1
+      RZV_RC=$?
+      if [ "$RZV_RC" != 0 ]; then
+        printf 'UNRUN\trendezvous_agreed\t%s\n' \
+          "rendezvous_agreement.py exited $RZV_RC; it is contracted to exit 0 always, so it died before writing a verdict — the scheduled-arm check DID NOT RUN (its traceback is above in this file)" \
+          >> "$OUTDIR/comms_gates.txt"
+      fi
+    else
+      # THE GATE NAME IS THE ONE THE CHECKER ITSELF WRITES -- `rendezvous_agreed`
+      # (rendezvous_agreement.py's single emit()), not the module's filename.
+      # This said `rendezvous_agreement` until 2026-09-18, which gave one check
+      # two names in comms_gates.txt: any consumer keyed on the second column
+      # (gate_g8's REPORT_ONLY_GATES membership test, or any tally of which
+      # gates ran across a campaign) saw one gate that never passes and another
+      # that never goes missing. The divergence landed on the ONE path where the
+      # name is the only evidence the gate was ever supposed to exist, since
+      # there is no output from the checker to corroborate it.
+      printf 'UNRUN\trendezvous_agreed\t%s\n' \
+        "rendezvous_agreement.py is missing from $HERE" \
+        >> "$OUTDIR/comms_gates.txt"
     fi
     # teardown is trapped long before GATES_STRICT is assigned, and `set -u` is
     # on, so an early die() would abort IN the trap on an unbound variable.
@@ -1795,9 +2180,67 @@ teardown() {
       log "exiting non-zero: GATES_STRICT=1 and the run-time gates failed"
       exit 1
     fi
+  elif [ "$COMMS" = "1" ]; then
+    # COMMS=1 AND NO REPORT FILE AT ALL. The condition above is a conjunction,
+    # and until 2026-09-18 it had no else: a treated run whose gate report never
+    # materialised fell straight out of the block, wrote no run_gates_verdict,
+    # and banked. Every consumer then read the key's ABSENCE, and only one of
+    # them treats absence as a problem — run_campaign.sh greps for the literal
+    # `=INVALID`, so the cell was skipped as complete on every later resume, and
+    # ts4_smoke21_check reports "<absent>" long after the campaign is over.
+    #
+    # This is strictly worse than any SUSPECT the block above can produce: not
+    # one gate ran, so nothing certifies that the emulator was in the path, that
+    # the link ever dropped, or that the arm was treated at all. That is exactly
+    # the "control wearing a treatment label" hazard, and it is the one failure
+    # that a cell must never be allowed to bank through. INVALID, therefore, and
+    # not SUSPECT — INVALID is the only verdict run_campaign.sh will redo, and a
+    # cell with no gate evidence is cheap to redo and worthless to keep.
+    #
+    # The COMMS=0 path deliberately still writes nothing. An ideal-comms run has
+    # no link to gate, so it has no verdict to record; gate_g8 reads the absence
+    # as MISSING and hard-fails it already, which is correct for a gate written
+    # for comms campaigns, and inventing a token here would change what those
+    # runs report without telling anyone anything new.
+    log "RUN INVALID: COMMS=1 but no $OUTDIR/comms_gates.txt — not one gate ran"
+    [ -f "$OUTDIR/run_manifest.txt" ] && \
+      echo "run_gates_verdict=INVALID" >> "$OUTDIR/run_manifest.txt"
+    if [ "${GATES_STRICT:-0}" = "1" ]; then
+      log "exiting non-zero: GATES_STRICT=1 and there is no gate report"
+      exit 1
+    fi
   fi
   log "teardown complete — outputs in $OUTDIR"
 }
+# --- resolve the ambient run-control knobs, before the trap and the manifest -
+# C2 (2026-09-14). Every knob below used to be resolved further down, AFTER the
+# manifest was written, so none of them could be recorded -- and several of them
+# define what the manifest's own run_end_t_sim MEANS. STOP_ON_DONE decides
+# whether the run ends on the endpoint at all or grinds to the duration cap, and
+# DONE_GRACE_S is the sim-second drain added after the last robot declares done;
+# an ambient `export DONE_GRACE_S=0` in the launching shell would shorten every
+# cell of a campaign, change the endpoint, and leave no trace anywhere.
+#
+# Resolving them here is a no-op for the run: each is the same `${X:-default}`
+# expansion it always was, the later lines that still carry it are idempotent
+# once the variable is set, and nothing reads any of them before this point.
+# What changes is that the cell can now say what it was run under.
+#
+# Placed HERE, immediately before `trap teardown`, for a second reason: teardown
+# reads GATES_STRICT, `set -u` is on, and the trap can
+# fire at any point after it is installed. Resolving them below the trap left an
+# early die() aborting inside the trap on an unbound variable -- the failure the
+# GATES_STRICT comment further down already warns about. Every name in this
+# block is now bound before the trap exists.
+STOP_ON_DONE="${STOP_ON_DONE:-1}"
+DONE_GRACE_S="${DONE_GRACE_S:-30}"
+HANG_HB="${HANG_HB:-40}"
+GATES_STRICT="${GATES_STRICT:-$COMMS}"
+POLL_S="${POLL_S:-2}"
+CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
+CLOCK_DEADMAN_S="${CLOCK_DEADMAN_S:-420}"
+CLOCK_FAIL_MAX="${CLOCK_FAIL_MAX:-60}"
+
 trap teardown EXIT INT TERM
 die() { log "ERROR $*"; exit 1; }   # trap runs teardown
 
@@ -1841,6 +2284,20 @@ wait_for() {
 # cannot drift from what actually spawned.
 log "=== $SCENARIO: ${N_ROBOTS}-robot ($ROBOTS) lidar explore+exploit, RViz=$RVIZ gui=$GZ_GUI ==="
 log "ROS_DOMAIN_ID=$ROS_DOMAIN_ID  (export the same value to inspect by hand)"
+# A11 (2026-09-15): say which teardown scope is in force, in the log, because
+# the two differ in what they are ALLOWED to kill and the difference is
+# invisible otherwise. Unset means stack_procs() and count_own() match
+# machine-wide, which is correct and intended for a sequential campaign and a
+# cross-kill the moment two cells overlap. Not made fatal: every campaign to
+# date runs sequentially with it unset, so refusing to start would break the
+# working path to guard a path nobody uses yet. It is already in the manifest
+# as ign_partition, so this line is for whoever is reading a cell log while the
+# cell is still running.
+if [ -n "${IGN_PARTITION:-}" ]; then
+  log "IGN_PARTITION=$IGN_PARTITION  (teardown scoped to this partition)"
+else
+  log "IGN_PARTITION unset  (teardown matches stack processes MACHINE-WIDE; safe only if this is the only cell running)"
+fi
 log "targets: $TARGETS"
 log "outputs: $OUTDIR"
 PRE=$(stack_procs || true)
@@ -2188,9 +2645,14 @@ else
   log "reconnect gate = silence (planner default) — the mid-run clock decides alone; no reconnect_gate param passed"
 fi
 if [ "$RENDEZVOUS_SCHEDULE" = "1" ]; then
-  log "scheduled rendezvous ON: on dispatch both robots derive the same (cell, t_meet) from the allocator's own tours and each departs at its own travel-time deadline; the midpoint is the floor, not the default"
+  log "scheduled rendezvous ON: the team agrees one (cell, interval) while still connected — proposed by robot 0, echoed verbatim, committed only once every peer is confirmed holding the identical pair — and on separation each robot anchors it to its own view of when contact was lost and departs at its own travel-time deadline"
 else
-  log "scheduled rendezvous OFF (RENDEZVOUS_SCHEDULE=0) — no rendezvous_schedule_enable param passed; the reconnect destination is the last-contact midpoint"
+  # Reworded 2026-09-16. This used to say "the reconnect destination is the
+  # last-contact midpoint", which stopped being true the day the three midpoint
+  # drives were removed, and while it was stale it actively CONCEALED the
+  # rendezvous/hybrid silent null — it read as a description of a working
+  # fallback. There is no fallback destination any more, in any arm.
+  log "scheduled rendezvous OFF (RENDEZVOUS_SCHEDULE=0) — no rendezvous_schedule_enable param passed, so no appointment is ever armed and there is NO fallback destination (the midpoint drives are gone). Only reconnect_mode=pursuit and the off arm are legal here; rendezvous/hybrid are refused above"
 fi
 if [ "$PURSUIT_PREDICTOR" = "mdp" ]; then
   log "pursuit predictor = mdp: the chase aims at the argmax over the peer's last received tour of P(peer there when we arrive); the budget and every terminator still come from the trail, and an unaffordable intercept downgrades to it"
@@ -2310,6 +2772,16 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "pursuit_explore_max=$PURSUIT_EXPLORE_MAX"
   echo "hold_escalate=$HOLD_ESCALATE_ARG"
   echo "hold_escalate_wait_sec=$HOLD_ESCALATE_WAIT"
+  # The generation-19 countdown. Stamped on EVERY cell, including the off and
+  # pursuit arms where they are inert: a reader comparing arms needs to see that
+  # the untreated cells carried the same numbers, and "absent" cannot say that.
+  echo "rendezvous_depart_delay_sec=$RDV_DEPART_DELAY"
+  echo "rendezvous_max_lateness_sec=$RDV_MAX_LATE"
+  echo "rendezvous_interval_sec=$RDV_INTERVAL"
+  echo "rendezvous_settle_sec=$RDV_SETTLE"
+  echo "rendezvous_appointment_wait_sec=$RDV_APPT_WAIT"
+  echo "rendezvous_latched_hold_sec=$RDV_LATCHED_HOLD"
+  echo "mission_start_hold_sec=$START_HOLD"
   echo "comms=$COMMS"
   echo "seed=$SEED"
   echo "tx_power_dbm=$TX_POWER"
@@ -2403,6 +2875,22 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "prox_resume_m=$PROX_RESUME_M"
   echo "targets=$TARGETS"
   echo "record=$RECORD"
+  # C2: the run-control knobs. The first two DEFINE the endpoint -- whether the
+  # run stops when the robots are done, and how much sim time drains after they
+  # are -- so a cell that omits them cannot have its run_end_t_sim interpreted.
+  # The rest are abort/watchdog thresholds: they decide whether a slow cell is
+  # killed or banked, which is a selection rule on the data. All were ambient
+  # and untraceable before 2026-09-14.
+  echo "stop_on_done=$STOP_ON_DONE"
+  echo "done_grace_s=$DONE_GRACE_S"
+  echo "hang_hb_sim_s=$HANG_HB"
+  echo "gates_strict=$GATES_STRICT"
+  echo "poll_s=$POLL_S"
+  echo "clock_every_s=$CLOCK_EVERY_S"
+  echo "clock_deadman_s=$CLOCK_DEADMAN_S"
+  echo "clock_fail_max=$CLOCK_FAIL_MAX"
+  echo "rviz=$RVIZ"
+  echo "gz_gui=$GZ_GUI"
   echo
   # Number of trunks the radio model can actually see. Recorded because it is
   # NOT recoverable from the commit sha while a change is uncommitted: two runs
@@ -2447,7 +2935,33 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     echo "mtime_explo_planner_node=$(stat -Lc '%y' "$planner_bin" 2>/dev/null)"
   else
     echo "sha256_explo_planner_node=missing"
+    # Present and saying "missing" beats absent, for the same reason spelled
+    # out twice for the params keys below: a consumer that greps for
+    # mtime_explo_planner_node and gets no line cannot tell a binary that was
+    # not there from a manifest written before the key existed.
+    echo "mtime_explo_planner_node=missing"
   fi
+  # The same argument, for the OTHER binary that carries behaviour. D2 (the
+  # goal-snap append) lives in simple_nav_planner_node, and generation 9 changes
+  # it. git_simple_nav_3d above moves with the SOURCE tree -- it moves whether or
+  # not colcon ran -- so it cannot witness a rebuild. That makes the one failure
+  # mode D2 has both specific and silent: edit simple_nav_3d, forget to build,
+  # and every provenance field in this manifest still reports generation 9 while
+  # the node on the wire is generation 8. Hash what ran.
+  #
+  # All four executables, not just the planner. They are built and installed as
+  # a unit, so a hash that moves for one and not the others is a partial or
+  # stale install -- which this symlink-install workspace can actually produce,
+  # and which is otherwise indistinguishable from a clean one.
+  for _navnode in simple_nav_costmap_node simple_nav_planner_node \
+                  simple_nav_controller_node simple_nav_navigator_node; do
+    _navbin="$WS/install/simple_nav_3d/lib/simple_nav_3d/$_navnode"
+    if [ -e "$_navbin" ]; then
+      echo "sha256_$_navnode=$(sha256sum -b "$_navbin" 2>/dev/null | cut -c1-16)"
+    else
+      echo "sha256_$_navnode=missing"
+    fi
+  done
   # And the params file, for the same reason — it is the OTHER half of what
   # the node actually ran, and it was invisible in the run record.
   #
@@ -2503,6 +3017,74 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     # written before the key existed.
     echo "global_alloc_comms_mask_in_params=missing"
     echo "coord_claim_radius_m_in_params=missing"
+  fi
+  # A10a (2026-09-15): the world GEOMETRY. Until now it was the one load-bearing
+  # input with no record in the cell at all. `scenario=` above names a yaml; that
+  # yaml names a world SHORT name; _world_registry.py maps that to an SDF file.
+  # Three hops, none of them written down, and the install tree is symlinked to
+  # source, so the SDF can change under a workspace that looks rebuilt without
+  # any hash already in this manifest moving.
+  #
+  # The gap is not hypothetical. On 2026-09-15 a sim review was written, and
+  # world edits applied, against flatforestv2.sdf (registry short name
+  # `flatforest`) while every ts1b cell had in fact run flatforest_dense.sdf.
+  # Nothing in a finished cell could have caught it, because no field named the
+  # file. These do.
+  #
+  # sdf_world_name is here because robot_sim.launch.py composes
+  # /world/<short_name>/create from the REGISTRY name, so the SDF's internal
+  # <world name> has to equal it or every spawn call goes to a service that does
+  # not exist. It matches today, verified for all six flatforest worlds; this
+  # records it per cell so a future rename reads as a diff instead of as a
+  # bring-up timeout.
+  _world_short=$(sed -n 's/^world:[[:space:]]*\([^[:space:]#]*\).*/\1/p' \
+    "$SCENARIO_PATH" 2>/dev/null | head -1)
+  echo "world=${_world_short:-missing}"
+  _world_sdf=$(python3 - "$WS" "${_world_short:-}" <<'PYWORLD' 2>/dev/null
+import os, runpy, sys
+ws, short = sys.argv[1], sys.argv[2]
+reg = os.path.join(ws, 'install/hmr_sim/share/hmr_sim/launch/_world_registry.py')
+e = runpy.run_path(reg)['WORLDS'][short]
+print(os.path.join(ws, 'install/hmr_sim/share/hmr_sim/worlds',
+                   e['sdf_subdir'], e['sdf_file']))
+PYWORLD
+)
+  if [ -n "${_world_sdf:-}" ] && [ -e "$_world_sdf" ]; then
+    echo "world_sdf=${_world_sdf#$WS/}"
+    echo "sha256_world_sdf=$(sha256sum -b "$_world_sdf" 2>/dev/null | cut -c1-16)"
+    # Internal name, plus three counts that make a geometry change legible
+    # without diffing a 900 kB file: how many models, how many are collidable,
+    # and how many are still dynamic (a physics cost, and for scene decoration
+    # always a mistake).
+    _world_geom=$(python3 - "$_world_sdf" <<'PYGEOM' 2>/dev/null
+import sys, xml.etree.ElementTree as ET
+w = ET.parse(sys.argv[1]).getroot().find('world')
+models = w.findall('model')
+print(f"sdf_world_name={w.get('name')}")
+print(f"world_models={len(models)}")
+print(f"world_collisions={len(list(w.iter('collision')))}")
+print("world_nonstatic_models=%d" % sum(
+    1 for m in models if (m.findtext('static') or 'false').strip() == 'false'))
+PYGEOM
+)
+    if [ -n "$_world_geom" ]; then
+      printf '%s\n' "$_world_geom"
+    else
+      # The SDF exists but did not parse. Say so in every key rather than
+      # dropping them, so a reader cannot mistake it for an older manifest.
+      echo "sdf_world_name=unparseable"
+      echo "world_models=unparseable"
+      echo "world_collisions=unparseable"
+      echo "world_nonstatic_models=unparseable"
+    fi
+  else
+    # Present and saying "missing", never absent: same rule as every key above.
+    echo "world_sdf=missing"
+    echo "sha256_world_sdf=missing"
+    echo "sdf_world_name=missing"
+    echo "world_models=missing"
+    echo "world_collisions=missing"
+    echo "world_nonstatic_models=missing"
   fi
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
@@ -2668,6 +3250,13 @@ for r in $ROBOTS; do
       -p pursuit_explore_max:=$PURSUIT_EXPLORE_MAX \
       -p hold_escalate:=$HOLD_ESCALATE_ARG \
       -p hold_escalate_wait_sec:=$HOLD_ESCALATE_WAIT \
+      -p rendezvous_depart_delay_sec:=$RDV_DEPART_DELAY \
+      -p rendezvous_max_lateness_sec:=$RDV_MAX_LATE \
+      -p rendezvous_interval_sec:=$RDV_INTERVAL \
+      -p rendezvous_settle_sec:=$RDV_SETTLE \
+      -p rendezvous_appointment_wait_sec:=$RDV_APPT_WAIT \
+      -p rendezvous_latched_hold_sec:=$RDV_LATCHED_HOLD \
+      -p mission_start_hold_sec:=$START_HOLD \
       -p exploitation_enabled:=$EXPLOIT_ARG \
       -p rendezvous_expected_peers:=$((N_ROBOTS - 1)) \
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
@@ -2749,7 +3338,14 @@ log "planners up (exactly $N_ROBOTS explo_planner_node)"
 # not produce a degraded run, it produces a run that measures the wrong thing
 # while looking healthy, and an hour of sim time is more expensive than a
 # restart. GATES_STRICT=0 still forces the old report-and-continue behaviour.
-GATES_STRICT="${GATES_STRICT:-$COMMS}"
+# GATES_STRICT: resolved with the other run-control knobs above (the
+# `C2 (2026-09-14)` block, ~:2119).
+#
+# All eight of these back-references read "~:1801" until 2026-09-18, which is
+# the snap-scrub/ROS-sourcing block and has never resolved a knob. The grep
+# string is the durable half of the reference; the number is a convenience that
+# goes stale on the next insertion above it, as it already has once. If they
+# disagree, believe the grep.
 if [ "$COMMS" = "1" ]; then
   GATE_REPORT="$OUTDIR/comms_gates.txt"
   ROBOT_CSV=$(echo $ROBOTS | tr ' ' ',')
@@ -2795,6 +3391,17 @@ fi
 
 T0=$(sim_clock)
 [ -n "$T0" ] || die "cannot read /clock"
+# Wall clock at T0, so the run-end block can bank BOTH a total cell wall time
+# and a bring-up-free one. $SECONDS is a bash builtin counting from shell start
+# and is never reassigned in this file (grep '^SECONDS='), so T0_WALL is
+# literally "seconds of bring-up" and $SECONDS at the end is the whole cell.
+# The decision this exists for: generation 9's FOV bundle is 6x the rays of
+# generation 8 at up to 2x the length with NO candidate-count offset (the
+# n_yaw 4->1 cut is inert on this path — FRONTIER_ONLY=1), and nothing measures
+# plan CPU. The agreed gate is to read the wall/sim ratio off the FIRST cell
+# against the ~1.149 generation-8 baseline rather than guess, and that read was
+# not possible from a manifest that banked started_utc and no finish stamp.
+T0_WALL=$SECONDS
 log "sim t0=$T0 — targets release at +120 / +420 / +720 s of the SCHEDULER's clock"
 if [ "$DURATION_S" != "0" ]; then
   log "will stop at t_sim=$((T0 + DURATION_S))"
@@ -2820,15 +3427,15 @@ LAST_HB=0
 #
 #   PURSUE       <= PURSUIT_BUDGET_MAX   600 s   (doPursue gives up at budget)
 #   RETURN_NAV   <= RECONNECT_NAV_MAX    600 s
-#   RETURN_SYNC  <= MIDRUN_MAX_WAIT      240 s
+#   RETURN_SYNC  <= MIDRUN_MAX_WAIT       30 s
 #   pre-dispatch quiet                   ~40 s   (observed)
 #                                       ------
-#                                       ~1480 s
+#                                       ~1270 s
 #
 # plus an unbounded-in-principle correction: doProximityHold REFUNDS held time
 # to pursue_start_time_, so PURSUE's wall duration can exceed its budget by the
 # accumulated hold, up to proximity_max_hold_sec (120 s, never overridden here)
-# — call it ~1600 s worst case.
+# — call it ~1390 s worst case.
 #
 # The first version of this comment said 840 s, having simply omitted PURSUE.
 # That figure was already falsified by the bank: the longest banked manoeuvre
@@ -2859,7 +3466,7 @@ LAST_HB=0
 # real hang is 0 in 500 banked cells, so the expected cost of the extra 600 s
 # is ~zero and it buys 1.5x over the configured ceiling. Still inside
 # DURATION=3000, so the gate stays live — the check below enforces that.
-HANG_HB="${HANG_HB:-40}"
+# HANG_HB: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 # ...and say so out loud when it is NOT, because "well inside DURATION" is a
 # claim about two numbers that are set independently and never compared. At
 # HANG_HB=30 the gate needs 1800 sim-s of frozen steps, so any cell shorter
@@ -2892,11 +3499,11 @@ fi
 # row rather than by a fixed field number: `state` sits partway along a schema
 # that only ever grows at the right-hand end, so its index has changed once
 # already and would change again the next time a column is appended before it.
-STOP_ON_DONE="${STOP_ON_DONE:-1}"
+# STOP_ON_DONE: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 # Grace, in sim seconds, between all-DONE and teardown: lets the last metrics
 # rows land, the reliable backlog drain, and the gate watcher see the final
 # state. Without it the run ends inside the very merge the endpoint measures.
-DONE_GRACE_S="${DONE_GRACE_S:-30}"
+# DONE_GRACE_S: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 DONE_SINCE=-1
 # Last value of the `state` column in a planner CSV, or empty if the file has no
 # data rows yet.
@@ -2924,8 +3531,8 @@ planner_state() {
 # and is only forced to POLL_S resolution when the answer is about to change:
 # on the all-DONE edge, and inside the grace window, which is exactly where the
 # resolution is the thing being bought.
-POLL_S="${POLL_S:-2}"
-CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
+# POLL_S: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
+# CLOCK_EVERY_S: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 LAST_STEPS=-1; STALL=0
 LAST_CLOCK_WALL=0
 # Wall-clock deadman on the sim clock itself.
@@ -2942,14 +3549,14 @@ LAST_CLOCK_WALL=0
 # Deliberately generous. Sim time can legitimately stall for tens of seconds
 # during a heavy lidar frame or a costmap rebuild, and killing a healthy slow
 # cell is a worse failure than the one being prevented.
-CLOCK_DEADMAN_S="${CLOCK_DEADMAN_S:-420}"
+# CLOCK_DEADMAN_S: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 LAST_T_SEEN=-1
 LAST_T_WALL=$SECONDS
 # A /clock read that returns nothing `continue`s, so it must not be able to spin
 # unbounded either: an rmw failure would otherwise look exactly like the frozen
 # clock above, minus the log line.
 CLOCK_FAIL=0
-CLOCK_FAIL_MAX="${CLOCK_FAIL_MAX:-60}"
+# CLOCK_FAIL_MAX: resolved with the other run-control knobs above (the `C2 (2026-09-14)` block, ~:2119).
 while true; do
   sleep "$POLL_S"
   for entry in "${PIDS[@]}"; do
@@ -3174,7 +3781,37 @@ done
 # "still unfinished when the horizon cut it off" are different observations and
 # the analysis must not average them together.
 echo "run_end_reason=${RUN_END_REASON:-censored_at_T}" >> "$OUTDIR/run_manifest.txt"
+# T0 IS WALL-PACED, SO THIS IS NOT A CLEAN DURATION. Bring-up deadlines are
+# wall-clock, so how much SIM time elapses before T0 depends on the real-time
+# factor, which depends on team size: RTF 0.9063 at N=2 vs 0.4217 at N=4 gave a
+# measured pre-T0 offset of 28.80 +- 2.02 s and 24.71 +- 0.99 s respectively --
+# a systematic ~4.1 sim-s bias that is ALIGNED WITH N, on top of the
+# DONE_GRACE_S drain that is inside this number by construction. Kept because
+# several scripts read it and because it is the only figure that describes the
+# harness's own horizon, but it is not the endpoint.
 echo "run_end_t_sim=$((T - T0))" >> "$OUTDIR/run_manifest.txt"
+# C2: the endpoint, taken from the planners themselves. Each robot's `run_end`
+# event carries t_rel_sec, measured from that planner's own t0, so it has no
+# wall-paced zero point and no bring-up offset. Written per robot AND as the
+# max, because "when did the team finish" is the max over robots while "how
+# long did this robot run" is the per-robot value, and conflating them is how
+# an order statistic got reported as a team mean. Absent/unparseable robots are
+# recorded as empty rather than 0 -- a missing endpoint must not read as a fast
+# one.
+_tmax=""
+for r in $ROBOTS; do
+  _tr=$(sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"run_end".*"t_rel_sec"[[:space:]]*:[[:space:]]*\([0-9.eE+-]*\).*/\1/p' \
+        "$OUTDIR/$r.events.jsonl" 2>/dev/null | tail -1)
+  case "$_tr" in
+    ''|*[!0-9.eE+-]*) _tr="" ;;
+  esac
+  echo "run_end_t_rel_sec_$r=$_tr" >> "$OUTDIR/run_manifest.txt"
+  if [ -n "$_tr" ]; then
+    _tmax=$(awk -v a="${_tmax:-}" -v b="$_tr" 'BEGIN{ if (a == "") print b; else print (b+0 > a+0 ? b : a) }')
+  fi
+done
+echo "run_end_t_rel_sec_max=$_tmax" >> "$OUTDIR/run_manifest.txt"
+unset _tmax _tr
 # 1 = the full ${DONE_GRACE_S}s drain elapsed after the last planner declared,
 # 0 = all_done was reached but the horizon cut the drain short, empty = the run
 # never reached the all-DONE state at all. Emitted unconditionally, including
@@ -3182,5 +3819,25 @@ echo "run_end_t_sim=$((T - T0))" >> "$OUTDIR/run_manifest.txt"
 # run happened not to drain" — the distinction that made done_action_in_params
 # worth fixing in the same file.
 echo "done_drain_complete=${DONE_DRAIN_COMPLETE:-}" >> "$OUTDIR/run_manifest.txt"
+# Cell cost, banked so it can be read rather than reconstructed from directory
+# mtimes. Two numbers because they answer two questions and the ratio of the
+# wrong one is meaningless:
+#   run_end_wall_sec          — the WHOLE cell, bring-up included. This is the
+#                               quantity the ~79 s + 1.149x t_sim budget model
+#                               predicts, so it is the one to compare against it.
+#   run_end_wall_sec_since_t0 — wall seconds after T0 only. Divide this by
+#                               run_end_t_sim for a real-time factor that does
+#                               not have bring-up folded into it.
+# Neither is a planner-CPU measurement and neither should be quoted as one: a
+# cell is Gazebo plus scovox plus the planners, and at ~1 core per sim-second
+# scovox dominates. What they CAN do is answer "did generation 9's raycast
+# change the cell budget", which is the whole point — if this ratio matches
+# generation 8's, the 12x upper bound on the FOV cost did not matter, and if it
+# does not, it shows up on cell 1 and costs one cell to learn.
+# Absent keys mean an OLD manifest, never a zero-cost cell — same rule as
+# done_drain_complete above.
+echo "run_end_wall_sec=$SECONDS" >> "$OUTDIR/run_manifest.txt"
+echo "run_end_wall_sec_since_t0=$((SECONDS - T0_WALL))" >> "$OUTDIR/run_manifest.txt"
+echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUTDIR/run_manifest.txt"
 log "run ended at t_sim=+$((T - T0))s (${RUN_END_REASON:-censored_at_T})"
 # teardown runs on EXIT

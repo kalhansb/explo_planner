@@ -1,13 +1,31 @@
 /// @file target_scheduler_node.cpp
 /// @brief Time-based tree-target publisher for perceptive exploitation.
 ///
-/// Today there is no live tree detector: the experiment uses a *preselected*
-/// list of tree targets released on a time schedule. This node reads that list
-/// as parallel ROS parameter arrays and publishes each as a TreeTarget on the
-/// shared targets topic when its release time (relative to node start, in sim
-/// time) elapses. The explo_planner subscribes to the same topic, so when a
-/// real detector is implemented it publishes the identical message and this
-/// scheduler is simply dropped — no planner change.
+/// The experiment uses a *preselected* list of tree targets released on a time
+/// schedule. This node reads that list as parallel ROS parameter arrays and
+/// publishes each as a TreeTarget on the shared targets topic when its release
+/// time (relative to node start, in sim time) elapses.
+///
+/// A LIVE DETECTOR DOES EXIST — tree_detector_node.cpp, built by the same
+/// package — and it publishes the identical message on the same topic, so the
+/// explo_planner cannot tell them apart. The two are mutually exclusive
+/// alternatives chosen by the `use_detector` launch argument, which defaults to
+/// false. It is kept deliberately, not for want of a detector: the schedule is
+/// an INPUT the experiment controls, so every arm and every seed meets the same
+/// targets at the same times, which is what makes an exploitation contrast
+/// attributable to the arm rather than to what each robot's own map happened to
+/// segment.
+///
+/// NO CAMPAIGN RUNS EITHER ONE TODAY, and this said "this scheduler is what the
+/// campaigns actually run" until 2026-09-18. That was true of the exploitation
+/// campaigns and is false of every reconnection/comms campaign since: the
+/// matrix requires pure exploration, so run_campaign.sh launches each cell with
+/// EXPLOIT=0, and run_explo_sim_rviz.sh then sets exploitation_enabled:=false
+/// and starts no target_scheduler at all (see the EXPLOIT block there for why
+/// leaving it on would contaminate the endpoint — target detours of
+/// arm-dependent length, and a /exploration/targets bus the radio emulator does
+/// not relay). This node's own default is unchanged; what changed is which
+/// experiment is being run. Read the cell's manifest, not this sentence.
 ///
 /// It is C++ (not a Python one-shot) so use_sim_time / bag playback time is
 /// handled the same way the planner handles it: release times are measured on

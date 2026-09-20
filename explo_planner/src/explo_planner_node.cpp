@@ -2,15 +2,15 @@
 /// @brief Standalone SCovox Beta EIG exploration planner node — self-contained.
 ///
 /// This is the EIG-only planner that the exploration/exploitation system is
-/// built on top of. It is a deliberate DUPLICATE of ExplorationPlannerNode
-/// (exploration_planner_node.hpp/.cpp): that node is the multi-planner
-/// comparison harness (eig/entropy/frontier/random/ssmi) used for experiments;
-/// this one is hard-wired to the SCovox Beta expected-information-gain scorer
-/// and owns its own copy of the state machine so it can diverge as the
-/// exploration/exploitation behaviour grows without disturbing the comparison
-/// node. The reusable pieces (scoring, candidate generation, FOV evaluation,
-/// cost grid, coordination, map cache, metrics) are still shared via
-/// explo_planner_lib.
+/// built on top of. It began as a fork of a multi-planner comparison node
+/// (eig/entropy/frontier/random/ssmi) that NO LONGER EXISTS in this workspace:
+/// do not go looking for exploration_planner_node.hpp/.cpp, it is gone, and
+/// this is now the only planner node. What survives from that fork is the
+/// shape of this file — hard-wired to the SCovox Beta expected-information-gain
+/// scorer and owning its own copy of the state machine, which is why there is
+/// no planner_type knob anywhere below (see the note at the class declaration).
+/// The reusable pieces (scoring, candidate generation, FOV evaluation, cost
+/// grid, coordination, map cache, metrics) are shared via explo_planner_lib.
 ///
 /// Map ingest is topic-based (not the old GetRegion service): the planner
 /// SUBSCRIBES to the fused ScovoxMap topic (latched QoS) and rebuilds a local,
@@ -38,8 +38,10 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <map>
 #include <numeric>
+#include <utility>  // std::pair, std::move
 
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
@@ -119,9 +121,14 @@ enum class State {
   // Mesh-reconnection pursuit (robot-carried radios). Instead of driving home
   // to the anchor, chase the missing peer's last declared goal (and its last
   // heard pose) on a staleness-scaled budget; the mesh re-forms the moment we
-  // come within range, no arrival needed. Budget spent -> fall back to the
-  // deterministic meeting point (hybrid) or hold in place (pursuit). Gated by
-  // reconnect_mode_; see the pursuit_* params.
+  // come within range, no arrival needed. Budget spent -> explore on the
+  // fallback allowance (pursuitExploreFallback), and only then hold in place
+  // and beacon (holdForTeam). THE SAME LADDER IN BOTH ARMS: hybrid has no
+  // separate "fall back to the meeting point" branch here, and has not since
+  // 2026-09-16 — what hybrid does that pursuit cannot is KEEP AN APPOINTMENT,
+  // which pre-empts the chase from doPursue rather than following it. Gated by
+  // reconnect_mode_; see the pursuit_* params and planner_util.hpp's arm
+  // definitions, which are the canonical text.
   PURSUE,
   // Coordinated proximity stop (multi-robot). A DRIVING robot that has lost
   // right-of-way to a nearby moving teammate cancels its nav goal and parks
@@ -325,6 +332,212 @@ private:
   bool dispatchReconnect(const char* reason);
 
   // ---- Scheduled rendezvous (P5, §3.5) --------------------------------
+  /// The exchanged (cell, interval) pair. Declared here only so the handshake
+  /// methods below can name it; it is DEFINED with the rest of the P5 state,
+  /// where the comment explaining why the appointment travels on the wire
+  /// instead of being derived twice belongs.
+  struct RendezvousProposal;
+
+  /// Is every peer in MUTUAL direct contact right now?
+  ///
+  /// The rendezvous gate, and deliberately stricter than
+  /// `teamComplete(accountedPeerCount, rendezvous_expected_peers_)`. That one
+  /// counts peers heard on EITHER channel — "I can hear them" — with no test
+  /// that they can hear
+  /// me, and doc/limitations.md §10 records one-way contact as observed rather
+  /// than hypothetical. The two robots would then stop stamping their anchors
+  /// at different instants, which is the one thing an agreed INTERVAL cannot
+  /// absorb.
+  ///
+  /// `TeamModel::Peer::direct` is the handshake: true only when we received
+  /// from the peer inside the TTL AND the `in_range_mask` it sent named us
+  /// back. Both ends evaluate the same symmetric predicate, so both stop on
+  /// the same physical event.
+  ///
+  /// Reads the model rather than re-deriving: `drainTeamWorld` ticks it at the
+  /// planning rate, well inside one heartbeat.
+  bool rendezvousTeamMutual() const;
+
+  /// Is any peer we are receiving from RIGHT NOW announcing that ITS OWN view
+  /// of the team is broken? (TeamWorld/team_incomplete, generation 23.)
+  ///
+  /// The contagion term: this is how a robot that can hear everyone learns
+  /// that two of its peers cannot hear each other. See TeamWorld.msg for why
+  /// nothing else can tell it — no channel in accountedPeerCount relays
+  /// REACHABILITY, and there is no map relay, so an A—B—C bridge is a genuine
+  /// information partition that only C can close. (Its third channel,
+  /// `finished`, IS relayed. That is a claim about a peer's run ending, not
+  /// about who can hear whom, so it closes no partition; see peerAccounted.)
+  ///
+  /// `direct || heard_one_way` and not `direct`: both mean "received first-hand
+  /// inside the TTL", but `direct` additionally requires the peer's mask to
+  /// name us back, and suppressing the one-way case would drop exactly the
+  /// robot that most needs relaying — it cannot hear us, so its own read is
+  /// already broken and this announcement is the only channel it has.
+  bool peerReportsTeamBreak() const;
+
+  /// Is any peer we are receiving from RIGHT NOW still DRIVING to the agreed
+  /// cell? (TeamWorld/appointment_inbound, generation 23.)
+  ///
+  /// The appointment barrier's other half. Its release predicate is a comms
+  /// test and the drive ends on arrival, so without this a robot standing at
+  /// the cell leaves the instant its partner comes into radio range — tens of
+  /// metres out — and the partner, which may not release en route because the
+  /// CELL is the agreed thing, walks the rest of the way to an empty cell and
+  /// then waits there alone.
+  ///
+  /// `direct || heard_one_way` for the same reason peerReportsTeamBreak needs
+  /// it: the bit carries no TTL, so a peer that goes silent mid-drive must stop
+  /// holding the barrier. Its silence holds it through teamComplete instead,
+  /// which is the stronger test and the one that can clear.
+  ///
+  /// NO FINISHED EXEMPTION, deliberately unlike peerReportsTeamBreak. That one
+  /// must exempt a finished peer because its bit never clears and would hang an
+  /// unbounded barrier; this one always clears within nav_budget_sec, so there
+  /// is no hang to prevent — and a robot that latched coverage on its way to
+  /// the meeting is still coming, so exempting it would reproduce this very
+  /// defect for exactly that robot.
+  bool peerInboundToAppointment() const;
+
+  /// Does any peer we are receiving from RIGHT NOW report a still-driving
+  /// robot on ITS first-hand horizon? (TeamWorld/appointment_inbound_seen,
+  /// generation 27.)
+  ///
+  /// The one-hop companion the closure door requires. The door admits peers
+  /// that are only reachable through a bridge robot, and such a peer's own
+  /// appointment_inbound cannot arrive here — the bit is never relayed — so
+  /// the bridge's report is the only witness the still-driving veto can have
+  /// for it. The closure expands exactly one hop through a direct bridge
+  /// (team_model.cpp/tick) and the bridge hears that hop first-hand, so this
+  /// report covers every peer the door's CLOSURE admits that
+  /// peerInboundToAppointment cannot see; the count's `finished` disjunct is
+  /// the one admission neither veto covers (the accepted residual noted in
+  /// reachablePeerCount). Same liveness pairing, no-TTL and no-finished-exemption
+  /// arguments as above; a reporter's own run ending does not invalidate what
+  /// it currently receives.
+  bool peerReportsInboundToAppointment() const;
+
+  /// HOW MANY PEERS ARE ACCOUNTED FOR RIGHT NOW — the liveness number every
+  /// DECISION in this file runs on, with one sanctioned exception since
+  /// generation 27: the appointment barrier's release door also consults
+  /// reachablePeerCount() below. Three channels, unioned:
+  ///
+  ///  1. the peer's coordination claim is unexpired — Coordination::peerLive,
+  ///     the pre-generation-23 answer and the only one that exists before
+  ///     TeamModel is configured;
+  ///  2. TeamWorld reports the link `direct` — a bidirectionally confirmed
+  ///     radio statement, aged out on TeamModel::direct_ttl_sec;
+  ///  3. the peer announced `finished`, so its run is over and it will never
+  ///     arrive at anything. UNLIKE 1 AND 2 THIS ONE IS NOT FIRST-HAND AND HAS
+  ///     NO TTL: TeamWorld/robot_finished relays it, team_model.cpp only ever
+  ///     ORs it true, and nothing but a first-hand observation of the peer
+  ///     un-finishing clears it. A finished peer therefore counts accounted for
+  ///     the rest of the run from a bit that may have arrived through a third
+  ///     robot, with no contact of any kind. That is the intended reading —
+  ///     "will never arrive" is not a statement about the radio — but it does
+  ///     mean this count is only a reachability claim over the UNFINISHED
+  ///     peers, and every argument built on it has to say so.
+  ///
+  /// CHANNEL 1 ALONE IS NOT A STATEMENT ABOUT THE RADIO, and that is the
+  /// defect this closes. The presence beacon is STATE-GATED — see `beaconing`
+  /// on the heartbeat, which excludes PLAN — so a planner that spends longer
+  /// than coord_claim_ttl_sec inside a single solve publishes nothing, ages
+  /// out of every peer's claim table with the link perfectly healthy, and
+  /// those peers then announce team_incomplete and arm a "peer-separation"
+  /// manoeuvre against a robot standing next to them. That is a false
+  /// positive on the exact mechanism generation 23 exists to measure, and it
+  /// fires at N=2 as well, where contagion is supposed to contribute nothing.
+  /// TeamWorld rides the same comms emulator but publishes on its own
+  /// unconditional timer, so channel 2 cannot be suppressed by planner
+  /// latency; when the radio is genuinely down BOTH channels stop, so the
+  /// union adds no false negatives.
+  ///
+  /// CHANNEL 3 is what bounds the appointment barrier. Waiting is unbounded
+  /// on purpose (rendezvous_appointment_wait_sec = 0: the team meets and does
+  /// not leave early), so without it one robot ending its run — every ending
+  /// except the coverage latch used to publish finished=false forever — holds
+  /// every other robot at the meeting point until the duration cap and
+  /// censors the cell. Exempting a finished peer is what peerReportsTeamBreak
+  /// and the allocator's vehicle set already do with the same bit.
+  ///
+  /// Telemetry uses this too: `peers_live` and `coord_active_peers` in every
+  /// CSV are this number as of schema 8, so an analysis can reconstruct the
+  /// decision from the row that recorded it. The raw Coordination::livePeerCount
+  /// survives at exactly one site — the not-yet-configured fallback below.
+  ///
+  /// THE BEACON-SUPPRESSION WARN ON THE HEARTBEAT IS NOW A DIAGNOSTIC, NOT A
+  /// HAZARD. It still measures how long this robot went unbeaconed, which is
+  /// worth knowing, but a suppressed episode no longer changes any decision:
+  /// channel 2 carries the robot through it. A smoke run that shows suppression
+  /// episodes AND no "peer-separation" arms attributable to them is the
+  /// confirmation that this fix landed.
+  int accountedPeerCount(const rclcpp::Time& now) const;
+
+  /// accountedPeerCount for ONE peer, named the way the claim table names it.
+  /// Every site that asks about a single teammate — the chase release, the
+  /// quarry-live column, missingPeerRecord's choice of who the barrier is
+  /// waiting on — goes through this, so "the team is whole" and "this peer is
+  /// back" can never be answered by two different predicates.
+  bool peerAccounted(const std::string& name, const rclcpp::Time& now) const;
+
+  /// HOW MANY PEERS ARE REACHABLE RIGHT NOW — accountedPeerCount's question
+  /// asked over the comms CLOSURE instead of this robot's own edges: a peer
+  /// counts if TeamModel::inComms says a relay path reaches it this tick, or
+  /// if it announced `finished` (same exemption as the count above, same
+  /// reason). Zero before TeamModel is configured.
+  ///
+  /// ONE DECISION CONSUMES THIS, ON PURPOSE: the appointment barrier's
+  /// release door in manoeuvreReleaseEligible (generation 27). The ARM must
+  /// never read it — in an A—B—C bridge A and B are genuinely partitioned on
+  /// the maps (no relay carries them through C), so the meeting must still
+  /// be called; see the arming site. But once the team has GATHERED, a pair
+  /// the meeting point itself cannot close is not resolved by more waiting:
+  /// the gen-26 N=3 smoke parked all three robots in RETURN_SYNC from
+  /// ~350 s to the 660 s cap over one tree on one 8 m chord (pair 0-2 up
+  /// 1.3% of the window while both other pairs held 100%). team_model.hpp
+  /// scopes inComms to "the dispatch decision" — and releasing a barrier is
+  /// exactly a dispatch decision; every data consumer stays on first-hand
+  /// freshness.
+  int reachablePeerCount() const;
+
+  /// THE generation-23 team predicate: this robot hears everyone AND nobody it
+  /// can hear says otherwise.
+  ///
+  /// The exact complement of the arming condition, and it must be used at
+  /// every one of the five sites listed at the arming site — arm on `!P`, end
+  /// on `P`, for ONE `P`. Generation 27 sanctions one asymmetry: the barrier
+  /// RELEASE ends on `P` OR the reachable door (argued at
+  /// manoeuvreReleaseEligible), which cannot ratchet because the spent latch
+  /// still clears on exactly `P`. Passing `live_peers` in rather than reading
+  /// the coordinator here keeps it callable from const context and keeps every
+  /// site visibly sampling the same count it already had.
+  bool teamSettled(int live_peers) const;
+
+  /// The barrier's release predicate: for an appointment manoeuvre,
+  /// teamSettled OR every expected peer reachable (the generation-27 door —
+  /// see the definition), both gated on nobody still driving in; plain
+  /// teamComplete otherwise.
+  ///
+  /// The split exists because the two manoeuvres answer different questions.
+  /// An APPOINTMENT is the team-wide meeting the contagion arms: it ends when
+  /// the team is whole by the predicate that called it — or, since generation
+  /// 27, when everyone it could ever gather is already REACHABLE, because at
+  /// the meeting point the mesh predicate is a geometry test one occluding
+  /// trunk can fail forever. A release weaker than the arm cannot churn here:
+  /// rendezvous_spent_ still clears only on the strict predicate, so a
+  /// closure-released team goes back to exploring and cannot re-arm until a
+  /// genuine mesh reunion (contrast generation 19, where the LATCH cleared
+  /// weak and the arm never stopped). Every other return —
+  /// a midrun reconnect, a terminal homing — is this robot's own business and
+  /// keeps the local "I can hear my peers" test it has always had; widening
+  /// those to a team-wide predicate would let one distant robot's break hold a
+  /// pair that has already reconnected.
+  ///
+  /// Reads appointment_manoeuvre_, which transitionTo() clears AFTER both of
+  /// its classifiers run, so the classifiers see the same branch the release
+  /// site saw.
+  bool manoeuvreReleaseEligible(int live_peers) const;
+
   /// Freeze the world the next appointment will be derived from.
   ///
   /// Called on the heartbeat while the team reads COMPLETE, so what it holds
@@ -335,29 +548,136 @@ private:
   /// which time the two worlds have diverged by exactly the backlog the
   /// meeting exists to exchange. No-op unless the schedule is enabled.
   void refreshRendezvousSnapshot();
-  /// Derive the appointment from the frozen snapshot and arm it. Emits one
+  /// Run one round of the propose/echo/commit handshake. Called from the same
+  /// heartbeat site as refreshRendezvousSnapshot, but UNCONDITIONALLY — the
+  /// team-mutual state is passed in as `team_mutual` rather than gating the
+  /// call, because the three things this does need three different gates.
+  ///
+  /// DERIVE (proposer only) requires `team_mutual`. It is the step that must
+  /// predate the separation: it argmins over a snapshot that is only a shared
+  /// problem while the team is confirmed whole.
+  ///
+  /// ECHO does not, and gating it was a deadlock: a follower could only adopt
+  /// the proposer's triple while the WHOLE team was mutually in contact, but
+  /// the commit it feeds needs every follower to have already adopted. At N=2
+  /// the two conditions coincide and it worked; at N>=3 the fleet is almost
+  /// never mutually whole for the two-plus TeamWorld periods a
+  /// propose->echo->commit round trip costs, so nothing was ever agreed and
+  /// every arming refused (measured: 0 agreements and 18/18 refusals over a
+  /// 600 s 3-robot cell).
+  ///
+  /// COMMIT does not require it either, and that is not a relaxation. It
+  /// requires every peer to have been HEARD holding this robot's exact triple,
+  /// which is strictly stronger and of a different kind: the mask is a claim
+  /// about connectivity at one instant, an echo is first-hand evidence of what
+  /// that specific robot decided. Freshness is not tested either. The full
+  /// argument, including why a latch cannot quietly go stale now that a peer
+  /// may upgrade off the centroid placeholder, is at the commit rule itself.
+  ///
+  /// Echoing early is therefore not a private input and does not weaken the
+  /// agreement: a follower adopts the proposer's three integers VERBATIM. All
+  /// it buys is that the fleet is already converged when a brief whole-team
+  /// window opens, so that window only has to be long enough to commit in —
+  /// not long enough to negotiate in. At N=4 that window was measured at about
+  /// two seconds.
+  void maintainRendezvousProposal(bool team_mutual);
+  /// PROPOSER ONLY: solve the schedule over the frozen snapshot and return the
+  /// (cell, interval, t_meet) triple to publish. Returns an invalid proposal
+  /// when the snapshot cannot support a solve. The plan behind it lands in
+  /// rendezvous_held_provenance_.plan for the event (there is no
+  /// rendezvous_held_plan_ member; the next line names it correctly and this
+  /// one did not until 2026-09-17). Whether what came back is a CHOICE or
+  /// the centroid placeholder is read off the provenance it fills in —
+  /// `rendezvous_held_provenance_.plan.candidates <= 1` — at the one call site,
+  /// which is what sets `rendezvous_held_provisional_`.
+  RendezvousProposal deriveRendezvousProposal();
+  /// Turn the committed triple into a standing appointment. THE PLACE AND THE
+  /// TIME ARE BOTH THE TRIPLE'S: `cell` is adopted verbatim off the wire and
+  /// `t_meet_ms` is an occurrence of the agreed recurrence — the first one this
+  /// robot can still ARRIVE at within rendezvous_max_lateness_sec
+  /// (nextAgreedOccurrence, floored at t_now plus this robot's shortfall, which
+  /// is zero unless it genuinely cannot make the nearest rung). Every robot
+  /// that can reach the agreed instant attends the SAME instant; a robot that
+  /// cannot, and a robot arming after the instant has genuinely passed, slip by
+  /// whole intervals. (Until generation 25 the floor was
+  /// now + rendezvous_depart_delay_sec — a lead time added UNCONDITIONALLY,
+  /// which forked the ts4 N=3 cell across two occurrences with every robot able
+  /// to make the first. That is the distinction the shortfall's clamp at zero
+  /// keeps; see the block at the assignment. It described a private countdown
+  /// here until generation 23 — see nextAgreedOccurrence in planner_util.hpp
+  /// for why that was not a rendezvous.) `interval_ms` is the recurrence period
+  /// that occurrence is taken from. Emits one
   /// `rendezvous_agreed` per call, refusals included. Returns true when an
-  /// appointment now stands.
+  /// appointment now stands. Does NOT solve — see the P5 state block for why
+  /// deriving twice was abandoned.
   bool armAppointment(const char* reason);
+  /// This robot's drive time to `cell` from where it is right now, or -1 when
+  /// there is no usable estimate — no configured snapshot world, or a position
+  /// or target the snapshot's grid cannot place.
+  ///
+  /// TAKES A CELL rather than reading appointment_.cell so the rung choice in
+  /// armAppointment can ask it BEFORE the appointment is armed. It is the only
+  /// place the grid lookup lives; both readers below go through it.
+  ///
+  /// OPTIMISTIC BY CONSTRUCTION. GlobalAllocator::costMm masks the graph's
+  /// unreachable sentinel with a centroid straight line, so this is finite even
+  /// for a cell there is no route to, and it prices no nav overhead. That is
+  /// why the two decisions built on it use the marked-up appointmentLeadMs
+  /// rather than this, and why the reachability WARN in armAppointment asks the
+  /// graph directly instead.
+  long long travelMsToCell(int cell) const;
+  /// travelMsToCell marked up by rzv_cfg_.depart_safety_milli, or -1 when there
+  /// is no estimate. ONE function because the rung choice at arming and the
+  /// departure trigger must price the same drive the same way — if they drift,
+  /// a robot signs up to a rung on one arithmetic and leaves for it on another.
+  long long appointmentLeadMs(int cell) const;
   /// This robot's own travel time to the standing appointment, recomputed
   /// LIVE from where it is now (a chase moves it). -1 when there is no
   /// appointment or no usable cell for the current position.
+  ///
+  /// THE LOGGED COVARIATE. It is written as `travel_sec` and answers "how far
+  /// was this robot from the meeting", which is what separates a late arrival
+  /// from a robot that was never close. The departure rule reads the marked-up
+  /// appointmentLeadMs, not this.
   long long appointmentTravelMs() const;
-  /// Departure test: is it time to break off and drive to the appointment?
-  /// Per-robot by construction, so the far robot leaves first and the two
-  /// arrive together — see §3.5's departure rule.
+  /// Departure test: is it time to leave so as to ARRIVE at the agreed
+  /// occurrence? `now + appointmentLeadMs >= t_meet_ms`, guarded by the armed
+  /// flag, degrading to a bare `now >= t_meet_ms` when there is no estimate.
+  ///
+  /// EVERY ROBOT AIMS AT THE SAME INSTANT AND LEAVES ON ITS OWN, so the far one
+  /// leaves first and the arrivals coincide instead of being staggered by drive
+  /// distance. Whatever spread is left lands on doReturnSync's barrier, which
+  /// holds until the team reads complete rather than until a cap expires.
+  ///
+  /// THE LEAD IS LIVE, and that is what makes drift safe: a robot that explores
+  /// away from the meeting — or a chase that drags it away — grows its own lead
+  /// and is pulled out earlier, so the rung it signed up to at arming stays
+  /// reachable without anyone re-deciding which rung it is.
   bool appointmentDue();
   /// Centre of the appointment cell, as a drive destination.
   Eigen::Vector3f appointmentPoint() const;
-  /// Close a standing appointment and emit its `rendezvous_outcome`. A
-  /// "no-show" also writes the cell off, so the next arming inside the same
-  /// outage cannot pick it again. No-op when nothing is armed.
-  void closeAppointment(const char* outcome, bool arrived, double waited_sec);
+  /// Close a standing appointment and emit its `rendezvous_outcome`. No-op
+  /// when nothing is armed. Note it does NOT release rendezvous_spent_: the
+  /// outage gets one appointment, and the release happens when the team is
+  /// whole again.
+  /// Emit the appointment's single outcome row and disarm it.
+  ///
+  /// `mutual` records whether the reunion was whole-team TWO-WAY contact, as
+  /// distinct from `outcome`, which names what the barrier acted on
+  /// (teamComplete over live peers: one-way and direct-only, no relay — see
+  /// the release site in heartbeatTick()). The two were one field
+  /// until 2026-09-18 and disagreed at N>=3 — see the classifier for the cell
+  /// that logged a no-show in the same millisecond as its own reconnection.
+  void closeAppointment(const char* outcome, bool arrived, double waited_sec,
+                        bool mutual);
 
   /// Flicker guard for manoeuvre release: true once `eligible` has held
   /// continuously for reconnect_release_confirm_sec (immediately when the
   /// window is 0). Resets whenever eligible drops or the state changes.
   bool releaseConfirmed(bool eligible);
+  /// Non-mutating twin of releaseConfirmed, for callers that need the
+  /// barrier's answer without advancing its dwell. Keep the two in step.
+  bool releaseHeld(bool eligible) const;
   void startReturnTo(const Eigen::Vector3f& dest, const char* what,
                      const char* reason);
   void doReturnNav();
@@ -441,8 +761,10 @@ private:
   void standDownExploitation();
   // Presence-only intent (goal = own pose), kept fresh by the heartbeat.
   // Published at every barrier hold and at DONE-idle entry: a parked robot
-  // must stay countable by livePeerCount or a teammate that finishes later
-  // waits forever on a robot that is metres away and silent.
+  // must stay countable or a teammate that finishes later waits forever on a
+  // robot that is metres away and silent. Since generation 23 the beacon is
+  // belt to accountedPeerCount's braces: a finisher also publishes finished=1
+  // on TeamWorld, which accounts for it even under done_action=shutdown.
   void publishPresenceIntent();
   // Freshest last-contact record whose producer is NOT currently live — the
   // teammate the barrier is actually waiting on. nullptr when every recorded
@@ -729,21 +1051,523 @@ private:
   // between the pair can be attributed to staleness rather than to the
   // scheduler.
   //
-  // WHAT AGREEMENT ACTUALLY RESTS ON, stated plainly because the code cannot
-  // enforce it: RendezvousScheduler::solve is deterministic given identical
-  // inputs, so both robots derive the same appointment IF their snapshots
-  // agree. Mine holds my own position first-hand and the peer's from its last
-  // beacon; the peer's holds the mirror image. The two therefore differ by up
-  // to one beacon period of motion — which is invisible at cell granularity
-  // unless the motion crossed a boundary. This is the same residual the
-  // shipped midpoint construction already carries ("both midpoints agree to
-  // whatever the robots moved between the two receipt instants"), not a new
-  // one; what P5 adds is the shared_hash + cell + t_meet fields that make it
-  // MEASURABLE offline instead of assumed.
+  // WHAT AGREEMENT RESTED ON UNTIL 2026-09-16, AND WHY IT DID NOT HOLD. The
+  // claim used to be that RendezvousScheduler::solve is deterministic, so both
+  // robots derive the same appointment IF their snapshots agree — and that the
+  // snapshots differ by at most one beacon period of motion, invisible at cell
+  // granularity. The arithmetic half is true and was confirmed in the data.
+  // The snapshot half is false, and the margin is not small:
+  //
+  //   ts3 n2+n3, every separated pair that armed at both ends
+  //     same (cell, interval):        21 of 64 pairs (33%)
+  //     median t_meet disagreement:   91 s at N=2, 125 s at N=3 (max 496 s)
+  //     N=3 alone:                    0 of 7 pairs agreed
+  //     both ends fell to the floor:  2 of 6 agreed — so even the midpoint
+  //                                   floor is not symmetric
+  //     identical shared_hash:        still 9 of 24 disagreed, and the
+  //                                   candidate COUNT differed in 5 of 19
+  //
+  // The last line is the one that closes it: with the same snapshot hash the
+  // two solves still saw different candidate sets, so shared_hash was never a
+  // complete witness of the inputs and no amount of hash-gating could have
+  // made independent derivation safe. A private map is a private input.
+  //
+  // So the appointment is now EXCHANGED, not derived twice — see
+  // rendezvous_proposal_ below and TeamWorld.msg. The snapshot survives for two
+  // narrower jobs: the PROPOSER solves over it to derive the pair, and every
+  // robot reads its grid for the cell centre and its edges for its own travel
+  // estimate. Those are per-robot by design (staggered departures), so a
+  // snapshot that has drifted costs accuracy in one robot's deadline and can no
+  // longer cost the team the meeting.
   CellWorld               rendezvous_world_;
   std::vector<AllocRobot> rendezvous_vehicles_;
   bool                    have_rendezvous_snapshot_ = false;
   double                  rendezvous_snapshot_at_sec_ = -1.0;
+
+  // ---- The agreed proposal (the wire protocol above) -------------------
+  //
+  // A (cell, interval) pair, compared as exact integers. `interval_ms` is
+  // measured FROM THE SEPARATION, not from any robot's clock origin, which is
+  // what makes it echoable: the same two numbers mean the same appointment on
+  // every robot, and each end converts to its own t_meet by adding the instant
+  // its own view of the team went incomplete.
+  struct RendezvousProposal {
+    int       cell        = -1;
+    long long interval_ms = -1;
+    /// The meeting instant itself, in MISSION-ELAPSED ms on the proposer's
+    /// clock, echoed verbatim like the other two.
+    ///
+    /// WHY AN INSTANT AND NOT JUST THE INTERVAL (2026-09-17). The interval was
+    /// origin-free by design, and each robot supplied its own origin: the
+    /// instant its view of the team stopped being mutually whole. That is one
+    /// physical event at N=2 and the ts4 smoke measured the two ends 0.84 s
+    /// apart — but it is NOT one event at N>=3, because "every one of MY links
+    /// is up" is a per-robot predicate over a graph that comes apart edge by
+    /// edge. In the N=3 rendezvous cell the three anchors were 13.18 / 34.18 /
+    /// 33.98 s, so three robots holding a byte-identical pair kept it at times
+    /// spread over 21 s. The interval was exact and the appointment was not.
+    ///
+    /// An instant removes the per-robot term entirely: the proposer computes it
+    /// once and everyone adopts the integer. What remains is the skew between
+    /// the robots' own mission-clock baselines, which is bounded by node start
+    /// and measured at ~1.2 s across the ts4 cells — against the 21 s spread it
+    /// replaces, and against the 30 s settle window it has to fit inside.
+    ///
+    /// NOT against a wait cap: there is no longer one to compare it to. This
+    /// used to read "against a 240 s wait cap", which was
+    /// reconnect_midrun_max_wait_sec, and that is the PURSUIT cap — the
+    /// appointment barrier's patience is unbounded by design
+    /// (rendezvous_appointment_wait_sec = 0.0, see appointment_manoeuvre_
+    /// below). Residual skew therefore cannot cost a meeting at all in the
+    /// early direction; it only decides how much of the settle window an
+    /// early arrival spends waiting.
+    ///
+    /// Mission-elapsed rather than an absolute stamp, keeping the reason the
+    /// original field had: field clocks drift hours apart (the 2026-07-06
+    /// bunker/curt bags were 4531 s apart while recording simultaneously), and
+    /// a meeting time that arrives as an absolute stamp is one a drifting clock
+    /// silently relocates. The interval is kept alongside because it is what
+    /// the scheduler actually computed and what the floor below is expressed
+    /// in; it is no longer the thing the appointment is built from.
+    long long t_meet_ms   = -1;
+    /// A ZERO INTERVAL IS NOT A SCHEDULE, so it is not a valid pair. The test
+    /// was `interval_ms >= 0` until generation 29, which let one through — and
+    /// a zero-spaced lattice has no "next occurrence" to roll to, so
+    /// nextAgreedOccurrence hands back an instant already in the past and the
+    /// appointment is due the moment it is armed. That path is guarded at the
+    /// far end and the scheduler cannot mint a zero (the interval is floored
+    /// at the larger of rendezvous_interval_sec and the furthest robot's
+    /// drive), but the argument for deleting the already-passed diagnostic in
+    /// armAppointment is written as "while the committed interval is
+    /// positive", and a precondition a predicate does not enforce is one a
+    /// later change can quietly remove. It is enforced here instead.
+    bool valid() const {
+      return cell >= 0 && interval_ms > 0 && t_meet_ms >= 0;
+    }
+    /// ALL THREE INTEGERS. This is the commit comparison — a robot holds the
+    /// pair only when every live peer is publishing exactly this — so a field
+    /// left out here is a field two robots may silently disagree on while the
+    /// protocol reports agreement.
+    bool operator==(const RendezvousProposal& o) const {
+      return cell == o.cell && interval_ms == o.interval_ms &&
+             t_meet_ms == o.t_meet_ms;
+    }
+    bool operator!=(const RendezvousProposal& o) const { return !(*this == o); }
+  };
+
+  // WHO DERIVES. A constant, not an election. The handshake runs only inside
+  // the team-complete guard, where every robot in the fleet is live by
+  // definition, so "the lowest LIVE id" and "the lowest id" are the same robot
+  // and the scan that would distinguish them can only introduce disagreement —
+  // two robots running it a heartbeat apart can answer differently. The config
+  // block enforces the one assumption this rests on (team-complete means the
+  // WHOLE fleet) and refuses to start otherwise.
+  static constexpr int kRendezvousProposerId = 0;
+
+  // How often the proposer retries a derive BEFORE the team has ever agreed a
+  // pair. See the bootstrap block in maintainRendezvousProposal: the run's one
+  // free agreement window is the opening seconds, when the fleet is still
+  // co-located, and the steady-state period is far too coarse to land inside
+  // it. Not a parameter: it is a pacing floor for a transient state, and every
+  // knob on this path is one more thing two robots can be configured to
+  // disagree about.
+  static constexpr double kRendezvousBootstrapPeriodSec = 5.0;
+
+  // How long a gathered team will stand on the agreed cell waiting for the
+  // NEXT pair to commit before it gives up and leaves on the one it has.
+  // Kalhan's rule is "the time to meet is updated before going to explore
+  // again", so the re-agreement is part of the meeting and not something that
+  // happens to the team while it drives away: without the wait the release and
+  // the request land on the same tick and the fleet disperses through the
+  // handshake, which is the one window where a link break leaves the team on a
+  // pair derived before the outage.
+  //
+  // BOUNDED, so the worst case is exactly the old behaviour plus this much
+  // standing still. A commit needs one derive (paced by the bootstrap period)
+  // and one echo round-trip, so the honest case is under ten seconds and this
+  // is headroom, not a budget anyone expects to spend. Sized against the retry
+  // cadence rather than picked round: six bootstrap periods.
+  //
+  // Not a parameter for the same reason the period above is not one, and
+  // because a robot only ever observes its OWN commit here — there is nothing
+  // for two robots to agree about, so a knob would buy nothing but a way to
+  // set it wrong.
+  static constexpr double kRendezvousReagreeWaitSec =
+      6.0 * kRendezvousBootstrapPeriodSec;
+
+  // What this robot PUBLISHES. On the proposer it is its own derivation; on
+  // everyone else it is the proposer's pair copied verbatim — the echo. It is
+  // deliberately NOT what the robot drives: publishing a pair only says "I have
+  // received this", and driving it before the peers have it back is exactly the
+  // race the commit below exists to remove.
+  RendezvousProposal rendezvous_held_;
+
+  // WHY THE DIAGNOSTICS TRAVEL WITH THE PAIR AND NOT ON THEIR OWN. A
+  // (cell, interval) pair is two integers; everything that explains WHY that
+  // cell won — the penalty it beat, how many candidates it beat, the world it
+  // was searched over — lives outside the wire format, so it has to be carried
+  // alongside the pair in memory. Carried WRONG, it silently describes a
+  // different appointment than the one the row logs, which is worse than
+  // logging nothing: the two failure modes are
+  //
+  //   * TWO LIVE GENERATIONS. The proposer re-derives every 30 s, so between a
+  //     new solve and the team's echo of it the robot holds a NEW plan and an
+  //     OLD committed pair. A separation in that window arms the old cell and,
+  //     if the plan were read live, would stamp it with the new solve's
+  //     penalty and candidate count.
+  //   * A REFUSED RE-DERIVE. deriveRendezvousProposal clears the plan before it
+  //     solves and a refusal leaves the standing pair alone, so a live read
+  //     would report an armed, committed, whole-team appointment with
+  //     penalty -1 over 0 candidates — the follower shape, on the proposer.
+  //
+  // Hence one struct per pair, copied at the commit site. PROPOSER ONLY: a
+  // follower echoes two integers and never runs the argmin, so its copy stays
+  // at the sentinels and the event says so with -1s rather than with zeros a
+  // real search could also have produced.
+  struct RendezvousProvenance {
+    RendezvousPlan plan;
+    // The frozen snapshot the argmin actually ran over, and when it ran. NOT
+    // the robot's latest snapshot: refreshRendezvousSnapshot runs every
+    // team-complete heartbeat while the argmin runs every
+    // rendezvous_proposal_period_sec_, so the live hashes are up to a period
+    // newer than the search they would be claimed to describe.
+    unsigned int shared_hash     = 0;
+    unsigned int grid_hash       = 0;
+    double       derived_at_sec  = -1.0;
+  };
+  RendezvousProvenance rendezvous_held_provenance_;
+  double               rendezvous_held_at_sec_ = -1.0;
+
+  // The held pair was won by the CENTROID FALLBACK with nothing to beat — the
+  // allocator had produced no tour yet, so the candidate set was the team's own
+  // centroid and nothing else. It is a real, keepable appointment (that is the
+  // point of the fallback), but it is the appointment of a team that had not
+  // yet decided where it was going, and it is the only pair the proposer may
+  // replace WITHOUT the team having first gathered and kept it.
+  //
+  // WHY THE EXCEPTION EXISTS AT ALL, given that one-pair-per-meeting is
+  // deliberate, and given that a provisional pair would be replaced at the
+  // first meeting anyway. Because the first meeting may never come: the pair is
+  // what the team drives to, so a placeholder is not merely a poor first
+  // meeting point, it is a poor first meeting point that has to be kept before
+  // anything can improve it.
+  // The two clocks that have to line up for a tour-informed proposal are the
+  // fleet becoming mutually complete and the allocator producing a tour, and
+  // the ts4 smoke measured them both landing around t+25 s with the team
+  // already dispersing: at N=4 the mutual window was about two seconds wide and
+  // the tours were empty for all of it. Freezing the first thing derivable
+  // makes the meeting place a function of which of those two won a race, which
+  // is not a property anything should depend on.
+  //
+  // EXACTLY ONE UPGRADE, and only to a pair that had a choice to make
+  // (`candidates > 1`). A provisional pair is never replaced by another
+  // provisional pair, so the published cell does not follow the centroid
+  // around; and once a real pair is held this flag is false forever, leaving a
+  // kept meeting as the only thing that reopens the derive gate. The window the
+  // upgrade reopens is the one the message header already documents — a
+  // separation between the proposer publishing and the last peer echoing leaves
+  // the fleet split across two generations — and it is reopened ONCE, early,
+  // while the whole team is in mutual contact, rather than every 30 s for the
+  // whole run, which is the form that put one robot on cell 56 and its partner
+  // on cell 57.
+  //
+  // "ONCE, EARLY, WHILE MUTUAL" WAS NOT A BOUND ON THE WINDOW (generation 22).
+  // It reads like one and it is not, because `team_mutual` is a claim about the
+  // last few seconds: the proposer may hold it true for a peer that has already
+  // stopped listening. That is not a corner case, it is what happened — the
+  // upgrade in ts4 smoke20's N=3 hybrid cell was authored 0.6 s after its last
+  // peer went silent, and split the fleet across exactly the two generations
+  // this paragraph claims to have narrowed. "Early" was doing the real work
+  // here and it was never enforced.
+  //
+  // THE PRE-MISSION-HOLD CONFINEMENT IS NOT WHAT SHIPPED, and this member's doc
+  // said it was for a day. It was tried on 2026-09-17 and withdrawn the same day
+  // on measurement — a held robot completes no exploration steps, the upgrade's
+  // input is completed steps, so the confinement deleted the upgrade instead of
+  // scheduling it. Read the forty lines at the derive gate before re-adding it.
+  //
+  // WHAT PROTECTS THE UPGRADE NOW is the commit rule, not a window: every
+  // commit needs every echo (the unanimity return near the end of
+  // maintainRendezvousProposal), so an upgrade authored into a fleet that has
+  // already come apart simply does not commit anywhere, and the team keeps the
+  // triple it has.
+  bool rendezvous_held_provisional_ = false;
+
+  // What this robot DRIVES: the pair it has heard every peer confirm.
+  // Monotone — a pair that has been committed is never withdrawn, only
+  // replaced by a later committed one — so an outage that starts mid-handshake
+  // falls back to the previous agreement rather than to nothing.
+  RendezvousProposal   rendezvous_agreed_;
+  RendezvousProvenance rendezvous_agreed_provenance_;
+  double               rendezvous_agreed_at_sec_ = -1.0;
+  // Was the COMMITTED triple the centroid placeholder? Distinct from
+  // rendezvous_held_provisional_, which tracks what this robot currently holds
+  // and can change under it: this one is stamped with the commit and answers
+  // "what did the team actually agree to", which is the question the arm is
+  // measuring. A whole campaign of true here ran the rendezvous arm without
+  // ever exercising the scheduler's argmin — a legitimate result, but not the
+  // one the arm name implies, and not visible anywhere else.
+  bool                 rendezvous_agreed_provisional_ = false;
+  // How many peers had CONFIRMED the pair at the moment it was committed.
+  //
+  // It used to be structurally fleet-1 on every armed row — an assertion, not a
+  // measurement — because the commit rule returned early unless every peer had
+  // echoed. That stopped being true on 2026-09-17, when a FINAL triple started
+  // committing on first-hand evidence from the proposer instead (see the commit
+  // rule in maintainRendezvousProposal for the N=3 split that forced it). A
+  // final-triple row may now read anywhere in [0, fleet-1] and none of those
+  // values is a defect; a PROVISIONAL row is still fleet-1 by construction.
+  // Pair it with rendezvous_agreed_provisional_ before reading anything into it.
+  //
+  // It is NOT a liveness count — it says nothing about how many peers are
+  // reachable now, which is the whole point of an appointment agreed beforehand
+  // and kept through an outage.
+  int                  rendezvous_agreed_peers_  = 0;
+
+  // A COMPLETED MEETING IS OWED A NEW PLACE AND TIME. Set where the barrier
+  // releases the gathered team back to exploring, cleared when the proposer
+  // adopts the pair it asks for.
+  //
+  // THIS IS THE ONE MOMENT RE-AGREEMENT IS FREE, and it is the same argument
+  // that justified agreeing beforehand in the first place: deriving needs the
+  // team mutually whole over one shared snapshot, which is exactly what a
+  // gathered team standing on the agreed cell is. The pair the meeting replaces
+  // was argmin'd over the map the team held BEFORE it exchanged anything, so
+  // holding it for the rest of the run means every later meeting is sited by a
+  // map that is now several outages out of date.
+  //
+  // SET ON EVERY ROBOT, READ ONLY BY THE PROPOSER. The release site is shared
+  // code and the proposer is a fleet id fixed for the whole run
+  // (kRendezvousProposerId), so a follower sets this and nothing ever consumes
+  // it — harmless in the same way the rest of the held-pair machinery is inert
+  // on a follower, and cheaper than teaching the barrier who proposes. A
+  // follower can never become the proposer mid-run, so the stale `true` it
+  // carries has nothing to wake up.
+  //
+  // A REQUEST, NOT A COMMAND. The derive it opens can come back provisional or
+  // refuse, in which case the flag stays set and the request is retried on the
+  // bootstrap period rather than being lost; the team leaves on the pair it
+  // already keeps until a better one is actually found. See the adopt site for
+  // why it is cleared there and not at the attempt.
+  bool                 rendezvous_reagree_due_   = false;
+
+  // THE SECOND HALF OF THE MEETING: the team has exchanged maps and asked for
+  // the next pair, and is now standing on the cell until that pair commits.
+  // A stage, not a duration — the settle above answers "have the maps moved",
+  // this answers "does the next meeting exist yet", and the two run in series
+  // because the re-agreement is argmin'd over the map the settle just merged.
+  //
+  // `from` is the pair the robot arrived on. The release test is that
+  // rendezvous_agreed_ has moved OFF it, which is the commit rule's own output
+  // (every peer echoed the same triple) and reads identically on the proposer
+  // and on a follower — unlike rendezvous_reagree_due_ above, which only the
+  // proposer ever clears.
+  //
+  // NO CLOCK OF ITS OWN. The wait is measured off the settle's clock, as
+  // `settled_sec - rendezvous_settle_sec_`, because the two stages are
+  // consecutive halves of one uninterrupted stand on the cell and a second
+  // rclcpp::Time here would be a second thing to keep in step for no extra
+  // information. It inherits the settle clock's property along with its
+  // reading: node time, so an unresolvable mission clock cannot skip the wait.
+  bool                 rendezvous_reagree_waiting_ = false;
+  RendezvousProposal   rendezvous_reagree_from_;
+
+  // What the map looked like when the gathered team started its settle, so the
+  // release can report what the exchange actually moved instead of asserting
+  // that it moved something. `taken` is false when no settle ran — a zero delta
+  // and an unmeasured one are different facts and the log says which it has.
+  struct MapExchangeBaseline {
+    bool      taken  = false;
+    double    voxels = 0.0;   ///< dense map, own sensing included
+    uint32_t  hash   = 0;     ///< cell census, shared part only
+    long long merged = 0;     ///< cells a peer's census has changed, cumulative
+  };
+  MapExchangeBaseline  rendezvous_exchange_;
+
+  // Cells whose local status a PEER's census has changed, over the whole run.
+  // The one signal here that no amount of this robot's own driving can move, so
+  // a difference across the settle is first-hand evidence that a peer told this
+  // robot something it did not know — which is the thing the meeting is for.
+  long long            team_merge_applied_total_ = 0;
+
+  // Last pair heard from each peer, by fleet id, with the mission-elapsed
+  // receipt time that dates it. Written in drainTeamWorld AFTER the team_hash
+  // and grid_hash checks, so a cell id in here is guaranteed to name the same
+  // ground ours does.
+  std::vector<RendezvousProposal> rendezvous_peer_;
+  std::vector<double>             rendezvous_peer_at_sec_;
+  // The provisional flag that arrived WITH that pair, parallel-indexed like the
+  // receipt times above. Deliberately NOT a field of RendezvousProposal: that
+  // struct's operator== is the protocol's exact-bytes commit comparison, and
+  // folding a flag into it would make two robots holding the same three integers
+  // compare unequal because one of them is further along in deciding to keep
+  // them. The flag qualifies the pair; it is not part of it.
+  //
+  // uint8_t rather than bool because std::vector<bool> is a bit-proxy and this
+  // is read by index next to two vectors that are not.
+  std::vector<uint8_t>            rendezvous_peer_provisional_;
+
+  // THE LATCH: the pair each peer has been OBSERVED holding, by fleet id, kept
+  // until this robot's own held pair changes. This is what the commit rule
+  // counts, and replacing an instantaneous scan of rendezvous_peer_ with it is
+  // the difference between a rendezvous arm that works at N=3 and one that is
+  // silently identical to `off`.
+  //
+  // WHY A LATCH IS SOUND HERE, and it does NOT rest on the pair being frozen —
+  // it is not frozen. The proposer derives at most one pair per MEETING: the
+  // derive branch in maintainRendezvousProposal is gated on a held pair that is
+  // absent, provisional, or spent by a meeting the team has just kept, so
+  // between meetings it is shut, and a run that never gathers derives exactly
+  // once. (The old gate was `due && (none_yet || confirmed)`; neither term
+  // exists any more, and the second was unreachable. See the ONE PAIR PER
+  // MEETING block at the derive site for why the condition moved.) A follower
+  // only ever adopts the proposer's pair, so at any instant there is one pair
+  // in play — but it is replaced from time to time, and a latch written before
+  // a replacement is stale by definition.
+  //
+  // What makes the latch sound is therefore not that it cannot go stale, but
+  // that neither kind of staleness can be read as agreement. This robot's own
+  // replacement is handled by comparing against `rendezvous_held_` at commit
+  // time, so every latch naming the old pair stops counting the moment the new
+  // one is held, with nothing to clear. A PEER's replacement is handled by the
+  // clear in the latch loop, which drops the latch on the first message showing
+  // that peer somewhere else. Between them, a latch that still counts is a
+  // latch nothing has contradicted, and expiring THAT on a TTL discards a fact
+  // that has not stopped being a fact.
+  //
+  // WHAT THE OLD RULE COST. It required every peer to be inside
+  // coord_claim_ttl_sec (5 s) AND holding the pair AND mutually in direct
+  // contact, ALL AT THE SAME INSTANT. That is an N-way coincidence on an
+  // occlusion-gated radio, and its probability collapses with team size: one
+  // peer to line up at N=2, two at N=3, three at N=4. Measured on the gen-12
+  // N=3 smoke — the proposer derived cell 24 at t=63.6 s and both followers
+  // echoed it (t=67.1 and t=74.0), so all three robots genuinely held the same
+  // pair — and the commit never fired because the 6.9 s between the two echoes
+  // outlived the window. Every one of the 18 armings in that run refused with
+  // "no (cell, interval) pair was agreed" while the fleet was, in fact, agreed.
+  //
+  // WHAT IS NOT RELAXED. Equality is still exact (same cell, same interval, no
+  // tolerance), the pair is still derived once while the team is whole, and the
+  // anchor is still stamped ONLY under rendezvousTeamMutual() — so the shared
+  // time origin is untouched. The only thing dropped is the requirement that
+  // the confirmations be CONTEMPORANEOUS, which was never what made the
+  // appointment exact.
+  //
+  // TWO DIFFERENT STALENESSES, AND ONLY ONE OF THEM IS FREE. Comparison against
+  // rendezvous_held_ scopes a latch to OUR pair: if this robot's held pair
+  // changes, every entry for the old one stops matching on the next tick, with
+  // no explicit clear to forget. That one is free.
+  //
+  // The PEER's pair changing is not, and it is a false commit rather than a
+  // missed one. It became reachable the moment the proposer was allowed its one
+  // upgrade (see rendezvous_held_provisional_): the proposer moves off the
+  // placeholder, a follower still on the placeholder counts its stale latch for
+  // the proposer, reaches fleet-1, announces agreement and arms against a triple
+  // the proposer does not hold. So the latch loop DOES clear explicitly, on any
+  // first-hand message showing the peer somewhere else, and the property that
+  // makes the remaining staleness harmless is stated where it is enforced.
+  std::vector<RendezvousProposal> rendezvous_peer_confirmed_;
+
+  // How often the proposer may issue a NEW pair. Every re-issue opens a window
+  // of one TeamWorld period in which the team holds two adjacent generations,
+  // so the cost of a short period is agreement and the cost of a long one is a
+  // stale meeting point. 30 s against team_world_hz=1.0 puts the window at
+  // roughly 3%, and a 30-s-old meeting cell is still on somebody's current
+  // tour.
+  //
+  // IT ALSO BOUNDS SNAPSHOT STALENESS, and that is the reason it is not the
+  // knob a campaign reaches for to space the meetings out. refreshRendezvousSnapshot
+  // refreshes on this same period, and the snapshot is what appointmentLeadMs
+  // costs the drive against — so raising this to widen the timetable would make
+  // every punctuality estimate up to that much older, which is the opposite of
+  // what generation 29 is for. The timetable spacing is
+  // rendezvous_interval_sec_; these two used to be the same number for no
+  // better reason than that this one existed first.
+  double rendezvous_proposal_period_sec_ = 30.0;
+
+  // THE SPACING OF THE TIMETABLE: the shortest gap between two legal meeting
+  // instants, feeding RendezvousScheduler::Config::min_interval_ms. The
+  // scheduler may only ever space the occurrences FURTHER apart than this (the
+  // reachability floor), never closer, so this is the floor on the recurrence
+  // and in practice is the recurrence — the tour term it competes with was
+  // 28.3 s at N=2 in the ts4 smoke.
+  //
+  // WHAT IT BUYS AT 300 s. Two things the 30 s it replaced could not. A robot
+  // that misses an occurrence waits five minutes rather than thirty seconds for
+  // the next one, which is the whole point of the rungs being far enough apart
+  // to be worth arriving at; and it widens hybrid's chase window (see the
+  // terminal-chase gate in dispatchReconnect), which at 30 s was negative on
+  // most armings — the hybrid arm stopped chasing altogether and became a
+  // second rendezvous arm, with the four-arm contrast quietly down to three.
+  //
+  // WIDENS IS NOT GUARANTEES, and the difference matters to anyone sizing the
+  // arm off this number. Let `lead` be the robot's marked-up drive, `budget`
+  // rendezvous_max_lateness_sec_, and `g` the phase gap from the floored
+  // arming instant to the next rung of the lattice — uniform-ish on [0,
+  // interval), because the outage that arms the appointment does not know
+  // where the timetable is. armAppointment floors at t_now + max(0, lead -
+  // budget) and appointmentDue fires `lead` early, so the window is
+  //
+  //     W = g - min(lead, budget)
+  //
+  // which ranges over [-budget, interval): `interval - budget` is its
+  // SUPREMUM, not a floor, and W is negative whenever the arming happens to
+  // land within min(lead, budget) of a rung — roughly budget/interval of them,
+  // about one arming in five here against about five in six at 30 s. What 300 s
+  // buys is that most armings chase, not that every arming does.
+  double rendezvous_interval_sec_ = 300.0;
+
+  // THE SEPARATION ANCHOR, and the reason it is not team_last_complete_time_.
+  //
+  // Both robots convert the agreed INTERVAL into a t_meet by adding it to
+  // their own reading of when contact was lost, so the whole design rests on
+  // the two readings naming the same physical event. team_last_complete_time_
+  // cannot carry that: it advances on received intents alone, so a link that
+  // heals in one direction advances it on exactly one robot. This one advances
+  // only while every peer is in MUTUAL direct contact (see rendezvousTeamMutual),
+  // which is a symmetric condition and therefore stops on both robots at the
+  // same event.
+  //
+  // Kept separate rather than tightening team_last_complete_time_ itself: that
+  // clock feeds the reconnect confirmation gate and the release tests in every
+  // arm, and making it stricter would change the off/pursuit arms too — a
+  // behaviour change smuggled in under a rendezvous fix.
+  rclcpp::Time rendezvous_anchor_time_;
+  bool         have_rendezvous_anchor_ = false;
+
+  // The anchor above may be WRONG ON THIS ROBOT ONLY, and this says so.
+  //
+  // It is a latch of the last observed mutual-contact instant, sampled on the
+  // heartbeat timer — and that timer shares a single-threaded executor with the
+  // state machine and the metrics sampler, both of which are measured to
+  // overrun (hb_late_count_). A gap that swallows the whole mutual ->
+  // not-mutual transition leaves the latch at the last tick before the gap
+  // instead of at the separation, and every other robot, unblocked, holds the
+  // right instant. That is the one failure this subsystem cannot absorb: the
+  // pair is exact, the intervals match, and the two ends keep the identical
+  // appointment at times that differ by the length of the stall.
+  //
+  // Set on a starved tick that finds the team already apart; cleared by the
+  // next healthy stamp.
+  //
+  // IT IS A DIAGNOSTIC ONLY, and has been since the agreed-triple change
+  // (2026-09-17). It used to say "armAppointment refuses while it is set", and
+  // that was true when t_meet was `my_anchor + interval` — a suspect anchor
+  // moved the meeting instant, on this robot alone, and refusing was the only
+  // way to stop two robots keeping an exact appointment at two different times.
+  // t_meet is now the integer the team committed, adopted verbatim off the
+  // wire, so the anchor's value cannot move it and armAppointment does not read
+  // this flag. See armAppointment for the deliberate removal of those refusals.
+  // Its one remaining reader is the WARN below, which it de-duplicates.
+  bool rendezvous_anchor_starved_ = false;
+
+  // One appointment per outage. Without this the robot re-arms the SAME agreed
+  // pair the moment the first one closes — same cell, and a t_meet that is now
+  // in the past, so appointmentDue() is instantly true and it drives straight
+  // back to the cell it just left. The pair cannot change during an outage (the
+  // protocol is frozen), so a second arming has nothing new to say. Cleared
+  // when the team reads complete, next to the agreed-pair refresh.
+  bool rendezvous_spent_ = false;
 
   // The standing appointment. Armed by armAppointment, cleared by
   // closeAppointment, and while armed it SUPPRESSES the mid-run trigger: the
@@ -755,13 +1579,90 @@ private:
   bool           appointment_armed_    = false;
   bool           appointment_departed_ = false;
   bool           appointment_arrived_  = false;
+  /// "THE AGREED CELL COULD NOT BE PLACED ON ANY GRID I HOLD."
+  ///
+  /// Set by appointmentPoint() on the branch where neither the snapshot world
+  /// nor the live world can turn `appointment_.cell` into a position, which is
+  /// the branch that returns `latest_pos_` and therefore makes the robot
+  /// "depart" to where it already is.
+  ///
+  /// IT EXISTS BECAUSE THE OUTCOME WAS OTHERWISE A LIE IN THE WRONG DIRECTION.
+  /// A goal at the robot's own position passes the arrival test on the next
+  /// tick (goal_xy_tol_ is 0.4 m), so `appointment_arrived_` goes true, and the
+  /// classifier's arrived/unreachable split then reads "I was at the cell and
+  /// nobody else came" — a peer no-show — for a robot that never moved and
+  /// never had a cell to move to. That is a navigation-side failure wearing a
+  /// coordination-side failure's name, which is the exact inversion the
+  /// `run-ended` case was added to stop; this is the same class, one branch
+  /// over.
+  ///
+  /// `mutable` because appointmentPoint() is const and is called from the four
+  /// departure sites. Those calls ARE the departure, so the write lands once,
+  /// at the moment the robot commits to a cell it cannot place.
+  mutable bool   appointment_unplaceable_ = false;
+  /// "THE MANOEUVRE I AM CURRENTLY IN WAS STARTED TO KEEP AN APPOINTMENT."
+  ///
+  /// Separate from appointment_armed_ on purpose, and the separation is a bug
+  /// fix rather than bookkeeping. appointment_armed_ answers "does an
+  /// appointment stand?", and closeAppointment clears it — including from
+  /// transitionTo(), which runs on EVERY state change, including the one that
+  /// STARTS the drive to the meeting cell. So the flag could go false on the
+  /// departure tick itself, and two decisions downstream silently changed
+  /// meaning underneath a robot already on its way:
+  ///
+  ///   - the barrier's wait_cap fell back to reconnect_midrun_max_wait_sec
+  ///     (240 s, the PURSUIT cap) instead of the unbounded appointment
+  ///     patience, so "be there until all robots are connected" quietly became
+  ///     "be there for four minutes";
+  ///   - the arrival stamp below never fired, so appointment_arrived_ stayed
+  ///     false and no-show could not be told from unreachable.
+  ///
+  /// This flag tracks the MANOEUVRE, so it survives the appointment record
+  /// being closed and is cleared only when the manoeuvre itself ends.
+  bool           appointment_manoeuvre_ = false;
+  /// "I AM AT THIS BARRIER BECAUSE THE TEAM SETTLED WHILE I WAS STILL WALKING."
+  ///
+  /// True only on the generation-25 conversion in doReturnNav, which joins the
+  /// barrier from wherever the walker stands. It distinguishes that exit from
+  /// the other three (arrival, nav budget, no progress), and the distinction
+  /// decides whether doReturnSync may send the robot back onto the road: the
+  /// conversion's whole premise is "the team is together, so standing here is
+  /// as good as standing at the cell", and when that premise lapses the robot
+  /// is simply stopped in the wrong place. The budget and no-progress exits
+  /// carry the opposite evidence — the cell could NOT be reached — so resuming
+  /// those would loop a drive that has already failed.
+  ///
+  /// Cleared in startReturnTo, so every leg (including a resumed one) starts
+  /// false and one lapse can cost at most one resume; a second resume needs a
+  /// second genuine settle to convert on.
+  bool           appointment_settle_converted_ = false;
   double         appointment_armed_at_sec_   = -1.0;
   double         appointment_arrived_at_sec_ = -1.0;
-  // Cells a no-show has written off, within the current outage. Cleared when
-  // the team reconnects. The floor is exempt from it by construction (see
-  // RendezvousScheduler::solve) so this list can never empty the candidate
-  // set, which is the deadlock the rule exists to prevent.
-  std::vector<int> rendezvous_noshow_;
+  /// HYBRID only: the mid-run trigger has already been allowed one chase for
+  /// the appointment that currently stands. Scoped to the appointment, not to
+  /// the outage or the run, so it is cleared wherever appointment_armed_ is
+  /// set or cleared and nowhere else.
+  ///
+  /// Exists because the mid-run trigger spends an attempt BEFORE calling
+  /// dispatchReconnect and does not refund one that dispatches nothing. Hybrid
+  /// is the only arm that can reach that trigger with an appointment already
+  /// standing, and a chase that declines there (stale peer record, uncoverable
+  /// trail) declines again on the next PLAN tick for the same reason — so
+  /// without this the budget drains in seconds, exhaustion reverts the run to
+  /// terminal-only reconnection, and hybrid's pursuit half dies for the rest
+  /// of the run with nothing in the log but an exhaustion warning.
+  bool           appointment_chase_tried_ = false;
+  //
+  // THE NO-SHOW LIST IS GONE (2026-09-16). It held the cells a no-show had
+  // written off so the NEXT solve of this outage would avoid them, and it was
+  // removed because both halves of that sentence stopped being true at once:
+  // there is no next solve during an outage (the pair is agreed while connected
+  // and frozen on separation), and there is no second arming either
+  // (rendezvous_spent_). Worse, it was per-robot — a cell one robot wrote off
+  // was still a candidate on the other, so feeding it back in was one more way
+  // for two robots to solve different problems. The `excluded` log column went
+  // with it; `RendezvousPlan::rejected_excluded` survives as a faithful mirror
+  // of a scheduler field that is now structurally 0.
 
   // ---- MDP interception (P6, §3.7) ------------------------------------
   //
@@ -788,6 +1689,16 @@ private:
   // the thing TeamWorld.my_tour broadcasts and the peers' predictors consume.
   // Empty whenever the allocator is off or refused, which is the honest
   // encoding: a peer that hears no tour predicts nothing and chases the trail.
+  //
+  // TWO writers, both in service of that encoding. doPlan assigns it on every
+  // solve (so a refusal clears it); publishTeamWorld clears it whenever this
+  // robot is not in the exploration loop that produced it. The second exists
+  // because the first only runs INSIDE that loop: on a manoeuvre, a homing
+  // leg, or after the latch, no solve happens and the route would otherwise
+  // sit on the 1 Hz heartbeat forever at a receiver-stamped age of zero. The
+  // wire field carries no stamp, so "stale" and "current" are the same
+  // message and the consumer cannot tell them apart — see the long note at
+  // the broadcast site. Re-populated by the next solve on re-entry to PLAN.
   std::vector<int> my_tour_;
 
   /// What a peer last told us FIRST-HAND about its route, and where it was
@@ -864,6 +1775,12 @@ private:
   /// and either can be the first to fire, so a baseline set in only one of
   /// them would be a startup-order dependency nothing would ever notice.
   double     missionElapsed();
+  /// missionElapsed() evaluated at a PAST rclcpp::Time instead of now. The
+  /// rendezvous anchor needs it: team_last_complete_time_ is an rclcpp::Time
+  /// and the interval it anchors is mission-elapsed, so the two have to be
+  /// brought onto one scale. Returns -1 when the baseline is not latched yet or
+  /// `when` predates it, so a caller cannot silently anchor on a negative.
+  double     missionElapsedAt(const rclcpp::Time& when) const;
   double     cell_census_period_s_ = 5.0;
   /// Sim-time stamp of the last census, -1 = none yet.
   double     last_cell_census_sec_ = -1.0;
@@ -893,22 +1810,45 @@ private:
   // 0 = off (shipped default). See the param load for why it exists.
   double cand_min_goal_dist_{0.0};
   double goal_yaw_tol_;
+  // True when the MODELLED sensor spans a full circle, derived from fov_hfov
+  // at load rather than configured. It decides whether the exploration arrival
+  // gate blocks on yaw: that gate exists so "the sensor actually observes the
+  // region the planner scored", which a 360 deg sensor satisfies at every
+  // heading. Derived, not a knob, because the two must never disagree — a
+  // separate `require_goal_yaw` param is exactly the kind of thing that ends up
+  // set to the wrong value beside a changed fov_hfov.
+  bool   fov_is_omnidirectional_ = false;
   // Deadline for the post-arrival in-place rotation, measured from the first
   // tick the robot is inside goal_xy_tol_ — NOT shared with nav_budget_sec_,
   // which budgets the drive (see doNavigate).
   double goal_rotate_timeout_sec_;
   // Minimum interval between re-sends of an *unchanged* goal pose. A changed
   // pose always publishes immediately; this only throttles the keep-alive.
-  // Nav2's bt_navigator turns every incoming goal_pose into a fresh
-  // NavigateToPose goal, which preempts the running one and rewrites the BT
-  // blackboard "goal" — so GoalUpdated (the first child of the default
-  // navigate_to_pose_w_replanning_and_recovery RecoveryFallback) returns
-  // SUCCESS, the recovery RoundRobin is halted before Spin/Wait/BackUp can
-  // finish, and RecoveryNode still counts it as a completed recovery. At the
-  // old 10 Hz re-send rate that burned all 6 retries in well under a second,
-  // so any transient planning/control failure became an immediate nav2 ABORT
-  // instead of a recovery. Set 0 to publish only on change (best once nav2
-  // bringup is known reliable — it lets every recovery run to completion).
+  //
+  // The rationale here used to be nav2's: bt_navigator turning every goal_pose
+  // into a fresh NavigateToPose goal, GoalUpdated halting the recovery subtree
+  // while still consuming RecoveryNode's retries, so an unthrottled 10 Hz
+  // re-send provoked an immediate ABORT rather than a recovery. None of that
+  // machinery is in this stack — the navigator is simple_nav_3d, which takes
+  // goal_pose as a plain PoseStamped and serves no action at all — so the harm
+  // that argument described cannot happen here, and its conclusion that 0 is
+  // "strictly the best setting" INVERTS. What is actually true:
+  //
+  //   * A re-send of an UNCHANGED goal is a genuine no-op. The navigator's
+  //     intake drops a goal equal to the one it is driving (same_goal_pose —
+  //     position AND yaw), and after arrival a re-send re-arms it for a single
+  //     50 ms tick that issues no velocity command. The controller compares
+  //     position only, so an identical pose cannot disturb a rotation already
+  //     in progress.
+  //   * A goal published while the navigator is DOWN is lost in silence. There
+  //     is no action feedback, no acknowledgement of any kind; the planner would
+  //     sit out the entire nav budget waiting on a goal nobody received.
+  //
+  // So the keep-alive is cheap insurance rather than damage control, and 0 gives
+  // up the one case that matters while buying nothing. republishGoal's
+  // sub_appeared fast path covers the common instance (bringup ordering); the
+  // periodic re-send covers a navigator that dies and restarts mid-run, which
+  // nothing else in this system would notice.
   double goal_republish_sec_;
   double integrate_wait_;
   double nav_speed_est_mps_;
@@ -1035,21 +1975,63 @@ private:
   // anchor loses its router-bubble meaning: the link existed because the PAIR
   // of poses was within range, and both endpoints have moved since. The mode
   // picks the reconnection manoeuvre at exploration exhaustion:
-  //   rendezvous — the legacy return-to-own-anchor barrier. Still sound on a
-  //     mesh BY SYMMETRY: every robot returning to its own last-contact pose
-  //     restores the pair distance the link had when it last worked.
+  // THE CANONICAL ARM DEFINITIONS LIVE IN planner_util.hpp — this table is a
+  // pointer to them, not a second source of truth. It was a second source of
+  // truth until 2026-09-17 and all three entries had drifted into describing a
+  // binary that no longer existed (an own-anchor barrier, a bare hold-in-place,
+  // and a midpoint fallback that was deleted on 2026-09-16), which is worse
+  // than no table at all: every one of them named a mechanism a reader could
+  // then go looking for.
+  //   rendezvous — ONE meeting cell agreed by the whole team while connected,
+  //     driven to at the first agreed occurrence once the team reads
+  //     incomplete, held until everyone is present, then held
+  //     rendezvous_settle_sec more for the map merge. An agreed place, or
+  //     nothing.
   //   pursuit   — chase the missing peer's last declared goal (trail head) on
-  //     a staleness-scaled budget; budget spent -> hold in place and beacon.
-  //   hybrid    — pursue on the budget, then fall back to the deterministic
-  //     meeting point (midpoint of the last-contact pose pair — both sides
-  //     compute the same one from their own record) and wait there. Worst
-  //     case degenerates to rendezvous' guarantee; best case wins early.
+  //     a staleness-scaled budget; budget spent -> explore on the fallback
+  //     allowance -> hold in place and beacon. No agreed destination ever, and
+  //     that absence is the A/B against hybrid.
+  //   hybrid    — exactly the union of the two and nothing else: chase while
+  //     the next agreed occurrence is not yet due, keep the appointment once
+  //     it is. Same fallback ladder as pursuit; the appointment pre-empts
+  //     the chase rather than following it.
   // Code default is the legacy mode; the yaml/sim opt into hybrid.
   ReconnectMode reconnect_mode_ = ReconnectMode::RENDEZVOUS;
   // Hard ceiling on one chase (s). <= 0 disables pursuit (pursuit/hybrid then
   // behave like their fallback). Also the worst-case bound a WAITING teammate
   // can assume about its pursuer, so it wants a config'd cap, not a formula.
   double pursuit_budget_max_sec_    = 240.0;
+  // P1 / §3.8. The speed the robot ACTUALLY travels at (m/s), measured, used
+  // for one thing only: deciding whether a chase is feasible at all.
+  //
+  // It exists because the nav family's speed is a WATCHDOG estimate and the
+  // pursuit gate was asking it a PREDICTOR's question. nav_speed_estimate_mps
+  // (0.15) with nav_safety_factor (3.0) prices travel at 20 s/m, against a
+  // measured 0.397 m/s — a factor of eight. For the watchdog that inflation is
+  // harmless in the safe direction: budgets come out generous and a slow leg
+  // gets more rope. For a REFUSAL it inverts. A bigger model time means "this
+  // chase cannot finish", so the same conservatism that makes the watchdog
+  // lenient makes the gate harsh: under the campaign cap of 600 s the gate
+  // refused every chase past 600/20 = 30 m, which is exactly the observed
+  // refusal floor (108 refusals, min 30.0 m, p50 42.9 m, max 75.1 m) in a plot
+  // whose diagonal is larger than that. Pursuit was being declined on an
+  // arithmetic artifact, not on an affordability judgement.
+  //
+  // The fix is NOT to correct nav_speed_estimate_mps: that number also sizes
+  // the exploration nav budget at three call sites, where raising it by 2.6x
+  // would shorten every goal deadline and start failing goals that currently
+  // succeed — a far larger behavioural change than the one being made. Nor is
+  // it to raise pursuit_budget_max_sec: that cap is the worst-case absence a
+  // WAITING teammate is entitled to assume, so it must stay denominated in
+  // real seconds and must not be inflated to buy back model seconds.
+  //
+  // So the two questions get the two speeds they were always described as
+  // wanting. No safety factor is applied here, deliberately: a safety factor
+  // on a feasibility bound is a thumb on the scale toward refusing, and the
+  // cap already carries all the margin this decision is allowed to have.
+  // <= 0 is clamped away at the use site rather than rejected, same convention
+  // as nav_speed_estimate_mps.
+  double pursuit_speed_measured_mps_ = 0.40;
   // Last-contact record age (s) beyond which the trail head is worthless and
   // pursuit is skipped outright; freshness scales the budget linearly down to
   // zero across this window. <= 0 = no staleness gate.
@@ -1217,9 +2199,176 @@ private:
   // it used to be commented as "2.5x", which was 600/240 and silently became
   // false the moment the threshold moved to 90 in generation 9.
   double reconnect_midrun_max_wait_sec_ = 240.0;
+
+  // --- THE APPOINTMENT IS A SCHEDULE KEPT FROM A 100 s NOTICE FLOOR --------
+  //
+  // GENERATION 19 REMOVED THE RECURRING SCHEDULE AND GENERATION 23 PUT IT
+  // BACK. What follows is why it went, because the measurement that killed it
+  // is real; see nextAgreedOccurrence in planner_util.hpp for why it no longer
+  // decides the question. Up to gen 18 the
+  // team agreed a place, a PHASE and a PERIOD, and each robot walked to
+  // "the next occurrence at or after now". That needs every robot to select
+  // the same occurrence index, and there is no shared quantity to select it
+  // with: the mission clock is shared but the moment each robot decides it is
+  // alone is not. "Are all my links up?" is a per-robot question about a graph
+  // that fails one edge at a time, so at N>=3 the fleet splits its answers.
+  // Both candidates were tried and both failed on measurement, not on theory:
+  //
+  //   the separation anchor  gen 17 keyed the occurrence off it; the ts4 N=3
+  //                          cell anchored its three robots 13.2 / 34.2 /
+  //                          34.0 s apart, so gen 18 removed it.
+  //   each robot's own now   gen 18's replacement; the same cell armed at
+  //                          16.1 / 52.5 / 67.4 s — a 51 s spread against a
+  //                          30 s period, so the three robots walked to three
+  //                          DIFFERENT meetings (t+34, t+64, t+94).
+  //
+  // The spread is real and cannot be removed; what generation 23 changed is
+  // what it costs. The rule is: WHEN THE TEAM IS INCOMPLETE, WAIT OUT THIS
+  // NOTICE, THEN DRIVE TO THE AGREED CELL FOR THE FIRST AGREED OCCURRENCE AT
+  // OR AFTER IT AND STAY THERE UNTIL EVERYONE IS BACK. The occurrence is
+  // selected off the committed (t_meet, interval) and this floor, so the
+  // origin is shared even though the floor is not, and the 51 s spread becomes
+  // a departure spread quantised to whole intervals — then ARRIVAL spread,
+  // which the barrier below absorbs by construction rather than by inequality.
+  //
+  // The place is still agreed in advance by the whole team, which is the half
+  // of the protocol that was never broken — the ts4 N=3 cell committed a
+  // byte-identical triple on all three robots within 21 ms.
+  //
+  // INERT SINCE GENERATION 25. Through generation 24 this was a per-robot
+  // notice floor on the arming (attend the first occurrence at or after
+  // now + delay), and that per-robot term is what forked the ts4 N=3 cell:
+  // the 33 s arming spread plus 100 s of notice straddled the agreed instant,
+  // two robots kept it and the third rolled a whole interval past it. The
+  // arming floor is now bare `t_now`. The parameter stays declared, read and
+  // logged ONLY so the manifest schema and the cross-arm param rows stay
+  // comparable with earlier generations; it is not validated (see the
+  // validation block) and it decides nothing. Flap patience lives where it
+  // always really was: the reconnect
+  // silence window gates the arming, and the P5 supersede cancels a standing
+  // appointment when the team returns before departure.
+  double rendezvous_depart_delay_sec_ = 100.0;
+
+  // Barrier give-up for an APPOINTMENT specifically. <= 0 is unbounded: stand
+  // at the agreed cell until every robot is present, however long that takes.
+  //
+  // SEPARATE FROM reconnect_midrun_max_wait_sec_ ON PURPOSE. That cap is what
+  // bounds a PURSUIT — a chase to a predicted intercept that may be at the
+  // wrong place entirely, where giving up is the correct response to a bad
+  // prediction. An appointment is the opposite: the place is one every robot
+  // agreed to, and the only reason a peer is not there yet is that it has
+  // further to drive or noticed later. Giving up on it converts a meeting that
+  // was going to happen into a no-show, which is exactly what the ts4 N=3 cell
+  // did — husky burned the full 240 s and walked away from a cell two of three
+  // robots had already stood on together.
+  //
+  // Sharing one parameter between the two would also mean the pursuit arm's
+  // patience could not be tuned without moving the rendezvous arm's definition,
+  // and the four arms have to stay independently specifiable.
+  double rendezvous_appointment_wait_sec_ = 0.0;
+
+  // How late a robot may agree to BE. The team's schedule is a lattice —
+  // t_meet + k*interval — and this decides which rung THIS robot signs up to:
+  // the first one it can still reach with no more than this much lateness,
+  // measured at arming against its own marked-up drive (appointmentLeadMs).
+  //
+  // IT IS A FLOOR ON THE RUNG, NEVER A NEW INSTANT. The rung is always one the
+  // whole team allocated; the only per-robot decision is `k`, and the floor can
+  // only ever push it LATER (clamped at bare t_now, see armAppointment). A
+  // robot that can make the nearest rung signs up to that one, so a team whose
+  // members can all make it does not fork — which is the property the bare
+  // floor bought in generation 25 and the reason the lateness budget is
+  // subtracted from the robot's drive rather than added to the floor.
+  //
+  // WHY NOT ZERO. The lattice spacing is floored at the furthest robot's drive,
+  // so a zero budget would roll a robot a whole interval for being a second
+  // short — paying one full period of separation to avoid one second of
+  // waiting, when the barrier at the far end absorbs waiting for free. 60 s is
+  // Kalhan's figure (2026-09-19); against the 300 s lattice it rolls about one
+  // arming in five, and it is what the chase window above is measured against.
+  //
+  // IT BOUNDS WHAT THE ROBOT SIGNS UP TO, NOT WHEN IT ARRIVES. appointmentDue()
+  // is polled at plan boundaries, so a robot whose departure instant falls
+  // mid-leg departs when that leg ends: realised lateness is this budget plus
+  // the remainder of whatever the robot was already driving. Deliberate — the
+  // alternative is abandoning a nav goal on a timer, and the barrier at the far
+  // end waits (rendezvous_appointment_wait_sec 0) so the cost is the early
+  // arrivals' standing time and not a missed meeting. Analyse realised lateness
+  // off the arrival rows, never off this number.
+  double rendezvous_max_lateness_sec_ = 60.0;
+
+  // The cap on the AT-THE-RENDEZVOUS HOLD only (see coverage_latch_hold_start_sec_).
+  // It is deliberately NOT rendezvous_appointment_wait_sec: that one is the
+  // patience of a robot that still has exploring to do, and "stay until
+  // everyone is here" — unbounded — is the requested behaviour for it. A robot
+  // with nothing left to explore has no exploring to trade against the wait, so
+  // an unbounded hold there is not patience, it is a cell that runs to the
+  // harness wall clock with one robot standing still and a censored completion
+  // time. Bounding the two separately is what lets the arm keep its unbounded
+  // patience without that cost.
+  //
+  // IT HAS TO OUTLAST ONE ROLLED RUNG, which makes it a function of the meeting
+  // lattice and not a free choice: a teammate that cannot make this rung
+  // arrives rendezvous_interval_sec later, plus its own permitted lateness, and
+  // a cap shorter than that sum tears the run down as that robot drives onto
+  // the cell. The node cannot check the relation — it never sees the harness's
+  // interval — so the derivation lives with the value, in RDV_LATCHED_HOLD in
+  // run_explo_sim_rviz.sh, which ships 420 against a 300 s lattice.
+  double rendezvous_latched_hold_sec_ = 300.0;
+
+  // Hold at the meeting point AFTER the team reads complete, before exploring
+  // again. The point of the meeting is the map exchange, and the exchange is
+  // not instantaneous: peer voxels cross the comms emulator at a bounded rate
+  // once the link is up, so a barrier that releases on the first tick of
+  // connectivity releases before the thing it was waiting for has happened,
+  // and both robots re-plan against maps that have not merged yet. That is a
+  // meeting that costs the full drive and delivers a fraction of its value.
+  double rendezvous_settle_sec_ = 30.0;
+
+  // Instant the settle hold started, and whether one is running.
+  //
+  // ROS TIME, NOT MISSION-ELAPSED (2026-09-18). This was a mission-elapsed
+  // double with -1 meaning "not settling", and the hold was gated on
+  // `t_now >= 0.0` — so on any tick where missionElapsed() could not answer,
+  // the settle was SKIPPED and the barrier released immediately. That is the
+  // wrong direction to fail: the hold exists because the team being connected
+  // is not the same event as the maps having merged, so an unmeasurable clock
+  // should hold, not release. The clock is unnecessary anyway — the settle is
+  // a DURATION, and a duration needs no epoch, only a difference — and
+  // rclcpp::Time on the sim clock is available on every tick this state runs.
+  // The bool is the usual guard: rclcpp::Time default-constructs on the SYSTEM
+  // clock and subtracting that from a sim-time now() throws inside a timer
+  // callback.
+  rclcpp::Time rendezvous_settle_start_;
+  bool         rendezvous_settling_ = false;
+
   // Per-run cap on mid-run attempts. Every dispatch costs exploration time;
-  // after this many failures the policy has had its chance and the robot
+  // after this many DISPATCHES the policy has had its chance and the robot
   // reverts to terminal-only behaviour (logged, so the analysis can see it).
+  //
+  // DISPATCHES, NOT FAILURES (comment corrected 2026-09-18; the code has always
+  // done this). `++midrun_attempts_` is spent on the dispatch path regardless
+  // of how the manoeuvre ends, so six SUCCESSFUL mid-run reconnections exhaust
+  // the budget exactly as fast as six failed ones, and nothing ever refunds or
+  // resets it — `midrun_attempts_` is a run-lifetime counter with no clear site.
+  //
+  // THAT IS A DOSE TERM, AND IT IS NOT UNIFORM ACROSS THE DESIGN, which is why
+  // it is spelled out here rather than left to the reader:
+  //   * By ARM. Exhaustion removes mid-run chasing, so it bites `pursuit` and
+  //     hybrid's chase half. It barely touches `rendezvous`, whose trigger is
+  //     already suppressed whenever an appointment stands, and not at all in
+  //     `off`.
+  //   * By RUNG. More robots means more outages means the budget is reached
+  //     sooner in mission-elapsed terms. At the smoke's measured mesh uptimes
+  //     (N=3 rendezvous 29%, N=4 14.7%) the N=4 rung spends attempts fastest.
+  // So a run that exhausts the budget is running a WEAKER treatment from that
+  // point on, and the point arrives earlier at N=4 than at N=2. Whether the
+  // budget should refund successes is a treatment-design question for Kalhan,
+  // NOT an arithmetic defect, so it is left alone and made observable instead:
+  // `midrun_attempts_used` on run_end says how close each cell came, which is
+  // what an analyst needs to decide whether the cap bound anything at all. In
+  // the banked smoke cells it never exceeded 1 of 6, but those cells are ~300 s
+  // against ts4's 3000 s.
   int    reconnect_midrun_max_attempts_ = 6;
   // --- Link-state gating for the mid-run trigger (see §30.11 and §30.24) ---
   // THE DEFECT THIS FIXES. Everything above measures silence with a RECORD-AGE
@@ -1297,6 +2446,10 @@ private:
   // is logically necessary and is kept; the debounce on top of it is a tuning
   // knob the data does not support, so it defaults off and stays available.
   double reconnect_link_down_confirm_sec_ = 0.0;
+  /// The two link_states table widths this node knows how to read. Keep in
+  /// step with hmr_comms_sim_node.cpp's kLinkStateCols.
+  static constexpr size_t kLinkColsLegacy    = 9;
+  static constexpr size_t kLinkColsWithValid = 10;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr
       link_states_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr link_index_sub_;
@@ -1304,6 +2457,20 @@ private:
   int  link_robot_count_   = 0;      ///< robots in that table, self included
   bool link_index_usable_  = false;  ///< an index naming us has arrived
   bool link_index_warned_  = false;  ///< unusable-index complaint is emitted once
+  /// Columns per pair in the emulator's link_states table, read off the message
+  /// layout rather than assumed. 9 (pre-generation-9) and 10 (with `valid`) are
+  /// both accepted; 0 means no message has been parsed yet.
+  ///
+  /// This used to be a hardcoded 9. It was correct for as long as the emulator
+  /// published 9 columns, and it failed silently the moment it did not: the
+  /// stride walks the flat array, so at N>=3 a 10-column payload read with a
+  /// stride of 9 puts row 1 onwards one field out of phase, and what the gate
+  /// then reads as `i`, `j` and `connected` are other rows' physical fields. At
+  /// N=2 there is a single row and the extra field is simply never reached,
+  /// which is the worst version of the bug: it would have passed every
+  /// two-robot smoke test on its way into a three-robot campaign.
+  size_t link_cols_        = 0;
+  bool link_cols_warned_   = false;  ///< unparseable-layout complaint, once
   /// Newest reading of MY links: true only when every peer in the index has a
   /// usable row and all of them are up.
   ///
@@ -1420,6 +2587,11 @@ private:
   // field default rendezvous_max_wait_sec=0 (wait forever, so no terminal
   // barrier ever expires): it can only act where an escape hatch is already
   // configured, and there it converts a give-up into one more attempt.
+  //
+  // IT IS NOT INERT IN A CAMPAIGN. run_explo_sim_rviz.sh passes
+  // rendezvous_max_wait_sec=$RDV_MAX_WAIT, default 600 (:429), so terminal
+  // barriers DO expire and this escalation is live on every arm. Read the
+  // paragraph above as the field-deployment case only.
   bool   hold_escalate_          = true;
   double hold_escalate_wait_sec_ = 300.0;
   bool   hold_escalated_         = false;
@@ -1434,13 +2606,17 @@ private:
   // at most 2x this apart — 8 m at the default, against a link that was still
   // carrying traffic at 54 m in the run that motivated the meeting point.
   //
-  // This is also what makes an unreachable meeting point cheap. The midpoint is
-  // synthetic and never checked against the map, and the comms emulator kills a
-  // link by counting trunks within the Fresnel radius of the segment BETWEEN the
-  // pair — so a foliage-killed link puts the trunks on that segment and the
-  // midpoint at their centre. Demanding 0.4 m there means grinding against an
-  // obstacle until the budget expires; 4 m means arriving beside it and waiting,
-  // which is all the manoeuvre ever needed.
+  // This is also what makes an obstructed destination cheap. The original
+  // argument was about the MIDPOINT, which was synthetic and never checked
+  // against the map — deleted 2026-09-16 — but the tolerance is still doing the
+  // same job for the destination that replaced it. The agreed cell IS checked
+  // against the map at derive time, so it is not synthetic; what it is not is
+  // checked against the map AT ARRIVAL, tens of seconds and one merge later,
+  // and the comms emulator kills a link by counting trunks within the Fresnel
+  // radius of the segment between the pair — so exactly the places worth
+  // meeting at are the places with trunks near them. Demanding 0.4 m there
+  // means grinding against an obstacle until the budget expires; 4 m means
+  // arriving beside it and waiting, which is all the manoeuvre ever needed.
   double reconnect_arrive_tol_m_ = 4.0;
   // Ceiling on ONE manoeuvre drive leg. The distance-true budget in
   // startReturnTo is deliberately exempt from nav_max_timeout_sec (see there),
@@ -1464,8 +2640,50 @@ private:
   // least once (the beacon is 1 Hz), which a real reconnection does and a
   // range-edge blip does not. 0 = release on first read (legacy).
   double reconnect_release_confirm_sec_ = 6.0;
-  rclcpp::Time release_ok_since_;
-  bool         release_ok_armed_ = false;
+  // FOUR SITES ACT ON "THE TEAM CAME BACK" AND ALL FOUR DWELL (generation 23,
+  // fourth site generation 25). The confirm length is the SAME parameter for
+  // all of them, because the flicker they filter is one phenomenon and two
+  // constants in a yaml drift.
+  //
+  //   release_ok_*   the manoeuvre barrier (doReturnSync / doReturnNav)
+  //   team_back_ok_* cancelling a standing appointment because the outage ended
+  //                  (doPlan, P5) AND clearing rendezvous_spent_ so a new
+  //                  appointment may arm (heartbeatTick) AND converting an
+  //                  appointment walker to the barrier because the outage
+  //                  ended under it (doReturnNav, generation 25)
+  //
+  // TWO WINDOWS, NOT FOUR, and the split is by PREDICATE rather than by call
+  // site. The barrier asks manoeuvreReleaseEligible / teamComplete-or-arrived;
+  // the other three ask teamSettled(accountedPeerCount(now)) — character for
+  // character the same question, on the same clock, with the same threshold.
+  // Giving one question two independent windows is how "the outage is over"
+  // acquired two meanings the last time, and one of the two would answer on
+  // evidence the other was still refusing.
+  //
+  // ONE WRITER, AT 1 Hz, IN heartbeatTick. This is the load-bearing detail.
+  // dwellConfirmed measures a CONTINUOUS run, so it is only as continuous as its
+  // sampling: a window ticked from inside `if (appointment_armed_ && ...)` in
+  // doPlan would not decay while the branch was untaken, it would FREEZE, and
+  // the first sample after a gap would find `now - since` already past the
+  // confirm time and fire on one reading. Both hazards are real here — doPlan
+  // runs only in State::PLAN, i.e. roughly once per step rather than at 10 Hz,
+  // and the appointment gate is untaken for most of a run. The heartbeat is
+  // gated on nothing but coord_ and runs at coord_heartbeat_hz, which is also
+  // the beacon rate, so it samples the evidence exactly as fast as the evidence
+  // changes. doPlan's P5 and doReturnNav's walker conversion then READ the
+  // window with dwellHeld, each conjoined on its own live count, and cannot
+  // disturb it.
+  //
+  // Both added sites dwell in the SAFE direction. Superseding late leaves an
+  // appointment standing a few seconds longer than strictly needed; superseding
+  // on a flicker cancels a meeting the peer is still driving to. Releasing the
+  // latch late delays the next arming; releasing it on a flicker hands out a
+  // second arming inside one outage, which is the generation-19 ratchet.
+  // Seconds, not rclcpp::Time — see dwellConfirmed.
+  double release_ok_since_sec_    = 0.0;
+  bool   release_ok_armed_        = false;
+  double team_back_ok_since_sec_  = 0.0;
+  bool   team_back_ok_armed_      = false;
 
   // --- Proximity stop (coordinated yield) params ---
   // Thresholds/staleness live in the guard's Config; these are the node-side
@@ -1490,8 +2708,10 @@ private:
   //    as the robot climbs/descends (see loadLatestMap);
   //  - candidates are snapped to local ground + candidate_z_clearance
   //    (CandidateGenerator terrain mode), so published goals carry a real 3D
-  //    z. Nav2 consumes only (x, y, yaw) from the goal — the z rides along
-  //    for 3D consumers/RViz, or is zeroed when flatten_goal_z_ is set.
+  //    z. simple_nav_3d's UGV role consumes only (x, y, yaw) — its arrival test
+  //    is planar — so on a UGV the z rides along for 3D consumers/RViz, or is
+  //    zeroed when flatten_goal_z_ is set. Its UAV role does measure z, so there
+  //    the goal z is load-bearing rather than a passenger.
   // When false, all z handling is the legacy absolute flat-world behaviour.
   bool  terrain_relative_z_ = false;
   // Effective (absolute) z band currently ingested into map_cache_. Equal to
@@ -1695,6 +2915,45 @@ private:
   double coverage_latch_t_sim_    = -1.0;
   double coverage_latch_unknown_  = -1.0;
 
+  // The MONOTONIC form of "this robot's run is over", and the only thing
+  // TeamWorld/finished is ever published from. Latched once
+  // (coverage_latched_ || state_ == State::DONE) first holds and never cleared.
+  // It exists because that disjunction is not itself monotonic — DONE can be
+  // left through the exploit sub-loop — and the wire bit is RELAYED by peers,
+  // which is only sound for a bit that cannot go back to false. See
+  // publishTeamWorld and TeamWorld.msg/robot_finished.
+  bool   finished_announced_      = false;
+
+  // --- The at-the-rendezvous hold (2026-09-17, generation 21) ---
+  // Saturating the map while STANDING AT the agreed cell used to end the run on
+  // the spot: maybeLatchCoverageDone routed straight to startReturnHome, so a
+  // robot that had already arrived walked away from the meeting — possibly
+  // seconds before the peer it was waiting for got there. That is the one place
+  // a finished robot must not leave. The appointment's whole value is that
+  // somebody is present when the other robot arrives, and the saturated map
+  // this robot is carrying is exactly what the meeting exists to hand over.
+  //
+  // THE EXPLORATION ENDPOINT IS UNTOUCHED. exploration_complete is stamped
+  // before the hold is taken (same line it was always stamped on), so
+  // explore_done_sim_sec still measures when this robot's map saturated and not
+  // when the barrier let it go. What the hold changes is only what the robot
+  // DOES afterwards, which no exploration metric reads.
+  //
+  // `coverage_latch_hold_start_sec_` is mission-elapsed at the latch, and it is
+  // the hold's own clock: doReturnSync's `waited` runs from the tick the robot
+  // entered RETURN_SYNC, which is before the latch, and capping against that
+  // would charge the hold for time the robot spent waiting while it still had
+  // exploring left to do.
+  //
+  // `coverage_latch_teardown_` is what the appointment outcome classifier reads
+  // to tell "the meeting failed" from "this robot's run ended at the meeting".
+  // Without it a coverage-latched teardown logs `no-show` with `arrived=true` —
+  // observed on all three robots of the smoke20 N=3 rendezvous cell while all
+  // three were standing on cell 45 together, i.e. a no-show recorded at a
+  // meeting that had happened. Sticky once set: the run is over.
+  double coverage_latch_hold_start_sec_ = -1.0;
+  bool   coverage_latch_teardown_       = false;
+
   // --- Post-latch coast (done_seek_enabled) ---
   // A latch that lands MID-MANOEUVRE currently cancels the chase: the robot
   // brakes, discards its frozen contact pair, and the partner keeps waiting at
@@ -1702,7 +2961,7 @@ private:
   // it is the modal way a manoeuvre ends, 56 of 88 reconnect_end events across
   // the banked campaigns and 58-76% within every hybrid arm.
   //
-  // Coasting keeps the nav2 goal the robot ALREADY had, so it finishes the
+  // Coasting keeps the navigator goal the robot ALREADY had, so it finishes the
   // drive toward its partner and delivers its map. Crucially it costs nothing
   // in the metric: state_ reads DONE from the same tick, so the harness's
   // completion rule (every planner reads DONE) never sees the difference, and
@@ -1742,6 +3001,85 @@ private:
   bool   mission_return_enabled_  = false;
   double mission_home_tol_m_      = 1.0;
   double mission_return_max_sec_  = 600.0;
+
+  // THE PRE-MISSION HOLD: no robot plans or navigates until this much mission
+  // time has passed, IN EVERY ARM (2026-09-17, generation 22).
+  //
+  // It exists for the rendezvous agreement and it is applied to all four arms
+  // anyway, and both halves of that are deliberate.
+  //
+  // WHY IT EXISTS. The protocol's one free window is the start of the run, when
+  // the team is co-located and every link is up — the derive gate says so in as
+  // many words, and the measurement backs it: the centroid placeholder commits
+  // with a full echo round, on every robot, within about 21 ms. What was NOT
+  // guaranteed is that the window lasts long enough to also carry the ONE
+  // upgrade the proposer is allowed. It did not, in the ts4 smoke20 N=3 hybrid
+  // cell: bestla's last peer went silent at t+65.1 s and atlas authored the
+  // upgraded triple at t+65.7 s, 0.6 s later. bestla kept the 26-s-stale
+  // placeholder, atlas and husky took the upgrade, and the fleet drove to two
+  // different cells and waited out the rest of the run in two places. The team
+  // had dispersed before it had finished agreeing.
+  //
+  // So this does not add a rule to the protocol — it makes the protocol's
+  // existing precondition TRUE instead of merely likely, by refusing to start
+  // dispersing until the window it needs has actually elapsed.
+  //
+  // WHAT THIS HOLD DOES NOT DO, because it shipped for one day claiming to.
+  // A companion edit confined the provisional->final upgrade to this window, on
+  // the theory that an upgrade authored inside it cannot split the fleet. The
+  // theory is sound and the implementation was measured to be worthless: the
+  // upgrade needs candidate cells, candidate cells come from the allocator's
+  // tours, tours come from completed exploration steps, and a robot held here
+  // completes none. Confining the upgrade to the hold does not schedule it
+  // earlier, it prevents it forever. The full measurement is in the derive gate
+  // in maintainRendezvousProposal; the conjunct is gone and must not come back.
+  // What remains here is only the first half: agree the placeholder while
+  // everyone is still standing together.
+  //
+  // WHY ALL FOUR ARMS, including the two that never run the protocol. The hold
+  // is dead time on the primary endpoint, so applying it only where it is
+  // needed would add a fixed handicap to rendezvous and hybrid and to nothing
+  // else — a startup cost masquerading as a treatment effect, in the exact
+  // comparison the campaign exists to make. Applied uniformly it is a constant
+  // shared by every arm: it cancels in every between-arm contrast and is
+  // subtractable from every absolute completion time.
+  //
+  // WHY 60 s. The hold has exactly one job — carry the INITIAL agreement, the
+  // centroid placeholder, while the fleet is still co-located — and 60 s is far
+  // more than that job needs. The placeholder commits with a full echo round on
+  // every robot within about 21 ms of the first derive that has a snapshot; the
+  // derive retries every kRendezvousBootstrapPeriodSec (5 s) until one lands,
+  // and publishTeamWorld re-broadcasts the result at team_world_hz (1 Hz). So
+  // 60 s buys roughly twelve derive attempts and sixty re-broadcasts under
+  // guaranteed mutual contact, against a handshake that normally completes on
+  // the first one. The margin is there for a late map, not for the protocol.
+  //
+  // THIS NUMBER WAS 120 s FOR ONE DAY (2026-09-17) AND THE ARGUMENT FOR 120 IS
+  // WITHDRAWN. It was: the window must also contain the provisional->final
+  // upgrade, whose first occurrence was swept at 41-77 s over the banked cells,
+  // so 60 s sat below the N=2 minimum of 61.6 s. Every word of that is true and
+  // it is irrelevant, because the upgrade is no longer confined to the window —
+  // confining it was measured to delete it rather than schedule it, since the
+  // upgrade's input is completed exploration steps and a held robot completes
+  // none. With the confinement gone the upgrade fires whenever the allocator
+  // first has tours, at t=41 s or t=353 s, hold or no hold. The hold neither
+  // helps nor hinders it, so the sweep no longer constrains this number at all.
+  //
+  // DO NOT RE-DERIVE THIS NUMBER FROM THAT SWEEP. If a future change re-couples
+  // the upgrade to the hold, the sweep is still not the right input — the right
+  // input is the step counter, and the answer it gives is that no hold length
+  // works. See the derive gate in maintainRendezvousProposal.
+  //
+  // TOO SHORT IS NOT A CORRECTNESS RISK. Whatever the team has committed when
+  // the hold closes is agreed by construction, because every commit before that
+  // point happened with the fleet co-located and mutually whole. The failure
+  // mode of a hold that is too short is that the fleet leaves with no pair at
+  // all and the first arming refuses — which the smoke's Q0/Q1 catch directly,
+  // and which 60 s is twelve retries clear of.
+  double mission_start_hold_sec_  = 60.0;
+  // One-shot, so the "still holding" line cannot be mistaken for a stall and
+  // the release is stamped once with the number it waited for.
+  bool   mission_start_hold_logged_ = false;
   bool   have_home_               = false;
   Eigen::Vector3f home_pos_       = Eigen::Vector3f::Zero();
   float  home_yaw_                = 0.f;
@@ -1751,6 +3089,48 @@ private:
   bool   return_home_goal_sent_   = false;
   int    return_home_retries_     = 0;
   double return_home_dist_at_start_ = 0.0;
+  // Wall clock and hold clock for the leg, stamped together with the distance
+  // baseline above so all three measure THE SAME INTERVAL (2026-09-18).
+  //
+  // mission_complete used to derive its duration from state_enter_time_ while
+  // taking its distance from return_home_dist_at_start_, and those are not the
+  // same window the moment a proximity hold interrupts the leg: the release at
+  // checkProximityHold BACKDATES state_enter_time_ by the drive time already
+  // spent, deliberately, so the nav budget and the mission_return_max_sec cap
+  // CONTINUE across the hold instead of restarting. That is right for a budget
+  // — a commanded yield to a teammate is not the robot's own time to spend —
+  // and wrong for a report: it made homing_duration_sec a drive-only clock
+  // shipped next to a whole-leg distance, so distance/duration overstated the
+  // homing speed by exactly the held fraction.
+  //
+  // NOT A RARE SEAM, BUT NOT "BY CONSTRUCTION" EITHER, and the arithmetic here
+  // read 5.0 m until 2026-09-18. That is the yaml field default
+  // (shared_params.yaml:1107) and no campaign uses it: run_explo_sim_rviz.sh
+  // passes -p proximity_hold_dist_m:=$PROX_HOLD_M with PROX_HOLD_M:-1.5 (:175),
+  // and says why — a 5 m disc has each husky braked by the teammate standing on
+  // the next vantage angle ~3.5 m away, which would spend the run in
+  // PROXIMITY_HOLD. At 5.0 m against homes 3 m apart two robots homing at once
+  // would indeed hold each other unavoidably; at 1.5 m (resume 2.5 m) they park
+  // OUTSIDE each other's disc and the hold is a transient of the approach, not
+  // a certainty. The bias is real and arm-correlated all the same — the arms
+  // that regroup home together more often than the ones that do not — and an
+  // arm-correlated bias in a reported quantity is the kind that survives into a
+  // result, however often it fires. It just does not fire on every pair.
+  //
+  // So: this pair gives mission_complete a true wall-clock leg and the held
+  // time inside it, separately. The BUDGET still runs off state_enter_time_
+  // and is untouched — homing_duration_sec can therefore legitimately exceed
+  // mission_return_max_sec without the cap having failed, by up to the held
+  // time, and homing_held_sec is how you tell that apart from an overrun.
+  // Explicitly RCL_ROS_TIME, not default-constructed: a default rclcpp::Time
+  // is on the SYSTEM clock, and subtracting mismatched sources throws rather
+  // than returning a wrong number. Every caller of finishMissionReturn sits
+  // inside RETURN_HOME, which only startReturnHome can enter, so the stamp is
+  // always set in practice — this is so that if that ever stops being true the
+  // failure is a nonsense duration in one row and not an exception unwinding
+  // the run's last event.
+  rclcpp::Time return_home_start_time_{0, 0, RCL_ROS_TIME};
+  double return_home_hold_at_start_ = 0.0;
   std::string return_home_reason_;
   std::string mission_home_result_;      // empty until resolved
   double mission_home_sim_sec_    = -1.0;
@@ -1786,6 +3166,12 @@ private:
   HomeMode home_mode_ = HomeMode::DIRECT;
   rclcpp::Time approach_check_time_{0, 0, RCL_ROS_TIME};
   float  approach_check_metric_ = 0.f;
+  // Band clock for the near-home stall detector. Armed on entry to the
+  // suppression band and cleared on leaving it, on an escape leg, and on a
+  // relocalization jump -- a jump can teleport the robot into the band, and
+  // dwell time measured across one is not dwell time.
+  bool         near_home_armed_ = false;
+  rclcpp::Time near_home_since_{0, 0, RCL_ROS_TIME};
   int    home_escapes_used_     = 0;
   int    escape_last_crumb_     = -1;  // anti-repeat: never twice in a row
   int    escape_fallback_n_     = 0;   // rotates the behind-robot fallback
@@ -1793,18 +3179,32 @@ private:
   Eigen::Vector3f escape_target_ = Eigen::Vector3f::Zero();
   double return_approach_window_sec_ = 40.0;
   double return_approach_min_m_      = 1.0;
+  // Radius inside which the approach detector is muted, and the cap on how long
+  // a robot may sit inside it without arriving. Was a file-scope constexpr
+  // (kApproachSuppressM), which made the one number this defect turns on
+  // untunable without a rebuild -- see the band note below.
+  double return_approach_suppress_m_ = 3.0;
+  double return_near_home_stall_sec_ = 60.0;
   int    return_escape_max_attempts_ = 3;
   double return_escape_leg_sec_      = 30.0;
   // Geometry constants, all tied to the 2 m breadcrumb spacing: an escape
   // target is a crumb 0.75x-3x the spacing away, arrival is one spacing, and
-  // the approach check is suppressed inside 3 m because there the 1.0 m
-  // threshold is a large fraction of what is left (the frozen detector and
-  // the nav budget still cover that band).
+  // the approach check is suppressed inside return_approach_suppress_m_ because
+  // there the 1.0 m threshold is a large fraction of what is left.
+  //
+  // That suppression used to claim the frozen detector and the nav budget still
+  // covered the band. They do not, and the band is wider than the arrival test:
+  // arrival needs <= mission_home_tol_m (1.0 m), the mute radius is 3.0 m, and
+  // between the two a robot that keeps MOVING without closing the gap passes
+  // the frozen test every window (it accumulates distance) while the approach
+  // test is switched off. Only the overall nav budget remained, minutes away.
+  // Measured on ts1b: 7 homings parked in that band for 221-565 s against a
+  // 70.9 s median homing, 6 of which set their cell's makespan. The band clock
+  // above closes it -- see doReturnHome.
   static constexpr float kEscapeBandMinM      = 1.5f;
   static constexpr float kEscapeBandMaxM      = 6.0f;
   static constexpr float kEscapeArriveM       = 1.5f;
   static constexpr float kEscapeFallbackM     = 2.5f;
-  static constexpr float kApproachSuppressM   = 3.0f;
   // Placeholder passed on home_watchdog rows that record no detector
   // inequality (kind="escape-end", a leg termination rather than a fire).
   //
@@ -1864,19 +3264,27 @@ private:
   double       pursue_budget_sec_ = 0.0;
   rclcpp::Time pursue_start_time_;
   std::string  pursue_peer_id_;
-  // Snapshot of the record the chase was armed from. pursuitFallback derives
-  // the hybrid meeting point from THIS pair, not a re-read of last_contact_:
-  // a one-way packet heard mid-chase would move our midpoint away from the
-  // one the peer computes from its own (un-refreshed) record of us.
+  // Snapshot of the record the chase was armed from. WRITE-ONLY SINCE
+  // 2026-09-16 and kept deliberately. Its one reader was pursuitFallback's
+  // hybrid branch, which derived a meeting point from this pair — the last of
+  // the three midpoint drives, all now deleted. The member survives because
+  // the snapshot DISCIPLINE it documents is still load-bearing next door
+  // (reconnect_rec_, below), and because a chase that re-read last_contact_
+  // mid-drive is a mistake this codebase has made before: keeping the armed
+  // record visible is cheaper than rediscovering why it was taken. If a future
+  // reader wants it gone, delete startPursuit's write with it — do not leave
+  // the write and call the member live.
   LastContact  pursue_rec_;
 
   // The pair the CURRENT manoeuvre was armed from — the same discipline as
   // pursue_rec_, applied to the whole manoeuvre rather than just the chase.
-  // Every target a manoeuvre steers to is derived from THIS snapshot and never
-  // from a re-read of last_contact_: the peer computes its midpoint from its
-  // own record of the SAME contact event, so a one-way packet heard while we
-  // drove or waited would move our midpoint off the one the peer is driving to
-  // — which is exactly the non-convergence the meeting point exists to remove.
+  // Any target a manoeuvre derives from a per-peer record is derived from THIS
+  // snapshot and never from a re-read of last_contact_. The convergence
+  // argument that made it matter is gone with the midpoint drives (2026-09-16)
+  // — the destination is now the team-wide agreed cell, which no robot derives
+  // from a contact record at all — but the discipline is still what keeps the
+  // hold escalation's fallback stable: a one-way packet heard while we drove or
+  // waited must not move the target this robot is already being waited at.
   // The hold escalation is the site that needed it: it re-queried live, and a
   // refresh between dispatch and barrier expiry made it escalate to a point
   // the peer had no reason to be at. One snapshot per manoeuvre, taken by
@@ -1884,14 +3292,21 @@ private:
   LastContact  reconnect_rec_;
   bool         have_reconnect_rec_ = false;
 
-  // Human label of the current RETURN_NAV destination ("last-connected
-  // anchor" or "meeting point"), set by startReturnTo for doReturnNav's logs.
+  // Human label of the current RETURN_NAV destination, set by startReturnTo for
+  // doReturnNav's logs and read NOWHERE ELSE — it is a log string, not state.
+  // The values it actually takes are "appointment" (every dispatch and
+  // supersede path) and the hold escalation's own label, which is
+  // "appointment" or "last-connected anchor". "meeting point" was the third
+  // value until the midpoint drives were deleted on 2026-09-16; nothing writes
+  // it now.
   std::string  return_dest_label_;
 
   // Reconnect-manoeuvre clock, for the CSV's reconnect_elapsed_sec. Deliberately
   // NOT state_enter_time_: the manoeuvre spans state changes that must not
   // restart it — RETURN_NAV -> RETURN_SYNC on arrival, a PROXIMITY_HOLD taken
-  // mid-drive, and in HYBRID the whole PURSUE -> meeting-point handoff. Armed
+  // mid-drive, and in HYBRID the PURSUE -> appointment handoff (the chase
+  // breaking off because the departure deadline came due; there has been no
+  // PURSUE -> meeting-point handoff since 2026-09-16). Armed
   // once by whichever of startReturnTo/startPursuit fires first (hence the
   // already-active guard in both) and cleared in transitionTo on leaving the
   // manoeuvre states, so the column measures one thing: wall seconds this robot
@@ -1936,6 +3351,11 @@ private:
   int   pending_plan_rej_map_       = -1;
   int   pending_plan_rej_unreach_   = -1;
   int   pending_plan_rej_blacklist_ = -1;
+  // The visited half of pending_plan_rej_blacklist_, not a sixth disjoint
+  // bucket: every candidate counted here is ALSO counted there, so the five
+  // original rejection columns still sum to the candidates the filter refused
+  // and nothing about the old arithmetic changes. See metrics_logger.hpp.
+  int   pending_plan_rej_visited_   = -1;
   int   pending_plan_rej_minpos_    = -1;
   int   pending_plan_stall_ticks_   = -1;
 
@@ -2093,9 +3513,12 @@ private:
   rclcpp::Publisher<scovox_msgs::msg::RefinementRegion>::SharedPtr region_pub_;
   // Proximity guard inputs + actuation. The pose subs are the peers'
   // localiser outputs (map frame, ~10 Hz) — much fresher than the 1 Hz intent
-  // heartbeat that also feeds the guard. The action client exists ONLY to
-  // cancel the in-flight NavigateToPose on hold entry: ceasing to publish
-  // goal_pose does not stop nav2, the last accepted goal runs to completion.
+  // heartbeat that also feeds the guard. The action client was written to cancel
+  // the in-flight NavigateToPose on hold entry — ceasing to publish goal_pose
+  // does NOT stop the robot, since the navigator latches the last goal it
+  // accepted and drives it to completion — but on this stack it has no server to
+  // talk to and never fires. The brake goal does the stopping. Read the block at
+  // its construction before trusting a "cancel" anywhere.
   std::vector<rclcpp::Subscription<
       geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr> peer_pose_subs_;
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
@@ -2141,6 +3564,36 @@ private:
   // a deferral) while still recording a genuine second exhaustion later.
   int exp_complete_step_  = -1;
   int exp_complete_count_ = 0;
+  // mission_complete emissions this run. The contract is exactly one, and TWO
+  // guards at the top of startReturnHome enforce it: mission_return_done_
+  // (run-scoped) and the state_ == RETURN_HOME test (leg-scoped). Through
+  // generation 8 this comment named only the second, which structurally cannot
+  // see the defect that was actually measured — the second request arrives
+  // from DONE, not from RETURN_HOME, so the state test never fired on it.
+  // Incremented on every emission unconditionally: a counter that a guard
+  // prevents from ever reaching 2 would be a check that stopped checking.
+  int mission_complete_count_ = 0;
+  // The mission return is a ONCE-PER-RUN leg, and this is what makes that
+  // structural instead of a property of whichever state the second request
+  // happens to arrive from. Set the instant finishMissionReturn commits the
+  // ending; read by startReturnHome, which refuses every later request.
+  //
+  // Why the state test cannot carry this: finishMissionReturn ends in
+  // finishNow, so the robot is in DONE — not RETURN_HOME — by the time the
+  // second request arrives, and it does arrive. The coverage latch fires from
+  // the metrics tick, which is the deciding hook for done_criterion=latch and
+  // measures the ROI in EVERY state, so a robot that ended on barrier-gave-up
+  // can saturate its map minutes later while parked at home and ask to go
+  // home again. Measured on ts1b: 16 DONE->RETURN_HOME re-entries and 16
+  // robot-runs carrying two mission_complete rows, all of them in the
+  // treatment arm, the count rising with team size.
+  bool mission_return_done_ = false;
+  // Requests the latch above refused. A guard that leaves no trace is a guard
+  // no run can be shown to have needed, and "zero re-entries" and "the guard
+  // is inert" are not the same claim — so this rides out on run_end rather
+  // than living and dying inside the process. The first refusal also WARNs
+  // (once only: the caller can be a tick loop).
+  int mission_return_reentries_ = 0;
   // Why the node reached DONE, kept for the run_end the destructor writes in
   // done_action=idle (where DONE is not the end of the file). Empty = DONE was
   // never reached, i.e. the run was cut short from outside.
@@ -2255,9 +3708,16 @@ ExploPlannerNode::ExploPlannerNode()
   // Ladder rationale (and why the tail is NOT 0.55/0.50/0.45) in
   // config/shared_params.yaml — measured, those bottom rungs were dead columns
   // and the deepest one that fired was done_unknown_fraction itself.
+  //
+  // C1 (2026-09-14): the 0.62/0.60/0.58/0.56 tail is gone as well. With
+  // done_unknown_fraction at 0.64 -- between the 0.65 and 0.62 rungs -- those
+  // four could only be crossed after the robot had declared itself done, and
+  // measurement confirmed it (>=95% of crossings post-declaration in both
+  // arms, and the reach RATE itself tracked the treatment). The invariant this
+  // ladder now maintains: EVERY RUNG SITS STRICTLY ABOVE done_unknown_fraction.
+  // Move one and move the other.
   coverage_milestones_ = dp("coverage_milestones",
-      std::vector<double>{0.90, 0.85, 0.80, 0.75, 0.70,
-                          0.65, 0.62, 0.60, 0.58, 0.56});
+      std::vector<double>{0.90, 0.85, 0.80, 0.75, 0.70, 0.65});
   // clock_anchor cadence in SIM seconds. Each anchor is a (sim, wall) pair plus
   // the real-time factor since the previous one, which turns this file into the
   // conversion table for every other log in the run directory — they carry wall
@@ -2294,24 +3754,37 @@ ExploPlannerNode::ExploPlannerNode()
   // how far the hop was.
   goal_rotate_timeout_sec_ = dp("goal_rotate_timeout_sec", 15.0);
   goal_republish_sec_ = dp("goal_republish_sec", 5.0);
-  // The arrival gate must be strictly LOOSER than the navigator's own goal
-  // checker, or the navigator declares success and stops just outside the
+  // The arrival gate must be strictly LOOSER than the navigator's own stop
+  // condition, or the navigator declares success and stops just outside the
   // planner's tolerance, the planner never sees arrival, and failGoal()
-  // blacklists a goal the robot is standing on. nav2's shipped
-  // general_goal_checker defaults are xy 0.25 / yaw 0.25.
+  // blacklists a goal the robot is standing on.
+  //
+  // The navigator is simple_nav_3d, not nav2 — this comment used to justify the
+  // 0.3 threshold with nav2's general_goal_checker defaults (xy 0.25 /
+  // yaw 0.25), a checker that has never run in this system. simple_nav_3d's UGV
+  // stop condition is ugv.goal_xy_tol_m / ugv.goal_yaw_tol_rad, both 0.2 as
+  // shipped, but the park distribution is set by four stacked roundings rather
+  // than by either tolerance and the measured median arrival over ts1b's 240
+  // cells landed 0.269 m out. 0.3 is therefore the point below which the gate
+  // stops clearing the measured median, which is what these two warnings are
+  // actually about. A node cannot read another node's parameters, so the
+  // tolerance figures quoted below are documentation and have to be checked by
+  // hand against simple_nav_3d/launch/simple_nav_3d.launch.py; the 0.269 m is
+  // the load-bearing number and it is independent of them.
   if (goal_yaw_tol_ < 0.3) {
     RCLCPP_WARN(get_logger(),
-        "goal_yaw_tolerance=%.2f rad is at or below nav2's default "
-        "yaw_goal_tolerance (0.25) — the navigator can stop inside its own "
-        "tolerance but outside this gate, which fails the goal on the "
-        "rotate deadline and blacklists it. Use >= 0.4, or match it to this "
-        "robot's configured goal checker.", goal_yaw_tol_);
+        "goal_yaw_tolerance=%.2f rad is below 0.3 — the navigator stops as soon "
+        "as it is inside its OWN yaw tolerance (simple_nav_3d "
+        "ugv.goal_yaw_tol_rad, 0.2 as shipped), which can be outside this gate; "
+        "that fails the goal on the rotate deadline and blacklists the pose the "
+        "robot is standing on. Use >= 0.4, or match it to this robot's "
+        "navigator.", goal_yaw_tol_);
   }
   if (goal_xy_tol_ < 0.3) {
     RCLCPP_WARN(get_logger(),
-        "goal_xy_tolerance=%.2f m is at or below nav2's default "
-        "xy_goal_tolerance (0.25) — see the goal_yaw_tolerance warning.",
-        goal_xy_tol_);
+        "goal_xy_tolerance=%.2f m is below 0.3 — the median measured park is "
+        "0.269 m from the commanded point, so this gate would miss half of all "
+        "arrivals; see the goal_yaw_tolerance warning.", goal_xy_tol_);
   }
   // Minimum useful hop. Candidates nearer than this are rejected in doPlan
   // alongside the ones inside goal_xy_tolerance.
@@ -2334,8 +3807,10 @@ ExploPlannerNode::ExploPlannerNode()
   //
   // So this is not a heuristic to break ties; it encodes that a goal closer
   // than the sensor's useful standoff cannot reduce uncertainty where it
-  // stands. Scale it to the sensor, not the robot: a few metres for a VLP-16
-  // with fov_max_range 10 m.
+  // stands. Scale it to the sensor, not the robot: a few metres for a VLP-16.
+  // Note it is the VERTICAL fan that sets this, not fov_max_range — the +-15 deg
+  // band is what makes a 0.6 m standoff blind, and that is unchanged by the
+  // horizontal correction or by the range knob.
   //
   // Default 0.0 keeps the shipped behaviour bit-identical — every field
   // config that predates this parameter selects exactly the goals it did
@@ -2463,8 +3938,41 @@ ExploPlannerNode::ExploPlannerNode()
   // always finds *some* unobserved voxels at the cone edge), so unknown
   // fraction is the reliable signal here. Set done_unknown_fraction <= 0 to
   // disable.
+  // FIELD NOTE: this library default is deliberately NOT the campaign value.
+  // 0.64 is calibrated to flatforest, whose unknown fraction floors near 0.486;
+  // it is a world property, not a planner property, and baking it in here would
+  // silently mis-stop a different world. config/shared_params.yaml carries the
+  // calibrated value (C4), and any new world must recalibrate. 0.05 is the
+  // generic "map actually saturates" assumption, which flatforest violates.
   done_unknown_fraction_ =
       dp("done_unknown_fraction", 0.05);
+  // C1 invariant: every coverage milestone must sit STRICTLY ABOVE the stopping
+  // threshold. A rung at or below it can only be crossed after the robot has
+  // declared itself done, which makes it a measure of post-stop map merging;
+  // worse, whether a run reaches such a rung at all correlates with the arm, so
+  // it is a selection artifact masquerading as an arm-independent endpoint.
+  // This is checked rather than commented because the last time it broke,
+  // nothing said so -- the threshold moved to 0.64 and four rungs quietly
+  // changed meaning. Report-only: the rungs still fire, and the events carry
+  // post_latch, so the data stays interpretable either way.
+  if (done_unknown_fraction_ > 0.0) {
+    std::vector<double> below;
+    for (double m : coverage_milestones_)
+      if (m <= done_unknown_fraction_) below.push_back(m);
+    if (!below.empty()) {
+      std::ostringstream ss;
+      for (size_t i = 0; i < below.size(); ++i)
+        ss << (i ? ", " : "") << below[i];
+      RCLCPP_WARN(this->get_logger(),
+          "coverage_milestones: %zu rung(s) [%s] are at or below "
+          "done_unknown_fraction=%.3f. Those can only be crossed AFTER this "
+          "robot declares exploration complete, so they time post-stop map "
+          "merging, not exploration, and their reach rate tracks the arm. "
+          "Do not report them as endpoints (each event carries post_latch). "
+          "Fix by truncating the ladder, not by lowering the threshold.",
+          below.size(), ss.str().c_str(), done_unknown_fraction_);
+    }
+  }
   done_min_consecutive_steps_ =
       dp("done_min_consecutive_steps", 3);
   // WHICH RULE DECIDES FINISHED. The default is "latch" and the paragraph above
@@ -2523,7 +4031,10 @@ ExploPlannerNode::ExploPlannerNode()
   ccfg.n_rings    = dp("candidate_n_rings", 3);
   ccfg.min_radius = static_cast<float>(dp("candidate_min_radius", 2.0));
   ccfg.max_radius = static_cast<float>(dp("candidate_max_radius", 8.0));
-  ccfg.n_yaw      = dp("candidate_n_yaw", 4);
+  // 1, not the historical 4: with a full-azimuth FOV model the yaw samples at
+  // one position score the same view repeatedly (see fov_hfov below), so the
+  // extra three are aliasing noise the ranking would otherwise sort on.
+  ccfg.n_yaw      = dp("candidate_n_yaw", 1);
   ccfg.robot_z    = static_cast<float>(dp("candidate_robot_z", 0.3));
   ccfg.occ_thresh = static_cast<float>(dp("candidate_occ_thresh", 0.7));
   ccfg.ground_z   = static_cast<float>(dp("candidate_ground_z", 0.15));
@@ -2631,14 +4142,44 @@ ExploPlannerNode::ExploPlannerNode()
   }
 
   // FOV evaluation
+  // Defaults are the VLP-16 the robots actually carry, matching the SDF
+  // (-3.14159..+3.14159 by -0.261799..+0.261799), NOT the 60x45 deg RGB-D
+  // frustum they used to describe. These are the values a launch path that
+  // forgets to load shared_params.yaml gets, so a stale default here is a
+  // silent second sensor model -- which is what it was.
   FovConfig fcfg;
-  fcfg.hfov      = static_cast<float>(dp("fov_hfov", 1.047));
-  fcfg.vfov      = static_cast<float>(dp("fov_vfov", 0.785));
+  fcfg.hfov      = static_cast<float>(dp("fov_hfov", 6.28318));
+  fcfg.vfov      = static_cast<float>(dp("fov_vfov", 0.5236));
   fcfg.min_range = static_cast<float>(dp("fov_min_range", 0.3));
-  fcfg.max_range = static_cast<float>(dp("fov_max_range", 10.0));
-  fcfg.h_rays    = dp("fov_h_rays", 16);
-  fcfg.v_rays    = dp("fov_v_rays", 12);
+  fcfg.max_range = static_cast<float>(dp("fov_max_range", 20.0));
+  fcfg.h_rays    = dp("fov_h_rays", 96);
+  fcfg.v_rays    = dp("fov_v_rays", 16);
   fcfg.occ_stop  = static_cast<float>(dp("fov_occ_stop", 0.7));
+  // Full circle within one ray step. Not an exact == on 2*pi: the yaml carries
+  // a rounded 6.28318 and the SDF a rounded 3.14159, so an equality test would
+  // read the very configuration this is meant to recognise as directional.
+  // One h_step of slack is the honest tolerance -- anything inside it is a
+  // circle the ray comb cannot distinguish from a closed one.
+  {
+    const float h_step = (fcfg.h_rays > 0)
+        ? fcfg.hfov / static_cast<float>(fcfg.h_rays) : 0.0f;
+    fov_is_omnidirectional_ =
+        fcfg.hfov >= (2.0f * static_cast<float>(M_PI) - h_step);
+    if (fov_is_omnidirectional_) {
+      RCLCPP_INFO(get_logger(),
+          "FOV model is omnidirectional (hfov=%.4f rad over %d rays, %.2f deg "
+          "apart): exploration arrival does NOT gate on yaw. Exploitation "
+          "vantages still do.",
+          fcfg.hfov, fcfg.h_rays,
+          h_step * 180.0f / static_cast<float>(M_PI));
+    } else {
+      RCLCPP_INFO(get_logger(),
+          "FOV model is directional (hfov=%.4f rad = %.1f deg): exploration "
+          "arrival gates on yaw within %.2f rad.",
+          fcfg.hfov, fcfg.hfov * 180.0f / static_cast<float>(M_PI),
+          goal_yaw_tol_);
+    }
+  }
   fcfg.roi_min_x = ccfg.roi_min_x;
   fcfg.roi_max_x = ccfg.roi_max_x;
   fcfg.roi_min_y = ccfg.roi_min_y;
@@ -2832,18 +4373,32 @@ ExploPlannerNode::ExploPlannerNode()
           "Use 'reconnect_enabled' instead (value %d carried over).", v_old);
     }
   }
-  // Rendezvous barrier preconditions. It only *activates* where it is
-  // meaningful — coordination on (the barrier waits on peer claims) and a
-  // positive expected-peer count. In single-robot / no-coordination runs (or a
-  // one-robot team) it silently stays inert with no behaviour change, so a
-  // missing precondition is a plain INFO, not a warning.
+  // Reconnect-subsystem preconditions. The subsystem only *activates* where it
+  // is meaningful — coordination on (every manoeuvre reads the peer claim
+  // table) and a positive expected-peer count.
+  //
+  // R4: this is a WARN, not an INFO, and the message no longer says
+  // "rendezvous". What this branch turns off is the WHOLE reconnect subsystem:
+  // rendezvous, pursuit and hybrid alike. The old INFO wording cost a real
+  // diagnosis — a cell launched with reconnect_mode=hybrid whose manifest
+  // faithfully recorded `reconnect_mode_param=hybrid` while the binary had
+  // silently disabled every manoeuvre here, which reads downstream as a
+  // treated cell that produced no treatment. An arm being silently voided is
+  // not an INFO-level event. The only run where this is expected is a
+  // single-robot or explicitly uncoordinated cell, and there the warning is
+  // one line at start-up.
   rendezvous_expected_peers_ = dp("rendezvous_expected_peers", 0);
   rendezvous_max_wait_sec_   = dp("rendezvous_max_wait_sec", 0.0);
   if (reconnect_enabled_ &&
       (!coord_enabled_ || rendezvous_expected_peers_ <= 0)) {
-    RCLCPP_INFO(get_logger(),
-        "Rendezvous inactive (coordination_enabled=%d, expected_peers=%d): "
-        "running as plain exploration, finishing when goals are exhausted.",
+    RCLCPP_WARN(get_logger(),
+        "RECONNECT SUBSYSTEM DISABLED by preconditions "
+        "(coordination_enabled=%d, rendezvous_expected_peers=%d). "
+        "reconnect_enabled was requested but ALL manoeuvres — rendezvous, "
+        "pursuit and hybrid — are now off, and this robot runs as plain "
+        "exploration, finishing when goals are exhausted. Any manifest field "
+        "naming a reconnect mode for this run describes the REQUEST, not the "
+        "behaviour: read reconnect_enabled, not reconnect_mode_param.",
         coord_enabled_, rendezvous_expected_peers_);
     reconnect_enabled_ = false;
   }
@@ -2871,13 +4426,45 @@ ExploPlannerNode::ExploPlannerNode()
         dp("reconnect_mode", std::string("rendezvous"));
     bool mode_known = false;
     reconnect_mode_ = reconnectModeFromString(mode_str, &mode_known);
+    // FATAL, not a warning (2026-09-16). reconnectModeFromString keeps its
+    // documented fallback — it is a pure function with unit tests pinning
+    // "nonsense" -> RENDEZVOUS — but the NODE refuses to run on it. A typo in
+    // the arm name is not a mode choice, and the fallback silently retargets
+    // the run at a DIFFERENT ARM of the same experiment while every manifest
+    // field, every event-log param and every directory name still says the
+    // name that was asked for. There is no way to detect that downstream: the
+    // cell looks like a perfectly healthy member of the arm it was never in.
+    // One line at start-up costs a cell; a silent re-arming costs a campaign.
     if (!mode_known) {
-      RCLCPP_WARN(get_logger(),
-          "Unknown reconnect_mode '%s' — falling back to 'rendezvous'.",
+      RCLCPP_FATAL(get_logger(),
+          "Unknown reconnect_mode '%s'. The only modes are 'rendezvous', "
+          "'pursuit' and 'hybrid'; the off arm is reconnect_enabled=false, "
+          "NOT reconnect_mode='off'. Refusing to start rather than silently "
+          "running this cell as 'rendezvous' under the requested name.",
           mode_str.c_str());
+      throw std::runtime_error("unknown reconnect_mode '" + mode_str + "'");
+    }
+    // R4, second half. reconnect_mode_ is still parsed and still stamped into
+    // the log when the subsystem above turned itself off, so a run can carry a
+    // mode it will never execute. Say so at the point the mode is read, naming
+    // the mode, so the console log alone distinguishes "hybrid ran" from
+    // "hybrid was asked for and voided".
+    if (!reconnect_enabled_ && reconnect_mode_ != ReconnectMode::RENDEZVOUS) {
+      RCLCPP_WARN(get_logger(),
+          "reconnect_mode='%s' is INERT this run: the reconnect subsystem is "
+          "disabled, so no %s manoeuvre can fire. Do not score this cell as a "
+          "treated cell.", mode_str.c_str(), mode_str.c_str());
     }
   }
   pursuit_budget_max_sec_    = dp("pursuit_budget_max_sec", 240.0);
+  pursuit_speed_measured_mps_ = dp("pursuit_speed_measured_mps", 0.40);
+  if (pursuit_speed_measured_mps_ <= 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "pursuit_speed_measured_mps=%.3f is not a speed; the pursuit "
+        "feasibility gate will price every chase as instantaneous and refuse "
+        "nothing. Set it to the measured traverse speed.",
+        pursuit_speed_measured_mps_);
+  }
   pursuit_staleness_max_sec_ = dp("pursuit_staleness_max_sec", 900.0);
   pursuit_goal_stale_sec_    = dp("pursuit_goal_stale_sec", 180.0);
   pursuit_explore_fallback_  = dp("pursuit_explore_fallback", true);
@@ -2895,7 +4482,127 @@ ExploPlannerNode::ExploPlannerNode()
   // Set reconnect_midrun_silence_sec to 0 to restore the legacy behaviour.
   reconnect_midrun_silence_sec_  = dp("reconnect_midrun_silence_sec", 90.0);
   reconnect_midrun_max_wait_sec_ = dp("reconnect_midrun_max_wait_sec", 240.0);
+  if (!std::isfinite(reconnect_midrun_max_wait_sec_) ||
+      reconnect_midrun_max_wait_sec_ <= 0.0) {
+    // ZERO IS NOT "DO NOT WAIT" HERE, which is the whole reason this needs a
+    // guard the others made obvious. rendezvousWaitExpired tests
+    // `max_wait_sec > 0.0`, so a zero, a negative or a NaN all mean NEVER
+    // EXPIRES — and this is the one cap in the family whose expiry is the
+    // robot's only way back to exploring. Unbounded turns a mid-run attempt
+    // into the terminal barrier it is documented never to be: the robot stands
+    // at a failed chase's intercept for the rest of the cell with an
+    // unsaturated map, and the run is scored as though it had explored.
+    RCLCPP_WARN(get_logger(),
+        "reconnect_midrun_max_wait_sec %.1f would never expire, which parks a "
+        "robot mid-run -> 240 s.",
+        reconnect_midrun_max_wait_sec_);
+    reconnect_midrun_max_wait_sec_ = 240.0;
+  }
   reconnect_midrun_max_attempts_ = dp("reconnect_midrun_max_attempts", 6);
+  // The notice/wait/settle family (see the member comments). These three ARE
+  // the rendezvous arm's definition and are logged as params so a cell can be
+  // attributed to them without reading the binary.
+  rendezvous_depart_delay_sec_   = dp("rendezvous_depart_delay_sec", 100.0);
+  rendezvous_appointment_wait_sec_ =
+      dp("rendezvous_appointment_wait_sec", 0.0);
+  rendezvous_settle_sec_         = dp("rendezvous_settle_sec", 30.0);
+  rendezvous_max_lateness_sec_   = dp("rendezvous_max_lateness_sec", 60.0);
+  if (!std::isfinite(rendezvous_max_lateness_sec_) ||
+      rendezvous_max_lateness_sec_ < 0.0) {
+    // NaN is the dangerous one, and not for the usual reason: the rung floor
+    // subtracts this from the robot's drive, so a NaN propagates into the
+    // not_before argument and nextAgreedOccurrence's llround of a NaN is
+    // undefined. A negative budget is merely wrong — it demands the robot
+    // arrive EARLY by that much — but it would silently roll rungs on robots
+    // that could make the nearest one, forking a team that had no reason to.
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_max_lateness_sec %.1f is not a usable budget -> 60 s.",
+        rendezvous_max_lateness_sec_);
+    rendezvous_max_lateness_sec_ = 60.0;
+  }
+  rendezvous_latched_hold_sec_   = dp("rendezvous_latched_hold_sec", 300.0);
+  if (!std::isfinite(rendezvous_latched_hold_sec_) ||
+      rendezvous_latched_hold_sec_ < 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_latched_hold_sec %.1f is not a usable cap -> 300 s. A "
+        "negative cap would read as 'no cap' and strand a finished robot at "
+        "the meeting for the rest of the cell.",
+        rendezvous_latched_hold_sec_);
+    rendezvous_latched_hold_sec_ = 300.0;
+  }
+  if (rendezvous_latched_hold_sec_ > 0.0 &&
+      rendezvous_latched_hold_sec_ <= rendezvous_settle_sec_) {
+    // Same incoherence rendezvous_appointment_wait_sec is checked for below: a
+    // hold shorter than the settle gives up before the map exchange it is
+    // holding for could finish, so the hold pays its whole cost and collects
+    // none of its benefit.
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_latched_hold_sec (%.1f) <= rendezvous_settle_sec (%.1f): a "
+        "finished robot would leave the meeting before the merge it is waiting "
+        "for could complete.",
+        rendezvous_latched_hold_sec_, rendezvous_settle_sec_);
+  }
+  // rendezvous_depart_delay_sec is NOT validated: it has been inert since
+  // generation 25 (the arming floor carries no notice term — see the
+  // declaration) and a guard on a value that gates nothing would print
+  // reassurance about behaviour that cannot happen. It is logged exactly as
+  // the yaml passed it.
+  //
+  // NON-FINITE IS NOT "OFF", it is silent. The rest of the family is compared
+  // with `>`/`<`, and every comparison against NaN is false — so a NaN settle
+  // skips the hold and a NaN cap reads as unbounded. Each of those is a
+  // DIFFERENT arm from the one the campaign label claims, with nothing in the
+  // log saying so. Refuse to the documented default instead.
+  if (!std::isfinite(rendezvous_settle_sec_)) {
+    RCLCPP_ERROR(get_logger(),
+        "rendezvous_settle_sec is not finite; the map-exchange hold would be "
+        "skipped silently. Falling back to 30 s.");
+    rendezvous_settle_sec_ = 30.0;
+  }
+  // Negative is behaviourally identical to zero at both use sites, but the
+  // value is written into the manifest as this arm's definition, so normalise
+  // it: a cell whose params say -1 and whose barrier waited forever is a cell
+  // whose record does not describe it.
+  if (rendezvous_settle_sec_ < 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_settle_sec %.1f < 0 -> 0 (no map-exchange hold).",
+        rendezvous_settle_sec_);
+    rendezvous_settle_sec_ = 0.0;
+  }
+  if (!std::isfinite(rendezvous_appointment_wait_sec_) ||
+      rendezvous_appointment_wait_sec_ < 0.0) {
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_appointment_wait_sec %.1f is not a usable cap -> 0 "
+        "(wait without bound, the default).",
+        rendezvous_appointment_wait_sec_);
+    rendezvous_appointment_wait_sec_ = 0.0;
+  }
+  // COUPLING. A positive appointment cap shorter than the settle means the
+  // barrier gives up before it can ever finish holding for the map exchange:
+  // the two are both satisfiable only if the cap leaves room for the hold. Not
+  // reachable on the default (cap 0 = unbounded); worth saying out loud for the
+  // field escape hatch, which is the only way to reach it.
+  if (rendezvous_appointment_wait_sec_ > 0.0 &&
+      rendezvous_appointment_wait_sec_ <= rendezvous_settle_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_appointment_wait_sec (%.1f) <= rendezvous_settle_sec "
+        "(%.1f): a robot that waits out the cap gives up before the map "
+        "exchange hold can complete, so the meeting can never pay off.",
+        rendezvous_appointment_wait_sec_, rendezvous_settle_sec_);
+  }
+  // SAID OUT LOUD BECAUSE IT PINS A LOGGED COLUMN. This same wait is the
+  // scheduler's findability cap (deriveRendezvousProposal), so an unbounded
+  // barrier is an uncapped interval and `capped` is false on every row the run
+  // produces. That is the truth — a barrier nobody walks away from cannot be
+  // outrun by any interval — but a column that is constant by configuration and
+  // a column that is constant by accident look identical in the csv, and only
+  // one of them is worth investigating.
+  if (rendezvous_appointment_wait_sec_ <= 0.0) {
+    RCLCPP_INFO(get_logger(),
+        "rendezvous_appointment_wait_sec=0: a robot at the agreed cell waits "
+        "without bound, so the schedule's findability cap cannot bind and "
+        "RendezvousPlan::capped is false for the whole run by construction.");
+  }
   // Post-latch coast (see the member comments). OFF by default so this binary
   // reproduces every banked campaign bit-for-bit on the control side.
   done_seek_enabled_ = dp("done_seek_enabled", false);
@@ -2923,6 +4630,24 @@ ExploPlannerNode::ExploPlannerNode()
   mission_return_enabled_ = dp("mission_return_enabled", false);
   mission_home_tol_m_     = dp("mission_home_tol_m", 1.0);
   mission_return_max_sec_ = dp("mission_return_max_sec", 600.0);
+  // The pre-mission hold (see the member). Defaulted ON, unlike the two knobs
+  // above, and the asymmetry is the point: those change what the robot does and
+  // must be opted into so the binary reproduces banked behaviour, whereas this
+  // one closes a defect that split a fleet. A campaign that forgets the knob
+  // should get the fix, not the split. Generation 22 is a new generation
+  // precisely because of it and is not poolable with anything earlier.
+  mission_start_hold_sec_ = dp("mission_start_hold_sec", 60.0);
+  if (!std::isfinite(mission_start_hold_sec_) ||
+      mission_start_hold_sec_ < 0.0) {
+    RCLCPP_FATAL(get_logger(),
+        "mission_start_hold_sec=%.3f is not a finite non-negative duration. "
+        "A negative or NaN hold would compare false against every elapsed time "
+        "and silently restore the generation-21 behaviour this parameter "
+        "exists to replace — which is a fleet that can disperse mid-agreement "
+        "and meet in two places.",
+        mission_start_hold_sec_);
+    throw std::runtime_error("mission_start_hold_sec must be finite and >= 0");
+  }
   // Approach watchdog (generation 5). 1.0 m per 40 s = 0.025 m/s net, which is
   // ~9x below the slowest ARRIVED homing in the 71-homing population (mean
   // approach 0.220 m/s, median 0.388) and infinitely above seed11's -0.0001
@@ -2933,6 +4658,8 @@ ExploPlannerNode::ExploPlannerNode()
   // the cap: 40 + 40 + 3 x (30 escape + 40 window) = 290 s worst case.
   return_approach_window_sec_ = dp("return_approach_window_sec", 40.0);
   return_approach_min_m_      = dp("return_approach_min_m", 1.0);
+  return_approach_suppress_m_ = dp("return_approach_suppress_m", 3.0);
+  return_near_home_stall_sec_ = dp("return_near_home_stall_sec", 60.0);
   return_escape_max_attempts_ = dp("return_escape_max_attempts", 3);
   return_escape_leg_sec_      = dp("return_escape_leg_sec", 30.0);
   // Same unconditional both-directions announce contract as DONE-SEEK above:
@@ -3291,6 +5018,37 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("metrics_max_duty", metrics_max_duty_);
     exp_log_->addParamNum("experiment_log_anchor_period_sec",
                           experiment_log_anchor_period_sec_);
+    // THE SENSOR MODEL. Not previously recorded anywhere in the event log, at
+    // all — which meant a run_start row could not answer "what sensor did this
+    // planner think it had?", and the answer was wrong for every campaign
+    // before this generation (a 60 deg cone for a 360 deg lidar). A binary
+    // generation defined by a change to these numbers has to carry them, or the
+    // only proof of which model a cell ran under is the sha256 of the node plus
+    // an out-of-band memory of what that build contained.
+    //
+    // From fcfg, not from the raw parameters, for the same reason the
+    // separation block below gives: this is what the evaluator was constructed
+    // with. And the derived flag alongside the inputs, because it is what
+    // actually decides the arrival gate's behaviour.
+    exp_log_->addParamNum("fov_hfov", fcfg.hfov);
+    exp_log_->addParamNum("fov_vfov", fcfg.vfov);
+    exp_log_->addParamNum("fov_h_rays", fcfg.h_rays);
+    exp_log_->addParamNum("fov_v_rays", fcfg.v_rays);
+    exp_log_->addParamNum("fov_min_range", fcfg.min_range);
+    exp_log_->addParamNum("fov_max_range", fcfg.max_range);
+    exp_log_->addParamBool("fov_is_omnidirectional", fov_is_omnidirectional_);
+    exp_log_->addParamNum("candidate_n_yaw", ccfg.n_yaw);
+    // Recorded BECAUSE candidate_n_yaw is recorded, and immediately beside it.
+    // n_yaw only bites on polar-generated candidates; with enable_polar=false
+    // the candidate set comes from the frontier path, which fixes its own
+    // count and never consults n_yaw. The campaign harness runs polar OFF
+    // (FRONTIER_ONLY=1), so a reader who sees candidate_n_yaw drop 4 -> 1 and
+    // infers a 4x smaller candidate set is wrong -- and nothing in the run
+    // record contradicts them. A parameter whose meaning depends on another
+    // parameter cannot be logged without it; that pairing is the witness.
+    exp_log_->addParamBool("candidate_enable_polar", ccfg.enable_polar);
+    exp_log_->addParamNum("goal_xy_tolerance", goal_xy_tol_);
+    exp_log_->addParamNum("goal_yaw_tolerance", goal_yaw_tol_);
     exp_log_->addParamBool("coordination_enabled", coord_enabled_);
     // Separation term. Logged from separation_.config(), which is what the
     // planner will actually use, NOT from the raw parameters — configure()
@@ -3307,6 +5065,23 @@ ExploPlannerNode::ExploPlannerNode()
     // index a cell that ran unbounded as a treated one.
     exp_log_->addParamNum("alloc_peer_pos_max_age_sec",
                           alloc_peer_pos_max_age_sec_);
+    // The three "0 means auto" knobs, logged AFTER resolution (the auto branch
+    // runs well above this block), so what lands in the record is the value the
+    // planner used and not the sentinel that asked for it.
+    //
+    // coord_claim_radius_m is the one that matters most and the one most
+    // easily misread: 0.0 resolves to fov_max_range, which this generation
+    // DOUBLES (10 -> 20 m) for the lidar FOV. The shipped params pin 10.0, so
+    // the auto branch does not run and the disc is unchanged -- but that is a
+    // fact about the current yaml, not about the code, and anyone who sets it
+    // back to 0.0 silently doubles the coordination disc as a side effect of a
+    // sensor change. Only the resolved value can say which happened; the
+    // manifest's coord_claim_radius_m_in_params records the request, and a
+    // request is not an outcome.
+    exp_log_->addParamNum("coord_claim_radius_m", coord_claim_radius_m_);
+    exp_log_->addParamNum("coord_vantage_claim_radius_m",
+                          coord_vantage_claim_radius_m_);
+    exp_log_->addParamNum("cost_grid_radius_cap_m", cost_grid_radius_cap_m_);
     exp_log_->addParamNum("coord_claim_ttl_sec", coord_claim_ttl_sec_);
     exp_log_->addParamNum("coord_heartbeat_hz", coord_heartbeat_hz_);
     // Both names, one resolved value. `reconnect_enabled` is current;
@@ -3325,6 +5100,25 @@ ExploPlannerNode::ExploPlannerNode()
                           reconnect_midrun_silence_sec_);
     exp_log_->addParamNum("reconnect_midrun_max_wait_sec",
                           reconnect_midrun_max_wait_sec_);
+    // GENERATION 19'S ARM DEFINITION, one member since retired: wait and
+    // settle still decide how long a robot stays, but depart_delay has been
+    // inert since generation 25 (the arming floor carries no notice term — see
+    // the declaration) and is logged only so the param rows keep their schema. A
+    // cell that does not carry these is a cell from a binary whose rendezvous
+    // arm means something else. Logged unconditionally, on every arm, so the
+    // control arms record the values they are NOT using — a one-sided param is
+    // how a parameter quietly stops being comparable across arms.
+    exp_log_->addParamNum("rendezvous_depart_delay_sec",
+                          rendezvous_depart_delay_sec_);
+    exp_log_->addParamNum("rendezvous_appointment_wait_sec",
+                          rendezvous_appointment_wait_sec_);
+    exp_log_->addParamNum("rendezvous_settle_sec", rendezvous_settle_sec_);
+    // Generation 29's addition to that definition, and it is not optional
+    // bookkeeping: it decides which rung of the agreed lattice each robot signs
+    // up to, so two cells with different values are two different rendezvous
+    // arms. Same unconditional logging as the rest of the family.
+    exp_log_->addParamNum("rendezvous_max_lateness_sec",
+                          rendezvous_max_lateness_sec_);
     exp_log_->addParamNum("reconnect_midrun_max_attempts",
                           reconnect_midrun_max_attempts_);
     exp_log_->addParamNum("reconnect_min_share_voxels",
@@ -3370,6 +5164,11 @@ ExploPlannerNode::ExploPlannerNode()
                                !comms_link_robot_index_topic_.empty());
     exp_log_->addParamNum("comms_link_stale_sec", comms_link_stale_sec_);
     exp_log_->addParamNum("pursuit_budget_max_sec", pursuit_budget_max_sec_);
+    // Echoed beside the cap because the two together are the refusal
+    // threshold: a chase is refused past cap * speed metres, and neither
+    // number says that on its own.
+    exp_log_->addParamNum("pursuit_speed_measured_mps",
+                          pursuit_speed_measured_mps_);
     exp_log_->addParamNum("pursuit_staleness_max_sec",
                           pursuit_staleness_max_sec_);
     exp_log_->addParamNum("pursuit_goal_stale_sec", pursuit_goal_stale_sec_);
@@ -3405,6 +5204,10 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("return_approach_window_sec",
                           return_approach_window_sec_);
     exp_log_->addParamNum("return_approach_min_m", return_approach_min_m_);
+    exp_log_->addParamNum("return_approach_suppress_m",
+                          return_approach_suppress_m_);
+    exp_log_->addParamNum("return_near_home_stall_sec",
+                          return_near_home_stall_sec_);
     exp_log_->addParamNum("return_escape_max_attempts",
                           return_escape_max_attempts_);
     exp_log_->addParamNum("return_escape_leg_sec", return_escape_leg_sec_);
@@ -3507,6 +5310,18 @@ ExploPlannerNode::ExploPlannerNode()
   // scovox_node) to restore 2D free-cell + reachability filtering as a hard
   // startup precondition.
   use_planning_map_ = dp("use_planning_map", false);
+  // C5: record the 2D-map configuration in the manifest. These two decide
+  // whether candidate rejection and reachability filtering happen at all, and
+  // until now a run_start row could not say which of the two regimes produced
+  // it. Written here rather than in the block above because that block runs
+  // before these parameters are read; run_start is still held until the first
+  // live-clock tick, so anything added before then lands in the same row.
+  if (exp_log_) {
+    exp_log_->addParamBool("use_planning_map", use_planning_map_);
+    exp_log_->addParamStr("planning_map_topic",
+                          use_planning_map_ ? planning_map_topic
+                                            : std::string("(unsubscribed)"));
+  }
 
   // Cache ROI bounds for the fused-map ingest clip (loadLatestMap()).
   roi_min_x_ = ccfg.roi_min_x;
@@ -3851,8 +5666,24 @@ ExploPlannerNode::ExploPlannerNode()
   // §3.5. The meeting stops being a landmark and becomes a CONSTRAINT on the
   // tours already being driven: pick the cell whose forced insertion costs the
   // team's makespan the least, and meet when the slower robot gets there under
-  // its own tour. The last-contact midpoint stays in the candidate set as a
-  // guaranteed floor, so the worst case is exactly the shipped behaviour.
+  // its own tour.
+  //
+  // The MIDPOINT floor that used to backstop this is gone (2026-09-16; see the
+  // three removal notes in dispatchReconnect / pursuitFallback). It guaranteed
+  // a destination when no tour cell was worth its detour, but a place with no
+  // agreed time is not a rendezvous, and the floor_won telemetry showed it was
+  // not even symmetric — both ends chose it in only 2 of 6 separated pairs.
+  //
+  // THERE IS STILL A FLOOR. Passing none was tried for two days and cost the
+  // ts4 smoke its whole N=4 rung: with empty tours the candidate set was empty
+  // and the solve refused, once, 578 s before the end of a run that then never
+  // held an appointment at all. Since 2026-09-18 `floor_cell` is the centroid
+  // of the team's own vehicle cells — a quantity that, unlike the midpoint,
+  // exists at proposal time and is agreed by construction, because it comes out
+  // of the frozen shared snapshot every robot holds. See the floor block in
+  // deriveRendezvousProposal for the full argument. A refusal therefore still
+  // means something, but it now means the solve declined on cost, not that it
+  // had nothing to look at.
   //
   // WHY, in one measurement. Campaign mh1 ran the midpoint destination under
   // the §3.6 value gate: 100 of 110 evaluations declined, every single one on
@@ -3863,6 +5694,58 @@ ExploPlannerNode::ExploPlannerNode()
   // it returns. Nothing about the gate can fix a bad destination; the
   // destination had to change.
   rendezvous_schedule_enable_ = dp("rendezvous_schedule_enable", false);
+  // ---- THE INTERLOCK (2026-09-16) -------------------------------------
+  //
+  // The scheduler defaults to FALSE and is absent from shared_params.yaml; it
+  // is turned on out of band by the arm stacks. So the rendezvous and hybrid
+  // arms could be requested, recorded and scored with the mechanism that
+  // DEFINES them switched off, and nothing downstream would say so. After
+  // today's removal of the three midpoint drives there is no longer even a
+  // degraded behaviour left underneath:
+  //
+  //   rendezvous + scheduler off -> armAppointment never arms, dispatch falls
+  //       to the RENDEZVOUS tail and returns false. The arm does NOTHING. It
+  //       is the `off` arm wearing the rendezvous label — and `off` is a
+  //       SEPARATE ARM OF THE SAME EXPERIMENT, so this does not merely void
+  //       one cell, it silently moves it into a different condition.
+  //   hybrid + scheduler off -> `may_defer` is false forever, so dispatch is
+  //       pursuit's ladder and nothing else. It is the `pursuit` arm wearing
+  //       the hybrid label, which is worse than a null: it manufactures
+  //       agreement between two arms that the design needs to differ.
+  //
+  // Neither is detectable after the fact. Both produce complete, healthy,
+  // well-formed runs. `rendezvous_agreed` events are simply absent, and
+  // absence of a log line is exactly the evidence the nav-global-planner
+  // episode proved we cannot read (it needs a same-binary control to mean
+  // anything). So the check has to be here, at start-up, and it has to be
+  // fatal — a WARN in a 3000-second console log is a check that has stopped
+  // checking.
+  //
+  // This cannot fire at defaults: rendezvous_expected_peers defaults to 0,
+  // which forces reconnect_enabled_ false above, so a stock single-robot or
+  // uncoordinated launch never reaches the condition. It bites exactly the
+  // population it must — a coordinated multi-robot cell that asked for a
+  // reconnect arm — and the fix is one line in the arm stack.
+  if (reconnect_enabled_ && !rendezvous_schedule_enable_ &&
+      (reconnect_mode_ == ReconnectMode::RENDEZVOUS ||
+       reconnect_mode_ == ReconnectMode::HYBRID)) {
+    RCLCPP_FATAL(get_logger(),
+        "reconnect_mode='%s' with rendezvous_schedule_enable=false: this arm "
+        "IS the agreed meeting (place AND time), and without the scheduler "
+        "there is no agreement to make — %s. The cell would run to completion "
+        "looking healthy while carrying no treatment and scoring as a "
+        "different arm. Set rendezvous_schedule_enable=true, or run the off "
+        "arm with reconnect_enabled=false.",
+        reconnectModeName(reconnect_mode_),
+        reconnect_mode_ == ReconnectMode::RENDEZVOUS
+            ? "rendezvous would never arm an appointment and would behave as "
+              "the off arm"
+            : "hybrid would lose its rendezvous half and behave as the "
+              "pursuit arm");
+    throw std::runtime_error(
+        std::string("reconnect_mode=") + reconnectModeName(reconnect_mode_) +
+        " requires rendezvous_schedule_enable=true");
+  }
   if (rendezvous_schedule_enable_) {
     // The problem IS the cell world, same as P3/P4, and for the same reason
     // those two are fatal rather than degrading: a scheduler with no world
@@ -3931,21 +5814,174 @@ ExploPlannerNode::ExploPlannerNode()
     // is a shared param and not a per-robot estimate.
     rzv_cfg_.speed_mm_s =
         static_cast<long long>(dp("rendezvous_speed_mm_s", 500));
-    // Departure safety and margin. These do NOT have to match across the
-    // pair: each robot departs on its own travel estimate so that the two
-    // ARRIVE together, and identical deadlines in a pair would be evidence
-    // the mechanism is not doing what it claims. They are shared anyway
-    // because there is no reason for them to differ.
+    // The safety multiplier on the drive estimate. It reached this tree as half
+    // of a per-robot departure rule — leave when 1.2x your own drive remains,
+    // so the far robot leaves first and the arrivals coincide — and that rule
+    // is deleted (generation 19: departure is the agreed occurrence, and the
+    // spread is absorbed by the barrier instead of by leaving early). What it
+    // does now is mark up the reachability floor in RendezvousScheduler::solve,
+    // which is fleet-wide rather than per-robot, so it MUST match across the
+    // team or the derived interval would differ between robots.
+    //
+    // `rendezvous_depart_margin_sec` went with the departure rule; it had no
+    // other reader.
     rzv_cfg_.depart_safety_milli = static_cast<int>(
         std::lround(dp("rendezvous_depart_safety", 1.2) * 1000.0));
-    rzv_cfg_.depart_margin_ms = static_cast<long long>(
-        std::lround(dp("rendezvous_depart_margin_sec", 0.0) * 1000.0));
     if (rzv_cfg_.speed_mm_s <= 0) {
       RCLCPP_FATAL(get_logger(),
           "rendezvous_speed_mm_s=%lld: every arrival time would be infinite "
           "and there is no safe value to substitute.", rzv_cfg_.speed_mm_s);
       throw std::runtime_error("rendezvous_speed_mm_s must be positive");
     }
+
+    // THE PROPOSER RULE, and the one assumption it rests on. The pair is
+    // derived by the LOWEST-ID robot and echoed by everyone else, and the
+    // handshake runs only inside the team-complete guard — where, by
+    // definition, every peer the fleet has is live. That is what lets the
+    // proposer be a constant (fleet id 0) instead of a "lowest LIVE id"
+    // election: with the whole fleet present there is nothing to elect, and a
+    // constant cannot disagree with itself the way a liveness scan run at two
+    // slightly different instants can.
+    //
+    // It is only true if team-complete really means the WHOLE fleet. The
+    // harness passes rendezvous_expected_peers = N_ROBOTS-1 and nothing else
+    // ever should, but if it ever passed fewer, "complete" would fire on a
+    // subset that need not contain robot 0 — every member of that subset would
+    // wait for a proposal nobody was making, and the arm would log a clean
+    // stream of "no agreed pair" refusals that reads exactly like a mechanism
+    // deciding not to fire. There is no safe degradation from that, so it is
+    // fatal here rather than a warning nobody reads.
+    if (rendezvous_expected_peers_ != fleet_.size() - 1) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_schedule_enable=true with rendezvous_expected_peers=%d "
+          "but a fleet of %d: the proposal handshake runs only while the team "
+          "reads complete and assumes that means every robot, so a partial "
+          "quorum could exclude the proposer (fleet id 0) and no appointment "
+          "would ever be agreed.",
+          rendezvous_expected_peers_, fleet_.size());
+      throw std::runtime_error(
+          "rendezvous_schedule_enable requires rendezvous_expected_peers == "
+          "team size - 1");
+    }
+    rendezvous_peer_.assign(static_cast<size_t>(fleet_.size()),
+                            RendezvousProposal{});
+    rendezvous_peer_at_sec_.assign(static_cast<size_t>(fleet_.size()), -1.0);
+    rendezvous_peer_provisional_.assign(static_cast<size_t>(fleet_.size()), 0);
+    rendezvous_peer_confirmed_.assign(static_cast<size_t>(fleet_.size()),
+                                      RendezvousProposal{});
+
+    // How often the proposer may issue a NEW pair. Every re-issue costs one
+    // TeamWorld period of disagreement (the peers have not echoed yet), so
+    // this trades agreement probability against how stale the meeting cell is
+    // allowed to get. At team_world_hz=1 the default puts the exposed window
+    // at ~1 s in 30.
+    rendezvous_proposal_period_sec_ =
+        dp("rendezvous_proposal_period_sec", 30.0);
+    if (rendezvous_proposal_period_sec_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_proposal_period_sec=%.3f: a non-positive period re-derives "
+          "the pair on every heartbeat, so the peers can never finish echoing "
+          "one and nothing is ever agreed.",
+          rendezvous_proposal_period_sec_);
+      throw std::runtime_error(
+          "rendezvous_proposal_period_sec must be positive");
+    }
+
+    // The spacing of the timetable, and deliberately NOT the period above: see
+    // the member for why widening the recurrence through the proposal period
+    // would age the snapshot the punctuality estimate is costed against.
+    rendezvous_interval_sec_ = dp("rendezvous_interval_sec", 300.0);
+    if (!std::isfinite(rendezvous_interval_sec_) ||
+        rendezvous_interval_sec_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_interval_sec=%.3f: the timetable spacing is the gap "
+          "between two legal meeting instants and a non-positive one names no "
+          "timetable at all — every occurrence would fall at the same instant, "
+          "and a robot that missed it would have no later rung to roll to.",
+          rendezvous_interval_sec_);
+      throw std::runtime_error("rendezvous_interval_sec must be positive");
+    }
+
+    // THE PROTOCOL'S ONLY DRIVER. refreshRendezvousSnapshot and
+    // maintainRendezvousProposal are called from exactly one place —
+    // heartbeatTick — and that timer only exists when coord is enabled with a
+    // positive rate. With it off, the handshake never runs a single round,
+    // rendezvous_agreed_ is never valid, and every arming refuses with "no
+    // (cell, interval) pair was agreed": the silent-null failure this block
+    // already refuses to ship for rendezvous_expected_peers, arriving through
+    // a different parameter.
+    if (!coord_enabled_ || coord_heartbeat_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_schedule_enable=true with coord_enable=%s and "
+          "coord_heartbeat_hz=%.3f: the propose/echo/commit handshake runs "
+          "only on the coordination heartbeat, so no pair could ever be "
+          "agreed and every appointment would refuse.",
+          coord_enabled_ ? "true" : "false", coord_heartbeat_hz_);
+      throw std::runtime_error(
+          "rendezvous_schedule_enable requires coord_enable with a positive "
+          "coord_heartbeat_hz");
+    }
+
+    // THE PROTOCOL'S ONLY WIRE. The (cell, interval) pair travels in
+    // TeamWorld's rendezvous block and nowhere else, and TeamWorld itself is
+    // switched entirely by this rate: the publisher, the subscription and the
+    // whole drain live inside `if (team_world_hz_ > 0.0)`. It also defaults to
+    // 0.0 and is NOT in shared_params.yaml, so this is a live way to configure
+    // a rendezvous campaign in which the protocol never runs at all.
+    //
+    // It is worth being blunt about what that would have produced, because it
+    // would not have looked like a fault: every robot refuses every arming,
+    // never manoeuvres, and finishes — a complete, plausible, entirely null
+    // result set with no failed run to investigate. The other half of the same
+    // hole is the anchor: rendezvousTeamMutual() reads TeamModel, which is fed
+    // only by this drain, so with no TeamWorld no anchor is ever stamped
+    // either.
+    if (team_world_hz_ <= 0.0) {
+      RCLCPP_FATAL(get_logger(),
+          "rendezvous_schedule_enable=true with team_world_hz=%.3f: the agreed "
+          "(cell, interval) pair is exchanged only in TeamWorld, and the "
+          "mutual-contact anchor is read only from the model TeamWorld feeds. "
+          "With the exchange off nothing is agreed, nothing is anchored, and "
+          "every appointment refuses — a silently null rendezvous arm.",
+          team_world_hz_);
+      throw std::runtime_error(
+          "rendezvous_schedule_enable requires a positive team_world_hz");
+    }
+
+    // THE MUTUAL-CONTACT BUDGET. Not the commit rule's — the commit latches
+    // confirmations and consults no TTL at all, deliberately, because a peer's
+    // choice of pair is a decision it cannot revise rather than a liveness
+    // claim that can age out. What DOES run on a TTL is everything that has to
+    // be true NOW: TeamModel::Peer::direct, and through it
+    // rendezvousTeamMutual(), and through that the proposer's derive gate and
+    // rendezvous_anchor_time_ — the shared origin every agreed interval is
+    // measured from. A TeamWorld rate slower than that TTL means peers read
+    // stale more often than fresh, the team never reads mutually whole, and
+    // the protocol stalls one step earlier than it used to: no pair is ever
+    // derived, so there is nothing to confirm.
+    //
+    // Warned rather than fatal: the exact threshold depends on jitter and
+    // loss, and a campaign deliberately probing a slow team_world_hz should be
+    // able to run. 3 messages inside the TTL is the same slack the default
+    // (1 Hz against 5 s) leaves.
+    const double mutual_ttl = team_model_.config().direct_ttl_sec;
+    if (team_world_hz_ > 0.0 && mutual_ttl > 0.0 &&
+        team_world_hz_ * mutual_ttl < 3.0) {
+      RCLCPP_WARN(get_logger(),
+          "rendezvous: team_world_hz=%.3f against a direct-contact TTL of "
+          "%.1f s leaves only %.1f message(s) inside the window mutual contact "
+          "is judged on. Expect the team never to read whole, no pair to be "
+          "derived, and every appointment to refuse with 'no (cell, interval) "
+          "pair was agreed'.",
+          team_world_hz_, mutual_ttl, team_world_hz_ * mutual_ttl);
+    }
+
+    RCLCPP_INFO(get_logger(),
+        "rendezvous: proposer is fleet id 0 (%s); this robot is id %d (%s), "
+        "so it %s. Re-proposal period %.1f s.",
+        fleet_.nameOf(0).c_str(), fleet_.self_id, robot_name_.c_str(),
+        fleet_.self_id == 0 ? "DERIVES the pair" : "ECHOES the proposer's pair",
+        rendezvous_proposal_period_sec_);
   }
   if (exp_log_) {
     exp_log_->addParamBool("rendezvous_schedule_enable",
@@ -3955,8 +5991,10 @@ ExploPlannerNode::ExploPlannerNode()
                             static_cast<double>(rzv_cfg_.speed_mm_s));
       exp_log_->addParamNum("rendezvous_depart_safety",
                             rzv_cfg_.depart_safety_milli / 1000.0);
-      exp_log_->addParamNum("rendezvous_depart_margin_sec",
-                            rzv_cfg_.depart_margin_ms / 1000.0);
+      exp_log_->addParamNum("rendezvous_proposal_period_sec",
+                            rendezvous_proposal_period_sec_);
+      exp_log_->addParamNum("rendezvous_interval_sec",
+                            rendezvous_interval_sec_);
     }
   }
 
@@ -4478,8 +6516,45 @@ ExploPlannerNode::ExploPlannerNode()
         rclcpp::QoS(rclcpp::KeepLast(1)),
         [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
           if (!link_index_usable_) return;
-          constexpr size_t kCols = 9;   // emulator's kLinkStateCols
           const auto& d = msg->data;
+          // Stride from the publisher's own layout (dim[1].size is the
+          // emulator's kLinkStateCols), falling back to whichever known width
+          // divides the payload. Decided once and then held, so a malformed
+          // message cannot silently re-interpret the table mid-run.
+          if (link_cols_ == 0) {
+            const size_t declared = msg->layout.dim.size() >= 2
+                ? static_cast<size_t>(msg->layout.dim[1].size) : 0;
+            for (const size_t cand : {declared, kLinkColsWithValid,
+                                      kLinkColsLegacy}) {
+              if ((cand == kLinkColsWithValid || cand == kLinkColsLegacy) &&
+                  !d.empty() && d.size() % cand == 0) {
+                link_cols_ = cand;
+                break;
+              }
+            }
+            if (link_cols_ == 0) {
+              if (!link_cols_warned_) {
+                link_cols_warned_ = true;
+                RCLCPP_ERROR(get_logger(),
+                    "link_states on '%s' carries %zu values, which is not a "
+                    "whole number of %zu- or %zu-column rows. The link gate "
+                    "will take NO samples: it stays unready, and the reconnect "
+                    "trigger falls back to the record-age clock it would use "
+                    "with the gate off. Fix the emulator/planner version skew.",
+                    comms_link_states_topic_.c_str(), d.size(),
+                    kLinkColsWithValid, kLinkColsLegacy);
+              }
+              return;
+            }
+            RCLCPP_INFO(get_logger(),
+                "link_states table on '%s': %zu columns per pair%s.",
+                comms_link_states_topic_.c_str(), link_cols_,
+                link_cols_ == kLinkColsLegacy
+                    ? " (no `valid` column — pre-generation-9 emulator, masking "
+                      "on the path-loss floor instead)"
+                    : " (masking on `valid`)");
+          }
+          const size_t kCols = link_cols_;
           // Per-PEER, not a running OR over the rows: see link_connected_. The
           // vectors are indexed by the peer's own row index so a table that
           // repeats or omits a pair cannot be miscounted by an accumulator.
@@ -4490,10 +6565,17 @@ ExploPlannerNode::ExploPlannerNode()
             const int i = static_cast<int>(d[k]);
             const int j = static_cast<int>(d[k + 1]);
             if (i != link_self_idx_ && j != link_self_idx_) continue;
-            // Startup mask, same discriminator as link_logger.py: the path-loss
-            // floor is ~49 dB at one metre and only grows, so <= 0 is a row the
-            // emulator never computed. Treating it as a disconnection would
-            // manufacture a reconnection the instant poses arrive.
+            // Validity mask, same discriminator and same preference order as
+            // link_logger.py. A row the emulator did not compute -- no pose yet,
+            // or a pose that has gone stale -- must not be read as a
+            // disconnection, because the transition out of it would manufacture
+            // a reconnection. Generation 9 publishes the emulator's own verdict
+            // in column 9; older tables do not, and there the path-loss floor
+            // (~49 dB at one metre, monotone increasing) stands in for it. An
+            // invalid row is published fully zeroed, so on a 10-column table
+            // both tests fire together and the second is redundant, not
+            // conflicting.
+            if (kCols == kLinkColsWithValid && d[k + 9] == 0.0) continue;
             if (d[k + 4] <= 0.0) continue;
             const int other = (i == link_self_idx_) ? j : i;
             if (other < 0 || other >= static_cast<int>(n) ||
@@ -4561,7 +6643,8 @@ ExploPlannerNode::ExploPlannerNode()
         comms_link_robot_index_topic_.c_str(), comms_link_stale_sec_);
   }
 
-  // --- Proximity-stop wiring: peer localiser poses + the nav2 cancel client.
+  // --- Proximity-stop wiring: peer localiser poses + the (inert) nav2 cancel
+  // client.
   if (proximity_stop_enabled_) {
     // "<robot_name>:<topic>" entries, e.g. "curt:/curt/pcl_pose". These are
     // the peers' localiser poses: already map-frame, ~10 Hz, and independent
@@ -4611,10 +6694,37 @@ ExploPlannerNode::ExploPlannerNode()
           topic.c_str());
     }
 
-    // NavigateToPose client used purely for async_cancel_all_goals() on hold
-    // entry. bt_navigator turns every goal_pose into a NavigateToPose goal it
-    // sends itself; cancel-all from this client cancels that goal too. Never
-    // used to SEND goals — the goal_pose topic remains the only command path.
+    // THE CANCEL PATH IS DEAD, AND IT IS KEPT DELIBERATELY. Read this before
+    // trusting the word "cancel" anywhere in this file or in a robot log.
+    //
+    // This client was written for nav2, where bt_navigator turns every goal_pose
+    // into a NavigateToPose goal it sends itself and honours cancel-all from any
+    // client. The navigator actually running in these experiments is
+    // simple_nav_3d, which subscribes to goal_pose as a plain PoseStamped and
+    // serves NO action — there is no rclcpp_action server anywhere in that
+    // package. So '/<robot>/navigate_to_pose' has no server,
+    // action_server_is_ready() is false forever, and every call site guards on
+    // it: the cancel is never SENT, as opposed to sent-and-ignored.
+    //
+    // What that costs operationally: little, because the brake goal was always
+    // the primary mechanism and the cancel the redundancy. A goal published at
+    // the robot's own pose stops it in ~100-150 ms — the navigator declares
+    // arrival on its next 50 ms tick and stops republishing active_goal, and
+    // simple_nav_planner_node clears its plan and publishes an EMPTY path on its
+    // next 100 ms tick, which makes the controller publish a zero Twist. What it
+    // costs in DIAGNOSIS is real, and it has been paid once: "belt and braces"
+    // reads as two independent stop mechanisms when there is one, so a stop that
+    // fails must be diagnosed as a single point of failure. The log lines were
+    // corrected for this (see abandonNavGoal); the comments are corrected here.
+    //
+    // Kept rather than deleted: a client with no server does no work, the
+    // readiness guard is correct as written, and deleting it would be a code
+    // change with no behavioural effect during a window where every behavioural
+    // change costs a binary generation. If this stack ever gains a real
+    // NavigateToPose server, the redundancy returns on its own.
+    //
+    // Never used to SEND goals — the goal_pose topic remains the only command
+    // path.
     proximity_nav_cancel_action_ =
         dp("proximity_nav_cancel_action", std::string(""));
     if (proximity_nav_cancel_action_.empty())
@@ -4733,7 +6843,14 @@ ExploPlannerNode::ExploPlannerNode()
         static_cast<double>(ccfg.ground_search_below),
         static_cast<double>(ccfg.ground_search_above),
         static_cast<double>(ccfg.ground_stack_max_m),
-        flatten_goal_z_ ? "flattened to 0 (strict-2D nav)" : "3D (nav2 ignores z)");
+        // "the navigator ignores z" is true of simple_nav_3d's UGV role, whose
+        // arrival test is std::hypot in XY. It is NOT true of its UAV role, which
+        // measures a 3D distance to the goal — so on a UAV a wrong goal z is a
+        // wrong goal, not a harmless passenger. Both halves are named because the
+        // old wording ("nav2 ignores z") licensed the reader to stop thinking
+        // about z on every platform.
+        flatten_goal_z_ ? "flattened to 0 (strict-2D nav)"
+                        : "3D (ignored by the UGV arrival test, USED by the UAV's)");
   }
 }
 
@@ -4953,7 +7070,8 @@ void ExploPlannerNode::tick() {
   // rate, before the state dispatch, so the hold pre-empts everything the
   // driving states would otherwise do this tick. The stationary states are
   // deliberately exempt — a dwelling/integrating/planning robot is already
-  // still, and the moving peer's costmap treats it as an ordinary obstacle.
+  // still, and the moving peer's obstacle grid treats it as an ordinary
+  // obstacle.
   // RETURN_HOME is in the driving set for the strongest version of the reason:
   // under mission return BOTH robots converge on start poses ~3 m apart, so the
   // final approach is the one leg of the run where a crossing is guaranteed
@@ -4978,8 +7096,47 @@ void ExploPlannerNode::tick() {
       //    fused map + pose are ready and run map-less (straight-line costs, no
       //    2D obstacle/reachability filtering, in both exploration and exploit).
       {
-        const bool start = have_map_ && have_pose_ &&
+        // THE PRE-MISSION HOLD, and it is ANDed with the preconditions rather
+        // than sequenced after them: the two clocks are independent, so the
+        // release is at max(preconditions, hold) and a robot whose map arrives
+        // late does not get a shorter hold than one whose map arrived at once.
+        //
+        // Measured from missionElapsed(), which is each robot's OWN baseline —
+        // about a second apart across a fleet in the banked smokes. That is the
+        // right clock even so. The hold is not an appointment and nothing has
+        // to line up on it; what it has to do is guarantee a stretch of
+        // co-located mutual contact, and a second of skew at the far end of a
+        // 60 s window does not threaten that. Using a shared wire time here
+        // would import the agreement problem the hold exists to solve.
+        //
+        // A clock that is not live yet reads -1, which is BELOW the hold and so
+        // holds — the safe direction. It cannot hold forever: missionElapsed()
+        // latches its baseline on the first tick with a positive clock, and
+        // without a clock there is no map and no pose either, so the
+        // preconditions are false regardless.
+        const double held_for = missionElapsed();
+        const bool hold_done  = held_for >= mission_start_hold_sec_;
+        const bool preconds_met = have_map_ && have_pose_ &&
                            (!use_planning_map_ || have_plan_map_);
+        const bool start = preconds_met && hold_done;
+        if (!hold_done) {
+          // Deliberately its own line rather than another missing precondition
+          // in the WARN below. Holding is the design working; the WARN names
+          // faults, and a 60 s wait appearing there every 5 s would read as a
+          // stuck startup in exactly the logs someone scans for one.
+          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 15000,
+              "Pre-mission hold: %.0fs of %.0fs. Not planning or navigating "
+              "yet — the team agrees its rendezvous place while it is still "
+              "co-located, and dispersing mid-agreement is what splits a "
+              "fleet. Applied in every arm so the cost is shared.",
+              std::max(0.0, held_for), mission_start_hold_sec_);
+        } else if (!mission_start_hold_logged_ &&
+                   mission_start_hold_sec_ > 0.0) {
+          mission_start_hold_logged_ = true;
+          RCLCPP_INFO(get_logger(),
+              "Pre-mission hold complete at t+%.0fs (configured %.0fs).",
+              held_for, mission_start_hold_sec_);
+        }
         if (start) {
           if (use_planning_map_) {
             RCLCPP_INFO(get_logger(),
@@ -4991,10 +7148,23 @@ void ExploPlannerNode::tick() {
                 "obstacle/reachability filtering. Starting exploration.");
           }
           transitionTo(State::PLAN, "startup-preconditions-met");
-        } else {
+        } else if (!preconds_met) {
           // Name the missing precondition so a stuck startup (wrong topic /
           // namespace / QoS, dead mapper, no TF) is diagnosable instead of a
           // silent indefinite wait.
+          //
+          // GATED ON !preconds_met, NOT ON !start (2026-09-18). `start` is the
+          // conjunction of the preconditions AND the pre-mission hold, so
+          // keying the WARN off it meant that during the hold — when every
+          // input has arrived and nothing is wrong — the log carried
+          // "Waiting to start: map=1 pose=1 planning_map=1", a line that
+          // reports all three preconditions satisfied while asserting the robot
+          // is still waiting for them, every 5 s for the length of the hold.
+          // That is a message which can only mislead: it names no fault, offers
+          // no next step, and contradicts the "Pre-mission hold: Xs of Ys" INFO
+          // printed immediately above it. The hold already has its own two log
+          // lines (progress and completion); this WARN is for faults, and being
+          // held is not one.
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
               "Waiting to start: map=%d pose=%d planning_map=%d (0 = not yet "
               "received; planning_map %s).",
@@ -5068,12 +7238,18 @@ void ExploPlannerNode::tick() {
       // streak, where DONE is genuinely revocable.
       if (done_action_ == "idle") {
         if (coverage_latched_) {
-          // Coast watchdog. Nothing else in this branch touches nav2, so if
+          // Coast watchdog. Nothing else in this branch touches the navigator, so if
           // done_seek let a goal stand this is the ONLY bound on it — without
           // it an unreachable goal drives a "finished" robot until teardown.
-          // Two exits, and both brake, so a coast can never leave the platform
-          // rolling: the robot stops making progress (nav2 arrived, or gave up
-          // and is no longer commanding), or the cap expires.
+          // Two exits, and a coast can never leave the platform rolling —
+          // but only ONE of them brakes, and the asymmetry is deliberate:
+          //   [arrived] fires BECAUSE the robot already stopped (30 s with no
+          //     progress: the navigator declared arrival, or its local planner
+          //     stopped producing a path and the controller fell back to a
+          //     zero Twist). There is nothing left to stop, so it just ends
+          //     the coast and parks.
+          //   [timeout] fires with the robot STILL MOVING, so it is the one
+          //     that calls abandonNavGoal and publishes the brake goal.
           if (done_seek_coasting_) {
             const double tnow  = this->now().seconds();
             const double coast = tnow - done_seek_start_sim_;
@@ -5150,25 +7326,52 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
   // way or the other, so the clock stops and the CSV reverts to its sentinel.
   const bool manoeuvre = (s == State::RETURN_NAV || s == State::RETURN_SYNC ||
                           s == State::PURSUE || s == State::PROXIMITY_HOLD);
+  // Carries the barrier's own verdict from the manoeuvre-end block to the
+  // appointment classifier below, which runs after appointment_manoeuvre_ is
+  // cleared and so cannot re-ask manoeuvreReleaseEligible itself. False
+  // whenever no appointment manoeuvre ends on this transition.
+  bool appointment_barrier_released = false;
   if (reconnect_active_ && !manoeuvre) {
     const double manoeuvre_sec = (this->now() - reconnect_start_time_).seconds();
-    const int live =
-        coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+    const int live = accountedPeerCount(this->now());
     // Classified mechanically from the two facts that decide it, with the
-    // raw fields alongside so an analysis can re-classify: the team being
-    // complete AT THIS INSTANT is what "reconnected" means (every release
-    // path in the manoeuvre states tests exactly that), and landing in a
-    // state where exploration is over — DONE, or RETURN_HOME under mission
+    // raw fields alongside so an analysis can re-classify: the barrier having
+    // CONFIRMED the team complete is what "reconnected" means, and landing in
+    // a state where exploration is over — DONE, or RETURN_HOME under mission
     // return — instead of PLAN is what "gave up" means. RETURN_HOME must be
     // in that set or every latch-ended manoeuvre in a mission-return run
     // re-buckets from gave_up to abandoned and the outcome mix stops being
     // comparable across campaigns.
     //
+    // releaseHeld, NOT bare teamComplete (2026-09-18). This line used to claim
+    // that "every release path in the manoeuvre states tests exactly that",
+    // and no release path did: they all test
+    // releaseConfirmed(teamComplete(...)), which adds the
+    // reconnect_release_confirm_sec dwell. On the bare read a single
+    // range-edge flicker ends a manoeuvre as "reconnected" that the barrier
+    // itself never released. See the longer note on the appointment
+    // classifier below; the two sites share one defect and one fix.
+    //
+    // manoeuvreReleaseEligible, NOT bare teamComplete, for the same reason
+    // (2026-09-18, generation 23): it is the expression the barrier that just
+    // ended actually tested, which for an APPOINTMENT manoeuvre is teamSettled
+    // or the generation-27 reachable door, and for every other manoeuvre is
+    // teamComplete. Reading teamComplete here
+    // would label a contagion-held appointment "reconnected" at the instant its
+    // own barrier was still refusing to release, and the rows this classifier
+    // feeds are the ones the arms are compared on.
+    //
+    // Safe to read appointment_manoeuvre_ here: it is cleared further down this
+    // function, AFTER both classifiers, precisely so the two of them see the
+    // manoeuvre that is ending rather than the absence of one.
+    //
     // Hoisted above the log line, and above the `if (exp_log_)`, so the line
     // and the event carry ONE expression's answer. Computing it twice is how
     // a log and its event drift apart, which is the whole defect class this
     // generation is closing.
-    const char* outcome = teamComplete(live, rendezvous_expected_peers_)
+    const bool manoeuvre_released = releaseHeld(manoeuvreReleaseEligible(live));
+    const char* outcome =
+        manoeuvre_released
                     ? "reconnected"
                     : ((s == State::DONE || s == State::RETURN_HOME)
                            ? "gave_up" : "abandoned");
@@ -5197,6 +7400,19 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
     }
     reconnect_active_ = false;
     hold_escalated_ = false;
+    // The appointment classifier below runs after the clear on the last line
+    // of this block and must still know whether it was THIS appointment's own
+    // barrier that released (generation 27: the release can hold with
+    // teamSettled false — the reachable door — and without this the
+    // closure-released meeting would bank as "no-show arrived=true", the
+    // smoke20 sign reversal in a new dress).
+    appointment_barrier_released = appointment_manoeuvre_ && manoeuvre_released;
+    // The manoeuvre is over, so it is no longer serving an appointment —
+    // whatever became of the appointment RECORD, which the block below decides
+    // separately and on its own predicate. This is the only clear site: the
+    // latch's entire purpose is to outlive closeAppointment(), so clearing it
+    // there would restore the bug it exists to fix.
+    appointment_manoeuvre_ = false;
     // The armed-from pair belongs to the manoeuvre that just ended; the next
     // dispatch takes its own snapshot from its own query.
     have_reconnect_rec_ = false;
@@ -5224,9 +7440,98 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
   // kept it (departed, then either met somebody or did not), or the run ended
   // underneath it.
   if (appointment_armed_) {
-    const int appt_live =
-        coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-    const bool team_back = teamComplete(appt_live, rendezvous_expected_peers_);
+    // THE LABEL MUST NAME WHAT THE BARRIER DID (2026-09-18).
+    //
+    // This read rendezvousTeamMutual() — every pair in DIRECT contact — while
+    // doReturnSync releases the robot on teamComplete(accountedPeerCount):
+    // every peer *I* have heard first-hand, on the claim table or on TeamWorld.
+    // The two differ by ONE-WAY CONTACT, by MY EDGES vs ALL PAIRS, and by
+    // FINISHED PEERS — but NOT by relayed reachability: accountedPeerCount's
+    // two reachability channels are both first-hand, see the correction at the
+    // release site in heartbeatTick(). Its third channel is `finished`, which
+    // does relay and has no TTL, so a peer that ended its run counts toward
+    // teamComplete forever and can never be mutual; on that peer the barrier
+    // releases and rendezvousTeamMutual() never will.
+    // At N=2 the all-pairs quantifier collapses onto the single peer, so there
+    // the gap is mutuality alone; at N>=3 they part company on both counts, and
+    // the ts4 N=3 cell wrote both verdicts in the same millisecond:
+    //
+    //   ...799657  Rendezvous: full team connected (2/2) -> re-planning...
+    //   ...799709  Reconnect manoeuvre ended after 81.9 s sim: reconnected
+    //   ...799740  Rendezvous appointment at cell 44 closed: no-show
+    //
+    // The robot reconnected and recorded a no-show for the meeting that
+    // reconnected it. `outcome` is this arm's headline metric, so that is not a
+    // cosmetic disagreement — it is the measurement inverting on exactly the
+    // team sizes the campaign is about.
+    //
+    // The 2026-09-16 move ONTO the mutual predicate was right for the problem
+    // it solved (two robots labelling one appointment differently after a
+    // one-way heal) and wrong here, because the two robots are no longer the
+    // ones disagreeing: the barrier and the classifier are, on the same robot.
+    // The fix is not to pick the stricter predicate, it is to pick the SAME
+    // one — and it has to be the barrier's, because the barrier is what
+    // actually ended the manoeuvre. A label describing a condition the code
+    // never acted on is a label about nothing.
+    //
+    // The stricter fact is not discarded, it is DEMOTED to its own column:
+    // `mutual` on the outcome event records whether the reunion was whole-team
+    // two-way, or only one-way / partial, so the two remain separable in the analysis
+    // instead of one silently overwriting the other. That is what the schema
+    // 6 -> 7 bump carries.
+    //
+    // AND IT HAS TO BE THE BARRIER'S DECISION, NOT THE BARRIER'S INPUT
+    // (2026-09-18). The paragraph above is right and the first implementation
+    // of it still missed by one layer: it called teamComplete(), which is what
+    // the barrier CONSULTS, while the barrier actually releases on
+    // releaseConfirmed(teamComplete(...)) — a reconnect_release_confirm_sec
+    // (6 s) dwell that exists precisely because a single range-edge flicker
+    // can satisfy teamComplete for one tick while draining no map deltas.
+    // Classifying on the raw read labels such a flicker "reconnected" and
+    // closes the appointment on a manoeuvre the barrier never ended and a
+    // meeting that never happened. Gen 18 under-counted reunions by using a
+    // predicate stricter than the barrier's; that version over-counted them by
+    // using a looser one. Same disagreement, same file, opposite sign.
+    //
+    // releaseHeld() is the non-mutating twin of releaseConfirmed() — see its
+    // definition for why the classifier must not call the mutating one.
+    //
+    // teamSettled AND NOT manoeuvreReleaseEligible (2026-09-18, generation 23),
+    // even though the manoeuvre classifier above uses the latter. Two reasons,
+    // and they point the same way:
+    //
+    //   * appointment_manoeuvre_ has ALREADY BEEN CLEARED by the time control
+    //     reaches here — the clear sits in the manoeuvre-end block above, which
+    //     is why that block's classifier can still read it and this one cannot.
+    //     manoeuvreReleaseEligible() here would silently mean teamComplete.
+    //   * It would be the wrong question anyway. This block labels the
+    //     APPOINTMENT, which arms on !teamSettled and supersedes on teamSettled
+    //     whether or not any manoeuvre ever ran for it — a deferred appointment
+    //     stands while the robot is still EXPLORING and has no barrier at all.
+    //     teamSettled is this site's share of the five-site rule.
+    //
+    // PLUS THE BARRIER'S OWN VERDICT (2026-09-19, generation 27). The
+    // reachable door means an appointment barrier can now release with
+    // teamSettled still false — a gathered team whose last pair one trunk
+    // keeps dark — and on teamSettled alone this block would bank that
+    // meeting as "no-show arrived=true": the sign reversal documented below,
+    // returned through the release. So team_back also accepts
+    // appointment_barrier_released, the verdict the manoeuvre-end block
+    // captured from manoeuvreReleaseEligible BEFORE clearing
+    // appointment_manoeuvre_. It is the barrier's DECISION, not its input, so
+    // the flicker argument above is preserved; and it is scoped to the
+    // appointment whose own manoeuvre just ended — a DEFERRED appointment
+    // still closes only on teamSettled or run end, so a bridge topology alone
+    // still closes nothing as reconnected.
+    //
+    // So the two classifiers in this function CAN disagree, and that is not the
+    // 2026-09-18 defect returning: they label different objects (the manoeuvre
+    // that ended vs the appointment that stood), and they disagree only where
+    // a non-appointment manoeuvre ends underneath a deferred appointment.
+    const int live_now = accountedPeerCount(this->now());
+    const bool team_back = releaseHeld(teamSettled(live_now)) ||
+                           appointment_barrier_released;
+    const bool team_back_mutual = rendezvousTeamMutual();
     const bool run_over  = (s == State::DONE || s == State::RETURN_HOME);
     // A DEPARTED appointment is resolved the moment the manoeuvre keeping it
     // ends. An UNDEPARTED one must survive leaving the manoeuvre states,
@@ -5248,17 +7553,43 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
       // coordination failure's name, and counting those together is how a
       // mechanism that never arrives anywhere looks like one whose partner
       // never turns up.
-      const char* appt_outcome = team_back              ? "reconnected"
+      //
+      // `run-ended` (2026-09-17) separates "the meeting failed" from "this
+      // robot's run ended at the meeting". Those are different events and the
+      // classifier used to call them both no-show: in the smoke20 N=3
+      // rendezvous cell all three robots logged `no-show arrived=True`
+      // immediately after exploration_complete -> reconnect_end
+      // reason=coverage-latched, while all three were standing on cell 45
+      // together. A no-show recorded at a meeting that happened is not a
+      // miscount of one arm's outcomes, it is a sign reversal: the rendezvous
+      // arm's headline failure count was made of its successes.
+      //
+      // It sits ABOVE the arrived/unreachable split because it answers a prior
+      // question. Whether this robot reached the cell says how the appointment
+      // was going; it says nothing once the run ended underneath it, and a
+      // teardown mid-drive is no more "unreachable" than a teardown on the cell
+      // is a "no-show". team_back still wins: if the team is back, the meeting
+      // succeeded regardless of what ended the run.
+      //
+      // `unplaceable` (2026-09-18) sits in the same position and for the same
+      // reason as `run-ended`: it answers a prior question. If this robot could
+      // not turn the agreed cell into a position it never departed for the
+      // meeting at all, whatever the arrival test says — appointmentPoint()
+      // returned `latest_pos_`, so arrived=true means "I am where I already
+      // was", not "I reached the cell". Below team_back, because a team that
+      // came back anyway did meet; above the arrived/unreachable split, because
+      // that split is only meaningful once there was somewhere to go. It also
+      // reports arrived=false: the row must not carry an arrival this robot
+      // did not make.
+      const char* appt_outcome = team_back                ? "reconnected"
                                  : !appointment_departed_ ? "superseded"
+                                 : coverage_latch_teardown_ ? "run-ended"
+                                 : appointment_unplaceable_ ? "unplaceable"
                                  : appointment_arrived_   ? "no-show"
                                                           : "unreachable";
-      closeAppointment(appt_outcome, appointment_arrived_, waited);
-      // The no-show write-offs are scoped to ONE outage: they encode "we both
-      // waited there and nobody came", which says nothing about the next
-      // separation. Cleared on the reconnection rather than on the
-      // appointment, so a SECOND appointment inside the same outage still
-      // avoids the cell the first one failed at.
-      if (team_back) rendezvous_noshow_.clear();
+      closeAppointment(appt_outcome,
+                       appointment_arrived_ && !appointment_unplaceable_,
+                       waited, team_back_mutual);
     }
   }
 
@@ -5581,26 +7912,327 @@ void ExploPlannerNode::doPlan() {
   // exploring, and break off exactly when the departure rule says the robot
   // can still just make it.
   if (appointment_armed_ && !appointment_departed_) {
-    const auto appt_now = this->now();
-    const int appt_live =
-        coord_ ? static_cast<int>(coord_->livePeerCount(appt_now)) : 0;
-    if (teamComplete(appt_live, rendezvous_expected_peers_)) {
+    // SAME PREDICATE AS THE ARMING TEST BELOW — see the long note there for
+    // why it is teamSettled and not rendezvousTeamMutual. The event that
+    // STARTS an appointment and the event that CANCELS it have to be one
+    // event, or one robot cancels while the other drives.
+    //
+    // Under contagion that requirement bites harder, not softer: C armed
+    // because A announced a break, so C must also WAIT for A to stop announcing
+    // it. Cancelling on C's own teamComplete — which was true throughout —
+    // would supersede the appointment on the tick after it armed, every tick,
+    // and the contagion would be inert while looking live in the logs.
+    //
+    // This is also the cheap filter on the beacon-suppression false positive
+    // the arming note describes: a peer that went quiet for less than the
+    // countdown is back in the count before the deadline, and the appointment
+    // is cancelled here without anyone leaving.
+    //
+    // AND IT DWELLS, SINCE GENERATION 23. The predicate matched the arming
+    // site's; the EVIDENCE THRESHOLD did not. Arming acts on the team coming
+    // apart, which one missed beacon shows; superseding acts on the team coming
+    // BACK, and one claim arriving inside the 5 s TTL makes that true for a
+    // single reading. Without a dwell here, a range-edge flicker that happened
+    // to land on a PLAN tick cancelled the appointment outright — while the
+    // barrier that guards the actual reunion refused the very same evidence for
+    // 6 s. The two are now the same threshold as well as the same predicate.
+    // Cancelling a few seconds late costs a few seconds of a standing clock;
+    // cancelling on a flicker strands a peer that is already driving to the cell.
+    //
+    // A READ, NOT A WRITE, and that is not a stylistic choice. The window is
+    // stepped once per heartbeat in heartbeatTick (see the member declaration
+    // for why the writer has to be the unconditional site). This block is inside
+    // `appointment_armed_ && !appointment_departed_`, which is untaken for most
+    // of a run, and doPlan is entered only in State::PLAN — roughly once per
+    // step, not at 10 Hz. Ticking a continuity window from here would measure
+    // "two consecutive plan entries agreed", which two samples thirty seconds
+    // apart satisfy trivially, and between appointments it would not decay at
+    // all. dwellHeld asks the question without owning the clock.
+    //
+    // CONJOINED ON A FRESH COUNT. dwellHeld takes the live read as its
+    // `eligible` argument and returns false when it is false, so the heartbeat's
+    // 1 Hz view can never supersede an appointment on a tick where this robot's
+    // own current count says the team is not settled. The dwell can only ever
+    // subtract from the old condition, never add to it.
+    const int live_for_supersede = accountedPeerCount(this->now());
+    if (dwellHeld(teamSettled(live_for_supersede), this->now().seconds(),
+                  reconnect_release_confirm_sec_, team_back_ok_armed_,
+                  team_back_ok_since_sec_)) {
       // The outage ended on its own before the deadline. The appointment did
       // not cause that and must not claim it — but it DID stand for the whole
       // outage, and an appointment that simply vanishes leaves a
       // rendezvous_agreed with no rendezvous_outcome, which reads offline as
       // one that is still open at the end of the run. Closed as superseded.
-      closeAppointment("superseded", /*arrived=*/false, /*waited_sec=*/0.0);
-      rendezvous_noshow_.clear();
+      //
+      // `mutual` is a genuine second read, NOT the branch condition restated.
+      // It used to be `rendezvous_schedule_enable_`-era code that passed
+      // rendezvousTeamMutual() from inside `if (rendezvousTeamMutual())`,
+      // i.e. the literal `true` on every superseded row — which falsified the
+      // schema-7 contract that the field distinguishes a whole-team two-way
+      // reunion from a one-way one. Here the team is complete by the branch; whether it is
+      // also all-pairs-TWO-WAY is the open question the column exists to
+      // answer. ("relayed" was the wrong word for the complement and is
+      // corrected throughout — nothing relays an intent; see heartbeatTick().)
+      closeAppointment("superseded", /*arrived=*/false, /*waited_sec=*/0.0,
+                       /*mutual=*/rendezvousTeamMutual());
     } else if (appointmentDue()) {
       RCLCPP_INFO(get_logger(),
-          "Rendezvous: departure deadline for cell %d reached (t_meet t+%.0fs, "
-          "my travel %.0fs) -> breaking off exploration for the appointment.",
+          "Rendezvous: time to leave for cell %d (meeting at t+%.0fs, my "
+          "travel %.0fs) -> breaking off exploration for the appointment.",
           appointment_.cell, appointment_.t_meet_ms / 1000.0,
           appointmentTravelMs() / 1000.0);
       appointment_departed_ = true;
+      // An appointment-due departure is a MID-RUN manoeuvre: exploration is not
+      // over, the deadline simply arrived. Say so explicitly, because
+      // reconnect_terminal_ is ambient state whose RESTING value is `true` (it
+      // is declared true and re-armed true at every manoeuvre end), and this
+      // site reaches startReturnTo without passing either of the two places
+      // that set it for a dispatch -- the mid-run clear below, or
+      // finishOrRendezvous's terminal set. Inherited, the barrier that ends
+      // this manoeuvre takes the run-ENDING wait cap (rendezvous_max_wait_sec)
+      // instead of the mid-run one, so a deadline departure can finish the run.
+      // Measured on ts1b: 40 barrier give-ups, every one flagged terminal, none
+      // of which any dispatch had earned.
+      //
+      // Must precede startReturnTo: transitionTo stamps reconnect_end with this
+      // flag, so assigning after it would label the manoeuvre in the log as the
+      // opposite of what it ran as. Same ordering note as resumeExploring.
+      reconnect_terminal_ = false;
       startReturnTo(appointmentPoint(), "appointment", "appointment-due");
       return;
+    }
+  }
+
+  // A SCHEDULED APPOINTMENT ARMS ON THE CLOCK, NOT ON THE SILENCE GATE.
+  //
+  // Pure rendezvous only. The appointment is a promise made while the team was
+  // whole — a fixed place AND a fixed time — so the thing that starts it
+  // running is the separation itself, not a later decision that reconnecting
+  // has become worthwhile. Arming it here does NOT send the robot anywhere:
+  // it keeps exploring, and the departure rule above breaks it off at
+  // t_meet minus its own travel, which is the mechanism that makes the fleet
+  // arrive together.
+  //
+  // Gen 10 armed it from dispatchReconnect instead, behind the mid-run gate,
+  // and the gate needs reconnect_midrun_silence_sec of team-incomplete before
+  // it fires. Whenever the agreed interval was shorter than that gate the
+  // meeting time had already passed before any robot was permitted to look at
+  // it: measured on a 2-robot cell, anchor 240 s, interval 20 s, armed at
+  // 378.6 s and 438.1 s, both robots recording 234.1 s of lateness on an
+  // appointment neither could ever have kept. The place was agreed and the
+  // time was decorative.
+  //
+  // HYBRID IS INCLUDED HERE AS OF 2026-09-16, and the mid-run trigger below
+  // was changed in the same edit to make that safe.
+  //
+  // It used to be excluded, on the reasoning that hybrid's rule is "pursue
+  // when deemed necessary unless the rendezvous is due", so the necessity
+  // judgement must fire first — and that arming on the clock would delete its
+  // pursuit half, because the mid-run trigger is suppressed while an
+  // appointment stands. The second half of that was true and is now fixed at
+  // the trigger. The first half confused two different things: WHEN the
+  // appointment is armed, and WHEN the robot departs for it. Arming does not
+  // move t_meet — that is anchor + interval, and the anchor is the shared
+  // separation event — so arming early costs the pursuit half nothing. The
+  // departure is still owned by the deadline.
+  //
+  // What the exclusion DID cost was symmetry, which is the one property this
+  // whole protocol exists to provide. Arming only from dispatchReconnect put
+  // hybrid's appointment behind the mid-run gate, and that gate is per-robot
+  // and genuinely asymmetric: the link-gate veto is computed from each robot's
+  // OWN unshared backlog, and it refuses often (102 of 115 refusals on mt2
+  // were the cost inequality alone). So one hybrid robot's gate says go and
+  // arms, the other's says stay and never arms — and the first drives to the
+  // agreed cell and waits out the full 240 s cap for a partner that was never
+  // coming, logging a no-show against an appointment only one end ever held.
+  // A meeting one participant does not know about is not a meeting, and
+  // "hybrid keeps a rendezvous" has to mean the same thing on both robots or
+  // the arm is not testing what its name says.
+  //
+  // Arming at the separation, for both arms, makes the appointment a property
+  // of the SEPARATION rather than of each robot's private judgement about it.
+  // The judgement still governs the pursuit, which is where hybrid's rule
+  // actually puts it.
+  // NOT GATED ON have_rendezvous_anchor_ (2026-09-18). It was, and that was a
+  // fifth anchor-keyed refusal surviving the four armAppointment already
+  // dropped — see the block there explaining why: `t_meet` is the integer the
+  // team committed, not `anchor + interval`, so the anchor cannot move the
+  // meeting and cannot be a reason to refuse one. Keeping the conjunct here
+  // had a cost the others did not, because of WHERE the flag is set: its only
+  // write is inside `if (rzv_mutual)` on the heartbeat, while
+  // maintainRendezvousProposal was deliberately un-gated from mutuality so a
+  // follower can echo and commit without it. At N>=3 in this radio regime
+  // all-pairs mutual contact holds for a few seconds at spawn and then
+  // essentially never, so a robot that joined the agreement late — valid
+  // rendezvous_agreed_, no anchor it ever stamped — could hold a perfectly
+  // good committed appointment and be unable to arm it for the whole run.
+  // The anchor is still stamped, still logged, and still the column that
+  // separates an early agreement from a late commit.
+  if ((reconnect_mode_ == ReconnectMode::RENDEZVOUS ||
+       reconnect_mode_ == ReconnectMode::HYBRID) && reconnect_enabled_ &&
+      rendezvous_schedule_enable_ && !appointment_armed_ &&
+      !rendezvous_spent_ && rendezvous_agreed_.valid()) {
+    // ONE PREDICATE FOR "THE TEAM CAME APART" (2026-09-18), and it is
+    // teamComplete. Read this before changing the test: the node has now had
+    // this defect twice, in both polarities, and both times the cause was two
+    // predicates rather than the wrong one.
+    //
+    // THE RULE. Arming here, superseding at the top of this function, the
+    // outcome classifier in transitionTo(), the barrier release in
+    // doReturnSync/doReturnNav and the rendezvous_spent_ release on the
+    // heartbeat are FIVE SITES THAT MUST AGREE. Arm on !P, end on P, for one
+    // P. If they disagree in either direction the arm ratchets:
+    //
+    //   gen 18  armed on the weak predicate, cleared the latch on the strict
+    //           one. The latch never cleared at N>=3, the arm went inert for
+    //           70% of a 604 s cell, and that starvation is what the countdown
+    //           rewrite was opened to fix.
+    //   gen 19  armed on the strict predicate (!rendezvousTeamMutual) and
+    //           closed, released and cleared on the weak one. The arm never
+    //           STOPPED: arm -> 100 s -> drive to the cell -> barrier releases
+    //           at once because teamComplete was true the whole time -> settle
+    //           -> close -> latch clears on the next heartbeat -> !mutual is
+    //           still true -> arm again, about every 106 s for the whole run,
+    //           against a team that never separated. ~25 spurious regroups per
+    //           3000 s cell, every rendezvous_outcome row reading
+    //           reconnected/arrived=0/waited=0.0, and N=2 unaffected — so it
+    //           would have reached the analysis disguised as a team-size
+    //           effect on exactly the comparison this campaign exists to make.
+    //   gen 27  weakens ONE side at ONE site, deliberately and without the
+    //           ratchet: the barrier RELEASE (and only it) gains a reachable
+    //           door — closure-or-finished over every expected peer — because
+    //           the gen-26 N=3 smoke gathered all three robots at the cell
+    //           and one trunk on one 8 m chord kept the mesh false to the
+    //           duration cap (zero outcome rows, exploration over for half
+    //           the run). Both ratchets above ran through the LATCH, and the
+    //           latch still clears only on the strict dwelt teamSettled, so a
+    //           closure-released, still-mesh-broken team cannot re-arm until
+    //           a genuine reunion. The arm, the supersede, the classifiers'
+    //           mesh half and the latch stay in lock-step on ONE P.
+    //
+    // WHY teamComplete IS THE RIGHT P AND rendezvousTeamMutual IS NOT. Mutual
+    // asks for all N(N-1)/2 links DIRECT and mask-confirmed at one instant. In
+    // this radio regime (70 dB trunks, 30 m horizon) that holds for a few
+    // seconds at spawn and then never again at N>=3 — so as a definition of
+    // "the team is together" it declares a healthy team permanently broken,
+    // and any rule built on it fires forever. teamComplete asks the weaker
+    // question — "can I currently hear each of them" — which at least admits
+    // healthy topologies that mutual declares broken.
+    //
+    // P IS teamSettled SINCE GENERATION 23, AND THAT IS teamComplete PLUS ONE
+    // TERM. The history above is why the change is made at all five sites in
+    // the same edit, and why the term is the SAME function on both polarities
+    // rather than a second predicate that happens to agree today.
+    //
+    // WHAT THE EXTRA TERM FIXES. teamComplete is NOT relay-inclusive — a claim
+    // to the contrary sat here until 2026-09-18 and was backwards.
+    // accountedPeerCount counts DIRECTLY received traffic for reachability
+    // (proof at the release site in heartbeatTick(); RobotIntent carries no
+    // peer list and hmr_comms_sim_node forwards nothing). Its `finished`
+    // channel IS relayed, but a finished robot is not a robot anyone is trying
+    // to reach, so it cannot supply the missing hop. So in an A-B-C bridge with A-B
+    // down: C hears both and stays put, while A and B each see one peer against
+    // rendezvous_expected_peers=2 and BOTH ARM. That is a PARTIAL arming — two
+    // robots break off for a meeting the third never attends — and it is not
+    // what the directive says. The directive is "if ANY robot is disconnected,
+    // ALL robots go".
+    //
+    // Nor is the partition cosmetic. There is no map relay either: dscovox
+    // subscribes to peers' raw scovox_bin and publishes only fused products for
+    // LOCAL consumers, so nothing carries A's voxels to B through C. (An older
+    // version of this comment asserted the map "still flows A->C->B" and
+    // flagged it as unverified; it has since been checked and it is FALSE.
+    // Do not restore it.) A and B are genuinely partitioned and C is the only
+    // robot that can close it, so suppressing their arming would be the wrong
+    // repair — the meeting is needed.
+    //
+    // THE REPAIR IS CONTAGION, one hop. Every robot publishes its OWN first-hand
+    // !teamComplete as TeamWorld/team_incomplete, and teamSettled additionally
+    // requires that no peer we are currently receiving from is announcing a
+    // break. One hop suffices at every N and every topology, over the UNFINISHED
+    // robots: a robot whose own read is COMPLETE has heard every unfinished peer
+    // first-hand inside one TTL and therefore receives their bits itself, and a
+    // robot whose own read is BROKEN arms off that read without needing anyone's.
+    // So every unfinished robot arms iff some unfinished robot's own bit is set —
+    // unanimous, with no relay and no second hop. A finished peer counts complete
+    // through the `finished` channel with no contact at all, which costs nothing
+    // because its bit is discarded at both ends on purpose (the publisher forces
+    // team_incomplete=false at DONE; peerReportsTeamBreak skips `finished`).
+    // TeamWorld.msg states the one residual window. (Contrast
+    // in_range_mask, whose closure is exactly two hops: A-B-C is covered,
+    // A-B-C-D is not.) The full argument, including why the announced bit must
+    // be the first-hand read and never the derived armed state, is in
+    // TeamWorld.msg.
+    //
+    // WHAT IT COSTS, measured rather than asserted. Complementarity makes the
+    // team-wide predicate equivalent to an all-pairs complete graph, and in the
+    // generation-22 smoke (same radio regime) the full mesh held 29.0% of the
+    // run at N=3 rendezvous, 41.1% at N=3 hybrid and 14.7% at N=4 under the 5 s
+    // liveness TTL. So at N>=3 these arms now stand armed for most of the run.
+    // That is NOT a permanent manoeuvre: per P5 above a standing appointment is
+    // a CLOCK, not a decision — robots keep exploring until the departure
+    // deadline — so what it produces is periodic rendezvous at the agreed
+    // interval, which is the mechanism as described. It IS a large behavioural
+    // change and generation 23 is not comparable with 22 on these arms.
+    //
+    // WHY rendezvousTeamMutual IS STILL NOT P, even though teamSettled is also
+    // an all-pairs condition in steady state. Mutual demands every link direct
+    // AND mask-confirmed SIMULTANEOUSLY, at one instant, from one robot's
+    // vantage; teamSettled is a conjunction of N first-hand reads each taken in
+    // its own robot's own time and carried on a 1 Hz topic, so it degrades to
+    // "nobody has recently said otherwise" instead of failing on every
+    // sub-second flicker. The anchor needs the instantaneous version and says
+    // so; the arm does not.
+    //
+    // THE COST, stated rather than hidden. teamComplete counts received
+    // intents inside a TTL, so it is one-way-blind and STATE-GATED — a peer
+    // stuck in a long PLAN loop stops beaconing and reads as missing. That
+    // false positive is real and it is why the countdown is 100 s and not 10:
+    // a suppression episode that ends with room to spare inside the countdown
+    // is cancelled by the supersede above before anyone departs. It cannot
+    // ratchet, either, because the spent latch clears on exactly this
+    // predicate's complement — one appointment per episode, not one per tick.
+    // The mid-run pursuit trigger already accepts this same exposure on the
+    // same count.
+    //
+    // "WITH ROOM TO SPARE" IS reconnect_release_confirm_sec (generation 23),
+    // and the asymmetry is deliberate. This site arms the instant the predicate
+    // goes false, with no dwell; the supersede and the spent-latch release both
+    // require its complement to hold for 6 s of heartbeats first. The two
+    // directions are not the same claim. Coming APART is shown by a missing
+    // beacon, and a robot that waits for confirmation of that is a robot that
+    // departs late for a meeting it has already been told about. Coming BACK is
+    // shown by a single arriving claim, which a range-edge flicker produces just
+    // as readily as a reunion — and acting on it cancels a meeting a peer may
+    // already be driving to, or hands out a second arming inside one outage. So:
+    // arm on one sample, stand down on a held run. The practical cost is the
+    // 6 s at the end of the window, during which a suppression episode that has
+    // genuinely ended has not yet been believed.
+    //
+    // Every other precondition armAppointment tests is re-tested above rather
+    // than left to it, because this site is evaluated on every PLAN tick and
+    // armAppointment logs a rendezvous_agreed row on refusal as well as
+    // success — calling it speculatively would bury the real rows under
+    // hundreds of refusals.
+    const int live_for_arm = accountedPeerCount(this->now());
+    if (!teamSettled(live_for_arm)) {
+      // TWO REASONS, ONE PREDICATE. The arm is unconditional on !teamSettled;
+      // the string only records WHICH half of it fired, so a contagion arm can
+      // be counted without a new column or a schema bump. "separation" is this
+      // robot's own read failing — the pre-generation-23 behaviour, unchanged,
+      // so banked parsers that expect it still find it. "peer-separation" means
+      // this robot can hear everyone and armed SOLELY because a peer announced
+      // a break: it is the C of the A-B-C bridge, and the count of these is how
+      // much the contagion actually did. Nothing in the tree matches on this
+      // string, which is what makes a second value safe here.
+      //
+      // WHERE IT LANDS: the plaintext "Rendezvous schedule [%s]" line in
+      // armAppointment, NOT the jsonl — RendezvousAgreedEvent has no reason
+      // field and adding one would bump a schema that several banked parsers
+      // pin. grep the cell's planner logs for "[peer-separation]".
+      armAppointment(teamComplete(live_for_arm, rendezvous_expected_peers_)
+                         ? "peer-separation"
+                         : "separation");
     }
   }
 
@@ -5610,17 +8242,46 @@ void ExploPlannerNode::doPlan() {
   // the coverage check (a saturated robot must route through the terminal
   // path). Only evaluated in PLAN, i.e. between hops: detection latency past
   // the silence crossing is one residual hop (typically 15-60 s), which is
-  // per-robot jitter the analysis inherits. livePeerCount is re-read here
+  // per-robot jitter the analysis inherits. The peer count is re-read here
   // because the heartbeat-maintained clock is quantized at 1 Hz and starvable
   // — without the re-check a peer that reconnected within the last heartbeat
   // period still reads missing and we brake for a manoeuvre that dissolves on
   // its first tick.
+  //
+  // THE APPOINTMENT SUPPRESSION IS NOT ABSOLUTE FOR HYBRID (2026-09-16).
+  // `!appointment_armed_` is the right gate for RENDEZVOUS — that arm has
+  // nothing to do between the separation and the deadline but explore — and it
+  // was the right gate for hybrid only while hybrid armed from inside this
+  // trigger. Now that hybrid arms at the separation, an absolute suppression
+  // would mean the appointment always exists by the time the gate fires, the
+  // trigger never runs, startPursuit is never called, and hybrid collapses
+  // into rendezvous with extra logging. So hybrid is let through while its
+  // appointment is still PENDING — armed, not yet departed — which is exactly
+  // the interval its own rule assigns to the chase:
+  //
+  //     [ contact lost .... departure deadline .... t_meet + wait ]
+  //       ^--- CHASE owns this ---^--- APPOINTMENT owns this ---^
+  //
+  // Bounded to ONE chase per appointment by appointment_chase_tried_, and that
+  // bound is load-bearing rather than tidiness. `++midrun_attempts_` below is
+  // spent BEFORE dispatchReconnect and is not refunded when it returns false,
+  // and dispatchReconnect returns false on exactly the path this opens up — a
+  // chase that declines (stale record, uncoverable trail) while an appointment
+  // stands. Without the flag a persistently stale record would spend the
+  // entire attempt budget on consecutive PLAN ticks without the robot moving,
+  // and budget exhaustion reverts the run to terminal-only reconnection, so
+  // the failure mode would be "hybrid's pursuit half dies silently a few
+  // seconds into the first outage". One attempt, then the robot explores until
+  // the deadline, which is the correct behaviour for a chase that cannot start.
+  const bool hybrid_may_chase =
+      reconnect_mode_ == ReconnectMode::HYBRID && appointment_armed_ &&
+      !appointment_departed_ && !appointment_chase_tried_;
   if (reconnect_midrun_silence_sec_ > 0.0 && reconnect_enabled_ &&
-      have_anchor_ && team_seen_complete_ && !appointment_armed_) {
+      have_anchor_ && team_seen_complete_ &&
+      (!appointment_armed_ || hybrid_may_chase)) {
     if (midrun_attempts_ < reconnect_midrun_max_attempts_) {
       const auto trig_now = this->now();
-      const int live =
-          coord_ ? static_cast<int>(coord_->livePeerCount(trig_now)) : 0;
+      const int live = accountedPeerCount(trig_now);
       const double missing_for =
           (trig_now - team_last_complete_time_).seconds();
       const bool cooldown_ok =
@@ -5640,8 +8301,9 @@ void ExploPlannerNode::doPlan() {
         //
         // missing_for is the TEAM-PRESENCE clock, not the peer's record age:
         // team_last_complete_time_ is stamped on the 1 Hz heartbeat while
-        // livePeerCount() reads the team complete, and a peer stays live until
-        // its claim expires coord_claim_ttl_sec (5 s) after its last beacon. So
+        // accountedPeerCount() reads the team complete, and a peer stays
+        // accounted until BOTH its claim (coord_claim_ttl_sec, 5 s) and its
+        // TeamWorld `direct` flag (TeamModel::direct_ttl_sec, 5 s) age out. So
         // missing_for ~= peer_record_age_sec - TTL. Measured on g8r1's 5 banked
         // mid-run dispatches the difference is 4.98-4.99 s (4.99, 4.99, 4.99,
         // 4.99, 4.98) -- the TTL, from below, to two decimals. A previous
@@ -5738,6 +8400,13 @@ void ExploPlannerNode::doPlan() {
           // walk on every PLAN tick for the rest of the run.
           const double gate_sec = midrunGateSec(missing_for, &est_unshared);
           bool gate_refuses = false;
+          // Hoisted out of the reconnect_gate_info_ block below because the row
+          // is now written after the dispatch, which is outside it. Only ever
+          // written when gate_evaluated says the gate actually ran — with the
+          // gate off there is no verdict, and a default-constructed row would
+          // report a knowledge/cost comparison nothing performed.
+          ReconnectGateEvent ev;
+          bool gate_evaluated = false;
           if (missing_for >= gate_sec) {
             // §3.6 knowledge + value gate. Strictly downstream of the silence
             // clock above, so it can only refuse a dispatch that clock already
@@ -5775,12 +8444,25 @@ void ExploPlannerNode::doPlan() {
               const GateVerdict gv = evaluateReconnectGate(
                   cell_world_, vehicles, missing, alloc_cfg_);
 
-              if (exp_log_) {
-                // Emitted on EVERY evaluation, fired or not: a gate is judged by
-                // what it suppressed, and a suppression that logs nothing is
-                // indistinguishable from a trigger that never armed.
-                ReconnectGateEvent ev;
-                ev.dispatched          = gv.dispatch;
+              // Emitted on EVERY evaluation, fired or not: a gate is judged by
+              // what it suppressed, and a suppression that logs nothing is
+              // indistinguishable from a trigger that never armed.
+              //
+              // BUILT HERE, WRITTEN AFTER THE DISPATCH (2026-09-16). `dispatched`
+              // used to be assigned the gate VERDICT and the row written before
+              // the dispatch was attempted, so the two disagreed on exactly the
+              // population that matters: a gate that said go, an attempt duly
+              // spent, and dispatchReconnect then returning false because a
+              // standing appointment had already claimed this outage's one
+              // chase. Those rows said dispatched=true with no manoeuvre
+              // anywhere in the run, which is the same shape as the checks that
+              // stopped checking — a column reporting its failure case as its
+              // success case. It now reports what actually happened. The flip is
+              // one-directional (only true -> false, only on that population),
+              // so a row that says dispatched on an older generation still means
+              // what it meant; it is the gen-15 rows that gained a distinction.
+              gate_evaluated = true;
+              {
                 ev.knowledge           = gv.knowledge;
                 ev.unshared_cells      = gv.unshared_cells;
                 ev.c_no_mm             = gv.c_no_mm;
@@ -5790,9 +8472,13 @@ void ExploPlannerNode::doPlan() {
                 ev.refused             = gv.refused;
                 ev.team_incomplete_sec = missing_for;
                 ev.gate_sec            = gate_sec;
+                // Deliberately still PRE-increment: "attempts already used when
+                // this evaluation ran". The increment below happens after this
+                // row's decision, and moving the read past it would silently
+                // shift every value in the column by one against every banked
+                // generation.
                 ev.attempts_used       = midrun_attempts_;
                 ev.peers               = peers_str;
-                exp_log_->logReconnectGate(expCtx(), ev);
               }
 
               if (!gv.dispatch) {
@@ -5809,8 +8495,14 @@ void ExploPlannerNode::doPlan() {
               }
             }
 
+            bool midrun_dispatched = false;
             if (!gate_refuses) {
               ++midrun_attempts_;
+              // Spent whether or not the chase starts, because this is the one
+              // chase hybrid_may_chase allows for the standing appointment and
+              // a declined chase must not be retried into the attempt budget.
+              // Set before dispatchReconnect so an early return cannot skip it.
+              if (appointment_armed_) appointment_chase_tried_ = true;
               reconnect_terminal_ = false;
               hold_escalated_ = false;
               dispatch_gate_sec_      = gate_sec;
@@ -5832,8 +8524,62 @@ void ExploPlannerNode::doPlan() {
                   "interrupting exploration for the reconnect manoeuvre.",
                   missing_for, gate_sec, link_down_for, est_unshared,
                   midrun_attempts_, reconnect_midrun_max_attempts_);
-              if (dispatchReconnect("peer-lost")) return;
+              midrun_dispatched = dispatchReconnect("peer-lost");
+              if (!midrun_dispatched) {
+                // The attempt is spent anyway and that is deliberate (see the
+                // comment on the increment): for hybrid this IS the one chase
+                // the standing appointment allows, and refunding it would let
+                // the trigger re-fire on the next PLAN tick for the rest of the
+                // outage. Said out loud because the alternative is a spent
+                // attempt with no trace of where it went.
+                //
+                // CLOSE THE MID-RUN BOOKKEEPING HERE TOO (2026-09-18). Spending
+                // the attempt is not enough on its own, because nothing else on
+                // this path runs: `reconnect_terminal_ = false` was set above in
+                // anticipation of a manoeuvre, and the two places that undo it
+                // — transitionTo's manoeuvre-end block (gated on
+                // reconnect_active_, which a declined dispatch never sets) and
+                // resumeExploring (only reached from inside PURSUE) — are both
+                // out of reach from here. So the decline used to fall straight
+                // through to ordinary exploration leaving midrun_end_armed_
+                // exactly as it found it, i.e. `cooldown_ok` true on the very
+                // next PLAN tick with missing_for still past the gate. The
+                // trigger then re-fires at 10 Hz and spends the ENTIRE attempt
+                // budget in well under a second, writing one reconnect_gate row
+                // per tick, and the run reads as though it tried six times when
+                // it made one decision six times.
+                //
+                // This is the same defect resumeExploring documents at length,
+                // on the one path that does not go through it — and it bites
+                // hardest exactly where the arm needs the budget: for HYBRID,
+                // "a standing appointment already owns this outage" is the
+                // ordinary, correct decline, so the first trigger after arming
+                // burned every remaining attempt.
+                //
+                // reconnect_terminal_ is restored to its resting `true` for the
+                // same reason resumeExploring restores it: left false it makes
+                // may_defer true for a LATER terminal dispatch, so the barrier
+                // that is supposed to be allowed to end the run defers instead.
+                // Safe to set here because no manoeuvre started, so no
+                // reconnect_dispatch/reconnect_end row is stamped from this
+                // path and none can be mislabelled by it.
+                midrun_last_end_    = this->now();
+                midrun_end_armed_   = true;
+                reconnect_terminal_ = true;
+                RCLCPP_INFO(get_logger(),
+                    "Reconnect (mid-run): attempt %d spent but no manoeuvre "
+                    "started — %s. Exploration continues.",
+                    midrun_attempts_,
+                    appointment_armed_
+                        ? "a standing appointment already owns this outage"
+                        : "no arm-appropriate manoeuvre was available");
+              }
             }
+            if (gate_evaluated && exp_log_) {
+              ev.dispatched = midrun_dispatched;
+              exp_log_->logReconnectGate(expCtx(), ev);
+            }
+            if (midrun_dispatched) return;
           }
         }
       }
@@ -5969,12 +8715,22 @@ void ExploPlannerNode::doPlan() {
   //
   //   U(c) = info_gain(c) / (ε + path_cost(c))^γ
   //
-  // γ = 1 is the shipped form: information per unit distance, which at constant
+  // γ = 1 is the SSMI form: information per unit distance, which at constant
   // speed is information per SECOND. That is the correct greedy objective when
-  // the metric is time to completion, so γ = 1 is not an arbitrary default and
-  // the burden of proof is on moving it. It is also the default here, and the
-  // γ == 1 branch below skips std::pow so the shipped path stays bit-identical
-  // rather than merely close.
+  // the metric is time to completion, so γ = 1 is not an arbitrary reference
+  // point and the burden of proof was on moving it.
+  //
+  // IT IS NOT WHAT ANY CAMPAIGN RUNS, and this comment called it "the shipped
+  // form ... also the default here" until 2026-09-18. γ = 1.0 survives at
+  // exactly one site, the dp() fallback below. Everywhere the value is actually
+  // configured it is 0.5: shared_params.yaml:693, and run_explo_sim_rviz.sh
+  // passes -p utility_cost_exponent:=$UTIL_GAMMA with UTIL_GAMMA:-0.5 (:1565),
+  // which wins over the yaml. The burden of proof was discharged on 2026-08-19
+  // — see that script's own note that a run reproducing anything older must set
+  // UTIL_GAMMA=1.0 explicitly — by the measurement written out below.
+  //
+  // The γ == 1 branch below skips std::pow, so the SSMI reference path stays
+  // bit-identical rather than merely close. That branch is dead in a campaign.
   //
   // WHY THE KNOB EXISTS. Measured over 703 logged decisions on flatforest_dense
   // (campaign p14, off arm, to the 0.60 unknown rung): across the candidate set
@@ -6212,6 +8968,12 @@ void ExploPlannerNode::doPlan() {
 
     alloc_ev.shared_hash       = cell_world_.sharedHash();
     alloc_ev.grid_hash         = g.configHash();
+    // Taken from the solve's own result, not recomputed here. A digest of the
+    // inputs reassembled at the call site is a digest of a second thing
+    // believed to be equal, and the drift between them would be invisible in
+    // exactly the way this exists to make visible.
+    alloc_ev.alloc_hash        = alloc.alloc_hash;
+    alloc_ev.edge_hash         = alloc.edge_hash;
     for (int cid = 0; cid < cell_world_.size(); ++cid) {
       const CellStatus s = cell_world_.status(cid);
       if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
@@ -6288,7 +9050,17 @@ void ExploPlannerNode::doPlan() {
     int unreachable = 0;
     int blacklist = 0;
     int minpos = 0;
+    // `blacklist` is the union the per-step `blk` column has always reported;
+    // `visited` is the recently-visited half of it, broken out because the two
+    // halves get different treatment at the amnesty and a reader cannot tell
+    // from the union which one starved the tick.
+    int visited = 0;
+    // Candidates rejected by the failed-goal blacklist, and by the visited
+    // suppression, kept apart on purpose — see the rejection sites. The
+    // amnesty consumes `suppressed` first and falls back to
+    // `visited_suppressed` only when there is nothing else at all.
     std::vector<size_t> suppressed;
+    std::vector<size_t> visited_suppressed;
   };
 
   // The candidate filter chain, lifted out of the walk so that the real pick
@@ -6344,9 +9116,32 @@ void ExploPlannerNode::doPlan() {
     // 3. Failed-goal blacklist (existing) + recently-visited suppression.
     //    Both counted as `blk` in the per-step log: they reject for the same
     //    reason from the planner's point of view -- do not go back there yet.
+    //
+    //    BUT THEY ARE RECORDED SEPARATELY, because "the same reason" stopped
+    //    being true at the amnesty below. Only failed-goal rejections were
+    //    pushed onto a suppressed list, so a tick where EVERY candidate sat
+    //    within visited_goal_radius_m (6.0 m) of somewhere reached in the last
+    //    visited_goal_ttl_sec (180 s in every campaign — run_explo_sim_rviz.sh
+    //    passes VISITED_TTL, whose default is 180.0; shared_params.yaml:313
+    //    still reads 120.0 and no campaign uses it) found `suppressed_only`
+    //    empty, skipped the safety valve entirely, and returned starved — at
+    //    10 Hz, up to 1800 consecutive dead ticks waiting for a TTL to expire,
+    //    logged as `blk` next to the mechanism that DOES have a valve. Worse,
+    //    the visited test runs FIRST, so a candidate that is both visited and
+    //    failed never reached the failed branch either: a robot boxed in by
+    //    its own recent trail could not be rescued by the failed-goal amnesty
+    //    on a candidate set that qualified for it twice over.
+    //
+    //    So both lists are kept, and the amnesty tries them in order —
+    //    failed-only first, exactly as before, then visited as a last resort.
+    //    That leaves every tick that has a failed-only candidate behaving
+    //    bit-for-bit as it did; the only ticks that change are the ones that
+    //    used to do nothing at all.
     if (visited_goal_radius_m_ > 0.0 &&
         visited_goals_.isNear(vp.position, visited_goal_radius_m_)) {
       ++t.blacklist;
+      ++t.visited;
+      t.visited_suppressed.push_back(idx);
       return false;
     }
     if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
@@ -6388,23 +9183,32 @@ void ExploPlannerNode::doPlan() {
   const int rejected_map         = tally.map;
   const int rejected_unreachable = tally.unreachable;
   const int rejected_blacklist   = tally.blacklist;
+  // A SUBSET of rejected_blacklist, not a peer of it — see the member doc.
+  const int rejected_visited     = tally.visited;
   const int rejected_minpos      = tally.minpos;
   std::vector<size_t>& suppressed_only = tally.suppressed;
+  std::vector<size_t>& visited_only    = tally.visited_suppressed;
   // Whether the pick came from the walk itself rather than from the amnesty
   // fallback below. sep_reordered is only defined for a walk pick — see there.
   const bool found_in_walk = found;
-  if (!found && !suppressed_only.empty()) {
+  // One amnesty, run against whichever suppression list is in play, so the two
+  // tiers cannot drift apart the way the rejection sites did. `bl` is the
+  // blacklist that suppressed these candidates and therefore the one that
+  // orders them and dates them; `source` is the wire/log word for which tier
+  // granted the reprieve.
+  const auto tryAmnesty = [&](std::vector<size_t>& pool,
+                              FailedGoalBlacklist& bl, double radius_m,
+                              const char* source, const char* prose,
+                              const char* stamp_verb) {
+    if (found || pool.empty()) return;
     // Retired last, then least-recently-failed (see amnestyOrderBefore for why
     // the retired partition has to be there). stable_sort so equal keys keep
     // the score order they inherited from `order`.
-    std::stable_sort(
-        suppressed_only.begin(), suppressed_only.end(),
-        [&](size_t a, size_t b) {
-          return amnestyOrderBefore(failed_goals_, candidates[a].position,
-                                    candidates[b].position,
-                                    failed_goal_radius_m_);
-        });
-    for (size_t idx : suppressed_only) {
+    std::stable_sort(pool.begin(), pool.end(), [&](size_t a, size_t b) {
+      return amnestyOrderBefore(bl, candidates[a].position,
+                                candidates[b].position, radius_m);
+    });
+    for (size_t idx : pool) {
       const auto& vp = candidates[idx];
       // Re-run the peer-claim check. In the loop above the blacklist rejection
       // `continue`s BEFORE MinPos is consulted, so a suppressed candidate has
@@ -6421,31 +9225,56 @@ void ExploPlannerNode::doPlan() {
           continue;  // not counted again; it was already counted as blk
         }
       }
-      const double last_fail = failed_goals_.lastFailTimeNear(
-          vp.position, failed_goal_radius_m_);
+      const double last_fail = bl.lastFailTimeNear(vp.position, radius_m);
       const double age = std::isfinite(last_fail)
                              ? plan_start.seconds() - last_fail
                              : -1.0;
-      const bool amnesty_retired =
-          failed_goals_.isRetiredNear(vp.position, failed_goal_radius_m_);
+      // Only the failed-goal blacklist retires sites; visited_goals_ never
+      // calls setRetireAfter, so this reads false on that tier by
+      // construction rather than by accident. `source` is what tells the two
+      // apart in the log — do not read retired=false as "the failed tier".
+      const bool amnesty_retired = bl.isRetiredNear(vp.position, radius_m);
       current_goal_ = vp;
       selected_idx = idx;
       found = true;
       RCLCPP_WARN(get_logger(),
-          "Step %d: all %zu candidates suppressed by the failed-goal "
-          "blacklist; AMNESTY re-attempt of the %s goal "
-          "(%.2f, %.2f), last failed %.1fs ago.",
-          step_, candidates.size(),
-          amnesty_retired ? "least-recently-failed RETIRED"
-                          : "least-recently-failed",
-          vp.position.x(), vp.position.y(), age);
+          "Step %d: all %zu candidates suppressed by the %s; AMNESTY "
+          "re-attempt of the least-recently-%s%s goal (%.2f, %.2f), last %s "
+          "%.1fs ago.",
+          step_, candidates.size(), prose, stamp_verb,
+          amnesty_retired ? " RETIRED" : "",
+          vp.position.x(), vp.position.y(), stamp_verb, age);
       if (exp_log_) {
         exp_log_->logGoalAmnesty(expCtx(), vp.position.x(), vp.position.y(),
-                                 age, amnesty_retired);
+                                 age, amnesty_retired, source);
       }
       break;
     }
-  }
+  };
+  // ORDER IS THE BEHAVIOURAL CONTRACT. The failed tier goes first and is
+  // reached on exactly the ticks it was reached on before this split, with the
+  // same pool, the same ordering and the same pick — so no tick that used to
+  // produce a goal produces a different one. The visited tier only runs when
+  // the failed tier found nothing to offer, i.e. on ticks that previously
+  // returned starved and drove the robot nowhere.
+  //
+  // WHAT THE VISITED TIER TRADES AWAY, because it is not free. It hands back a
+  // goal within visited_goal_radius_m of somewhere this robot stood in the
+  // last visited_goal_ttl_sec, so a robot boxed in by its own trail now drives
+  // back over covered ground instead of standing still. That converts a
+  // VISIBLE failure into a quieter one: plan_stall_ticks stops climbing (the
+  // column the harness gates watch) and the metres reappear as redundancy,
+  // which is a headline endpoint here. The exchange is still worth making — a
+  // stalled robot re-covers nothing but also explores nothing, and its partner
+  // inherits the whole map — but it must stay countable, which is the entire
+  // reason the goal_amnesty row carries `source` and the step row carries
+  // plan_rej_visited. Any run whose redundancy looks anomalous should be
+  // checked against its `source="visited"` count BEFORE the number is
+  // attributed to an arm.
+  tryAmnesty(suppressed_only, failed_goals_, failed_goal_radius_m_, "failed",
+             "failed-goal blacklist", "failed");
+  tryAmnesty(visited_only, visited_goals_, visited_goal_radius_m_, "visited",
+             "recently-visited suppression", "visited");
 
   // ---- Allocator bookkeeping (P3) -------------------------------------
   //
@@ -6456,18 +9285,37 @@ void ExploPlannerNode::doPlan() {
   if (alloc_ran) {
     alloc_ev.picked_rank = found ? alloc_rank[selected_idx] : -1;
 
-    // Staleness (§3.4). A focus cell that yields no admissible candidate for
-    // k consecutive ticks is re-measured from the map and, if it still claims
-    // to be worth exploring, demoted to COVERED — mTARE's not-connected ->
-    // COVERED demotion, and the only thing that stops a phantom EXPLORING cell
-    // from being re-assigned forever and from dragging the rendezvous minimax
+    // Staleness (§3.4). A focus cell that keeps yielding no admissible
+    // candidate is re-measured from the map and, if it still claims to be
+    // worth exploring, demoted to COVERED — mTARE's not-connected -> COVERED
+    // demotion, and the only thing that stops a phantom EXPLORING cell from
+    // being re-assigned forever and from dragging the rendezvous minimax
     // toward ground nobody can clear.
     //
-    // The counter advances only on a tick that selected a goal from OUTSIDE
-    // the focus neighbourhood. A tick that selected nothing at all is global
-    // starvation — the map, the blacklist or reachability rejected everything
-    // everywhere — and charging that to the focus cell would demote a cell for
-    // being unlucky about somebody else's failure.
+    // WHAT THE COUNTER ACTUALLY COUNTS, because it is not "k consecutive
+    // ticks" and said so until 2026-09-18: `alloc_focus_skips_` is indexed BY
+    // CELL ID and is only touched on a tick where that cell is the focus. So
+    // it counts k consecutive APPEARANCES AS FOCUS that failed, not k
+    // consecutive ticks — the focus cell moves as the allocator re-solves, and
+    // a cell's count survives however many ticks pass with some other cell in
+    // the chair. There is no decay. A cell that misses once, drops out of the
+    // focus for two hundred ticks, and comes back to miss again is at 2.
+    //
+    // That is deliberately NOT patched into a strict tick run, because the
+    // demotion's real guard is not the counter at all: `shouldDemoteStaleFocus`
+    // fires only if a census taken THIS TICK still reads the cell unexplored.
+    // Ground that got cleared in the gap cannot be written off no matter what
+    // the counter says, so the counter's job is to decide when the question is
+    // worth asking, and a stricter clock would only make it ask less often.
+    //
+    // Two ways a tick declines to answer, and they are different:
+    //   - nothing selected at all (`!found`) is global starvation — the map,
+    //     the blacklist or reachability rejected everything everywhere — and
+    //     charging that to the focus cell would demote a cell for being
+    //     unlucky about somebody else's failure. Neither advances nor resets.
+    //   - some other cell was the focus. Not this cell's tick; untouched.
+    // Only a tick that selected a goal and had THIS cell in the chair moves
+    // the number, up on an out-of-focus pick and back to zero on a rank-0 one.
     const int focus = alloc_ev.focus_cell;
     if (focus >= 0 && focus < static_cast<int>(alloc_focus_skips_.size())) {
       if (found && alloc_ev.picked_rank == 0) {
@@ -6493,15 +9341,18 @@ void ExploPlannerNode::doPlan() {
           // lower again — so this is a one-way write-off of ground on behalf
           // of the whole team, and it is logged on every fire for precisely
           // that reason. What keeps it honest is the three conditions above:
-          // it must be the focus cell, it must have failed k consecutive
-          // times, and the map must still read it as unexplored after a fresh
-          // measurement taken this tick.
+          // it must be the focus cell, it must have failed k times in a row as
+          // focus (see the counter's note — that is not k consecutive ticks),
+          // and the map must still read it as unexplored after a fresh
+          // measurement taken this tick. The last of those is the one doing
+          // the work.
           cell_world_.commitSelf(focus, CellStatus::COVERED);
           alloc_ev.demoted = std::to_string(focus);
           RCLCPP_WARN(get_logger(),
               "Global allocator: focus cell %d produced no admissible "
-              "candidate for %d consecutive ticks and still reads unexplored "
-              "after a fresh census — demoting it to COVERED.",
+              "candidate on %d consecutive solves that held it as focus, and "
+              "still reads unexplored after a fresh census — demoting it to "
+              "COVERED.",
               focus, alloc_focus_skips_[focus]);
         }
         alloc_focus_skips_[focus] = 0;
@@ -6521,6 +9372,7 @@ void ExploPlannerNode::doPlan() {
   pending_plan_rej_map_       = rejected_map;
   pending_plan_rej_unreach_   = rejected_unreachable;
   pending_plan_rej_blacklist_ = rejected_blacklist;
+  pending_plan_rej_visited_   = rejected_visited;
   pending_plan_rej_minpos_    = rejected_minpos;
 
   if (!found) {
@@ -6539,12 +9391,20 @@ void ExploPlannerNode::doPlan() {
     // not, which is the point — the throttle is what made the log an
     // unreliable place to measure stall length from.
     pending_plan_stall_ticks_ = consecutive_all_rejected_;
+    // blk is the union and vis is its visited half, printed together because
+    // reaching here at all means BOTH amnesty tiers declined — and the two
+    // halves fail for opposite reasons. blk==vis says every candidate was this
+    // robot's own fresh trail and the visited tier still found nothing to
+    // hand back, which can only be MinPos vetoing the whole pool; blk>vis says
+    // real failed goals are in play.
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "Step %d: all %zu candidates rejected (close=%d map=%d unreach=%d "
-        "blk=%d minpos=%d). Retrying next tick; %d consecutive rejected ticks.",
+        "blk=%d vis=%d minpos=%d). Retrying next tick; %d consecutive "
+        "rejected ticks.",
         step_, candidates.size(), rejected_too_close,
         rejected_map, rejected_unreachable,
-        rejected_blacklist, rejected_minpos, consecutive_all_rejected_);
+        rejected_blacklist, rejected_visited, rejected_minpos,
+        consecutive_all_rejected_);
     return;  // stay in PLAN, retry next tick
   }
   // Reset only on a tick that actually selected a goal, so the counter measures
@@ -6679,7 +9539,7 @@ void ExploPlannerNode::doPlan() {
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
       "info=%.2f cost=%.2f field=%.2f±%.2f "
-      "[%zu cand, close=%d map=%d unreach=%d blk=%d "
+      "[%zu cand, close=%d map=%d unreach=%d blk=%d vis=%d "
       "minpos=%d, peers=%zu, %.1fms]",
       step_, current_goal_.position.x(), current_goal_.position.y(),
       current_goal_.yaw, current_goal_.score,
@@ -6689,8 +9549,9 @@ void ExploPlannerNode::doPlan() {
       // toward zero means the utility has stopped choosing on information.
       pending_mean_info_gain_, pending_info_gain_std_,
       candidates.size(), rejected_too_close, rejected_map,
-      rejected_unreachable, rejected_blacklist, rejected_minpos,
-      coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
+      rejected_unreachable, rejected_blacklist, rejected_visited,
+      rejected_minpos,
+      static_cast<size_t>(accountedPeerCount(plan_end)), plan_ms);
 
   // Throttled, and only when the term is on: a pilot needs to be able to see
   // from the console that the treatment is doing something, without waiting
@@ -6808,8 +9669,9 @@ void ExploPlannerNode::doNavigate() {
     phase_ = Phase::EXPLOIT;
     // The released hop must be stopped, not just forgotten: EXPLOIT_PLAN can
     // sit on "no vantage and no reachable approach yet — retrying" for as long
-    // as the give-up timer allows without ever publishing a goal, and nav2
-    // would drive out the abandoned exploration hop underneath it (invariant:
+    // as the give-up timer allows without ever publishing a goal, and the
+    // navigator would drive out the abandoned exploration hop underneath it
+    // (invariant:
     // see abandonNavGoal).
     abandonNavGoal("target released mid-hop");
     transitionTo(State::EXPLOIT_PLAN, "target-released-mid-hop");
@@ -6830,7 +9692,7 @@ void ExploPlannerNode::doNavigate() {
         current_goal_.position.y());
     have_active_intent_ = false;
     // PLAN usually re-goals on the next tick, but nothing guarantees it does —
-    // and until it does nav2 is still driving INTO a now-mapped obstacle
+    // and until it does the navigator is still driving INTO a now-mapped obstacle
     // (invariant: see abandonNavGoal).
     abandonNavGoal("goal inside obstacle");
     transitionTo(State::PLAN, "goal-inside-obstacle");
@@ -6889,14 +9751,30 @@ void ExploPlannerNode::doNavigate() {
   float dy = robot_pos.y() - current_goal_.position.y();
   float dist = std::sqrt(dx * dx + dy * dy);
 
-  // Goal reached only when BOTH position and orientation are within
-  // tolerance. The yaw check ensures the robot is facing the planned
-  // direction before we transition to INTEGRATE, so the sensor actually
-  // observes the region the planner scored.
+  // Goal reached on position, and on orientation only where orientation means
+  // something.
+  //
+  // The yaw term's whole justification was "so the sensor actually observes the
+  // region the planner scored". That is a statement about the SENSOR MODEL, and
+  // it is now enforced as one: an omnidirectional model scores a full circle
+  // from the goal position, so every heading observes what was scored and
+  // holding the robot still until it reaches a nominal yaw buys nothing. It is
+  // not free, either — the rotate deadline below fails the goal and failGoal()
+  // blacklists the position the robot is standing on, which is how ts1b
+  // produced 984 `budget-rotate` failures on a sensor that does not have a
+  // front.
+  //
+  // EXPLOIT vantages are the exception and keep the term unconditionally: a
+  // vantage capture IS directional (the ring angle exists precisely to frame
+  // the trunk), so arriving at the right point facing the wrong way is a real
+  // failure there. The exception is written as a phase test, not as a second
+  // parameter, so it cannot drift away from the model it describes.
+  const bool yaw_required =
+      (phase_ == Phase::EXPLOIT) || !fov_is_omnidirectional_;
   if (dist < goal_xy_tol_) {
     float yaw_err = std::remainder(latest_yaw_ - current_goal_.yaw,
                                    2.0f * static_cast<float>(M_PI));
-    if (std::abs(yaw_err) < goal_yaw_tol_) {
+    if (!yaw_required || std::abs(yaw_err) < goal_yaw_tol_) {
       if (phase_ == Phase::EXPLOIT) {
         if (current_is_approach_) {
           // Reached an approach waypoint (not a vantage): re-plan from here so
@@ -7055,7 +9933,8 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed,
                                test_name, test_value, test_threshold);
   }
   have_active_intent_ = false;  // release the claim on failure
-  // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
+  // The nav budget / no-progress watchdogs give up on this goal; the navigator
+  // does not
   // know that — the goal is still accepted and still driving (invariant: see
   // abandonNavGoal), and INTEGRATE is one of the states presumed stationary.
   abandonNavGoal(reason);
@@ -7072,8 +9951,7 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed,
 // already present the map is already merged, so exhaustion here means the team
 // is genuinely done — everyone reaches this together and lands in DONE.
 void ExploPlannerNode::recordExplorationComplete(const char* reason) {
-  const int active =
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  const int active = accountedPeerCount(this->now());
   // exploration_complete — THIS ROBOT declaring its own exploration exhausted,
   // recorded here and not at any of the endings below. That is the point: what
   // happens next is the independent variable (finish / return / chase / hold),
@@ -7202,10 +10080,46 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // Order matters. Record the declaration against the state we were actually in
   // (transitionTo would otherwise have already moved us), then stop the
   // platform, then end. The abandon is what the streak path never needed: it
-  // finished from PLAN, where the robot is stationary and nav2 holds no goal.
-  // This one can fire mid-drive, and nav2 does not know the run is over — an
+  // finished from PLAN, where the robot is stationary and the navigator holds no
+  // goal. This one can fire mid-drive, and the navigator does not know the run is
+  // over — an
   // uncancelled goal keeps driving a "finished" robot around.
   recordExplorationComplete("coverage-latched");
+
+  // DO NOT WALK AWAY FROM THE MEETING (2026-09-17). Everything below this
+  // block ends the run — parks, coasts, or drives home — and all three are
+  // wrong for a robot that is standing on the agreed cell waiting for the rest
+  // of the team. It has the saturated map the meeting exists to hand over, and
+  // leaving turns a meeting that was going to happen into a no-show.
+  //
+  // Gated on appointment_arrived_, not on appointment_manoeuvre_ alone: the
+  // return-budget and no-progress paths also enter RETURN_SYNC on an
+  // appointment manoeuvre with arrived=false, and those robots are not at any
+  // agreed place — holding them would be a hold in an arbitrary spot.
+  //
+  // Returning false does NOT un-finish anything. coverage_latched_ is already
+  // true, so the guard at the top of this function makes every re-entry a
+  // no-op, the manifest still reports finished, and exploration_complete was
+  // stamped one line up. The robot is finished; it is just not leaving yet.
+  // doReturnSync owns it from here: it ends the run when the barrier releases
+  // (and the map has settled), or when the latched hold's cap expires.
+  if (state_ == State::RETURN_SYNC && appointment_manoeuvre_ &&
+      appointment_arrived_) {
+    const double t_now = missionElapsed();
+    coverage_latch_hold_start_sec_ = (t_now >= 0.0) ? t_now : 0.0;
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous: map saturated while holding the agreed cell -> STAYING. "
+        "Exploration is recorded complete at t_sim=%.1f; this robot keeps the "
+        "appointment for up to %.0fs more so the team can still meet and merge.",
+        coverage_latch_t_sim_, rendezvous_latched_hold_sec_);
+    return false;
+  }
+
+  // Every ending below IS a coverage-latch teardown, so the appointment outcome
+  // classifier must not read one as a no-show. Set before any of them, because
+  // each one reaches transitionTo, which is where the classifier runs.
+  coverage_latch_teardown_ = true;
+
   // Mission return pre-empts BOTH legacy endings below (park, and the
   // done_seek coast): the homing traverse is itself the go-reconnect
   // behaviour the coast approximated, so the coast is superseded rather than
@@ -7223,7 +10137,8 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
         "Falling back to the park-in-place ending.");
   }
   // The abandon above this line was correct for a robot that latches while
-  // exploring: nav2 does not know the run is over and an uncancelled goal would
+  // exploring: the navigator does not know the run is over and an unreplaced goal
+  // would
   // drive a finished robot around at random. It is exactly WRONG for a robot
   // that latches while chasing its partner, because there the uncancelled goal
   // is aimed at the one place we want it to go. Coasting is therefore gated on
@@ -7253,11 +10168,10 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
 }
 
 bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
-  // livePeerCount, not the raw table size: exploit claims are retained past
-  // expiry by the grace window (vantage-contest lenience), and a graced claim
-  // must not count a 10-s-silent teammate as "present" for the barrier.
-  const int active =
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  // accountedPeerCount, not the raw table size: exploit claims are retained
+  // past expiry by the grace window (vantage-contest lenience), and a graced
+  // claim must not count a 10-s-silent teammate as "present" for the barrier.
+  const int active = accountedPeerCount(this->now());
   recordExplorationComplete(reason);
   // Mission return replaces the TERMINAL manoeuvre outright (mid-run
   // manoeuvres, dispatched from doPlan, are untouched — they ARE the
@@ -7284,6 +10198,11 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
     // was there all along), and cannot loop, because team_last_complete_time_
     // only advances while the team IS complete — in which case
     // shouldRendezvous is false and we never reach this branch.
+    //
+    // THIS IS THE ONLY `false` finishOrRendezvous RETURNS, and the bound above
+    // is why the caller contract ("ask again next tick") is safe. The dispatch
+    // below used to return one too, with no bound behind it; see the note there
+    // for what that cost.
     if (reconnect_confirm_sec_ > 0.0 && team_seen_complete_) {
       const double missing_for =
           (this->now() - team_last_complete_time_).seconds();
@@ -7300,7 +10219,37 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
     // terminal so a failed barrier wait is allowed to reach DONE.
     reconnect_terminal_ = true;
     hold_escalated_ = false;
-    return dispatchReconnect(reason);
+    if (dispatchReconnect(reason)) return true;
+    // A TERMINAL DISPATCH THAT DECLINES MUST STILL END THE RUN (2026-09-18).
+    // `false` from this function means "deferred, ask again next tick", and the
+    // only caller that acts on it (doLogStep) sends the node back to PLAN.
+    // That contract was written for the confirmation window above, which is
+    // bounded by reconnect_confirm_sec and resolves either way. It is NOT the
+    // contract dispatchReconnect honours: with reconnect_terminal_ set,
+    // may_defer is false by construction, so every `false` it can return here
+    // is the RENDEZVOUS/HYBRID tail declining outright — armAppointment refused
+    // (no agreed triple, or the pair already spent) and the 2026-09-16 removal
+    // left that arm with no unscheduled fallback to drive to.
+    //
+    // Propagating that `false` was a livelock, not a deferral. step_ is only
+    // incremented by doLogStep, PLAN's budget test re-fires on the frozen
+    // count, and nothing in the loop can make armAppointment change its mind
+    // while the team is separated (the agreed pair is frozen for the outage) —
+    // so the node spins in PLAN at 10 Hz, after recordExplorationComplete has
+    // already stamped the endpoint and disarmed the harness's stall gate.
+    //
+    // Finishing is the right answer, not a patch over one: "no appointment
+    // stands and this arm has nothing unscheduled to fall back on" is exactly
+    // the state the 2026-09-16 change chose to make terminal. The robot has
+    // finished exploring and has nowhere agreed to be; the honest ending is
+    // DONE, recorded against the same reason. The endpoint is unaffected —
+    // exploration_complete was stamped at the top of this function, before any
+    // of this was decided.
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous [%s]: terminal dispatch declined (no appointment and no "
+        "unscheduled fallback) -> DONE with %d/%d peers live.",
+        reason, active, rendezvous_expected_peers_);
+    return finishNow(reason);
   }
   if (reconnect_enabled_ && rendezvous_expected_peers_ > 0) {
     RCLCPP_INFO(get_logger(),
@@ -7316,9 +10265,14 @@ bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
 // its trail head to mean anything (pursuitBudgetSec == 0), and each mode
 // then falls through to its fallback. rec can be null even here: the
 // missing teammate may never have been heard at all (the anchor came from
-// a DIFFERENT peer) — then there is nothing to chase and no pair to
-// midpoint, so hybrid and rendezvous degrade to the own-anchor return
-// while pure pursuit holds in place (below).
+// a DIFFERENT peer) — then there is nothing to chase, and what the robot
+// does next does not depend on that record at all: rendezvous and hybrid
+// keep the APPOINTMENT, which was agreed from the team's own positions while
+// everyone was connected and needs no per-peer contact record, and pursuit
+// falls through to the explore allowance and then holds in place (below).
+// This used to read "no pair to midpoint, so hybrid and rendezvous degrade to
+// the own-anchor return" — both halves of that died with the midpoint drives
+// on 2026-09-16.
 //
 // Callers own reconnect_terminal_: finishOrRendezvous sets true (its barrier
 // may end in DONE), the mid-run trigger in doPlan sets false (its barrier
@@ -7464,12 +10418,283 @@ double ExploPlannerNode::midrunGateSec(double missing_for,
 // Scheduled rendezvous (P5, §3.5)
 // ==================================================================
 
+bool ExploPlannerNode::rendezvousTeamMutual() const {
+  if (!team_model_.configured()) return false;
+  // A one-robot fleet would pass the loop below VACUOUSLY and stamp an anchor
+  // it can never keep an appointment against. Refused explicitly rather than
+  // left to the loop, because "no peers" and "every peer confirmed" are the
+  // same iteration count and only one of them is a team.
+  if (team_model_.size() < 2) return false;
+  // EVERY EDGE OF THE GRAPH, not every edge incident on us. Two conditions, and
+  // the second one is the whole reason this function is not a loop over
+  // `direct`.
+  //
+  // At N=2 "my links are up" and "the team is complete" are the same sentence,
+  // because there is one link and TeamModel makes `direct` symmetric on it. At
+  // N>=3 they come apart, and the anchor is what falls through the gap. Take
+  // A-B-C and break A-B while A-C and B-C both hold. A sees B non-direct and
+  // freezes; B sees A non-direct and freezes; C sees BOTH of them directly, so
+  // a self-centred test says "complete" and C KEEPS RE-STAMPING for the entire
+  // duration of the split. When C is finally separated at T_C it computes
+  // t_meet = T_C + interval while A and B are holding T_AB + interval, and the
+  // skew T_C - T_AB is bounded by nothing at all: not the TTL, not the
+  // heartbeat, not the mission clock. Against reconnect_midrun_max_wait_sec_
+  // (240 s) any bridging episode longer than that is a guaranteed no-show, so
+  // the pair being exact buys nothing — the two ends keep an exact appointment
+  // at two different times.
+  //
+  // The repair needs no new wire field, because the missing information is
+  // already broadcast: TeamWorld.in_range_mask is each robot's own direct-
+  // contact mask, and TeamModel keeps the last one every peer sent. So C can
+  // SEE that A's mask has stopped naming B and freeze on the same event A and
+  // B froze on. The residual is that C learns it one TeamWorld period after A
+  // does, which is the same one-period cut this protocol already declares as
+  // its accepted residual (TeamWorld.msg, "WHAT THIS CANNOT DO") rather than a
+  // new one. What matters is that the bound no longer grows with team size.
+  const uint32_t full = fleetMask(team_model_.size());
+  // An empty `full` would make condition 2 below pass for every peer — the
+  // check would still run and still print as satisfied while testing nothing.
+  // A team size fleetMask() refuses is a configuration fault, not a degraded
+  // mode to keep scheduling through.
+  if (full == 0u) return false;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    // 1. Our own edge to the peer. `direct` and not `inComms()`: inComms() is
+    //    the transitive closure, which is true through a relay. A relayed link
+    //    carries the gossip fine, but the two ends of it are NOT synchronised
+    //    on when the chain breaks — the middle robot can lose one side seconds
+    //    before the other notices — and that difference lands in the anchor.
+    if (!team_model_.peer(id).direct) return false;
+    // 2. The peer's own edges, as the peer itself reported them. Read only
+    //    under (1), so the mask is first-hand and inside the TTL by
+    //    construction; a mask from a peer we cannot currently hear is a stale
+    //    claim about a graph that has since changed.
+    if ((team_model_.peer(id).in_range_mask & full) != full) return false;
+  }
+  return true;
+}
+
+bool ExploPlannerNode::peerAccounted(const std::string& name,
+                                     const rclcpp::Time& now) const {
+  if (!coord_) return false;
+  const int id = fleet_.idOf(name);
+  if (team_model_.configured() && id >= 0 && id < team_model_.size()) {
+    const TeamModel::Peer& p = team_model_.peer(id);
+    // `direct`, not `heard_one_way`: this count feeds teamComplete, which asks
+    // whether the team can actually EXCHANGE, and a peer that cannot hear us
+    // has not reconnected. peerReportsTeamBreak takes the one-way case on
+    // purpose and is the right place for it.
+    if (p.direct || p.finished) return true;
+  }
+  // The claim table is still consulted for every peer, including one the fleet
+  // list does not name: an unknown producer that is beaconing is a robot in
+  // range, and dropping it here would make it permanently "missing".
+  return coord_->peerLive(name, now);
+}
+
+int ExploPlannerNode::accountedPeerCount(const rclcpp::Time& now) const {
+  if (!coord_) return 0;
+  // Before TeamModel is configured there is no second channel and no
+  // `finished` bit to read, so the union collapses to the claim table — the
+  // pre-generation-23 answer, which is the right one when it is the only one.
+  if (!team_model_.configured() || fleet_.size() < 2)
+    return static_cast<int>(coord_->livePeerCount(now));
+  int n = 0;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    if (peerAccounted(fleet_.nameOf(id), now)) ++n;
+  }
+  return n;
+}
+
+int ExploPlannerNode::reachablePeerCount() const {
+  // Same guard shape as accountedPeerCount, but the collapse is to ZERO, not
+  // to the claim table: before TeamModel there is no closure to read, and a
+  // zero here makes the generation-27 door in manoeuvreReleaseEligible
+  // unsatisfiable, so the release falls back to the mesh predicate it had.
+  if (!team_model_.configured() || fleet_.size() < 2) return 0;
+  int n = 0;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    // inComms is the closure verdict — direct, or bridged by a peer's
+    // in_range_mask — and `finished` keeps the exemption peerAccounted gives
+    // it. That exemption is this count's ACCEPTED RESIDUAL, not a robot
+    // nobody waits on: a finished robot can still be driving in (see
+    // appointment_inbound's no-finished-exemption note in TeamWorld.msg), and
+    // `finished` relays with no age gate, so on this one channel the door can
+    // admit a peer neither inbound veto sees. Pre-existing in peerAccounted;
+    // generation 27 copies it, it does not widen it.
+    // Deliberately NO claim-table channel: the release ORs this count's
+    // teamComplete with teamSettled, whose accountedPeerCount already carries
+    // the claim table, and this count must stay a statement about the radio
+    // graph rather than about who beaconed recently.
+    if (team_model_.inComms(id) || team_model_.peer(id).finished) ++n;
+  }
+  return n;
+}
+
+bool ExploPlannerNode::peerReportsTeamBreak() const {
+  if (!team_model_.configured()) return false;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    const TeamModel::Peer& p = team_model_.peer(id);
+    // Receiving from it first-hand right now. Without this the bit would be
+    // whatever the peer last said before it went silent, which is a latch: a
+    // robot that announced a break and then dropped off the air entirely would
+    // hold the team armed forever off a message nobody can refresh.
+    if (!p.direct && !p.heard_one_way) continue;
+    // A FINISHED PEER DOES NOT ARM THE TEAM. `finished` already means "no
+    // longer someone worth reconnecting to" (TeamWorld.msg), and the reason is
+    // sharper here than anywhere else: the appointment barrier for a manoeuvre
+    // is UNBOUNDED (rendezvous_appointment_wait_sec defaults to 0 = no cap), so
+    // a parked robot that can never hear one distant peer would hold the whole
+    // team at the meeting point until the run's duration cap and censor the
+    // cell. It also buys nothing — the map still flows OUT of a finished robot
+    // over any link that carries its scovox_bin, and it has stopped needing map
+    // to flow in.
+    //
+    // This does NOT reintroduce the generation-18/19 split, because both the
+    // arm and the release read this same function: the predicate is weakened
+    // identically on both sides, which is the property that matters.
+    //
+    // A FINISHED PEER IS EXEMPT FROM THE COUNT TOO, AND PERMANENTLY. This read
+    // "a finished peer still counts toward teamComplete, so if it goes silent
+    // the team arms on the ordinary rule" until 2026-09-18, and that inverts
+    // the code: peerAccounted returns true on `p.finished` BEFORE it looks at
+    // any contact, and `p.finished` has no TTL — the gossip relay only ever ORs
+    // it true (team_model.cpp, "PURE OR, NEVER CLEARS") and only a first-hand
+    // observation of the peer un-finishing can clear it. So a finished peer
+    // goes silent, parks, and keeps counting present for the rest of the run.
+    // The team does NOT arm on it, which is the whole point — an ordinary-rule
+    // arm here would hold everyone at the unbounded barrier for a robot that is
+    // never coming, i.e. exactly the censoring this exemption exists to stop.
+    // The exemption is deliberate at BOTH sites; only the sentence describing
+    // it was wrong.
+    if (p.finished) continue;
+    if (p.team_incomplete) return true;
+  }
+  return false;
+}
+
+bool ExploPlannerNode::peerInboundToAppointment() const {
+  if (!team_model_.configured()) return false;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    const TeamModel::Peer& p = team_model_.peer(id);
+    // Receiving from it first-hand right now, exactly as peerReportsTeamBreak
+    // requires and for the same reason: the bit has no TTL of its own.
+    if (!p.direct && !p.heard_one_way) continue;
+    // No `finished` skip here, unlike peerReportsTeamBreak — see the
+    // declaration for why the exemption that function needs would be a defect
+    // in this one.
+    if (p.appointment_inbound) return true;
+  }
+  return false;
+}
+
+bool ExploPlannerNode::peerReportsInboundToAppointment() const {
+  if (!team_model_.configured()) return false;
+  for (int id = 0; id < team_model_.size(); ++id) {
+    if (id == team_model_.selfId()) continue;
+    const TeamModel::Peer& p = team_model_.peer(id);
+    // The same liveness gate as peerInboundToAppointment, for the same
+    // reason: the report carries no TTL of its own, so a reporter that goes
+    // silent must stop holding the barrier.
+    if (!p.direct && !p.heard_one_way) continue;
+    if (p.appointment_inbound_seen) return true;
+  }
+  return false;
+}
+
+bool ExploPlannerNode::teamSettled(int live_peers) const {
+  return teamComplete(live_peers, rendezvous_expected_peers_) &&
+         !peerReportsTeamBreak();
+}
+
+bool ExploPlannerNode::manoeuvreReleaseEligible(int live_peers) const {
+  // THE APPOINTMENT'S SECOND TERM (2026-09-18). teamSettled is a COMMS test and
+  // the drive ends on ARRIVAL, so on its own it lets a robot standing at the
+  // cell call the meeting over the moment its partner comes into range with
+  // most of the walk still to go. Added HERE and not inside teamSettled because
+  // this function is the barrier's release predicate and teamSettled has other
+  // consumers — the arm, the supersede, the presence dwell — that are asking a
+  // different question and must not acquire a term about who is still driving.
+  //
+  // THE REACHABLE DOOR (2026-09-19, generation 27). teamSettled is full mesh
+  // over this robot's own edges plus the contagion, and at the meeting point
+  // that is a GEOMETRY test, not a patience test: under 70 dB trunks one tree
+  // on one chord keeps one pair dark at 8 m forever. The gen-26 N=3 smoke
+  // measured exactly that — pair 0-2 up 1.3% of the window with both other
+  // pairs at 100%, all three robots gathered at the agreed cell and parked in
+  // RETURN_SYNC from ~350 s to the 660 s cap, zero rendezvous_outcome rows,
+  // the cell banked CLEAN. Waiting cannot close such a pair, so the barrier
+  // also releases when every expected peer is REACHABLE — in TeamModel's
+  // comms closure, or finished — i.e. "until all robots are connected" read
+  // as one connected component rather than all pairs. What the dark pair
+  // could not exchange it still has not (there is no map relay); the meeting
+  // delivered every exchange its radio physically allowed, and parking longer
+  // was buying nothing.
+  //
+  // The door is OR'd with teamSettled, not a replacement: reachablePeerCount
+  // has no claim-table channel, so the mesh disjunct still carries the
+  // lost-TeamWorld window accountedPeerCount covers. The contagion is
+  // deliberately NOT consulted behind the door — at a gathered barrier the
+  // announcing peers are the ends of the dark pair themselves, and their
+  // announcements ARE the hang; a peer that genuinely drops mid-settle drops
+  // out of the closure and fails the door's teamComplete directly. And the
+  // inbound veto reaches as far as the door admits: reachable includes a
+  // robot still walking in, and leaving before it stands at the cell is the
+  // gen-23 defect again — but a peer admitted through a bridge is one this
+  // robot cannot hear, so its own appointment_inbound never arrives (the bit
+  // is never relayed), and the raw term alone would go blind on exactly the
+  // peers the door newly admits. peerReportsInboundToAppointment closes that
+  // gap with the bridge's one-hop report: the closure expands exactly one hop
+  // through a direct bridge, the bridge hears that hop first-hand, so veto
+  // coverage equals door admission on the CLOSURE channel at every N. A
+  // three-hop straggler is already excluded by the door's own count. The
+  // count's `finished` disjunct is the one admission neither veto covers —
+  // the accepted residual noted in reachablePeerCount.
+  //
+  // RELEASING WEAKER THAN THE ARM IS SAFE HERE AND ONLY HERE. The five-site
+  // rule (see the arming site) exists because gen 18/19 ratcheted when the
+  // sites disagreed — but both ratchets ran through the LATCH: the arm can
+  // only re-fire once rendezvous_spent_ clears, and that clear still requires
+  // the strict dwelt teamSettled on the heartbeat. A closure-released team
+  // that is still mesh-broken therefore CANNOT re-arm until a genuine
+  // reunion; it goes back to exploring, which is what the release is for.
+  return appointment_manoeuvre_
+             ? ((teamSettled(live_peers) ||
+                 teamComplete(reachablePeerCount(), rendezvous_expected_peers_)) &&
+                !peerInboundToAppointment() &&
+                !peerReportsInboundToAppointment())
+             : teamComplete(live_peers, rendezvous_expected_peers_);
+}
+
 void ExploPlannerNode::refreshRendezvousSnapshot() {
   if (!rendezvous_schedule_enable_) return;
   if (!cell_world_.configured()) return;
-  // The copy is the point (see rendezvous_world_). It is a grid of cells and
-  // a distance matrix, taken at most once per heartbeat and only while the
-  // team is complete, so its cost is bounded and it is off the PLAN path.
+  // ONE REFRESH PER PROPOSAL PERIOD, not one per heartbeat. The copy below is
+  // a CellWorld — a cell grid AND the mutable all-pairs distance matrix it
+  // memoises — so at coord_heartbeat_hz=1 this was a full matrix copy every
+  // second for the whole run, on the single-threaded executor, to feed an
+  // argmin that only runs every rendezvous_proposal_period_sec_.
+  //
+  // The period is shared with the derive deliberately. The two clocks are
+  // phased independently, so the bound is one period, not one heartbeat — the
+  // argmin can read a snapshot up to rendezvous_proposal_period_sec_ old. That
+  // is the same bound the proposal itself already carries, so sharing the
+  // number means there is no second staleness to reason about, and 30 s of
+  // drift in a meeting cell is well inside what the wait absorbs.
+  // Followers refresh on the same clock even though
+  // they never solve, because appointmentTravelMs and appointmentPoint read
+  // this world during the outage and a follower that never refreshed would
+  // have no grid to cost its drive against.
+  const double t_snap = missionElapsed();
+  if (have_rendezvous_snapshot_ && t_snap >= 0.0 &&
+      rendezvous_snapshot_at_sec_ >= 0.0 &&
+      (t_snap - rendezvous_snapshot_at_sec_) < rendezvous_proposal_period_sec_) {
+    return;
+  }
   rendezvous_world_    = cell_world_;
   // UNBOUNDED (0), and here the TTL could not bite even if it were passed: the
   // snapshot is refreshed ONLY while the whole team is in comms (see the
@@ -7495,6 +10720,1093 @@ void ExploPlannerNode::refreshRendezvousSnapshot() {
   have_rendezvous_snapshot_   = true;
   rendezvous_snapshot_at_sec_ = missionElapsed();
 }
+
+ExploPlannerNode::RendezvousProposal
+ExploPlannerNode::deriveRendezvousProposal() {
+  rendezvous_held_provenance_ = RendezvousProvenance{};
+  RendezvousProposal out;
+  if (!have_rendezvous_snapshot_) return out;
+  // The origin the published instant is measured from. Refused rather than
+  // defaulted: a negative mission clock means this node has not ticked live
+  // yet, and an appointment stamped in a frame that does not exist yet is one
+  // the peers would evaluate against a different zero.
+  const double t_derive = missionElapsed();
+  if (t_derive < 0.0) return out;
+
+  // The allocation the schedule is inserted into. Solved HERE over the frozen
+  // snapshot rather than reused from doPlan's live solve: doPlan solves the
+  // world as it is now, which is the right problem for this robot's next hop
+  // and the wrong one for a value that has to describe the whole team.
+  const Allocation alloc = GlobalAllocator::solve(
+      rendezvous_world_, rendezvous_vehicles_, alloc_cfg_);
+
+  RendezvousScheduler::Config cfg = rzv_cfg_;
+  // NO EXCLUSIONS. The no-show write-off was a per-robot list, and a per-robot
+  // input to a value the whole team has to share is exactly what gen 9 got
+  // wrong. It cannot come back as a shared input either: the team would have
+  // to agree on the write-offs first, which is the same agreement problem one
+  // level down.
+  cfg.exclude.clear();
+  // THE DIVERGENCE CAP IS GONE, and that part is structural rather than a
+  // choice: it was fed by min_share / (my_rate + peer_rate) from the
+  // LAST-CONTACT record, a quantity that by definition does not exist yet at
+  // proposal time, because the proposal is derived while everyone is still
+  // connected. The pairwise rate sum does not survive N>2 either.
+  //
+  // THE SAME FIELD NOW CARRIES THE FINDABILITY BOUND (2026-09-17). The
+  // inequality survives generation 19 but its SUBJECT CHANGED, and the change
+  // is easy to miss because the arithmetic is untouched. It used to read
+  // `recurrence period <= barrier wait`: a robot arming too late for occurrence
+  // k drove to k+1 and was at most one period behind peers still standing
+  // there. Under generation 20's countdown there were no occurrences at all,
+  // and the same comparison asked `the furthest robot's drive <= barrier wait`
+  // — because after the reachability floor that is what `interval_ms` IS — i.e.
+  // can the last robot to set off get there before the ones already waiting
+  // give up.
+  //
+  // GENERATION 23 PUTS THE OCCURRENCES BACK and the ORIGINAL reading is the
+  // live one again: arming keeps the first agreed occurrence this robot can
+  // still reach (nextAgreedOccurrence), so a robot that arms only after
+  // occurrence k has passed — or too close to it to arrive — really does drive
+  // to k+1, exactly as the pre-19 sentence describes. Both readings want the same
+  // number, which is why the arithmetic never moved. Feeding the barrier's own
+  // parameter in keeps the two sides of it one constant rather than two that
+  // drift apart in a yaml.
+  //
+  // A wait cap of 0 means "wait forever" at the barrier and maps to an uncapped
+  // interval here, under either reading: if nobody ever leaves, every arrival
+  // is in time. So the sentinel needs no special case.
+  //
+  // WHAT THE CAP DOES: it shapes the agreed integer and sets `capped`. Under
+  // generation 23 the interval is load-bearing again — it is the spacing
+  // between occurrences, so it decides how long a robot that misses one waits
+  // for the next, and it caps hybrid's chase window — which since generation
+  // 29 ends not at the next agreed occurrence but at the moment this robot
+  // must LEAVE for it, i.e. one marked-up drive earlier. The window is
+  // therefore `interval` minus the robot's lead plus whatever the rung roll
+  // gives back, and it can be negative: a robot that has to depart the instant
+  // it arms does not chase at all. Sizing this cap is sizing that window.
+  // A capped `interval_ms` still understates the furthest drive, so
+  // read `tour_interval_ms`, which is logged uncapped beside it, before drawing
+  // any distance conclusion from the interval.
+  //
+  // IT IS THE APPOINTMENT BARRIER'S WAIT, NOT THE MID-RUN RECONNECT WAIT
+  // (2026-09-19). This read reconnect_midrun_max_wait_sec until generation 29,
+  // and the note here used to warn against merging the two without re-deriving
+  // which one the cap belongs to. Re-derived: the robots this bound is about
+  // are the ones ALREADY STANDING at the agreed cell when a straggler arrives
+  // at the next occurrence, and doReturnSync spends
+  // rendezvous_appointment_wait_sec on them — the mid-run wait is what a
+  // PURSUIT reunion spends, and no pursuit ever consults this schedule. Feeding
+  // the wrong barrier in was survivable while it was the larger of the two; it
+  // stops being survivable at a 300 s timetable, where a 240 s cap can no
+  // longer cut the interval (the reachability floor outranks it) and so does
+  // nothing but raise the broken-inequality WARN below on every single derive,
+  // about a barrier that does not give up.
+  //
+  // SO THE CAP IS INERT WHENEVER THE APPOINTMENT WAIT IS UNBOUNDED, `capped`
+  // with it, and that is said out loud at startup rather than left for an
+  // analyst to discover as a column of zeroes — see the parameter's own
+  // validation. Inert is the correct state here: a barrier nobody walks away
+  // from cannot be outrun, so there is no interval long enough to break the
+  // inequality. Configure a finite rendezvous_appointment_wait_sec and both the
+  // cap and the column come back to life.
+  cfg.max_interval_ms =
+      static_cast<long long>(rendezvous_appointment_wait_sec_ * 1000.0);
+  // THE FLOOR IS THE TEAM'S OWN CENTROID, and it is what makes "always agree a
+  // place beforehand" true rather than aspirational.
+  //
+  // The floor used to be the midpoint of the LAST-CONTACT pose pair, and that
+  // quantity does not exist at proposal time — the proposal is derived while
+  // everyone is still connected, so there is no last contact to take a midpoint
+  // of. Passing -1 instead was the obvious reading, and it cost the ts4 smoke an
+  // entire arm: the only refusal the N=4 rung logged was "the tours are empty
+  // and the last-contact midpoint is outside the ROI". The team was mutually
+  // whole for about two seconds, the allocator had not produced a tour yet, the
+  // candidate set was therefore EMPTY, and the run continued for another 578 s
+  // with no appointment at all.
+  //
+  // The centroid of the snapshot's own vehicle cells is the same KIND of
+  // quantity the midpoint was — a place defined by where the team is, not by
+  // where the map says it should go — and unlike the midpoint it exists exactly
+  // when it is needed: at proposal time, while everyone is in contact and their
+  // positions are seconds old. It generalises to any N (the midpoint did not),
+  // it comes out of the frozen shared snapshot rather than anything private,
+  // and a rectangular ROI is convex so a centroid of in-ROI points is in-ROI.
+  //
+  // What it buys is that the candidate set is NEVER empty while a locatable
+  // robot exists, so the refusal above cannot recur. What it costs is that the
+  // team may agree to meet somewhere no tour goes — which is precisely the
+  // trade a fixed rendezvous makes, and `floor_won` records every time it did.
+  int floor_cell = -1;
+  {
+    double sx = 0.0, sy = 0.0;
+    int    n  = 0;
+    for (const AllocRobot& v : rendezvous_vehicles_) {
+      if (!rendezvous_world_.grid().valid(v.cell)) continue;
+      float cx = 0.0f, cy = 0.0f;
+      rendezvous_world_.grid().centre(v.cell, cx, cy);
+      sx += cx; sy += cy; ++n;
+    }
+    if (n > 0) {
+      floor_cell = rendezvous_world_.grid().idAt(
+          static_cast<float>(sx / n), static_cast<float>(sy / n));
+      // Convexity says this cannot happen; if the grid ever stops being a
+      // rectangle it will, and standing on somebody's own cell is a meeting
+      // point where a -1 is the empty candidate set all over again.
+      if (!rendezvous_world_.grid().valid(floor_cell)) {
+        for (const AllocRobot& v : rendezvous_vehicles_) {
+          if (rendezvous_world_.grid().valid(v.cell)) { floor_cell = v.cell; break; }
+        }
+      }
+    }
+  }
+
+  // THE TIMETABLE FLOOR. The scheduler already floors the interval at the
+  // furthest robot's DIRECT drive, which is the physics; this second floor is
+  // the policy — how far apart we want the rungs to be irrespective of how
+  // close together the team happens to be standing.
+  //
+  // IT BOUNDS A SCHEDULE AGAIN. Generation 19 removed the recurrence and left
+  // this bounding nothing but a logged integer; generation 23 put the
+  // occurrences back, so the number is once more the gap a robot that misses
+  // one waits for the next, and generation 29 makes it the size of hybrid's
+  // chase window too. See rendezvous_interval_sec_ for what that costs at 30 s.
+  //
+  // Read here rather than baked into rzv_cfg_ at construction because it is a
+  // parameter a campaign varies per arm, and every robot reads the same
+  // fleet-wide value — which is only a tidiness argument now, since the
+  // proposer is the only node that solves and the other two integers are
+  // adopted verbatim regardless.
+  cfg.min_interval_ms =
+      static_cast<long long>(rendezvous_interval_sec_ * 1000.0);
+
+  // THE REAL MISSION CLOCK, not the 0 this used to pass. The plan's t_meet is
+  // now an absolute mission-elapsed instant that goes on the wire and is
+  // adopted verbatim, so the origin has to be the frame every robot in the
+  // fleet evaluates in. Passing 0 here was what made the appointment
+  // origin-free and forced each robot to supply its own origin at arming time
+  // — the defect this replaces.
+  rendezvous_held_provenance_.plan = RendezvousScheduler::solve(
+      rendezvous_world_, rendezvous_vehicles_, alloc, floor_cell,
+      static_cast<long long>(t_derive * 1000.0), cfg);
+  // Stamped HERE, from the snapshot the solve above actually read, so the
+  // hashes on the eventual event name the world the argmin ran over rather
+  // than whichever refresh happened last. See RendezvousProvenance.
+  rendezvous_held_provenance_.shared_hash    = rendezvous_world_.sharedHash();
+  rendezvous_held_provenance_.grid_hash      = rendezvous_world_.grid().configHash();
+  rendezvous_held_provenance_.derived_at_sec = rendezvous_snapshot_at_sec_;
+
+  if (!rendezvous_held_provenance_.plan.valid()) return out;
+  if (rendezvous_held_provenance_.plan.t_meet_ms < 0) return out;
+
+  // THE FINDABILITY INEQUALITY, CHECKED RATHER THAN ASSUMED. Reaching here
+  // means the agreed interval came out longer than the barrier is willing to
+  // stand there: the early arrivals wait out the cap and leave while the last
+  // robot is still en route, and the log records a no-show for a meeting
+  // nobody was late to.
+  //
+  // KEYED ON THE INEQUALITY, NOT ON THE FLAGS, and that is not a stylistic
+  // choice. `capped` asks whether the cap cut the TOUR term, so a cap that
+  // sits above the tours and below the lattice floor overrules the barrier
+  // while reporting nothing — since generation 29 that is the common case,
+  // because the floor is a 300 s policy number rather than a drive. Reading
+  // `capped` here would have made this branch silent exactly where it matters.
+  // The two flags are printed below so the line says WHICH term won.
+  //
+  // IT IS THE APPOINTMENT BARRIER (2026-09-19), which inverts the note that
+  // stood here. The cap was derived from `reconnect_midrun_max_wait_sec` and
+  // this warn was therefore a statement about mid-run reconnect attempts rather
+  // than about the scheduled meeting — a warn about the wrong barrier, fired
+  // from the site that shapes the right one. It now reads
+  // `rendezvous_appointment_wait_sec`, so the sentence it prints is about the
+  // robots it names, and the campaign's 0 makes the whole branch unreachable
+  // rather than chronically true: there is no interval long enough to outrun a
+  // barrier that never ends. Configure a finite appointment wait and this comes
+  // back.
+  //
+  // It is still the honest outcome, because the alternative is worse — cutting
+  // the interval below the drive would only make the number smaller, not the
+  // robot faster — but it is not one to discover in a post-hoc analysis, so it
+  // is said once, here, where the numbers are.
+  if (cfg.max_interval_ms > 0 &&
+      rendezvous_held_provenance_.plan.interval_ms > cfg.max_interval_ms) {
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous: the agreed interval is %.0fs but the barrier only waits "
+        "%.0fs — a robot setting off last is NOT guaranteed to find anyone "
+        "still there, and will be logged as a no-show. Held at the floor "
+        "anyway (furthest robot's drive %.0fs, floored=%d): a shorter interval "
+        "does not shorten the drive.",
+        rendezvous_held_provenance_.plan.interval_ms / 1000.0,
+        cfg.max_interval_ms / 1000.0,
+        rendezvous_held_provenance_.plan.tour_interval_ms / 1000.0,
+        static_cast<int>(rendezvous_held_provenance_.plan.floored));
+  }
+
+  out.cell        = rendezvous_held_provenance_.plan.cell;
+  out.interval_ms = rendezvous_held_provenance_.plan.interval_ms;
+  out.t_meet_ms   = rendezvous_held_provenance_.plan.t_meet_ms;
+  return out;
+}
+
+void ExploPlannerNode::maintainRendezvousProposal(bool team_mutual) {
+  if (!rendezvous_schedule_enable_) return;
+  // Pure pursuit has no agreed meeting point BY DESIGN — that absence is the
+  // A/B against hybrid. Returning here keeps the arm's wire traffic honest as
+  // well as its behaviour: a pursuit robot publishes no proposal, so a mixed
+  // fleet cannot accidentally commit a pair half of it will never keep.
+  if (reconnect_mode_ == ReconnectMode::PURSUIT) return;
+  // THE SNAPSHOT GATE MOVED DOWN, ONTO THE DERIVE (2026-09-17). It used to sit
+  // here and stop the whole function, which quietly re-imposed the mutual-
+  // contact gate on the ECHO path that the declaration above says it must not
+  // take: have_rendezvous_snapshot_ is only ever set inside the rzv_mutual guard
+  // on the heartbeat, so a follower whose own heartbeat never landed inside the
+  // team's mutual window could not adopt, could not echo, and therefore starved
+  // EVERY robot's commit — the whole-fleet failure, at the same choke point this
+  // change exists to widen. At N=4 that window was about two seconds against a
+  // 1 Hz heartbeat with documented overruns, so one late tick was enough.
+  //
+  // AND THAT WINDOW IS NOT RADIO-LIMITED, which is the part worth acting on.
+  // Measured on the banked ts4 N=4 rendezvous cell's link_states.csv, all six
+  // pairs are simultaneously connected from t_sim 5.0 s to 46.4 s — a 41.4 s
+  // full mesh — and then never again for the remaining ~600 s of the run. The
+  // node's own rendezvousTeamMutual() recognised about two seconds of those
+  // 41.4. The two numbers are different quantities and do not contradict each
+  // other (one is the emulator's link truth, the other is received-intent
+  // freshness sampled on the heartbeat), but the GAP between them is the whole
+  // diagnostic: at N=4 the derive is starved by how the node reads contact, not
+  // by how long the team has it. Relaxing the gate to spanning connectivity
+  // does NOT recover it — the same file gives only 10.2% spanning against 6.4%
+  // full mesh, and after t=46.4 s just 4% of the run — so the lever is intent
+  // freshness inside the one early window, not a weaker topology test.
+  //
+  // Only deriveRendezvousProposal reads the snapshot; adopting, echoing and
+  // committing are arithmetic on three integers that arrived over the wire. So
+  // the gate belongs on the one branch that needs it, where a proposer without a
+  // snapshot simply does not derive this tick and still commits normally.
+  const double t = missionElapsed();
+  if (t < 0.0) return;
+  if (static_cast<int>(rendezvous_peer_.size()) != fleet_.size()) return;
+  if (static_cast<int>(rendezvous_peer_at_sec_.size()) != fleet_.size()) return;
+  if (static_cast<int>(rendezvous_peer_confirmed_.size()) != fleet_.size()) return;
+  // THE FOURTH PARALLEL VECTOR, ADDED 2026-09-18. The three above were checked
+  // and this one was not, while the function indexes it unconditionally
+  // (rendezvous_peer_provisional_[kRendezvousProposerId] below, and the write
+  // in the commit path). It is unreachable today only because all four are
+  // resized together in one block, which is a property of the CALLER — the
+  // guard existed to stop depending on that, and by omitting one vector it was
+  // reporting an invariant it had not checked. A guard that covers three of
+  // four is worse than no guard: it reads as proof.
+  if (static_cast<int>(rendezvous_peer_provisional_.size()) != fleet_.size()) return;
+  // A one-robot fleet would pass the commit loop VACUOUSLY — no peers to be
+  // stale, no peers to disagree, on_pair == 0 == fleet_.size()-1 — and commit a
+  // pair nobody else is holding, logging peers_on_pair = 0 on an armed row. It
+  // is a nonsense config (there is no one to meet) rather than a reachable one,
+  // but the commit rule is the single thing standing between this robot and a
+  // private appointment, so it does not get to pass by having no work to do.
+  if (fleet_.size() < 2) return;
+
+  const bool proposer = (fleet_.self_id == kRendezvousProposerId);
+
+  // WHY BOTH PROPOSER GATES LIVE INSIDE THE BRANCH BELOW, AND NOT OUT HERE.
+  //
+  // They used to be two early returns at this point in the function, above the
+  // latch and the commit. The commit rule then described itself as symmetric —
+  // "one rule, so no robot can reach a conclusion the others cannot" — while
+  // being nothing of the kind: on a FOLLOWER the latch and the commit ran every
+  // tick, and on the PROPOSER they were skipped entirely whenever the team was
+  // not mutually whole, and skipped FOREVER once an agreement existed. Two
+  // effects, both bad. The proposer could not latch an echo that arrived a tick
+  // after the team went incomplete — exactly the tick its followers were
+  // echoing on — so the robot that chose the pair was the last to be able to
+  // conclude the team held it. And with the second gate above the latch, the
+  // proposer's latch array froze at the instant of agreement, so any later
+  // recount ran on stale entries.
+  //
+  // Moving them in makes the sentence true rather than aspirational: everything
+  // from the latch down is now reached by every robot on every tick, and the
+  // ONLY thing the proposer does that a follower does not is derive.
+  //
+  // DERIVING is the step that must predate the separation, so it keeps the
+  // whole-team gate. The snapshot it solves over is only refreshed under the
+  // same condition, so a derive without it would re-solve a frozen world and
+  // return the same pair anyway — but it would also let the proposer issue a
+  // NEW generation mid-outage, which is the one thing that could split the
+  // fleet across two pairs. Refused structurally rather than relied upon.
+  //
+  // ONE PAIR PER MEETING (2026-09-19). Once a place and a time exist, the
+  // proposer stops deriving and that pair stands until the team has actually
+  // KEPT it: the barrier gathers everyone, the settle exchanges maps, and the
+  // release raises `rendezvous_reagree_due_`, which is the only other thing
+  // that re-opens this branch. It used to stand for the whole mission, which
+  // meant the meeting place was chosen from the thinnest tours the run would
+  // ever have and was never revisited no matter how much map arrived after it.
+  //
+  // Expressed as `!rendezvous_held_.valid()` — the condition the invariant
+  // actually needs — and not as the old `!rendezvous_agreed_.valid()`. The two
+  // differ in the window between holding a pair and the team confirming it,
+  // and the old form let the proposer re-derive inside that window, which is
+  // the one place a second generation could still be born. It also retires a
+  // dead term: the derive used to be gated on `due && (none_yet || confirmed)`
+  // where `confirmed` meant `rendezvous_agreed_ == rendezvous_held_`, and with
+  // the agreed-gate above it that disjunct was unreachable — it could only be
+  // true when rendezvous_agreed_ was valid, and a valid rendezvous_agreed_ had
+  // already returned. A condition that cannot change an outcome reads like a
+  // second chance to derive and is not one.
+  //
+  // This single condition is also what the confirmation latch's soundness rests
+  // on. The latch records "peer p was HEARD holding this triple" and is never
+  // aged out, so it is only safe while a peer's published triple cannot walk
+  // somewhere a standing latch would misrepresent.
+  //
+  // THE PERMITTED TRANSITIONS ARE empty -> P -> R -> R' -> ..., with P
+  // provisional and each R final for the one meeting it schedules. No triple
+  // here is terminal any more, so the latch cannot rely on being uncontradicted
+  // and does not: it clears explicitly on first-hand evidence of a peer holding
+  // something else, and the comparison that counts agreement is against
+  // `rendezvous_held_` rather than against any remembered generation, so the
+  // instant this robot moves to R' every latch still naming R stops matching —
+  // for free, on the next tick, with nothing to age out.
+  //
+  // WHAT THAT COSTS, stated plainly: a follower that misses R' keeps R, and if
+  // it never hears the proposer again the fleet keeps two appointments. That is
+  // the same exposure the upgrade exception already carries, contained the same
+  // way (WHAT ACTUALLY CONTAINS IT, below). The difference is in the evidence
+  // each one is authored on. The upgrade fires on `team_mutual`, a claim about
+  // the last few seconds that has measurably been wrong — see the 0.6 s case
+  // below. A re-agreement fires only where the barrier has just released,
+  // which means every expected peer was present and reachable at that instant:
+  // the strongest evidence of a whole fleet this node ever holds.
+  //
+  // It used to re-derive every rendezvous_proposal_period_sec_, and every
+  // re-derive opened a commit race: the proposer publishes generation N+1, the
+  // followers adopt and commit it one TeamWorld period later, and the proposer
+  // cannot commit until it sees those echoes a further period after that. For
+  // the round trip in between, the fleet genuinely holds two different pairs.
+  // That was harmless while arming waited for the silence gate — the race was
+  // long over by the time anyone looked — but arming now happens at the
+  // separation itself, so a separation landing inside that window arms a
+  // SPLIT fleet. Measured on a 2-robot cell: three outages, two agreed exactly
+  // (cells 57/57 and 27/27, anchors 0.5 s apart), and the third had one robot
+  // on cell 56 at t+28 s and the other on cell 57 at t+88 s. It waited at the
+  // agreed place; its partner waited at a different agreed place; the run
+  // recorded a no-show against an appointment both had kept faithfully.
+  //
+  // Deriving only at the instants above removes that failure mode rather than
+  // shrinking its window. A new generation can be born in exactly two places:
+  // before the fleet has ever separated, and at a barrier that does not release
+  // until every expected peer is present. Neither is a separation, so there is
+  // nothing for a generation to be split across. What remains is the anchor
+  // skew, which moves t_meet but never the CELL, so the worst case degrades
+  // from "two robots wait in two places" to "two robots wait in the same place
+  // a few seconds apart", and the barrier wait absorbs that.
+  //
+  // The FIRST pair is still chosen early, from thin tours, and it is still the
+  // literal reading of a fixed rendezvous: the place and the time are agreed
+  // BEFOREHAND, while the team is together, and are never renegotiated by
+  // robots that can no longer talk to each other. What changed is only that
+  // "together" now also means the team standing at an appointment it kept, and
+  // not just the team standing on the start line.
+  //
+  // THE OTHER EXCEPTION (2026-09-17) is `rendezvous_held_provisional_`, and every
+  // word above still applies to it: see that member for why a pair derived
+  // before any tour existed is not the pair this invariant is protecting, and
+  // for the exact bound on how often it can be replaced (once, only by a pair
+  // that had a choice to make, only while the team is mutually whole).
+  //
+  // CONFINING THAT EXCEPTION TO THE PRE-MISSION HOLD WAS TRIED ON 2026-09-17
+  // AND WITHDRAWN THE SAME DAY. The conjunct was `&& missionElapsed() <
+  // mission_start_hold_sec_` on the branch below. Read the next forty lines
+  // before re-adding it, because it is the obvious fix and it is wrong.
+  //
+  // THE DEFECT IT WAS AIMED AT IS REAL. The bound above — once, and only while
+  // mutually whole — is not enough, because `team_mutual` is a claim about the
+  // last few seconds rather than about the next few. In ts4 smoke20's N=3
+  // hybrid cell the proposer authored the upgrade 0.6 s after its last peer had
+  // gone silent: mutual was still reading true off a tolerance window that had
+  // not expired yet. The peer never received the upgrade, armed on the
+  // placeholder it had committed 26 s earlier, and the fleet kept two exact
+  // appointments in two different cells for the remaining 400 s of the run.
+  //
+  // WHY THE HOLD CANNOT BE THE CURE. The upgrade fires when the argmin has more
+  // than one admissible cell to choose between, and the candidate pool is the
+  // union of GlobalAllocator's tours, which are built only over cells in
+  // EXPLORING/EXPLORING_BY_OTHERS. A robot parked in WAIT_FOR_MAP completes
+  // zero steps and therefore grows no such cells. Measured over every banked
+  // cell that carries agreed_provisional (5 campaigns, 10 cells, 28 robot-runs,
+  // 58 rendezvous_agreed rows):
+  //
+  //   first NON-provisional commit, step counter at that commit
+  //     min 2, and 2 only at N=3; the distribution is {2,3,6,7,8}
+  //     no upgrade anywhere in the corpus was ever authored at step 0 or 1
+  //
+  // and on EVERY provisional commit the proposer's own provenance reads
+  // `candidates=1, rejected_unreachable=0, rejected_excluded=0` — the pool was
+  // EMPTY, not filtered. Nothing was rejected because nothing was offered. So
+  // the failure during a hold is not that co-located robots cannot reach the
+  // candidates; it is that there are no candidates to reach. Co-location, which
+  // is the one thing the hold manufactures, is not the binding constraint.
+  //
+  // A hold therefore does not DELAY the upgrade, it DELETES it: the branch
+  // below is the only site that ever clears rendezvous_held_provisional_, so a
+  // window that closes before the first non-provisional derive leaves the pair
+  // provisional for the rest of the run. Both scheduled arms would then measure
+  // "meet at the team's initial centroid" while passing every unanimity check,
+  // because a fleet that unanimously agrees a placeholder is still unanimous.
+  // Two banked upgrades that the confinement would have rejected outright:
+  // smoke18_n2 hybrid at t=311.1 s and smoke20_n3 rendezvous at t=353.6 s, both
+  // more than 250 s after the provisional they replaced.
+  //
+  // WHY NOT TIGHTEN THE LIVENESS TEST INSTEAD. Because it only shrinks the
+  // window. Any tolerance leaves a last instant at which the proposer believes
+  // the team is whole and it is not, and an upgrade authored in that instant
+  // splits the fleet.
+  //
+  // WHY NOT REQUIRE AN ECHO ROUND FOR THE UPGRADE, as the provisional pair
+  // requires. Also tried on 2026-09-17, also withdrawn: at N>=3 each FOLLOWER
+  // then waits on the OTHER FOLLOWERS' echoes, over follower-to-follower links
+  // this radio regime need not provide, and the measured result was a proposer
+  // that committed while its followers did not — the same split, with the
+  // proposer on the far side of it.
+  //
+  // WHAT ACTUALLY CONTAINS IT, and it is containment rather than a fix: the
+  // proposer keeps re-deriving for as long as the pair is provisional, and
+  // publishTeamWorld re-broadcasts the held pair every cycle to whoever can
+  // hear it. So a follower that misses the upgrade adopts it the next time the
+  // link comes back, and the disagreement is transient rather than permanent
+  // unless the two never speak again. That is the honest statement of this
+  // mechanism's guarantee. Committing one value atomically across a fleet that
+  // can partition mid-round is Two Generals and has no solution; what is
+  // achievable is eventual convergence under re-broadcast, and that is what
+  // this is. The rendezvous_agreed comms gate still reports any split that
+  // outlives the run.
+  if (proposer && team_mutual && have_rendezvous_snapshot_ &&
+      (!rendezvous_held_.valid() || rendezvous_held_provisional_ ||
+       rendezvous_reagree_due_)) {
+    // THE PERIOD GATES THE ATTEMPT, NOT THE SUCCESS, and that distinction is
+    // the whole content of this block now that the branch condition carries
+    // one-pair-per-meeting. Almost every tick that reaches here has no usable
+    // pair at all, so without pacing a run with nothing derivable yet — the
+    // normal state until the allocator has tours — would run a full
+    // GlobalAllocator::solve on every single heartbeat, for as long as that
+    // lasted, on the executor whose starvation this file spends a hundred lines
+    // accounting for. The first attempt is still immediate, because
+    // rendezvous_held_at_sec_ is negative until one has been made.
+    //
+    // BOOTSTRAP FASTER THAN STEADY STATE. The team is co-located and in full
+    // mutual contact for the first seconds of every run, and that is the one
+    // window in which agreement is free — the whole point of agreeing a place
+    // and a time BEFOREHAND. But the first derive attempt almost always
+    // refuses, because GlobalAllocator has no tours to insert a meeting cell
+    // into yet, and a refusal stamps the period clock just as a success does.
+    // At the steady-state period that pushes the first real attempt a full
+    // rendezvous_proposal_period_sec_ out, by which time an N>=3 fleet has
+    // dispersed and may not be mutually whole again for the rest of the run.
+    //
+    // So: retry on a short period until a pair actually exists. Bounded on both
+    // ends — it is never per-heartbeat (the executor-starvation bug this pacing
+    // exists to prevent), and the branch condition stops it dead the moment a
+    // pair exists. There is still no steady-state branch: between meetings the
+    // proposer never returns here, so rendezvous_proposal_period_sec_ only
+    // serves as a ceiling on the retry for anyone who configures it below the
+    // default. A re-agreement re-enters on the same short period, which is what
+    // it wants — the team is gathered and mutually whole, and every second
+    // spent retrying is a second the barrier holds everyone standing still.
+    const double derive_period =
+        std::min(kRendezvousBootstrapPeriodSec, rendezvous_proposal_period_sec_);
+    const bool due = rendezvous_held_at_sec_ < 0.0 ||
+                     (t - rendezvous_held_at_sec_) >= derive_period;
+    if (due) {
+      // Stamped BEFORE the solve and on both outcomes: the period measures
+      // time since the last DERIVATION ATTEMPT. Stamping only on success is
+      // what let the refusal path spin.
+      rendezvous_held_at_sec_ = t;
+      // SAVED BECAUSE THE DERIVE CLOBBERS IT. deriveRendezvousProposal resets
+      // rendezvous_held_provenance_ before it solves, so an attempt this block
+      // declines to adopt would leave the provenance describing a search whose
+      // answer nobody is holding — the "refused re-derive" failure mode
+      // documented on RendezvousProvenance, reached by the other door.
+      const RendezvousProvenance prev_prov = rendezvous_held_provenance_;
+      const RendezvousProposal p = deriveRendezvousProposal();
+      if (p.valid()) {
+        // PROVISIONAL means the argmin had nothing to choose between: the
+        // allocator had produced no tour, so the only admissible cell was the
+        // centroid fallback deriveRendezvousProposal always supplies. Keepable,
+        // but not a decision — see rendezvous_held_provisional_.
+        const bool now_provisional = rendezvous_held_provenance_.plan.candidates <= 1;
+        // ONE PAIR PER MEETING: adopt when nothing is held, when a provisional
+        // pair can be upgraded to a final one, or when the team has just kept
+        // the standing pair and is owed the next one. All three replacements
+        // carry `!now_provisional` because the centroid fallback is what the
+        // argmin returns when it had nothing to choose between, so adopting it
+        // over a tour-informed pair would trade a decision for a placeholder —
+        // and for a re-agreement that guard is what stops a barrier release
+        // that happens to catch the allocator empty from throwing away a good
+        // pair and sending the team back out aimed at its own centroid.
+        const bool adopt = !rendezvous_held_.valid() ||
+                           ((rendezvous_held_provisional_ ||
+                             rendezvous_reagree_due_) && !now_provisional);
+        if (adopt) {
+          if (p != rendezvous_held_) {
+            RCLCPP_INFO(get_logger(),
+                "Rendezvous proposal%s: cell %d, every %.0fs from t+%.0fs "
+                "(penalty %lld mm over %d candidate(s)).",
+                !rendezvous_held_.valid()
+                    ? ""
+                    : (rendezvous_held_provisional_
+                           ? " (upgraded from the centroid fallback)"
+                           : " (re-agreed after the team met)"),
+                p.cell, p.interval_ms / 1000.0, p.t_meet_ms / 1000.0,
+                rendezvous_held_provenance_.plan.penalty_mm,
+                rendezvous_held_provenance_.plan.candidates);
+          }
+          rendezvous_held_             = p;
+          rendezvous_held_provisional_ = now_provisional;
+          // CONSUMED BY THE ADOPTION, NOT BY THE ATTEMPT. A release that lands
+          // on a momentarily empty allocator returns a provisional pair, which
+          // the guard above correctly declines — and if that also cleared the
+          // request, the team would go back out on the pair it had just kept
+          // and the meeting the user asked to be re-sited would not be. Left
+          // set, the 5 s retry above simply asks again, still while everyone is
+          // standing at the agreed cell.
+          //
+          // IT CAN THEREFORE OUTLIVE THE GATHERING, if the links never firm up
+          // into rendezvousTeamMutual before the team disperses, and a later
+          // mutual moment would then author a pair on the weaker evidence the
+          // split-fleet note above is about. That is contained where every
+          // other new generation is contained, and by the same argument: what
+          // the robots DRIVE is rendezvous_agreed_, the commit rule needs every
+          // peer's echo before anything becomes agreed, so a pair authored into
+          // a fleet that has already come apart commits nowhere and the team
+          // keeps the pair it has.
+          rendezvous_reagree_due_      = false;
+        } else {
+          // Holding a provisional pair and this attempt is provisional too —
+          // still no tours. KEEP THE PUBLISHED PAIR RATHER THAN RESTAMPING IT:
+          // the centroid drifts as the robots move, so adopting each new one
+          // would republish a slightly different cell every bootstrap period,
+          // and every republication is a generation the followers have to
+          // re-echo and re-commit. The team would never finish agreeing to
+          // anything. The first fallback is as good as any later one — they all
+          // name the place the team was standing when it had no better idea.
+          rendezvous_held_provenance_ = prev_prov;
+        }
+      } else {
+        // A refused solve leaves the standing pair alone. Dropping a pair the
+        // team has already committed would be strictly worse than keeping it.
+        //
+        // THIS IS NOW AN ABNORMAL OUTCOME. It used to be the normal early-run
+        // answer — no tours to insert into, no floor, nothing admissible — and
+        // the centroid fallback removed exactly that case: a refusal here now
+        // means the snapshot has no locatable robot in it or the world is not
+        // configured, not that the run is young.
+        // THE COUNTS TRAVEL WITH THE REFUSAL. Without them this line cannot
+        // distinguish "no tours yet" from "every tour cell was filtered out",
+        // and those want opposite remedies. It is also, on the evidence of the
+        // ts4 N=4 rung, frequently the ONLY record that an entire arm ran
+        // without a treatment: the derive is gated on team_mutual, which at
+        // N=4 was true for about two seconds, so this fired once and the run
+        // continued for another 578 s with no appointment and every gate
+        // green. A single throttled WARN is not an adequate witness for that,
+        // which is why the campaign gate now fails the cell outright — but the
+        // WARN is what says WHY, so it has to carry the arithmetic.
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+            "Rendezvous proposal: nothing derivable from the frozen snapshot "
+            "(%s; %d candidate(s) survived, %d rejected unreachable, %d "
+            "excluded). Keeping the standing pair.",
+            rendezvous_held_provenance_.plan.refused.empty()
+                ? "no plan" : rendezvous_held_provenance_.plan.refused.c_str(),
+            rendezvous_held_provenance_.plan.candidates,
+            rendezvous_held_provenance_.plan.rejected_unreachable,
+            rendezvous_held_provenance_.plan.rejected_excluded);
+        // RESTORED AFTER THE WARN, NOT BEFORE IT. deriveRendezvousProposal
+        // overwrites the provenance before it solves, so the counts the WARN
+        // above needs are the REFUSED search's — but leaving them in place
+        // would describe a search whose answer nobody is holding, which is the
+        // exact failure mode prev_prov was saved for, reached by the other
+        // door. It became reachable when the derive gate was widened to allow
+        // the one upgrade: before that, a refusal here meant no pair was held,
+        // so there was nothing to misdescribe. If a provisional pair IS held,
+        // the commit below can fire on this very tick and copy the provenance
+        // into rendezvous_agreed_provenance_, where it lands on every armed row.
+        rendezvous_held_provenance_ = prev_prov;
+      }
+    }
+  } else if (!proposer) {
+    // `else if (!proposer)` and not a bare `else`. The branch condition above
+    // is now a conjunction rather than a plain `proposer` test, so a bare
+    // `else` would drop the PROPOSER into the adopt path on every tick it did
+    // not derive on — team incomplete, or a pair already held — and the
+    // proposer would adopt whatever a follower had last echoed at it. That is
+    // circular by construction (the followers are echoing the proposer's own
+    // pair) and would make the pair's origin unprovable the moment anything
+    // else went wrong.
+    //
+    // FOLLOWER: adopt the proposer's pair verbatim. No re-derivation, no
+    // nearest-valid-cell, no "repair" of a cell this robot dislikes — every
+    // one of those is a private input, and a private input is what the whole
+    // change exists to remove. A follower that dislikes the proposer's cell
+    // drives to it anyway: that is the agreement. The only thing it may do is
+    // fail to get there, which the outcome event records as a no-show —
+    // quietly meeting somewhere else is not on the menu, because the peer
+    // would still be standing at the agreed cell.
+    //
+    // Staleness does not clear the held pair. While the team reads complete
+    // the proposer is live by definition, so a gap here is a dropped message,
+    // and forgetting a pair over one drop would churn the whole fleet's
+    // agreement. Staleness bites where it should — the commit test below.
+    // ADOPT ONCE, on the !held.valid() test — the same write-once rule the
+    // proposer's derive branch takes, and for the same reason. The test used to
+    // be `p != rendezvous_held_`, which adopts any pair that DIFFERS from the
+    // one held, so a proposer that restarted mid-run and derived a second pair
+    // would be adopted over a pair this robot's peers have already latched as
+    // confirmed. The fleet would then hold two pairs with no way to tell which,
+    // and the latches would be vouching for the old one. One pair per run has to
+    // be enforced on every path that can write the pair, not just the deriving
+    // one.
+    //
+    // A proposer that does restart is not silently tolerated: it republishes an
+    // empty pair first, the latch-clearing branch below sees it first-hand and
+    // drops the confirmation, and the commit test stops passing. That is the
+    // intended failure — no agreement — rather than a private re-agreement.
+    //
+    // THE ONE UPGRADE, MIRRORED (2026-09-17). This branch has to take the same
+    // exception the proposer's derive gate takes, and it has to take it from the
+    // SAME evidence, which is why `provisional` is on the wire and not just in
+    // the proposer's head. Without it this code was not merely incomplete — the
+    // upgrade could not succeed in ANY interleaving. Either every follower
+    // ERRORed and kept the placeholder while the proposer published an orphan
+    // (the upgrade a structural no-op, plus a permanent ERROR), or, if the
+    // proposer had not yet seen every echo when it re-derived, the proposer
+    // committed nothing at all and refused every arming for the rest of the run
+    // while its followers drove the placeholder without it. The second shape is
+    // the ts4 N=4 arm death reproduced by the code written to fix it.
+    //
+    // NOT GATED ON team_mutual. The proposer's side is, because deriving is the
+    // step that must predate the separation; adopting is not, and gating the
+    // echo path on the whole team being in contact was already a deadlock once
+    // (see the declaration of maintainRendezvousProposal). A follower that hears
+    // the replacement adopts it whenever it hears it.
+    const RendezvousProposal& p = rendezvous_peer_[kRendezvousProposerId];
+    const bool p_prov = rendezvous_peer_provisional_[kRendezvousProposerId] != 0;
+    // THE DECISION ITSELF IS NOT HERE. It is five booleans in, one of four
+    // answers out, and it lives in RendezvousHandshake::adopt where a test can
+    // enumerate all thirty-two inputs — which is the only way anyone was ever
+    // going to notice that the upgrade could not succeed in any interleaving.
+    // What stays here is the ROS half: which message to print, and the writes.
+    using Adopt = RendezvousHandshake::Adopt;
+    const Adopt decision = RendezvousHandshake::adopt(
+        p.valid(), p_prov, rendezvous_held_.valid(),
+        rendezvous_held_provisional_, p == rendezvous_held_,
+        rendezvous_reagree_due_);
+    if (decision == Adopt::kTake || decision == Adopt::kUpgrade ||
+        decision == Adopt::kReagree) {
+      if (decision == Adopt::kReagree) {
+        // SPENT HERE, exactly as the proposer spends its own copy the moment it
+        // adopts. This robot asked for a replacement at the end of its settle
+        // and has just been given one; leaving the flag set would stand the
+        // request open for the rest of the run and turn every later generation
+        // into one this robot accepts unconditionally.
+        rendezvous_reagree_due_ = false;
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous proposal: adopting robot %d's next triple (re-agreed "
+            "after the team met) — cell %d, every %.0fs from t+%.0fs (was "
+            "cell %d at t+%.0fs).",
+            kRendezvousProposerId, p.cell, p.interval_ms / 1000.0,
+            p.t_meet_ms / 1000.0, rendezvous_held_.cell,
+            rendezvous_held_.t_meet_ms / 1000.0);
+      } else if (decision == Adopt::kUpgrade) {
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous proposal: robot %d upgraded off the centroid fallback "
+            "— adopting cell %d, every %.0fs from t+%.0fs (was cell %d).",
+            kRendezvousProposerId, p.cell, p.interval_ms / 1000.0,
+            p.t_meet_ms / 1000.0, rendezvous_held_.cell);
+      } else {
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous proposal: adopting robot %d's triple — cell %d, every "
+            "%.0fs from t+%.0fs%s.", kRendezvousProposerId, p.cell,
+            p.interval_ms / 1000.0, p.t_meet_ms / 1000.0,
+            p_prov ? " (provisional)" : "");
+      }
+      rendezvous_held_             = p;
+      rendezvous_held_provisional_ = p_prov;
+      rendezvous_held_at_sec_      = t;
+    } else if (decision == Adopt::kConflict) {
+      // The proposer is publishing a pair that is not the one we adopted, it is
+      // not the one upgrade, and this robot is not owed a replacement. So it is
+      // a real fault (a restarted proposer, a fleet that disagrees about who
+      // robot 0 is, two campaigns sharing a bus) and it is loud rather than
+      // silently resolved either way.
+      //
+      // THE FLAGS ARE IN THE MESSAGE because they are what separates this from
+      // the legitimate cases above, and the three shapes that land here say
+      // different things: provisional over final is a proposer walking
+      // BACKWARDS, final over final is a generation nobody at this robot asked
+      // for — which since generation 29 means the two sides disagree about
+      // whether the last meeting was kept, not that a second generation is
+      // illegal per se — and provisional over provisional is the centroid being
+      // republished, which the derive side is supposed to make impossible.
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 30000,
+          "Rendezvous proposal: robot %d is publishing cell %d / every %.0fs "
+          "from t+%.0fs (provisional=%d) but this robot already adopted cell "
+          "%d / every %.0fs from t+%.0fs (provisional=%d). This is neither the "
+          "permitted upgrade nor a replacement this robot is owed (it is not "
+          "waiting on one); KEEPING the adopted triple. The commit gate will "
+          "refuse until the fleet agrees again.",
+          kRendezvousProposerId, p.cell, p.interval_ms / 1000.0,
+          p.t_meet_ms / 1000.0, p_prov ? 1 : 0,
+          rendezvous_held_.cell, rendezvous_held_.interval_ms / 1000.0,
+          rendezvous_held_.t_meet_ms / 1000.0,
+          rendezvous_held_provisional_ ? 1 : 0);
+    }
+  }
+
+  // --- latch what the peers have been HEARD to hold ----------------------
+  //
+  // Runs after the adopt branch above on purpose. A follower learns the pair
+  // and records that the proposer holds it on the SAME tick, rather than
+  // waiting a full heartbeat for the next copy of a message it already has.
+  //
+  // rendezvous_peer_[id] is the last pair RECEIVED from that peer and is not
+  // cleared by silence, so this reads "the most recent thing peer id told me",
+  // and the latch turns that into "peer id has at some point told me it holds
+  // exactly the pair I hold".
+  //
+  // WHAT MAKES THAT SAFE TO OUTLIVE ITS FRESHNESS WINDOW. The transitions a
+  // peer's published triple may make are empty -> P -> R -> R' -> ..., where P
+  // is provisional and every R is final (TeamWorld.msg,
+  // rendezvous_provisional), and each step after the first two is one the team
+  // earned by keeping a meeting. A latch can therefore be contradicted by a
+  // later message in two ways — it records P and the peer has upgraded to R, or
+  // it records R and the team has re-agreed past it — and THIS LOOP DROPS IT IN
+  // BOTH, from the peer's own message, on the tick it arrives, because
+  // updatePeerLatch clears on any disagreement rather than on a named
+  // transition. A latch that survives is one no later message has contradicted.
+  //
+  // IT USED TO DROP ONLY ON pair -> empty, and that was a false-commit bug, not
+  // a missed-commit one: the proposer would upgrade P -> R, a follower still
+  // holding P would count its stale P-latch for the proposer, reach fleet-1,
+  // print "Rendezvous AGREED by all" and arm against a triple the proposer does
+  // not hold and can no longer return to. It would then record a no-show
+  // against a peer that was never on that schedule. Committing something false
+  // is strictly worse than committing nothing, and the freshness the commit
+  // rule deliberately does not test is not what was protecting it — first-hand
+  // contradiction is.
+  //
+  // The two-line body is RendezvousHandshake::updatePeerLatch, for the same
+  // reason the adopt decision moved: the clear-then-relatch ORDER is the whole
+  // correctness argument and it is worth a test that does not need a simulator.
+  for (int id = 0; id < fleet_.size(); ++id) {
+    if (id == fleet_.self_id) continue;
+    // NEVER HEARD FROM is not the same as heard-saying-nothing, and only the
+    // second is evidence. A peer whose slot still holds the default-constructed
+    // proposal because no TeamWorld has ever arrived from it must not be read
+    // as having contradicted anything — there is no latch to clear and no
+    // message to clear it with.
+    if (rendezvous_peer_at_sec_[id] < 0.0) continue;
+    RendezvousHandshake::updatePeerLatch(rendezvous_peer_[id],
+                                         rendezvous_held_,
+                                         rendezvous_peer_confirmed_[id]);
+  }
+
+  // --- the commit rule ---------------------------------------------------
+  //
+  // Symmetric on every robot, proposer included: commit when EVERY peer has
+  // been heard holding the same pair this robot holds. On the proposer that
+  // reads "all my followers have echoed"; on a follower it reads "the proposer
+  // said this AND my fellow followers have it too". One rule, so no robot can
+  // reach a conclusion the others cannot.
+  //
+  // The confirmations ACCUMULATE rather than having to coincide. Each peer's
+  // echo is latched into rendezvous_peer_confirmed_ when it is heard, and the
+  // commit counts latches. That is only sound if a latch cannot quietly stop
+  // being true, and the argument for THAT is not "the triple is frozen for the
+  // run" — it is not frozen at all: a peer moves empty -> provisional -> final,
+  // and then to a fresh final after every meeting it keeps. The argument is
+  // that EVERY contradicting transition is announced in the peer's own next
+  // message and the loop directly above drops the latch when it arrives, which
+  // does not care how many transitions there are. See it there, and the N=3
+  // measurement that forced accumulation in the first place at the declaration.
+  //
+  // FRESHNESS IS DELIBERATELY NOT TESTED HERE. It used to be, bounded by
+  // coord_claim_ttl_sec, on the reasoning that "the team is complete" and "the
+  // team is holding a pair" should not be true of different sets of robots.
+  // But those two statements are about different things: completeness is a
+  // claim about NOW, and holding the pair is a claim about a decision the peer
+  // already took and cannot revise. Ageing out the second one discards a fact
+  // that is still true, and at N>=3 it discarded enough of them that nothing
+  // was ever agreed. Liveness still gates everything it should — the anchor,
+  // the derive, the snapshot — just not this.
+  //
+  // MUTUAL CONTACT IS NOT TESTED HERE EITHER, and this is the substantive
+  // half. The old rule took it because a one-way link satisfies freshness, and
+  // committing under one would mean "concluding the team holds a pair my own
+  // echo may never have reached". The latch closes that hole directly instead
+  // of approximating it: a latch is only ever written from a message RECEIVED
+  // from that peer carrying that exact pair, so it is first-hand evidence that
+  // the peer holds it. This robot never infers a peer's state from its own
+  // transmissions, so there is nothing for one-way contact to break. The
+  // symmetric condition still guards the one quantity that genuinely needs
+  // both directions — rendezvous_anchor_time_, which is the shared origin every
+  // t_meet is measured from, and which is still stamped only under
+  // rendezvousTeamMutual().
+  if (!rendezvous_held_.valid()) return;
+  int on_pair = 0;
+  for (int id = 0; id < fleet_.size(); ++id) {
+    if (id == fleet_.self_id) continue;
+    // Scoped to the CURRENT held pair by exact equality, so a latch left over
+    // from a pair THIS robot has superseded does not count, with no clear to
+    // forget. The other direction — a latch left over from a pair the PEER has
+    // superseded — is not covered by this line and never was; it is cleared
+    // explicitly in the loop above, and the difference between the two is a
+    // false commit rather than a missed one.
+    if (rendezvous_peer_confirmed_[id] == rendezvous_held_) ++on_pair;
+  }
+  // Counted and then tested, rather than returning early inside the loop. The
+  // early-return form made this line unreachable-false — the loop could only
+  // fall out with the full count — so the one explicit statement of the rule
+  // ("every peer, not a quorum") was dead, and `rendezvous_agreed_peers_` was
+  // an arithmetic identity rather than a count of anything. It is now the real
+  // gate, and the field below is a number that could have come out lower.
+  //
+  // A FINAL TRIPLE COMMITS ON FIRST-HAND EVIDENCE AND DOES NOT WAIT FOR ECHOES
+  // (2026-09-17). This is the fix for the N=3 SPLIT FLEET, and the measurement
+  // that forced it is worth stating because the obvious reading of that failure
+  // is the wrong one.
+  //
+  //   1789641087.897  atlas   proposal (upgraded from the centroid fallback):
+  //                           cell 73 ... over 25 candidate(s)
+  //   1789641089.539  bestla  robot 0 upgraded off the centroid fallback —
+  //                           adopting cell 73 (was cell 44)
+  //   1789641089.539  husky   robot 0 upgraded off the centroid fallback —
+  //                           adopting cell 73 (was cell 44)
+  //   1789641092.865  atlas   AGREED by all 3 robots: cell 73 (provisional=0)
+  //                           ... and no such line on bestla or husky, ever.
+  //
+  // ALL THREE ROBOTS HELD CELL 73, 1.6 s apart. Nobody was partitioned from the
+  // proposer and nobody was stuck on the placeholder. What split the fleet was
+  // this rule: the proposer heard both echoes and committed, while each FOLLOWER
+  // was waiting on the OTHER FOLLOWER's echo — a follower-to-follower link that
+  // at N>=3 in this radio regime need not exist and here did not. Arming reads
+  // rendezvous_agreed_, so atlas would have driven to cell 73 while bestla and
+  // husky drove to cell 44. A real behavioural split, produced entirely by
+  // demanding evidence that could not change anyone's action.
+  //
+  // WHY THE ECHO ROUND IS THE RIGHT RULE FOR P AND THE WRONG ONE FOR R. The
+  // round exists so that no robot concludes something the others cannot. For a
+  // FINAL triple that is satisfied by construction, from two properties this
+  // protocol already enforces elsewhere:
+  //
+  //   * it is authored by ONE robot (kRendezvousProposerId) and adopted verbatim
+  //     — there are no integers to reconcile, only a value to receive; and
+  //   * final is TERMINAL — RendezvousHandshake::adopt refuses to replace it, so
+  //     a robot holding it will still be holding it at the end of the run.
+  //
+  // So every robot that ever receives R converges on R and stays there, and a
+  // robot that does not receive R is partitioned from the proposer — in which
+  // case no echo was reaching it either. The echo tells you WHO ELSE heard it,
+  // which is a fact the arming rule has no use for.
+  //
+  // THE PARAGRAPH ABOVE IS WRONG, AND IT COST A CELL (corrected 2026-09-17,
+  // generation 22). It is kept rather than deleted because the rule it argues
+  // for is still the rule in force below, and someone will otherwise make the
+  // same argument again.
+  //
+  // What it gets right is that a robot which does not receive R is partitioned
+  // from the proposer. What it slips on is the word "either" — it treats that
+  // robot as harmlessly out of the conversation, when what that robot actually
+  // does is ARM, on the placeholder it committed earlier, and drive to a
+  // different cell. Partition is not silence. The echo does not merely tell you
+  // who else heard it; withholding the commit until every peer has echoed is
+  // what stops the proposer from moving to a generation someone else can never
+  // reach. Under the old rule the proposer could not have committed R at all,
+  // and the fleet would have kept its one agreed placeholder.
+  //
+  // Measured, in ts4 smoke20's N=3 hybrid cell: bestla lost its last peer at
+  // t+65.1 s, the proposer authored R at t+65.7 s, and bestla armed on the
+  // placeholder while atlas and husky armed on R. Two exact appointments, two
+  // cells, 400 s of the run spent waiting in the wrong places.
+  //
+  // THE RULE STAYS ANYWAY, because reverting it restores a different split —
+  // the N=3 follower-to-follower deadlock measured directly above, which is not
+  // hypothetical either. Neither rule is correct on its own, and no rule is:
+  // committing an upgrade atomically across a partitionable fleet is the Two
+  // Generals problem, so every candidate protocol just chooses which robot gets
+  // left behind. Generation 22 tried to change WHEN this may run — confining
+  // the upgrade to the pre-mission hold, while the fleet is co-located — and
+  // that was withdrawn on measurement the same day: the upgrade's input is
+  // completed exploration steps, a held robot completes none, and the
+  // confinement deleted the upgrade instead of scheduling it. See the derive
+  // gate in maintainRendezvousProposal for the numbers.
+  //
+  // SO THIS SPLIT IS NOT CLOSED, it is bounded. The proposer keeps re-deriving
+  // while the pair is provisional and publishTeamWorld re-broadcasts the held
+  // pair every cycle, so a robot that misses an upgrade adopts it when the link
+  // returns; the disagreement lasts as long as the partition does, not as long
+  // as the run. A split that outlives the run is still reported by the
+  // rendezvous_agreed comms gate rather than silently tolerated.
+  //
+  // THE ECHO ROUND IS BACK, FOR EVERY COMMIT AND EVERY N (2026-09-18). The two
+  // paragraphs above are kept because both failures they describe are real and
+  // measured, and someone will otherwise re-derive one of them. What changed is
+  // not the argument, it is the thing being argued about: BOTH of those splits
+  // are splits between a robot on R and a robot on P, and both were harmful
+  // only because P was a placeholder rather than a usable agreement.
+  //
+  //   * P now carries the same three integers R does — cell, t_meet, interval —
+  //     and armAppointment attends the agreed schedule rather than overwriting
+  //     the time with a private countdown. A robot left on P is not stranded on
+  //     "a cell with no meeting"; it holds a complete place and time that the
+  //     whole fleet unanimously committed while it was co-located.
+  //   * A failed upgrade therefore degrades to "the team keeps the agreement it
+  //     already has", which is the correct behaviour for a fixed rendezvous and
+  //     is what the operator asked for in as many words: a predefined time and
+  //     place, agreed before the mission, not renegotiated by robots that can no
+  //     longer all hear each other.
+  //
+  // So the choice the Two Generals framing offers — which robot gets left
+  // behind — is not the choice being made here. Under unanimity NOBODY moves to
+  // a generation the rest of the fleet cannot reach: the upgrade either lands on
+  // everyone or on no one. The deadlock the gen-22 measurement recorded (each
+  // follower waiting on the other follower's echo, over a link this radio regime
+  // need not provide) still happens, and its outcome is now a unanimous fleet on
+  // P instead of a fleet in two places.
+  //
+  // WHAT IT COSTS is the case the note at the derive gate warned about: an
+  // upgrade that never lands leaves both scheduled arms measuring "meet at the
+  // team's initial centroid". That is no longer a silent degradation — the
+  // provisional flag is on the AGREED log line and in the banked row, so a cell
+  // that never upgraded is visible as such.
+  if (on_pair != fleet_.size() - 1) return;
+
+  // Stamped only when the pair CHANGES, so rendezvous_agreed_at_sec_ is the age
+  // of this agreement and not the age of the last re-confirmation of it; a
+  // stamp that refreshed on every heartbeat would report every appointment as
+  // brand new.
+  //
+  // It is REPORTED, never enforced: nothing refuses an old pair, and age is not
+  // a defect to bound. An agreement stamped at t+30 s is exactly as usable at
+  // t+2000 s, because what the team agreed is a PLACE and a RECURRING SCHEDULE
+  // — cell, t_meet, interval — and a schedule does not expire, it rolls forward
+  // (see nextAgreedOccurrence). What this number measures is "how long ago the
+  // team last agreed something", which is a diagnostic, not a validity test. A
+  // threshold here would be a private input deciding not to keep a public
+  // agreement, which is the thing the protocol exists to prevent.
+  //
+  // A SECOND AGREEMENT IS NOT AN ANOMALY. The triple is derived once per run,
+  // but a provisional pair may later be replaced by the tour-informed upgrade,
+  // so a cell with two rendezvous_agreed rows at increasing t is the upgrade
+  // landing rather than a handshake that failed to settle.
+  if (rendezvous_agreed_ != rendezvous_held_) {
+    // THE MESSAGE THE CAMPAIGN GATE GREPS FOR. sim/rendezvous_agreement.py
+    // fails a scheduled cell that never printed this line, so the leading
+    // "Rendezvous AGREED by all" is load-bearing text and not prose, and
+    // sim/rendezvous_agreement_calib.py renders this very format string to
+    // prove the two have not drifted apart.
+    //
+    // THE PROVISIONAL FLAG IS ON THE LINE because a cell where the whole team
+    // committed the centroid placeholder and a cell where it committed a
+    // tour-informed meeting point are measuring different mechanisms, and
+    // without this they are indistinguishable in the banked logs. Both are
+    // valid runs; only one of them exercised the scheduler's argmin. A team
+    // that commits provisional and upgrades later prints this line twice.
+    //
+    // THE MEETING TIME IS BACK ON THIS LINE (2026-09-18, second revision), as
+    // `from t+Ys` appended to the interval rather than as the gen-19 `every Xs
+    // from t+Ys` phrasing — the two carried the same pair of integers and the
+    // gen-19 form is a separate branch of the gate's regex, so reusing it would
+    // make a gen-23 line parse as a pre-gen-20 binary.
+    //
+    // It was dropped the same morning as false, and it was: armAppointment had
+    // been changed to overwrite t_meet with a private countdown, so the line
+    // described a schedule the code did not keep. The countdown is gone and the
+    // schedule is the thing armAppointment attends, so the line is a statement
+    // about behaviour again — and it is the ONLY place the agreed meeting time
+    // reaches the banked text logs, which is what an offline reader needs to
+    // check that two robots armed the same MEETING rather than the same cell.
+    //
+    // THE ECHO COUNT IS REPORTED SEPARATELY from the fleet size, and now they
+    // agree by construction: the early return above requires on_pair ==
+    // fleet-1 for every commit, so "all N robots" is an OBSERVATION and not, as
+    // it was for one day, an inference from the protocol. Both are printed
+    // anyway. If they ever differ in a banked log, the commit rule regressed,
+    // and a reader who only has the text log should be able to see that.
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous AGREED by all %d robots: cell %d, interval %.0fs from "
+        "t+%.0fs (provisional=%d, echoes %d/%d).",
+        static_cast<int>(fleet_.size()), rendezvous_held_.cell,
+        rendezvous_held_.interval_ms / 1000.0,
+        rendezvous_held_.t_meet_ms / 1000.0,
+        rendezvous_held_provisional_ ? 1 : 0,
+        static_cast<int>(on_pair), static_cast<int>(fleet_.size()) - 1);
+    rendezvous_agreed_        = rendezvous_held_;
+    rendezvous_agreed_provisional_ = rendezvous_held_provisional_;
+    // The triple and the reason it was chosen are copied TOGETHER, in the one
+    // place where the two are known to describe each other. On the proposer the
+    // held plan is the solve that produced this exact triple: the derive runs
+    // earlier in this same call, so either it produced both of these or it
+    // refused and put back the provenance of what is still held. On a follower
+    // it is the empty plan, deliberately.
+    rendezvous_agreed_provenance_   = rendezvous_held_provenance_;
+    rendezvous_agreed_at_sec_ = t;
+  }
+  // Outside the change test on purpose: it is re-asserted on every tick that
+  // reaches here, rather than being frozen at the agreement's birth.
+  //
+  // IT IS AN ASSERTION AGAIN (2026-09-18), because the echo round is back for
+  // every commit: the early return above is the only way out of this function
+  // without full agreement, so reaching here means on_pair == fleet-1 and this
+  // field cannot read anything else.
+  //
+  // It was a genuine measurement for one day, while a final triple committed on
+  // first-hand evidence and a row could legitimately carry on_pair < fleet-1.
+  // Anything analysing the banked corpus has to read it that way PER GENERATION
+  // and not pool: the same column means "how many peers had echoed" on gen 22
+  // and "fleet-1, always" on gen 23.
+  //
+  // Kept rather than replaced by a constant because it is the one place a
+  // regression in the commit rule would show up in the data rather than only in
+  // the code — a gen-23 row carrying on_pair < fleet-1 means this return was
+  // bypassed.
+  rendezvous_agreed_peers_ = on_pair;
+}
+
+// WHICH OCCURRENCE OF THE AGREED SCHEDULE THIS ARMING ATTENDS.
+//
+// The agreed triple is a RECURRING schedule, not a single instant: meetings
+// happen at `t_meet_ms + k * interval_ms` for k = 0, 1, 2, ... That is what
+// makes one agreement, made once while the team was whole, keepable for the
+// rest of the run — the property the countdown was reached for and got by
+// abandoning the agreed time instead.
+//
+// EVERY INPUT HERE IS AGREED OR SHARED. `t_meet_ms` and `interval_ms` are the
+// integers the whole team committed, byte-identical on every robot and part of
+// RendezvousProposal::operator== so a fleet cannot hold two of them and report
+// agreement. `not_before_sec` is this robot's mission clock, whose baselines
+// are ~1.2 s apart across the ts4 cells. So two robots disagree about k only
+// when their `not_before` values straddle a multiple of the interval, and when
+// they do the disagreement is bounded by ONE interval and resolves at the
+// barrier rather than sending anyone to a different place.
+//
+// WHY THIS IS NOT THE occurrenceAtOrAfter DESIGN THAT WAS REVERTED. That one
+// failed because a no-show was terminal: a robot that picked an earlier
+// occurrence than its peers logged the meeting as missed and left. The barrier
+// is unbounded now (rendezvous_appointment_wait_sec defaults to 0 = wait for
+// the team, not for a clock), so picking k too small costs waiting, which is
+// what a robot at a meeting point is supposed to be doing.
+//
+// A NON-POSITIVE INTERVAL degrades to the single agreed instant rather than
+// dividing by zero. The scheduler floors the interval at
+// rendezvous_proposal_period_sec (30 s), so this is a guard, not a path.
+//
+// IT LIVES IN planner_util.hpp, NOT HERE, and that is deliberate. This file
+// defines main(), every gtest target links gtest_main, and the two cannot go in
+// one binary — so nothing defined in this translation unit can ever be called by
+// a test, and node-side coverage is source-scan only. The arithmetic that
+// decides WHICH INSTANT the fleet meets at is the load-bearing half of the
+// rendezvous arm; it gets executable tests (test_planner_util.cpp), which means
+// it gets to be a free function in the library. This translation unit is already
+// inside namespace explo_planner, so the call below needs no qualification.
 
 bool ExploPlannerNode::armAppointment(const char* reason) {
   if (!rendezvous_schedule_enable_) return false;
@@ -7543,66 +11855,295 @@ bool ExploPlannerNode::armAppointment(const char* reason) {
     return true;
   }
 
+  // NOTHING IS SOLVED HERE ANY MORE. This function used to derive the
+  // appointment from the frozen snapshot, and that is precisely what broke: two
+  // robots running the same deterministic arithmetic over two private maps
+  // agreed on the cell 21 times in 64 (see the P5 state block for the full
+  // measurement). All that remains is bookkeeping — take the pair the team
+  // committed while it was still connected, give it this robot's own origin,
+  // and report what it did.
   RendezvousAgreedEvent ev;
-  for (int c : rendezvous_noshow_) {
-    ev.excluded += (ev.excluded.empty() ? "" : ",") + std::to_string(c);
-  }
+  ev.proposer_id = kRendezvousProposerId;
 
   const double t_now = missionElapsed();
   ev.t_now_sec = t_now;
+  double anchor = -1.0;
   if (t_now < 0.0) {
     // Every quantity here is mission-elapsed. Before the clock is live there
     // is no origin to measure a deadline from, and an absolute stamp would
     // not survive the pair (the two nodes start seconds apart).
     ev.refused = "mission clock is not live yet";
-  } else if (!have_rendezvous_snapshot_) {
-    ev.refused = "no frozen snapshot: the team has never read complete, so "
-                 "there is no world both robots are known to share";
+  } else if (rendezvous_spent_) {
+    // The one appointment this outage gets has already been kept or missed.
+    // Without this the latched pair would re-arm immediately with a t_meet
+    // that is now in the PAST, appointmentDue() would fire on the same tick,
+    // and the robot would drive back to the cell it just left — for as long as
+    // the outage lasted. The pair cannot have changed since (the protocol is
+    // frozen while separated), so a second arming has nothing new to say.
+    ev.refused = "the agreed pair has already been used in this outage";
+  } else if (!rendezvous_agreed_.valid()) {
+    // No pair was ever committed by the whole team — early in a run, or a
+    // fleet that never read complete. Refusing is the honest answer and the
+    // caller falls through to the unscheduled manoeuvre; inventing a private
+    // appointment here is exactly the behaviour being removed.
+    ev.refused = "no (cell, interval, t_meet) triple was agreed by the whole "
+                 "team before contact was lost";
+  } else {
+    // THREE ANCHOR REFUSALS USED TO STAND HERE and all three are gone, because
+    // every one of them was about the ORIGIN and the appointment no longer has
+    // a local origin to be wrong about. They refused when this robot had never
+    // seen mutual contact, when the executor was starved across the transition
+    // that stamps the anchor, and when the anchor predated the mission
+    // baseline — each because `t_meet = my_anchor + interval` would then be
+    // exact, agreed, and at the wrong time. `t_meet` is now the integer the
+    // team committed, so a suspect anchor cannot move it, and keeping the
+    // refusals would have blocked arming for a reason that had stopped
+    // existing. The anchor itself is still stamped and still logged: it is how
+    // the analysis tells an early agreement from a late commit.
+    if (have_rendezvous_anchor_) anchor = missionElapsedAt(
+                                     rendezvous_anchor_time_);
+    // A FOURTH REFUSAL STOOD HERE — "the agreed meeting time passed more than
+    // the wait cap ago" — and it went the same way as the other three, for the
+    // same kind of reason: the condition it tested cannot arise any more.
+    //
+    // It existed because `t_meet` was ONE instant, stamped when the proposal was
+    // derived. Nothing tied that instant to when the team finished committing
+    // it, and nothing tied it to when the team eventually came apart, so a
+    // separation an hour into a run armed an appointment whose time was an hour
+    // gone: appointmentDue() fired instantly, the robot drove to a cell whose
+    // meeting was over, and stood there for the full wait cap — a guaranteed
+    // no-show that consumed the outage's one appointment and read in the log
+    // exactly like a kept appointment the peer failed to attend. The refusal
+    // turned that into an honest "too late", which was the best that could be
+    // done with a time that was fixed before the separation it had to serve.
+    //
+    // The agreed time is now a RECURRING schedule and this arming attends the
+    // first occurrence of it not already past (nextAgreedOccurrence, below),
+    // so the meeting this robot arms cannot be behind it. There is no lateness
+    // left here to refuse on — and, unlike the countdown that briefly stood in
+    // its place, that is true without giving up the agreed instant: the roll
+    // is over the committed integers, and the only per-robot input is the
+    // robot's own `t_now`, which generation 25 made the BARE floor after the
+    // gen-24 `t_now + notice` floor forked the ts4 N=3 cell (the block at the
+    // assignment prices that out).
   }
 
-  Allocation alloc;
   if (ev.refused.empty()) {
-    ev.shared_hash      = rendezvous_world_.sharedHash();
-    ev.grid_hash        = rendezvous_world_.grid().configHash();
-    ev.snapshot_age_sec = t_now - rendezvous_snapshot_at_sec_;
+    // THE PLACE AND THE TIME ARE BOTH ADOPTED (2026-09-18, third revision).
+    //
+    // All three integers come off the wire exactly as the team committed them.
+    // `cell` is the place. `t_meet_ms` and `interval_ms` are a RECURRING
+    // SCHEDULE — meetings at t_meet + k*interval — and this arming attends the
+    // first occurrence this robot can still REACH, floored at t_now plus its
+    // own arrival shortfall (generation 29; zero for any robot inside its
+    // lateness budget, which is what keeps the team on one occurrence). The
+    // operator's rule ("a place and a time which is fixed") is the lattice: a
+    // robot never invents an instant, it only picks which rung of the agreed
+    // one it signs up to.
+    //
+    // WHAT THIS REPLACES, AND WHY THE REPLACEMENT WENT BACK. From 02:00 to now
+    // this line read `t_now*1000 + depart_delay*1000` — each robot's own
+    // countdown, minted at its own arming. That is not a rendezvous. It is N
+    // robots independently deciding to visit the same place, and the arm was
+    // therefore not measuring the mechanism it is named after. Two earlier
+    // attempts at an agreed time had failed and the countdown was the reaction
+    // to them; both failures are real and neither is a reason to keep it:
+    //
+    //   `anchor*1000 + interval` — anchored on "the instant MY view of the team
+    //   stopped being mutually whole". One event at N=2 (the ts4 N=2 cell put
+    //   the two anchors 0.84 s apart), a per-robot predicate over a graph that
+    //   comes apart edge by edge at N>=3 (13.18 / 34.18 / 33.98 s). The origin
+    //   was private. It is not private here: t_meet is authored once by the
+    //   proposer and adopted verbatim, and it is inside operator==, so a fleet
+    //   cannot hold two of them and still report agreement.
+    //
+    //   `occurrenceAtOrAfter(phase, period, now)` — a shared schedule indexed by
+    //   each robot's own arming instant: armings at 16.1 / 52.5 / 67.4 s against
+    //   a 30 s period gave three different meetings, "one robot logging a no-show
+    //   for a meeting the others were still driving to". THE NO-SHOW IS THE
+    //   DEFECT IN THAT SENTENCE, NOT THE SCHEDULE. A robot that picks an earlier
+    //   occurrence than its peers is standing at the agreed cell when they
+    //   arrive; it only fails if something makes it leave. The barrier is
+    //   unbounded (rendezvous_appointment_wait_sec = 0, the campaign default —
+    //   it holds until the team reads complete, not until a clock expires), so
+    //   the disagreement costs waiting rather than a missed meeting, and it is
+    //   bounded by one interval rather than by the run.
+    //
+    // THE FLOOR IS BARE t_now SINCE GENERATION 25, AND THE 100 s NOTICE THAT
+    // USED TO BE ADDED HERE IS WHAT FORKED THE ts4 N=3 CELL. With
+    // `t_now + 100`, the tolerance for arming spread was the gap from the
+    // last floor to the agreed instant MINUS the notice: the cell's schedule
+    // led by 149 s, the notice ate 100 of it, and the 33 s arming spread
+    // (an N>=3 graph dies edge by edge; anchors 72.90 / 72.84 / 90.58 s)
+    // crossed the rest. Two robots floored at ~178/179 s and kept the agreed
+    // 190.148 s; the third floored at ~211 s and rolled to 346.716 — base plus
+    // exactly one interval — so its peers stood at the cell 351 and 432 s and
+    // the cell censored with the barrier open. With this floor the same
+    // armings tolerate the WHOLE 149 s gap; only a robot that arms after the
+    // instant has genuinely passed, or that cannot reach it within its
+    // lateness budget, rolls forward — the two cases where rolling is the
+    // truth. The per-robot terms are `t_now` itself, the mission-clock
+    // baseline (`mission_t0_sec_`, latched on each node's first live tick),
+    // ~1.2 s across these cells — bounded by node start, not by the radio —
+    // and the arrival shortfall, which is EXACTLY ZERO for every robot that
+    // can make the occurrence and so cannot separate robots that can both
+    // attend. A late-run separation can still straddle an
+    // occurrence boundary by bad phase — no rule computed from private
+    // observations can prevent that — but the fork is no longer manufactured
+    // by subtracting a constant from the margin, and the barrier prices a
+    // residual fork at one interval of waiting rather than a censored run.
+    //
+    // t_meet IS AN ARRIVAL INSTANT (2026-09-19), so this picks the first rung
+    // of the team's lattice that this robot can actually BE AT. Departing in
+    // time to arrive is appointmentDue()'s job and needs no help here; what
+    // this decides is the case appointmentDue() cannot fix, where the nearest
+    // rung is already closer than this robot's drive and leaving instantly
+    // would still be late.
+    //
+    // THE BUDGET IS SUBTRACTED FROM THE DRIVE, NOT ADDED TO THE FLOOR, and the
+    // clamp at zero is the whole safety argument. Generation 19-24 set the
+    // floor to `now + rendezvous_depart_delay_sec`, a lead time every robot
+    // added unconditionally, so robots that could all comfortably make the same
+    // rung still split across two of them — the ts4 N=3 cell, two robots on one
+    // occurrence and the third a whole interval past it. Here the floor is bare
+    // t_now for every robot whose marked-up drive fits inside the margin plus
+    // the budget, which is the common case and cannot fork. It rises above
+    // t_now only for a robot that genuinely cannot arrive in time, and then by
+    // exactly its shortfall. Clamped at zero it can only ever move the rung
+    // LATER, so the "deadline already passed" impossibility below still holds.
+    //
+    // A FORK HERE IS PRICED, NOT PREVENTED. A robot that rolls is one interval
+    // out of step with peers that did not, and the barrier's unbounded wait
+    // pays for that in standing time. It is the better trade: the alternative
+    // is that robot arriving arbitrarily late — 563 s on the stopped ts4 cells
+    // — with the team standing for that instead, and the rolled robot spends
+    // the interval exploring rather than driving.
+    //
+    // NO ESTIMATE, NO ROLL. travel -1 means the robot cannot price its own
+    // drive, and a robot that cannot price it must not be the one to decide the
+    // team is unreachable; it keeps the nearest rung, as every robot did before
+    // this change.
+    //
+    // THE ROBOT KEEPS EXPLORING UNTIL IT DEPARTS. A later occurrence is not
+    // idle time — appointmentDue() gates the departure, not the work — so the
+    // quantisation buys exploration, and what it spends is time spent separated.
+    // That is the trade a fixed schedule makes and it is the thing the arm is
+    // supposed to measure.
+    appointment_             = RendezvousPlan{};
+    appointment_.cell        = rendezvous_agreed_.cell;
+    appointment_.interval_ms = rendezvous_agreed_.interval_ms;
+    const double shortfall_sec = arrivalShortfallSec(
+        appointmentLeadMs(appointment_.cell), rendezvous_max_lateness_sec_);
+    appointment_.t_meet_ms   = nextAgreedOccurrence(
+        rendezvous_agreed_.t_meet_ms, rendezvous_agreed_.interval_ms,
+        t_now + shortfall_sec);
+    // Diagnostics, PROPOSER ONLY, and read from the provenance that was copied
+    // alongside the pair at the commit site rather than from whatever the last
+    // solve left behind — see RendezvousProvenance for the two ways the live
+    // read got it wrong.
+    if (fleet_.self_id == kRendezvousProposerId) {
+      const RendezvousPlan& p = rendezvous_agreed_provenance_.plan;
+      appointment_.penalty_mm           = p.penalty_mm;
+      appointment_.floor_won            = p.floor_won;
+      appointment_.candidates           = p.candidates;
+      appointment_.rejected_unreachable = p.rejected_unreachable;
+      appointment_.rejected_excluded    = p.rejected_excluded;
+      // THE THREE THAT WERE MISSING (2026-09-17). `capped`, `floored` and
+      // `tour_interval_ms` are RendezvousPlan fields like the five above, the
+      // solve fills all eight, and the logged row reads them off THIS struct —
+      // so omitting them here made them structurally false/-1 on every row
+      // ever written, including the proposer's. That is worse than an inert
+      // column: `capped`'s own doc says a run where it is always true is one
+      // where the cap rather than the objective chose the meeting times, and
+      // the follower-row doc tells an analyst to take the value from the
+      // proposer's row. Both instructions pointed at a constant.
+      appointment_.capped               = p.capped;
+      appointment_.floored              = p.floored;
+      appointment_.tour_interval_ms     = p.tour_interval_ms;
+    } else {
+      // EXPLICIT SENTINELS ON A FOLLOWER ROW. A follower echoes three integers
+      // and never runs the argmin, so there is no candidate count and no
+      // verdict on the floor. The struct's own defaults would write 0 for the
+      // counts, which is a value a real search can also produce ("nothing was
+      // admissible"), and the two would be indistinguishable in the log. -1
+      // cannot be a count, so it can only mean "this row did not search".
+      appointment_.penalty_mm           = -1;
+      appointment_.candidates           = -1;
+      appointment_.rejected_unreachable = -1;
+      appointment_.rejected_excluded    = -1;
+      appointment_.floor_won            = false;   // no sentinel exists; see doc
+    }
 
-    // Solved HERE, over the frozen snapshot, and deliberately not reused from
-    // doPlan's live solve: doPlan solves the world as it is now, which is the
-    // right problem for choosing this robot's next hop and the wrong one for
-    // a value the peer has to reproduce.
-    alloc = GlobalAllocator::solve(rendezvous_world_, rendezvous_vehicles_,
-                                   alloc_cfg_);
-
-    RendezvousScheduler::Config cfg = rzv_cfg_;
-    cfg.exclude = rendezvous_noshow_;
-    // The divergence cap, from the same dead-reckoning model midrunGateSec
-    // uses for the trigger. Both robots hold the mirror image of the same two
-    // rates, so the sum is symmetric and both ends cap to the same value —
-    // which is the only reason a cap can be applied at all without breaking
-    // agreement. rate 0 (unknown) leaves it uncapped, matching the trigger's
-    // reading of "nothing known to share".
-    if (have_reconnect_rec_ && reconnect_min_share_voxels_ > 0.0) {
-      const double rate_sum = std::max(0.0, reconnect_rec_.self_rate) +
-                              std::max(0.0, reconnect_rec_.peer_rate);
-      if (rate_sum > 1e-9) {
-        cfg.max_interval_ms = static_cast<long long>(
-            (reconnect_min_share_voxels_ / rate_sum) * 1000.0);
+    // CAN THIS ROBOT ACTUALLY GET THERE? Asked of the graph DIRECTLY, not
+    // through appointmentTravelMs below, because that goes via
+    // GlobalAllocator::costMm and costMm masks the unreachable sentinel with a
+    // centroid straight line — so the travel estimate is finite even for a
+    // cell there is no route to, and the one robot that is never going to
+    // arrive looks exactly like the ones that will.
+    //
+    // It is REPORTED, never enforced. A follower does not solve, so it does
+    // not get to veto: the pair is the team's and the whole design is that it
+    // is kept exactly. And a negative reading here is as often ignorance as
+    // geometry — the graph blocks edges over unknown ground, so a robot that
+    // has simply not explored the corridor yet reads "unreachable" to a cell
+    // it will reach comfortably. Refusing on that would make followers walk
+    // away from appointments precisely in the far-apart case the arm exists to
+    // test. What it buys is that the resulting no-show is legible instead of
+    // anonymous.
+    if (rendezvous_world_.configured()) {
+      const int here = rendezvous_world_.grid().idAt(latest_pos_.x(),
+                                                     latest_pos_.y());
+      if (rendezvous_world_.grid().valid(here)) {
+        const double d = rendezvous_world_.distance(here, appointment_.cell);
+        ev.own_route_m = d;   // the graph's own negative sentinel passes through
+        if (!(d >= 0.0)) {
+          RCLCPP_WARN(get_logger(),
+              "Rendezvous [%s]: keeping the agreed appointment at cell %d, but "
+              "this robot's own map has NO ROUTE to it from cell %d — it will "
+              "very likely record a no-show. Kept anyway: the pair is the "
+              "team's, and an unreachable reading is as often unexplored "
+              "ground as blocked ground.",
+              reason ? reason : "?", appointment_.cell, here);
+        }
       }
     }
 
-    // The floor: the midpoint of the last-contact pair, the destination the
-    // pre-P5 node drives to. Admitted unconditionally by the scheduler, so
-    // the worst case of this whole phase is the behaviour it replaces.
-    int floor_cell = -1;
-    if (have_reconnect_rec_) {
-      const Eigen::Vector3f mp = meetingPoint(reconnect_rec_.self_pose,
-                                              reconnect_rec_.peer_pose);
-      floor_cell = rendezvous_world_.grid().idAt(mp.x(), mp.y());
-    }
-
-    appointment_ = RendezvousScheduler::solve(
-        rendezvous_world_, rendezvous_vehicles_, alloc, floor_cell,
-        static_cast<long long>(t_now * 1000.0), cfg);
+    ev.from_agreed        = true;
+    // Stamped with the COMMIT, not with what is held now: this row says what the
+    // team agreed to, and an upgrade that lands after the commit does not
+    // retroactively change what was armed here.
+    ev.agreed_provisional = rendezvous_agreed_provisional_;
+    ev.anchor_sec     = anchor;
+    // NOT CLAMPED AT ZERO, and the negative values are the point. This is
+    // (anchor - when the team committed), so a negative reading means the
+    // commit landed AFTER the separation it is anchored to — the late-commit
+    // case the "already passed" refusal above exists for, and the only field
+    // that can distinguish it from an ordinary early agreement. The clamp that
+    // used to be here folded every one of those onto 0.0, where they were
+    // indistinguishable from "agreed at the instant of separation", which is
+    // the healthiest reading the column has. A diagnostic that reports its
+    // worst case as its best case is worse than an absent one.
+    //
+    // GUARDED ON THE ANCHOR EXISTING, which it need not any more: arming no
+    // longer requires one (see the three removed refusals above), so `anchor`
+    // can legitimately be -1 here and the subtraction would then report a
+    // plausible-looking negative age that is really just the sentinel with the
+    // agreement time taken off it — the late-commit reading, manufactured.
+    ev.agreed_age_sec = anchor >= 0.0 ? anchor - rendezvous_agreed_at_sec_
+                                      : -1.0;
+    ev.peers_on_pair  = rendezvous_agreed_peers_;
+    // THE WORLD THE ARGMIN RAN OVER, on the proposer — captured inside
+    // deriveRendezvousProposal and carried here with the pair. Reading the live
+    // snapshot instead, as this did until the provenance existed, logged
+    // whatever the last team-complete heartbeat copied, which is up to one
+    // proposal period newer than the search it would be claiming to describe.
+    // On a follower they stay 0/-1: it never solved, so there is no derivation
+    // world to name, and its own snapshot is not one.
+    ev.shared_hash      = rendezvous_agreed_provenance_.shared_hash;
+    ev.grid_hash        = rendezvous_agreed_provenance_.grid_hash;
+    ev.snapshot_age_sec = rendezvous_agreed_provenance_.derived_at_sec >= 0.0
+                              ? t_now - rendezvous_agreed_provenance_.derived_at_sec
+                              : -1.0;
 
     ev.cell                 = appointment_.cell;
     ev.penalty_mm           = appointment_.penalty_mm;
@@ -7610,12 +12151,45 @@ bool ExploPlannerNode::armAppointment(const char* reason) {
     ev.candidates           = appointment_.candidates;
     ev.rejected_unreachable = appointment_.rejected_unreachable;
     ev.rejected_excluded    = appointment_.rejected_excluded;
+    // Read from the appointment rather than hardcoded. This is now a live
+    // column: deriveRendezvousProposal feeds the barrier wait in as
+    // max_interval_ms, so a solve whose tour term runs past the wait cap really
+    // does cap, and `capped` says the interval was pulled in to keep the
+    // meeting findable rather than left at the tours' own arrival. (It read
+    // "the period ... the occurrence" until 2026-09-18; nothing recurs, and the
+    // cap now bounds the furthest robot's drive — see Config::max_interval_ms.)
     ev.capped               = appointment_.capped;
-    ev.refused              = appointment_.refused;
-    if (appointment_.interval_ms >= 0)
-      ev.interval_sec = appointment_.interval_ms / 1000.0;
-    if (appointment_.t_meet_ms >= 0)
-      ev.t_meet_sec = appointment_.t_meet_ms / 1000.0;
+    // WHICH TERM SET THE TIMETABLE. Copied into appointment_ since generation
+    // 17 and read by nothing until now, which left the row unable to say
+    // whether `interval_sec` was the objective's answer or the lattice's —
+    // the distinction generation 29's 300 s floor makes the common one, and
+    // the one `capped` above cannot stand in for (it asks only whether the cap
+    // cut the tour term, and a cap above the tours cuts nothing while still
+    // being overruled by the floor).
+    ev.floored              = appointment_.floored;
+    ev.tour_interval_sec    = appointment_.tour_interval_ms >= 0
+                                  ? appointment_.tour_interval_ms / 1000.0
+                                  : -1.0;
+    ev.interval_sec         = appointment_.interval_ms / 1000.0;
+    ev.t_meet_sec           = appointment_.t_meet_ms / 1000.0;
+    // THE UNROLLED INTEGER, from the committed triple rather than from the
+    // appointment: `appointment_.t_meet_ms` above is what nextAgreedOccurrence
+    // made of it for THIS robot, and the two differ by whole intervals exactly
+    // when the roll did something. Logging the input is what lets a reader tell
+    // one generation's rows from the next one's — see the field's doc.
+    ev.agreed_base_sec      = rendezvous_agreed_.t_meet_ms / 1000.0;
+
+    // A "THE DEADLINE ALREADY PASSED" DIAGNOSTIC STOOD HERE and is deleted as
+    // unreachable rather than left as a guard that can never fire. It tested
+    // `t_meet_ms < t_now * 1000`, and t_meet_ms is assigned, above, as the
+    // first agreed occurrence at or after a floor that is t_now plus a
+    // non-negative shortfall (nextAgreedOccurrence), which cannot precede
+    // t_now while the committed interval is positive — and the scheduler mints
+    // only positive intervals (floored at the furthest robot's drive). The
+    // clamp at zero on that shortfall is what keeps this true: it is why the
+    // reachability roll can only move the instant later, never earlier. The
+    // condition is false by construction on every reachable path, and a branch
+    // that cannot execute is a claim that the reader has to disprove.
   }
 
   const bool armed = ev.refused.empty() && appointment_.valid();
@@ -7623,75 +12197,216 @@ bool ExploPlannerNode::armAppointment(const char* reason) {
     appointment_armed_          = true;
     appointment_departed_       = false;
     appointment_arrived_        = false;
+    appointment_chase_tried_    = false;
+    appointment_unplaceable_    = false;
     appointment_armed_at_sec_   = t_now;
     appointment_arrived_at_sec_ = -1.0;
+    rendezvous_spent_           = true;
     const long long travel = appointmentTravelMs();
     if (travel >= 0) {
+      // TRAVEL, NOT A DEPARTURE DEADLINE. There is still no derived deadline
+      // on this row: the robot AIMS at ev.t_meet_sec and leaves whenever its
+      // live lead says it must, which is a per-tick decision and not a number
+      // that can be stamped once. t_meet_sec is the same on every robot's row
+      // for the same outage unless one of them rolled a rung for
+      // unreachability, or armed after the instant had genuinely passed.
+      // Travel is kept because it is the covariate that separates "arrived
+      // late" from "was never close" — and, now, the one that explains a roll.
       ev.travel_sec = travel / 1000.0;
-      // The departure deadline, reported as the mission-elapsed instant it
-      // falls at. Per-robot on purpose: the far robot's is EARLIER, which is
-      // what staggers the departures so the arrivals coincide.
-      ev.depart_sec = appointment_.t_meet_ms / 1000.0 -
-                      (travel * std::max(0, rzv_cfg_.depart_safety_milli)) /
-                          1000.0 / 1000.0 -
-                      rzv_cfg_.depart_margin_ms / 1000.0;
     }
   } else {
-    appointment_ = RendezvousPlan{};
+    // Both writes, not just the plan. appointment_armed_ is already false on
+    // every path that reaches here — the early return at the top of this
+    // function makes it so — but that invariant is held REMOTELY, by a guard
+    // added for an unrelated defect, while the flag and the plan are read
+    // together everywhere downstream. Leaving one of the pair unwritten on a
+    // refusal path means a future edit to that far-away guard turns a refused
+    // appointment into an armed one pointing at a blank plan, and the first
+    // symptom is appointmentPoint() on an invalid cell. Cheap here, expensive
+    // to diagnose there.
+    appointment_armed_       = false;
+    appointment_unplaceable_ = false;
+    appointment_             = RendezvousPlan{};
   }
 
   if (exp_log_) exp_log_->logRendezvousAgreed(expCtx(), ev);
 
   if (armed) {
     RCLCPP_INFO(get_logger(),
-        "Rendezvous schedule [%s]: cell %d at t+%.0fs (in %.0fs%s), penalty "
-        "%lld mm over %d candidate(s)%s; my travel %.0fs, depart at t+%.0fs.",
-        reason, appointment_.cell, ev.t_meet_sec, ev.interval_sec,
-        appointment_.capped ? ", CAPPED by map divergence" : "",
-        appointment_.penalty_mm, appointment_.candidates,
-        appointment_.floor_won ? " (last-contact midpoint won)" : "",
-        ev.travel_sec, ev.depart_sec);
+        "Rendezvous schedule [%s]: cell %d, meeting at t+%.0fs — the pair "
+        "agreed by this robot and %d peer(s) %.0fs before separation; my "
+        "travel %.0fs.",
+        reason, appointment_.cell, ev.t_meet_sec, ev.peers_on_pair,
+        ev.agreed_age_sec, ev.travel_sec);
   } else {
     RCLCPP_WARN(get_logger(),
-        "Rendezvous schedule [%s]: no appointment — %s. Falling back to the "
-        "unscheduled manoeuvre.", reason, ev.refused.c_str());
+        "Rendezvous schedule [%s]: no appointment — %s. This arm has no "
+        "unscheduled fallback; the robot keeps exploring.",
+        reason, ev.refused.c_str());
   }
   return armed;
 }
 
-long long ExploPlannerNode::appointmentTravelMs() const {
-  if (!appointment_armed_ && !appointment_.valid()) return -1;
+long long ExploPlannerNode::travelMsToCell(int cell) const {
   if (!rendezvous_world_.configured()) return -1;
-  // From where this robot is NOW, not from where it was when the appointment
-  // armed: under hybrid it has been chasing since, and a deadline computed
-  // from the arming position would fire from the wrong side of the chase.
+  // BOTH ENDS BOUNDS-CHECKED. `here` has always been screened; `cell` was not,
+  // because the only caller passed appointment_.cell and the arming site
+  // bounds-checks that against cell_world_ when it comes off the wire. The rung
+  // chooser now asks this BEFORE arming, so the screen has to live here.
   const int here = rendezvous_world_.grid().idAt(latest_pos_.x(),
                                                  latest_pos_.y());
   if (!rendezvous_world_.grid().valid(here)) return -1;
+  if (!rendezvous_world_.grid().valid(cell)) return -1;
   return RendezvousScheduler::travelMs(
-      GlobalAllocator::costMm(rendezvous_world_, here, appointment_.cell),
+      GlobalAllocator::costMm(rendezvous_world_, here, cell),
       rzv_cfg_.speed_mm_s);
+}
+
+long long ExploPlannerNode::appointmentLeadMs(int cell) const {
+  const long long travel = travelMsToCell(cell);
+  if (travel < 0) return -1;
+  // THE SAME MARKUP THE SCHEDULER'S REACHABILITY FLOOR USES
+  // (rendezvous_scheduler.cpp: floor_ms). The floor guarantees the lattice
+  // spacing covers the furthest robot's marked-up drive; pricing the lead at a
+  // different rate here would mean a robot needing more lead than the spacing
+  // the team sized for it, which is the one case a rung roll cannot fix.
+  return (travel * std::max(0, rzv_cfg_.depart_safety_milli)) / 1000;
+}
+
+long long ExploPlannerNode::appointmentTravelMs() const {
+  // EITHER condition, because the two states this guards against are different
+  // and either one alone makes the answer meaningless: `!armed` is "nothing to
+  // travel to", `!valid()` is "the appointment field holds no cell".
+  //
+  // THIS WAS `&&` UNTIL 2026-09-18, AND THE COMMENT ABOVE IT CLAIMED THE
+  // CONJUNCTION WAS "the weaker test ... rather than an invariant a future edit
+  // could quietly break". It is the weaker test, which is exactly the problem:
+  // a conjunction refuses only when BOTH hold, so the single state the prose
+  // says it is defending against — armed with a blank plan, which armAppointment
+  // names in as many words as the thing its paired writes exist to prevent
+  // ("the first symptom is appointmentPoint() on an invalid cell") — fell
+  // straight through to costMm() on cell -1. The two DO coincide today: the one
+  // arming site sets `appointment_armed_` only under `appointment_.valid()`,
+  // and both clear sites write the flag and the plan together. So this changes
+  // no behaviour on any path that exists now, and that is the point — the
+  // guard is here for the edit that breaks the coincidence, and under `&&` it
+  // would not have caught it.
+  if (!appointment_armed_ || !appointment_.valid()) return -1;
+  // From where this robot is NOW, not from where it was when the appointment
+  // armed: under hybrid it has been chasing since, so the arming position can
+  // be a long way from the robot by the time anyone reads this. That freshness
+  // is load-bearing twice over — it is what makes the departure lead track a
+  // robot drifting away from the meeting, and stale it would misreport the
+  // `travel_sec` covariate, which is read precisely to explain a no-show.
+  return travelMsToCell(appointment_.cell);
 }
 
 bool ExploPlannerNode::appointmentDue() {
   if (!appointment_armed_) return false;
   const double t = missionElapsed();
   if (t < 0.0) return false;
-  return RendezvousScheduler::shouldDepart(
-      appointment_.t_meet_ms, static_cast<long long>(t * 1000.0),
-      appointmentTravelMs(), rzv_cfg_);
+  const long long now_ms = static_cast<long long>(t * 1000.0);
+  // LEAVE IN TIME TO ARRIVE AT t_meet (2026-09-19).
+  //
+  // t_meet is a MEETING instant, so the thing that has to land on it is the
+  // arrival. Between 2026-09-18 and this change it was a DEPARTURE instant —
+  // a bare `now >= t_meet` — and the difference is not cosmetic: under that
+  // rule every robot was late by its own drive, the barrier absorbed the
+  // stagger by making whoever arrived first stand and wait, and across the
+  // stopped ts4 cells that was the whole of the observed waiting. Kalhan,
+  // 2026-09-19: robots should only agree to meetings they can come to within a
+  // bounded delay.
+  //
+  // THE -1 CASE IS WHY THIS WAS REMOVED, and it is handled rather than
+  // designed around. Off the snapshot grid there is no estimate; a robot there
+  // cannot aim, so it leaves at t_meet and is late by its drive — exactly the
+  // old rule, which is the right degradation because it is the behaviour that
+  // needs no estimate. What the 2026-09-18 note objected to was that the
+  // degraded and normal paths "differed only in whether the robot left early".
+  // They still do. That difference is now the point rather than the defect:
+  // the mechanism is armed and driving on both paths, and neither one is the
+  // armed-but-inert state that note was really about.
+  //
+  // NO RUNG IS RE-DECIDED HERE. Which occurrence this robot is keeping was
+  // settled once, at arming; this only moves the departure earlier within it.
+  // Re-choosing the rung each tick would ratchet: a robot exploring away from
+  // the cell grows its lead, rolls to a later rung, explores further on the
+  // strength of it, and never attends at all.
+  //
+  // Staying due once overdue is preserved (>=, not ==): the trigger is polled
+  // on the PLAN tick and a strict equality would be missed by every robot that
+  // was mid-navigation on the tick the deadline passed.
+  const long long lead_ms = appointmentLeadMs(appointment_.cell);
+  if (lead_ms < 0) return now_ms >= appointment_.t_meet_ms;
+  return now_ms + lead_ms >= appointment_.t_meet_ms;
 }
 
 Eigen::Vector3f ExploPlannerNode::appointmentPoint() const {
   float x = 0.0f, y = 0.0f;
-  rendezvous_world_.grid().centre(appointment_.cell, x, y);
+  // THE SNAPSHOT WORLD MAY NEVER HAVE BEEN POPULATED (2026-09-17), and until
+  // today that was a SIGFPE rather than a bad answer: CellGrid::col() is
+  // `id % nx`, nx is 0 on a default-constructed grid, and the header says in
+  // as many words that callers are expected to have screened with valid().
+  // appointmentTravelMs() screens; this did not.
+  //
+  // WHAT MADE IT REACHABLE IS THE GATE MOVE IN THIS SAME CHANGE SET. The
+  // mutual-contact gate came off the adopt/echo/commit path so an N>=3 fleet
+  // could converge at all, but refreshRendezvousSnapshot() still runs ONLY
+  // under that gate. Before the move, committing implied a refresh had
+  // happened; after it, a follower whose own heartbeat never landed inside the
+  // team's mutual window adopts three integers off the wire, commits them,
+  // arms an appointment — armAppointment's refusals are clock/spent/invalid
+  // only, and its rendezvous_world_.configured() test wraps a diagnostic, not
+  // the arming — and then dies at the first departure. That is precisely the
+  // follower the move exists to serve, so the crash would have concentrated in
+  // the treated arms and the larger rungs: biased attrition, not downtime.
+  //
+  // FALL BACK TO THE LIVE WORLD rather than refusing. The adopted cell was
+  // bounds-checked against cell_world_ when it came off the wire, so that grid
+  // can place it; the two grids are the same geometry (rendezvous_world_ is a
+  // copy of cell_world_), which is why this is a fallback and not a different
+  // answer. The snapshot is still preferred, because it is the grid every
+  // other robot solved against.
+  const CellWorld* w = nullptr;
+  if (rendezvous_world_.configured() &&
+      rendezvous_world_.grid().valid(appointment_.cell)) {
+    w = &rendezvous_world_;
+  } else if (cell_world_.configured() &&
+             cell_world_.grid().valid(appointment_.cell)) {
+    w = &cell_world_;
+  }
+  if (w == nullptr) {
+    // Neither grid can place the cell. Standing still is the only safe answer
+    // — the alternative here is undefined behaviour, so it is not a close call
+    // — but standing still is NOT a no-show, and until 2026-09-18 it was
+    // recorded as one. See appointment_unplaceable_: a goal at the robot's own
+    // position is reached on the next tick, so the outcome classifier saw
+    // arrived=true and blamed the peers. The latch makes the row say what
+    // happened.
+    appointment_unplaceable_ = true;
+    RCLCPP_ERROR(get_logger(),
+        "Rendezvous: appointment cell %d cannot be placed on either the "
+        "snapshot grid (configured=%d) or the live grid (configured=%d). "
+        "Holding position instead of departing — this robot will record a "
+        "no-show. The appointment was adopted off the wire without this robot "
+        "ever having frozen a snapshot.",
+        appointment_.cell, static_cast<int>(rendezvous_world_.configured()),
+        static_cast<int>(cell_world_.configured()));
+    return latest_pos_;
+  }
+  // Placeable after all — clear the latch rather than leave a stale true. The
+  // cell does not change within one appointment, so in practice this only
+  // matters if a grid became configured between two departure reads, but a
+  // latch nobody clears is a latch that eventually reports the wrong run.
+  appointment_unplaceable_ = false;
+  w->grid().centre(appointment_.cell, x, y);
   // z from the robot's own frame: the drive and its arrival test are planar
   // (goal_xy_tol_), and the cell grid carries no height.
   return Eigen::Vector3f(x, y, latest_pos_.z());
 }
 
 void ExploPlannerNode::closeAppointment(const char* outcome, bool arrived,
-                                        double waited_sec) {
+                                        double waited_sec, bool mutual) {
   if (!appointment_armed_) return;
   const double t_end = missionElapsed();
 
@@ -7703,6 +12418,7 @@ void ExploPlannerNode::closeAppointment(const char* outcome, bool arrived,
   ev.outcome      = outcome;
   ev.arrived      = arrived;
   ev.waited_sec   = waited_sec;
+  ev.mutual       = mutual;
   if (exp_log_) exp_log_->logRendezvousOutcome(expCtx(), ev);
 
   RCLCPP_INFO(get_logger(),
@@ -7711,22 +12427,18 @@ void ExploPlannerNode::closeAppointment(const char* outcome, bool arrived,
       arrived ? "arrived" : "never arrived", std::fabs(ev.lateness_sec),
       ev.lateness_sec >= 0.0 ? "late" : "early", waited_sec);
 
-  // A no-show writes the cell off for the REST OF THIS OUTAGE. Both robots
-  // reach the same verdict from the same evidence (each waited out the cap
-  // alone), so the exclusion is symmetric and the next arming moves both to
-  // the same next-best cell. It can never empty the candidate set: the floor
-  // is exempt from cfg.exclude by construction.
-  if (std::strcmp(outcome, "no-show") == 0 &&
-      rendezvous_world_.grid().valid(appointment_.cell) &&
-      std::find(rendezvous_noshow_.begin(), rendezvous_noshow_.end(),
-                appointment_.cell) == rendezvous_noshow_.end()) {
-    rendezvous_noshow_.push_back(appointment_.cell);
-  }
+  // A no-show used to write the cell off here so the outage's NEXT solve would
+  // avoid it. There is no next solve — the pair is agreed while connected and
+  // frozen on separation — and no second arming either. The write-off would
+  // also have been per-robot, so it could only ever have pushed the two ends
+  // apart. See the rendezvous_spent_ / no-show-list note in the P5 state block.
 
-  appointment_armed_    = false;
-  appointment_departed_ = false;
-  appointment_arrived_  = false;
-  appointment_          = RendezvousPlan{};
+  appointment_armed_       = false;
+  appointment_departed_    = false;
+  appointment_arrived_     = false;
+  appointment_chase_tried_ = false;
+  appointment_unplaceable_ = false;
+  appointment_             = RendezvousPlan{};
 }
 
 bool ExploPlannerNode::dispatchReconnect(const char* reason) {
@@ -7740,16 +12452,17 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   dispatch_peer_age_sec_ =
       rec ? (this->now() - rec->stamp).seconds() : -1.0;
   reconnect_decline_reason_.clear();
-  // Freeze the pair THIS manoeuvre is armed from. Everything downstream that
-  // needs a meeting point — the RENDEZVOUS/HYBRID dispatch below, and the hold
-  // escalation when this manoeuvre's barrier expires — reads the snapshot, so a
-  // packet arriving mid-manoeuvre cannot move our midpoint away from the one
-  // the peer computes from the same contact event. See reconnect_rec_.
+  // Freeze the pair THIS manoeuvre is armed from, so nothing downstream can
+  // re-derive a destination off a packet that arrived mid-manoeuvre. Its one
+  // remaining consumer is the hold escalation's own-anchor fallback: the
+  // destination proper is the agreed appointment cell, which is team-wide and
+  // was never derived from this pair. See reconnect_rec_.
   have_reconnect_rec_ = (rec != nullptr);
   if (rec != nullptr) reconnect_rec_ = *rec;
   if (rec == nullptr) {
     // The missing teammate was never heard at all (the anchor came from a
-    // different peer), so there is nothing to chase and no pair to midpoint.
+    // different peer), so there is nothing to chase. The appointment is
+    // unaffected — it never read this record.
     reconnect_decline_reason_ = "no-peer-record";
   }
 
@@ -7771,9 +12484,24 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
   // "keep exploring until the deadline" is not an option for a robot whose
   // exploration is already over, so a terminal manoeuvre departs at once and
   // the appointment only supplies the DESTINATION.
+  //
+  // EXEMPT FROM THE DEFERRAL IS NOT EXEMPT FROM THE CHASE (2026-09-16).
+  // Hybrid's sentence is "do pursuit if rendezvous is not due yet when deemed
+  // necessary", and at a terminal dispatch with the deadline still ahead the
+  // rendezvous is precisely NOT due yet — so it is pursuit's turn, exactly as
+  // it would be for the pursuit arm reaching the same point. Departing here
+  // would mean hybrid never chases at a terminal dispatch at all, while
+  // pursuit always does: not a difference in dose but a whole missing half, in
+  // the dispatch that ends most runs. The deferral is still gone (the robot
+  // does not go back to exploring), and if the chase declines the appointment
+  // departure below happens on this same call, so nothing is delayed.
   const bool have_appointment = armAppointment(reason);
   const bool may_defer = have_appointment && !reconnect_terminal_;
-  if (have_appointment && (reconnect_terminal_ || appointmentDue())) {
+  const bool hybrid_terminal_chase =
+      have_appointment && reconnect_terminal_ &&
+      reconnect_mode_ == ReconnectMode::HYBRID && !appointmentDue();
+  if (have_appointment && (reconnect_terminal_ || appointmentDue()) &&
+      !hybrid_terminal_chase) {
     // Either exploration is over, or the deadline has already passed while
     // the silence clock was still counting — a long outage against a nearby
     // meeting. Go now.
@@ -7784,18 +12512,50 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
 
   if (reconnect_mode_ != ReconnectMode::RENDEZVOUS && rec != nullptr &&
       startPursuit(peer_id, *rec, reason)) {
+    if (appointment_armed_) appointment_chase_tried_ = true;
     return true;
   }
-  if (reconnect_mode_ == ReconnectMode::HYBRID && rec != nullptr) {
-    // The chase declined (record too stale, trail uncoverable) and the
-    // deadline is still ahead. Pre-P5 this parked the robot at the midpoint
-    // for the whole outage; with an appointment standing it goes back to
-    // exploring instead and departs when the clock says so. Strictly better:
-    // the ground covered in between is mission progress the parked robot
-    // never earned, and the meeting still happens.
+  if (reconnect_mode_ == ReconnectMode::HYBRID) {
+    // The chase declined (record too stale, trail uncoverable), or there was
+    // no record to chase from. HYBRID IS PURSUIT PLUS RENDEZVOUS AND NOTHING
+    // ELSE, so from here it does exactly what the pursuit arm does — the two
+    // lines below are a copy of that branch, deliberately, so the arms cannot
+    // drift apart.
+    //
+    // WHY THE MIDPOINT DRIVE IS GONE (2026-09-16). This branch used to fall
+    // through to startReturnTo(meetingPoint(self_pose, peer_pose)) — park at
+    // the midpoint of the two poses at last contact. It was removed from the
+    // RENDEZVOUS arm the same day for two reasons that apply here word for
+    // word: it is a place with NO TIME (nothing tells the peer when to be
+    // there or how long to wait), and it is not actually symmetric (the
+    // floor_won telemetry says both ends picked the midpoint in only 2 of 6
+    // separated pairs). Leaving it in hybrid alone would have been worse than
+    // leaving it in both, because it makes hybrid a THIRD behaviour rather
+    // than the composition of the other two: any hybrid-vs-pursuit or
+    // hybrid-vs-rendezvous contrast would then be confounded by a manoeuvre
+    // neither of those arms can perform, and the factorial reading of the
+    // four-arm design — which is the entire point of running four — would not
+    // hold. The previous justification ("its own mechanism's fallback ladder")
+    // described pursuit's ladder, and pursuit's ladder is the two lines below.
+    //
+    // `may_defer` still short-circuits: an appointment whose deadline is ahead
+    // means the robot keeps exploring until it is due rather than parking, and
+    // that deferral is the composition working as specified — pursuit while
+    // the rendezvous is not due yet.
     if (may_defer) return false;
-    startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
-                  "meeting point", reason);
+    // The terminal chase declined, so the appointment takes the manoeuvre back
+    // — the behaviour this dispatch had before the chase was given its turn.
+    // It must come before the explore fallback: exploration is over at a
+    // terminal dispatch, so falling through to it would send a robot with a
+    // standing appointment back out to a map it has already saturated.
+    if (hybrid_terminal_chase) {
+      startReturnTo(appointmentPoint(), "appointment", reason);
+      appointment_departed_    = true;
+      appointment_chase_tried_ = true;
+      return true;
+    }
+    if (pursuitExploreFallback(reason)) return true;
+    holdForTeam(reason);
     return true;
   }
   if (reconnect_mode_ == ReconnectMode::PURSUIT) {
@@ -7808,42 +12568,44 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
     holdForTeam(reason);
     return true;
   }
-  // RENDEZVOUS. Both robots drive to the SAME point: the midpoint of the two
-  // poses at last contact, which each end computes from its own last_contact_
-  // record without any further exchange (I hold my pose and the peer's; it
-  // holds the mirror image of the same pair, so both midpoints agree to
-  // whatever the robots moved between the two receipt instants).
+  // RENDEZVOUS. The arm IS the appointment: an agreed place and an agreed time,
+  // or nothing. If `may_defer` is true there is a standing appointment whose
+  // deadline is still ahead, and the robot keeps exploring until it is due —
+  // that deferral is the whole treatment. If it is false, armAppointment
+  // refused, and this arm has nothing left to do.
   //
-  // It used to be last_connected_anchor_ — each robot returning to where IT was
-  // standing at last contact. That cannot converge, and measurably did not:
-  // the link dies at the edge of range, so the two anchors are one comms range
-  // apart BY CONSTRUCTION. In p9log_rendezvous_seed1 atlas returned to
-  // (3.50, -26.23) and bestla to (-3.22, 27.46) — 54 m apart — five times
-  // between them, every manoeuvre timed out to PLAN having reconnected
-  // nothing, and the pair burned 918 s and 1137 s of a 3439 s run doing it.
-  // Two robots waiting for each other at opposite ends of the gap that
-  // separated them is the failure mode, not bad luck.
+  // WHY THERE IS NO FALLBACK HERE ANY MORE (2026-09-16). Until today a refusal
+  // fell through to an immediate drive to the midpoint of the two poses at last
+  // contact, justified on the grounds that each end computes that midpoint from
+  // the mirror image of the same pose pair and so both agree. Two things were
+  // wrong with keeping it:
   //
-  // The midpoint is the same construction HYBRID's fallback already uses
-  // above; sharing it is deliberate, so the arms differ in WHEN they go to a
-  // meeting point and not in where the meeting point is.
+  //   * It has a place and NO TIME. Nothing tells the peer when to be there or
+  //     for how long to wait, which is exactly the property this arm exists to
+  //     test. Pre-P5 that showed up as a median wait of 240 s — the cap, to the
+  //     second — and 16 no-shows in 21 n3 appointments.
+  //   * It is not actually symmetric. The `floor_won` telemetry says so: in
+  //     only 2 of 6 separated pairs did BOTH ends pick the midpoint floor, so
+  //     the shared-by-construction argument was already failing in the data.
   //
-  // P5 changes WHEN this leaves, not where it goes when it must go now: with
-  // an appointment standing, plain rendezvous keeps exploring until its own
-  // departure deadline instead of braking the instant the silence clock
-  // expires. That deferral IS the rendezvous arm of the 2x2 (appointment
-  // without chase); the destination it eventually drives to is the scheduled
-  // cell, which the pre-P5 midpoint is the floor of.
-  if (may_defer) return false;
-  if (rec != nullptr) {
-    startReturnTo(meetingPoint(rec->self_pose, rec->peer_pose),
-                  "meeting point", reason);
-    return true;
+  // So a refusal now means the robot carries on exploring and the manoeuvre
+  // simply does not happen. That is the honest reading of "meet at a place and
+  // a time both robots agreed on": if no pair was committed while the team was
+  // whole, there is no appointment to keep, and driving somewhere plausible
+  // instead would put the old asymmetric behaviour back inside the arm that is
+  // supposed to be measuring its replacement.
+  //
+  // The refusal is logged (armAppointment always emits a `rendezvous_agreed`
+  // row, refusals included), so "the arm did nothing here" is visible offline
+  // rather than inferred from an absence. HYBRID no longer has a midpoint tail
+  // either: its branch above now ends in pursuit's own fallback ladder, so the
+  // midpoint drive exists in no arm at all.
+  if (!may_defer) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+        "Rendezvous [%s]: no appointment stands and this arm has no "
+        "unscheduled fallback — continuing to explore.", reason);
   }
-  // No last-contact record (the peer was never heard, so there is no pair to
-  // take a midpoint of). The own-pose anchor is all this robot has.
-  startReturnTo(last_connected_anchor_, "last-connected anchor", reason);
-  return true;
+  return false;
 }
 
 // Flicker guard: a single live claim (one intent inside the 5 s TTL) is
@@ -7852,19 +12614,50 @@ bool ExploPlannerNode::dispatchReconnect(const char* reason) {
 // drained no map deltas. With a positive confirm window the release condition
 // must hold continuously that long. The dwell is cheap where it runs: PURSUE
 // keeps driving (budget still ticking), the barriers keep waiting.
+//
+// THE DWELL ITSELF LIVES IN planner_util (generation 23). This is the node's
+// window over it — the pair of state words and the node clock — and nothing
+// more. It was an inline state machine here until 2026-09-18, which meant the
+// package's one flicker rule was reachable only by a source scan, and meant the
+// two OTHER sites that act on the team coming back (appointment supersede,
+// rendezvous_spent_ release) each shipped without any dwell at all rather than
+// with a copy of this one. All three now call the same tested function.
+//
+// THIS PAIR OF STATE WORDS IS THE BARRIER'S ALONE. The other sites — the
+// appointment supersede, the rendezvous_spent_ release, and since generation
+// 25 the walker conversion in doReturnNav — share a second pair
+// (team_back_ok_*, written once per heartbeat) because they ask one identical
+// question, teamSettled; this one asks a different question — manoeuvre
+// release eligibility — so folding it in would make one caller's answer move
+// on the other's evidence. That is the distinction the member declaration
+// draws, and it is by predicate, not by call site.
 bool ExploPlannerNode::releaseConfirmed(bool eligible) {
-  if (!eligible) {
-    release_ok_armed_ = false;
-    return false;
-  }
-  if (reconnect_release_confirm_sec_ <= 0.0) return true;
-  const auto now = this->now();
-  if (!release_ok_armed_) {
-    release_ok_armed_ = true;
-    release_ok_since_ = now;
-    return false;
-  }
-  return (now - release_ok_since_).seconds() >= reconnect_release_confirm_sec_;
+  return dwellConfirmed(eligible, this->now().seconds(),
+                        reconnect_release_confirm_sec_, &release_ok_armed_,
+                        &release_ok_since_sec_);
+}
+
+// THE READ-ONLY HALF OF THE SAME QUESTION (2026-09-18), for callers that need
+// to know what the barrier decided without BEING the barrier.
+//
+// releaseConfirmed is a state machine: it arms the dwell on its first eligible
+// tick and answers false, and it disarms on the first ineligible one. Both
+// writes are the guard working. So a second caller — the outcome classifier —
+// cannot simply call it to find out whether the manoeuvre ended in a real
+// reunion: asking the question would advance or reset the very window being
+// asked about, and the barrier would then release a confirm-window late or
+// early depending on who ticked first.
+//
+// This returns the same boolean from the same two members without touching
+// either. Keeping the two answers in step is no longer a discipline a reader
+// has to maintain by hand: both now delegate to planner_util's dwellConfirmed /
+// dwellHeld pair, which are adjacent in that file and pinned against each other
+// by executable tests (test_planner_util). What this wrapper must preserve is
+// only that it passes the SAME three inputs as releaseConfirmed does.
+bool ExploPlannerNode::releaseHeld(bool eligible) const {
+  return dwellHeld(eligible, this->now().seconds(),
+                   reconnect_release_confirm_sec_, release_ok_armed_,
+                   release_ok_since_sec_);
 }
 
 // Shared barrier-entry stand-down. The rendezvous/pursuit barrier is HARD:
@@ -7901,8 +12694,9 @@ void ExploPlannerNode::standDownExploitation() {
   }
 }
 
-// Arm the drive to a barrier destination — the own-pose anchor (rendezvous
-// mode) or the pair midpoint (hybrid fallback) — reusing the NAVIGATE
+// Arm the drive to a barrier destination — the agreed appointment cell in
+// every arm that has one, or this robot's own last-connected anchor as the
+// hold escalation's fallback when it does not — reusing the NAVIGATE
 // smart-timeout + arrival test. A presence intent is published (and re-sent by
 // the heartbeat, which fires in the RETURN states) so teammates arriving
 // later count us at the barrier — without it two robots waiting at their own
@@ -7924,21 +12718,52 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   current_goal_.position = dest;
   current_goal_.yaw = latest_yaw_;
 
+  // IS THIS LEG SERVING AN APPOINTMENT? (2026-09-18)
+  //
+  // Every destination this function is ever given comes from one of two
+  // places: appointmentPoint(), or last_connected_anchor_. `what` already
+  // names which at every call site, and it is the only input that survives
+  // the tail-call into RETURN_NAV — so it is what the latch is derived from,
+  // here, once, instead of at each departure site where a future path could
+  // forget it. (No count of the call sites is written down on purpose: a
+  // number in a comment is a fact that goes stale silently, and this one was
+  // already wrong once.)
+  //
+  // The latch is NOT appointment_armed_ and must not be folded into it.
+  // transitionTo(RETURN_NAV) below runs the appointment outcome block, which
+  // can legitimately close (and disarm) the appointment on this very tick —
+  // the departure tick. Two things then read the wrong answer for the whole
+  // manoeuvre: the barrier's wait_cap falls back to the 240 s PURSUIT cap
+  // instead of the unbounded appointment patience, so "be there until all
+  // robots are connected" quietly becomes "be there for four minutes"; and
+  // the arrival stamp has nothing left to set, so a no-show cannot be told
+  // from an unreachable peer. This flag answers "the manoeuvre I am in was
+  // started to keep an appointment", which stays true until the manoeuvre
+  // ends regardless of what happens to the appointment record.
+  appointment_manoeuvre_ = (std::strcmp(what, "appointment") == 0);
+  // A new leg is on the road, not at a barrier: whatever brought the last one
+  // to a stop is spent. Cleared here rather than at the manoeuvre end so a
+  // resumed leg cannot resume itself.
+  appointment_settle_converted_ = false;
+
   RCLCPP_INFO(get_logger(),
       "Rendezvous: dispatched [%s], team incomplete (%d/%d peers) "
       "-> returning to %s (%.2f, %.2f).",
       reason,
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
+      accountedPeerCount(this->now()),
       rendezvous_expected_peers_, what, dest.x(), dest.y());
 
-  // startReturnTo has exactly two destinations across all three call sites (the
-  // hybrid fallback's meeting point; the own-pose anchor, both at dispatch and
-  // on hold-escalation), and `what` is what already distinguishes them in the
-  // log line above — so it is what the event's action is derived from.
+  // The action string is the analysis' name for WHERE this leg went, and the
+  // two destinations above are the two names. "meeting_point" is NOT one of
+  // them any more: it was the midpoint construction, whose last caller went
+  // with meetingPoint() in generation 19 (see planner_util.hpp for why), and
+  // deriving it from a strcmp that can no longer match left every appointment
+  // drive logged as "anchor_return" — an agreed cell reported as a retreat to
+  // the robot's own last-connected pose, which is a different manoeuvre with a
+  // different failure mode. Analyses read this field; it has to be true.
   refreshDispatchContext();
   logReconnectDispatch(
-      std::strcmp(what, "meeting point") == 0 ? "meeting_point"
-                                              : "anchor_return",
+      appointment_manoeuvre_ ? "appointment" : "anchor_return",
       &dest, /*budget_sec=*/-1.0, reason);
 
   publishGoal(current_goal_);
@@ -7979,21 +12804,63 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   progress_check_dist_ = cumulative_distance_;
 }
 
-// Drive toward the anchor. If the whole team reconnects en route, the barrier
-// is already satisfied — re-plan without finishing the drive. On arrival (or if
-// the anchor turns out unreachable) hand off to RETURN_SYNC to wait for the
-// team from wherever we ended up.
+// Drive toward the destination — the agreed appointment cell, or the robot's
+// own last-connected anchor. On arrival (or if the destination turns out
+// unreachable) hand off to RETURN_SYNC to wait for the team from wherever we
+// ended up.
+//
+// AN APPOINTMENT IS NOT RELEASED EN ROUTE (2026-09-18), BUT SINCE GENERATION
+// 25 IT CAN JOIN THE BARRIER EN ROUTE. For an anchor return the drive is a
+// means and reconnecting is the end, so reconnecting en route makes the rest
+// of the drive pointless and this function re-plans on the spot. For an
+// appointment, releasing straight to PLAN from here broke the directive in
+// two places at once —
+//
+//   "be there until all robots are connected THEN WAIT FOR A WHILE MORE so
+//    that map is updated then begin explore"
+//
+// — because the settle hold that serves that sentence lives in RETURN_SYNC,
+// which an en-route RELEASE skips entirely. In a three-robot outage the first
+// robot to see the team complete would leave immediately while the others were
+// still driving, so the one hold whose whole purpose is to let the merged map
+// propagate was paid by nobody. The generation-25 answer is neither of the
+// gen-24 options (release here, or drive to the ring no matter what): when the
+// team has SETTLED for the shared confirm window, the walker stops driving and
+// enters RETURN_SYNC from where it stands — the settle hold is still paid,
+// the release still happens at the one site that owns it, and the last metres
+// to the cell are not driven because the thing they were for has already
+// happened. Gen 24 held that finishing the drive was "the literal reading of
+// an exact place"; the ts4 24b N=2 hybrid cell priced that literalism: a robot
+// 2.4 m outside a 1.5 m ring, crawling at 0.06 m/s against meeting-point
+// clutter for 350 s with the link up 90.5% and the maps already merged, its
+// appointment_inbound bit holding two peers' barriers open to the censor.
+//
+// THE WATCHDOGS BELOW DO NOT CLOSE THAT CASE, which is why the conversion is
+// not redundant with them: the proximity-hold release refunds held time to the
+// nav budget and restarts the progress window (see doProximityHold), each
+// individually correct, so a hold/resume cycle around a parked partner defeats
+// both indefinitely — the same crawl cycled them for the whole 350 s. For the
+// genuinely-unreachable-cell case with the team still apart they remain the
+// exits, and they still hand off to RETURN_SYNC rather than PLAN.
 void ExploPlannerNode::doReturnNav() {
-  // livePeerCount — presence semantics, same note as finishOrRendezvous().
-  const int active =
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_))) {
+  // accountedPeerCount — presence semantics, same note as finishOrRendezvous().
+  const int active = accountedPeerCount(this->now());
+  // Guard BEFORE the call, not after: releaseConfirmed is a state machine that
+  // arms and disarms its dwell as a side effect, and running it on a path whose
+  // answer is discarded would advance a window nobody is reading.
+  //
+  // manoeuvreReleaseEligible is DELIBERATELY REDUNDANT with the guard beside
+  // it: && short-circuits, so on this path it can only ever evaluate its
+  // teamComplete branch. Written as the shared helper anyway so that the five
+  // sites read as one predicate and a future change to the guard cannot leave
+  // an appointment releasing here on the wrong half of it.
+  if (!appointment_manoeuvre_ && releaseConfirmed(manoeuvreReleaseEligible(active))) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team reconnected en route (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
     // RETURN_NAV is a driving state: stop the platform before PLAN. doPlan
     // can spend ticks retrying (map load, all candidates rejected) with the
-    // proximity guard off, and nav2 would keep executing the barrier goal
+    // proximity guard off, and the navigator would keep executing the barrier goal
     // underneath it the whole time (see abandonNavGoal).
     abandonNavGoal("return-released");
     // Re-confirm saturation against the post-merge map instead of finishing
@@ -8010,14 +12877,14 @@ void ExploPlannerNode::doReturnNav() {
   const float dist = std::sqrt(dx * dx + dy * dy);
   // reconnect_arrive_tol_m_, NOT goal_xy_tol_: the destination's value is
   // connectivity, not position (see the member). Both robots stopping within
-  // this of the same meeting point leaves them <= 2x it apart, and it turns an
-  // obstructed midpoint from a budget burn into an arrival beside it.
+  // this of the same destination leaves them <= 2x it apart, and it turns an
+  // obstructed destination from a budget burn into an arrival beside it.
   if (dist < static_cast<float>(reconnect_arrive_tol_m_)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: reached %s (dist=%.2f, tol=%.1f) -> waiting for team.",
         return_dest_label_.c_str(), dist, reconnect_arrive_tol_m_);
     // RETURN_SYNC assumes a stationary robot, but arrival-by-tolerance lands
-    // BEFORE nav2 finishes its own goal: without an explicit stop the
+    // BEFORE the navigator finishes its own goal: without an explicit stop the
     // controller keeps driving to the exact goal pose underneath the barrier
     // — and underneath whatever state the release transitions into next.
     // Same rationale as the release path above.
@@ -8025,12 +12892,51 @@ void ExploPlannerNode::doReturnNav() {
     // meeting was a coordination failure (both arrived, nobody was there) or
     // a navigation one (this robot never got there). Without the distinction
     // a no-show count is uninterpretable — see RendezvousOutcomeEvent.
-    if (appointment_armed_ && appointment_departed_ && !appointment_arrived_) {
+    //
+    // Keyed on appointment_manoeuvre_, not on (armed && departed): the
+    // appointment can be closed — and disarmed — on the very tick the drive
+    // starts, which left the arrival of a drive that did reach the cell
+    // unrecordable. What is being asserted here is a fact about THIS LEG.
+    if (appointment_manoeuvre_ && !appointment_arrived_) {
       appointment_arrived_        = true;
       appointment_arrived_at_sec_ = missionElapsed();
     }
     abandonNavGoal("return-arrived");
     transitionTo(State::RETURN_SYNC, "return-arrived");
+    return;
+  }
+
+  // THE GENERATION-25 CONVERSION (see the function header): an appointment
+  // walker whose team has settled joins the barrier from where it stands.
+  //
+  // team_back_ok_*, NOT release_ok_*: this site asks the supersede's question
+  // — "is the outage over?" — not the barrier's. The barrier's own predicate
+  // (manoeuvreReleaseEligible) is unsatisfiable from here by construction:
+  // this robot IS the inbound peer its !peerInboundToAppointment() term is
+  // waiting out. And the release_ok_ window cannot serve either, because its
+  // RETURN_NAV writer above is guarded off for appointments, so that window
+  // is FROZEN on this path — reading it would fire on one stale sample, the
+  // exact failure the dwell exists to prevent.
+  //
+  // dwellHeld, NOT dwellConfirmed: heartbeatTick owns this window's clock
+  // (one writer per window; it ticks unconditionally at 1 Hz). This site only
+  // reads the answer, conjoined on its own fresh presence count — the same
+  // pattern as the P5 supersede.
+  //
+  // appointment_arrived_ stays FALSE on this path, deliberately: the ring
+  // above is now the diagnostic that says whether the last metres were
+  // actually driven, so the outcome row can tell "met without reaching the
+  // cell" from "never got there while the team stayed apart".
+  if (appointment_manoeuvre_ &&
+      dwellHeld(teamSettled(active), this->now().seconds(),
+                reconnect_release_confirm_sec_, team_back_ok_armed_,
+                team_back_ok_since_sec_)) {
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous: team settled while driving to %s (dist=%.2f) -> joining "
+        "the barrier from here.", return_dest_label_.c_str(), dist);
+    appointment_settle_converted_ = true;
+    abandonNavGoal("return-team-settled");
+    transitionTo(State::RETURN_SYNC, "return-team-settled");
     return;
   }
 
@@ -8074,13 +12980,268 @@ void ExploPlannerNode::doReturnNav() {
 // heartbeat keeps broadcasting our presence throughout so arriving peers count
 // us and release their own barriers.
 void ExploPlannerNode::doReturnSync() {
-  // livePeerCount — presence semantics, same note as finishOrRendezvous().
-  const int active =
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_))) {
-    RCLCPP_INFO(get_logger(),
-        "Rendezvous: full team connected (%d/%d) -> re-planning against "
-        "merged map.", active, rendezvous_expected_peers_);
+  // accountedPeerCount — presence semantics, same note as finishOrRendezvous().
+  const int active = accountedPeerCount(this->now());
+  // THE BARRIER OF THE FIVE-SITE RULE (generation 23). For an APPOINTMENT this
+  // is (teamSettled OR every expected peer reachable in the comms closure —
+  // the generation-27 door) AND nobody still driving here. The mesh half is
+  // the condition the appointment armed on; the door is for the gather that
+  // one occluded chord keeps mesh-false forever, and it cannot hand the robot
+  // back for an instant re-arm because rendezvous_spent_ still clears only on
+  // the strict dwelt predicate. For a midrun or terminal reconnect
+  // it stays teamComplete: those are this robot's own business and a distant
+  // robot's break must not hold a pair that has already reconnected. See
+  // manoeuvreReleaseEligible().
+  //
+  // WHY THE SECOND TERM IS THERE, because the first one alone read as though it
+  // were enough. This block used to argue that "at the meeting point the robots
+  // are within a couple of metres of each other, so every pair should be up by
+  // construction — that is what meeting at one place is FOR". True of robots AT
+  // the meeting point, and the release never required them to be there: it is a
+  // comms test, the radio reaches tens of metres, and the drive it is paired
+  // with only ends on arrival. So the first robot to arrive released as soon as
+  // its partner came into range and left with most of that partner's walk still
+  // to go, and the partner — which may not release en route, the cell being the
+  // agreed thing — finished the walk to an empty cell and waited there alone.
+  // The gen-23 smoke measured 36 s of settle against 272 s of standing.
+  //
+  // THE HANG THIS ADMITTED WAS THEN MEASURED (gen-26 N=3 smoke: three robots
+  // gathered at the agreed cell, one trunk on one 8 m chord, all parked in
+  // RETURN_SYNC from ~350 s to the 660 s cap, zero outcome rows) and
+  // generation 27 narrows it. The appointment wait cap is
+  // rendezvous_appointment_wait_sec, which the campaign leaves at 0 =
+  // UNBOUNDED, and through generation 26 "gathers but cannot close every
+  // pair" waited here until the run's duration cap; the reachable door now
+  // releases that shape after the settle. What still waits unbounded is a
+  // team missing a peer from the CLOSURE itself — genuinely absent, still
+  // driving in, or dark to every robot present — which is the vigil the
+  // unbounded cap is FOR. The
+  // finished-peer exemption in peerReportsTeamBreak() removes the one case that
+  // could hold it open indefinitely. The claim that stood here — that the
+  // inbound term ends at the nav budget whether or not the cell was reachable —
+  // was FALSIFIED by the ts4 24b N=2 hybrid cell: the proximity-hold release
+  // refunds held time and restarts the progress window (see doProximityHold),
+  // so a walker crawling against meeting-point clutter held the bit, and this
+  // barrier, for 350 s to the censor with the team connected the whole time.
+  // Generation 25 closes that path at the source: a walker whose team has
+  // settled for the confirm window converts to RETURN_SYNC (see doReturnNav),
+  // which clears appointment_inbound on the next heartbeat — so the inbound
+  // term can now outlive the confirm window only while the team is genuinely
+  // still apart, which is the case it was written for.
+  if (releaseConfirmed(manoeuvreReleaseEligible(active))) {
+    // THE SETTLE HOLD (2026-09-18). The team being connected is not the same
+    // event as the maps having merged, and releasing on the first is releasing
+    // before the thing the meeting was for has happened. dscovox fusion is
+    // radio-gated: peer voxels cross the comms emulator at a bounded rate once
+    // the link is up, so "full team connected" marks the START of the exchange,
+    // not its end. A barrier that released on that tick paid the entire drive
+    // to the meeting point and then re-planned against a map that had received
+    // almost none of the partner's coverage — the cost of the manoeuvre with a
+    // fraction of its benefit, which would read in the analysis as the
+    // rendezvous arm simply being expensive.
+    //
+    // Held in RETURN_SYNC rather than as a sleep so the robot keeps
+    // heartbeating and keeps counting peers throughout: if a peer drops during
+    // the settle the completeness test below fails on the next tick and the
+    // barrier correctly goes back to waiting instead of releasing into a team
+    // that has already come apart again.
+    //
+    // ONLY AN APPOINTMENT SETTLES (2026-09-18). The hold is the last clause of
+    // the rendezvous rule — meet at the agreed cell, wait for everyone, "then
+    // wait for a while more so that map is updated" — so it belongs to the
+    // appointment and to nothing else. Charging it to every barrier put it on
+    // PURSUIT's reunions and on the terminal anchor hold too, which costs those
+    // arms rendezvous_settle_sec per manoeuvre for a mechanism they are the
+    // control for: the four-arm design reads as a factorial, and a treatment
+    // leaking into the control arm is exactly the leak that makes it stop
+    // reading as one. Every non-appointment barrier is now treated identically
+    // (no settle) in all four arms, so what is left is a difference between
+    // arms rather than a difference between barriers.
+    // NO CLOCK CONDITION IN THE GATE (2026-09-18). It used to carry
+    // `&& t_now >= 0.0` against missionElapsed(), which meant an unresolvable
+    // mission clock SKIPPED the settle and released the barrier on the spot.
+    // See the member: the settle is a duration, it is measured on the sim
+    // clock this state already reads for everything else, and there is no
+    // longer a state in which it can be silently not applied.
+    const auto settle_now = this->now();
+    // The mesh count for a mesh release, the closure count for a door release
+    // (generation 27): a correct door release must not log "1/2".
+    // sim/manoeuvre_events.py's RE_REJOIN greps this line — it matches both
+    // this text and its pre-27 "full team connected" form — so the prefix
+    // "Rendezvous: team reachable" is load-bearing; the jsonl rows carry the
+    // raw mesh count.
+    const int present = std::max(active, reachablePeerCount());
+    double settled_sec = 0.0;
+    if (appointment_manoeuvre_ && rendezvous_settle_sec_ > 0.0) {
+      if (!rendezvous_settling_) {
+        rendezvous_settling_    = true;
+        rendezvous_settle_start_ = settle_now;
+        // STAMPED WHERE THE HOLD STARTS, because that is the instant the
+        // exchange starts: the team has just become reachable and none of the
+        // peer's voxels have crossed the emulator yet. Anything that arrives
+        // between here and the release is what the meeting bought.
+        rendezvous_exchange_ = MapExchangeBaseline{
+            true, latest_map_voxels_, cell_world_.sharedHash(),
+            team_merge_applied_total_};
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous: team reachable (%d/%d) -> holding %.0fs for the "
+            "map exchange before re-planning.",
+            present, rendezvous_expected_peers_, rendezvous_settle_sec_);
+      }
+      settled_sec = (settle_now - rendezvous_settle_start_).seconds();
+      if (settled_sec < rendezvous_settle_sec_) {
+        return;   // still settling; stay put, keep heartbeating.
+      }
+      // AND THEN IT WAITS FOR THE NEXT APPOINTMENT (generation 29). The maps
+      // have merged; the rule's last clause is that the team agrees the next
+      // place and time and only THEN resumes exploring. Requested here rather
+      // than at the release below so the request is made while the fleet is
+      // still standing on the cell: the derive is the proposer's and the commit
+      // needs every peer's echo, and both of those are cheapest — and least
+      // likely to be lost to a link break — before anyone drives away.
+      if (!rendezvous_reagree_waiting_) {
+        rendezvous_reagree_waiting_ = true;
+        rendezvous_reagree_from_    = rendezvous_agreed_;
+        rendezvous_reagree_due_     = true;
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous: maps merged after %.0fs -> holding for the next place "
+            "and time (up to %.0fs).",
+            settled_sec, kRendezvousReagreeWaitSec);
+      }
+      if (rendezvous_agreed_ == rendezvous_reagree_from_) {
+        // THE COMMIT RULE'S OWN OUTPUT is the release test, not the request
+        // flag: rendezvous_agreed_ only moves when every peer has echoed the
+        // same triple, and it reads the same on the proposer and on a follower.
+        //
+        // BOUNDED, AND THE EXPIRY IS NOT A FAILURE TO RECOVER FROM. A schedule
+        // rolls forward rather than expiring (see nextAgreedOccurrence), so a
+        // team that leaves on the pair it already has still has a place and a
+        // time — an older place, sited by a staler map. Standing here longer
+        // than this trades that for a worse thing: an appointment arm that
+        // cannot explore because its handshake did not land.
+        if (settled_sec - rendezvous_settle_sec_ < kRendezvousReagreeWaitSec) {
+          return;   // keep standing on the cell; keep heartbeating.
+        }
+        RCLCPP_WARN(get_logger(),
+            "Rendezvous: no new pair committed in %.0fs -> leaving the meeting "
+            "on the pair the team already holds (cell %d, t+%.0fs).",
+            kRendezvousReagreeWaitSec, rendezvous_agreed_.cell,
+            rendezvous_agreed_.t_meet_ms / 1000.0);
+      }
+    }
+    // WHAT THE EXCHANGE ACTUALLY MOVED, not that it moved something. The line
+    // this replaces said "re-planning against merged map" on every release
+    // whether or not one byte had crossed, which is the shape of claim that
+    // survives a whole campaign unfalsified because nothing ever measures it.
+    // Three quantities because they fail differently: the cell delta is the
+    // only one a peer alone can move (this robot's own driving cannot change a
+    // status a peer's census set), the census hash answers "did the shared
+    // belief move at all" for a merge whose applied count is zero because the
+    // peer agreed, and the voxel delta is the dense map the planner actually
+    // costs tours over — which includes this robot's own sensing while it
+    // stood there, so it is the loosest of the three and is reported as such.
+    //
+    // A BASELINE IS NOT ALWAYS THERE: with the settle off there is no interval
+    // to difference, and printing a zero for that would report a silent
+    // exchange where there was only an unmeasured one.
+    //
+    // THE INTERVAL IS THE WHOLE MEETING, both stages of it: the baseline is
+    // stamped when the team becomes reachable and differenced here, after the
+    // re-agreement wait above, so peer cells that land while the team is
+    // standing there waiting for the next pair count as what the meeting
+    // bought. `settled_sec` is therefore the total time on the cell and is
+    // reported as "held", not as the settle parameter.
+    if (rendezvous_exchange_.taken) {
+      const long long merged_cells =
+          team_merge_applied_total_ - rendezvous_exchange_.merged;
+      const double gained_voxels =
+          latest_map_voxels_ - rendezvous_exchange_.voxels;
+      const bool census_moved =
+          cell_world_.sharedHash() != rendezvous_exchange_.hash;
+      RCLCPP_INFO(get_logger(),
+          "Rendezvous: team reachable (%d/%d) -> re-planning against merged "
+          "map (held %.1fs; the exchange applied %lld peer cell(s), the "
+          "shared census %s, the dense map gained %.0f voxel(s)).",
+          present, rendezvous_expected_peers_, settled_sec, merged_cells,
+          census_moved ? "moved" : "did not move", gained_voxels);
+      // NOT A GATE, AND DELIBERATELY SO. An exchange that moved nothing is a
+      // result — two robots that covered no ground the other needed — and
+      // refusing to re-site the meeting on it would leave the team on a pair
+      // derived before the FIRST outage for the rest of the run, which is
+      // strictly the worse of the two. The numbers are here to be read; the
+      // meeting earns its new place and time either way.
+      if (merged_cells == 0 && !census_moved && gained_voxels <= 0.0) {
+        RCLCPP_WARN(get_logger(),
+            "Rendezvous: the %.1fs meeting hold moved nothing at all — "
+            "the manoeuvre was paid for and returned no map.", settled_sec);
+      }
+    } else {
+      RCLCPP_INFO(get_logger(),
+          "Rendezvous: team reachable (%d/%d) -> re-planning against merged "
+          "map (no settle configured, so the exchange is unmeasured).",
+          present, rendezvous_expected_peers_);
+    }
+    rendezvous_exchange_ = MapExchangeBaseline{};
+    // ASK FOR THE NEXT MEETING. Requested rather than done here because
+    // deriving is the proposer's and needs the frozen snapshot; see
+    // rendezvous_reagree_due_ and the derive gate it opens.
+    //
+    // An APPOINTMENT has already asked, at the end of its settle, and has
+    // stood here until the answer committed — this raise is idempotent and is
+    // what covers the barriers that reach the release without a settle stage:
+    // a pursuit reunion, and an appointment run with rendezvous_settle_sec 0.
+    // Those leave immediately and re-agree while they drive, which is the
+    // older behaviour and all that is available without a hold to do it in.
+    rendezvous_reagree_due_ = true;
+    rendezvous_settling_ = false;
+    rendezvous_reagree_waiting_ = false;
+    // A LATCHED ROBOT DOES NOT GO BACK TO EXPLORING (2026-09-17). This release
+    // is unconditional in every earlier generation, and once
+    // maybeLatchCoverageDone can hold a FINISHED robot here it stops being
+    // safe: the robot would be handed back to PLAN with coverage_latched_ true,
+    // explore until max_steps_, and call finishOrRendezvous("step-budget") ->
+    // recordExplorationComplete a second time. That stamp is keyed on step_,
+    // not once per run, so the cell would carry TWO exploration_complete rows
+    // at very different t_sim — in the rendezvous and hybrid arms only — and
+    // the readers disagree about which to keep (ts1b_cells.py takes the last,
+    // n23.py the first). The primary endpoint would be corrupted asymmetrically
+    // across arms, which is worse than anything the hold was added to fix.
+    //
+    // This robot got what it was waiting for: the team is whole and the settle
+    // has run, so the merge it stayed for has happened. Ending here is the
+    // ending it would have taken at the latch, now taken at the right moment.
+    if (coverage_latched_) {
+      // THE ELAPSED HOLD, read before the start stamp is cleared on the next
+      // line. This printed rendezvous_latched_hold_sec_ — the CAP — until
+      // 2026-09-18, so every release-by-reconnection reported the same 300s
+      // whether it had stood there four seconds or two hundred and ninety, and
+      // the one question this line exists to answer (how long does a finished
+      // robot wait at the agreed cell?) could not be read out of the plaintext
+      // log at all. The expiry path 100 lines below always computed this
+      // correctly, which is why the two disagreed. -1 where there is no stamp
+      // to subtract from: the hold only starts if the latch fired with
+      // rendezvous_latched_hold_sec_ > 0, and printing 0.0 for "never started"
+      // would be the same lie pointing the other way.
+      const double t_release_now = missionElapsed();
+      const double held_to_release =
+          (coverage_latch_hold_start_sec_ >= 0.0 && t_release_now >= 0.0)
+              ? std::max(0.0, t_release_now - coverage_latch_hold_start_sec_)
+              : -1.0;
+      coverage_latch_hold_start_sec_ = -1.0;
+      coverage_latch_teardown_ = true;
+      abandonNavGoal("coverage-latched-released");
+      RCLCPP_INFO(get_logger(),
+          "Rendezvous: team met and the map settled while this robot was "
+          "already finished -> ending the run now (held %.0fs past the latch, "
+          "cap %.0fs).",
+          held_to_release, rendezvous_latched_hold_sec_);
+      if (mission_return_enabled_ && have_home_) {
+        (void)startReturnHome("coverage-latched-released");
+        return;
+      }
+      (void)finishNow("coverage-latched-released");
+      return;
+    }
     // Re-confirm saturation against the post-merge map instead of finishing
     // off the pre-barrier streak on the first PLAN tick.
     coverage_done_streak_ = 0;
@@ -8088,22 +13249,185 @@ void ExploPlannerNode::doReturnSync() {
     transitionTo(State::PLAN, "barrier-released");
     return;
   }
+  // NOT COMPLETE. Any partial settle is void — the hold exists to let a WHOLE
+  // team's maps merge, and restarting it is what makes a peer that drops
+  // mid-settle cost the settle rather than shorten it. The re-agreement wait
+  // is void with it: it is the same hold's second stage, and a commit needs
+  // every peer's echo, so a team that has come apart cannot finish one.
+  rendezvous_settling_ = false;
+  rendezvous_reagree_waiting_ = false;
 
-  // Mid-run barriers give up on their own (short) cap; terminal barriers keep
-  // the field cap, shortened after an escalation (the second wait is a
-  // confirmation of failure, not a second full vigil).
+  // THE CONVERSION IS REVERSIBLE (2026-09-19, generation 28). A walker that
+  // joined the barrier from the road did so on one premise — the team had
+  // settled, so this spot was as good as the cell. When that premise lapses
+  // the premise is all that is gone: the robot is left stopped in open forest,
+  // metres of unfinished walk from the one place the team agreed to be, and
+  // through generation 27 nothing ever sent it the rest of the way. The
+  // ts4 gen-27 N=2 rendezvous smoke cell measured it — both robots converted
+  // mid-drive at 367/369 s, the link died at 396 s and never returned, and
+  // both stood 13.0 m and 7.2 m short of the agreed cell until the 660 s cap:
+  // 330 s each, no outcome row, coverage frozen, and the one action that
+  // would have closed the pair (finishing the walk, which ends with them
+  // co-located) was the action the conversion cancelled. Waiting longer could
+  // not fix it, because the wait is deliberately unbounded and the robots were
+  // not where the waiting was supposed to happen.
+  //
+  // THE TERMS ARE manoeuvreReleaseEligible's FIRST HALF, NEGATED, and written
+  // out rather than called: that function also answers false while the team is
+  // together and a peer is still walking in — the case where standing still is
+  // exactly right — so resuming on its bare negation would put this robot back
+  // on the road to meet a peer that is already coming, each setting the other's
+  // inbound bit. A change to the release's "team is together" disjunction is a
+  // change to this test.
+  //
+  // The tolerance guard and the local copy are the hold-escalation's, for its
+  // two reasons: a robot already at the cell has nowhere to resume TO, and
+  // startReturnTo overwrites current_goal_ before it reads its own argument,
+  // so passing current_goal_.position directly would hand it a zeroed vector.
+  if (appointment_manoeuvre_ && appointment_settle_converted_ &&
+      !appointment_arrived_ && !teamSettled(active) &&
+      !teamComplete(reachablePeerCount(), rendezvous_expected_peers_)) {
+    const Eigen::Vector3f resume_target = current_goal_.position;
+    const float rdx = resume_target.x() - latest_pos_.x();
+    const float rdy = resume_target.y() - latest_pos_.y();
+    if (std::sqrt(rdx * rdx + rdy * rdy) >
+        static_cast<float>(reconnect_arrive_tol_m_)) {
+      RCLCPP_WARN(get_logger(),
+          "Rendezvous: the settle that stopped me here has lapsed (%d/%d "
+          "present) -> resuming the drive to the agreed cell (%.2f, %.2f).",
+          active, rendezvous_expected_peers_,
+          resume_target.x(), resume_target.y());
+      startReturnTo(resume_target, "appointment", "return-settle-lapsed");
+      return;
+    }
+  }
+
+  // WHICH PATIENCE APPLIES. Three cases, and generation 19 splits the first
+  // one in two:
+  //
+  //   appointment  STAY UNTIL EVERYONE IS HERE. The place was agreed by the
+  //                whole team in advance, so the only reason a peer is absent
+  //                is that it has further to drive or noticed the separation
+  //                later — both of which resolve by waiting. (Since
+  //                generation 27 a peer merely MESH-dark at the gathered cell
+  //                no longer spends this patience — the reachable door
+  //                releases that shape — so the peer waited on here is one
+  //                outside the closure itself.) Giving up here
+  //                converts a meeting that was going to happen into a no-show,
+  //                which is what the gen-18 ts4 N=3 cell measured: husky spent
+  //                the full 240 s and walked away from a cell two of the three
+  //                robots had already stood on together. Unbounded by default
+  //                (rendezvous_appointment_wait_sec <= 0).
+  //   pursuit      the mid-run cap. A chase drives to a PREDICTED intercept,
+  //                which can simply be the wrong place, and there is no
+  //                agreement behind it to be kept — so giving up is the right
+  //                response to a bad prediction rather than an abandonment.
+  //   terminal     the field cap, shortened after an escalation (the second
+  //                wait is a confirmation of failure, not a second full vigil).
+  //
+  // Keyed on appointment_manoeuvre_, NOT on appointment_armed_ (2026-09-18).
+  // The appointment record can be closed on the tick the drive departs — the
+  // supersede and the outcome block both run inside transitionTo(RETURN_NAV) —
+  // which silently dropped a robot standing at the agreed cell from the
+  // unbounded appointment patience to the 240 s PURSUIT cap, i.e. turned "stay
+  // until everyone is here" into "stay four minutes" without any line of code
+  // saying so. What decides the patience is what the robot is DOING, and it is
+  // keeping an appointment for as long as the manoeuvre lasts.
   const double wait_cap =
-      !reconnect_terminal_
-          ? reconnect_midrun_max_wait_sec_
-          : (hold_escalated_ ? hold_escalate_wait_sec_
-                             : rendezvous_max_wait_sec_);
-  const double waited = (this->now() - state_enter_time_).seconds();
+      reconnect_terminal_
+          ? (hold_escalated_ ? hold_escalate_wait_sec_
+                             : rendezvous_max_wait_sec_)
+          : (appointment_manoeuvre_ ? rendezvous_appointment_wait_sec_
+                                    : reconnect_midrun_max_wait_sec_);
+  double waited = (this->now() - state_enter_time_).seconds();
+
+  // THE CONTAGION HOLD, NAMED IN THE LOG (generation 23). Reaching here with
+  // the team complete means the ONLY thing still holding the barrier is a peer
+  // announcing that ITS view is broken — the case teamSettled added. Without
+  // this line that reads in the plaintext log as a gathered team and a barrier
+  // that refuses to release, which is indistinguishable from the release being
+  // broken. Since generation 27 the reachable door bounds this hold whenever
+  // the closure is whole, so a LONG run of these lines now also implies a peer
+  // outside the closure. Throttled to 30 s because the interesting quantity is
+  // "was it held, and roughly how long", not a per-tick trace.
+  if (appointment_manoeuvre_ &&
+      teamComplete(active, rendezvous_expected_peers_) &&
+      peerReportsTeamBreak()) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+        "Rendezvous: %d/%d present here but a peer still reports the team "
+        "incomplete -> holding the appointment (%.0fs).",
+        active, rendezvous_expected_peers_, waited);
+  }
+
+  // THE LATCHED HOLD'S OWN CAP (2026-09-17). Checked before, and independently
+  // of, rendezvousWaitExpired, because the cap it has to survive is the one
+  // above: on an appointment manoeuvre wait_cap is
+  // rendezvous_appointment_wait_sec, which is 0 = unbounded by default and is
+  // meant to be. That patience belongs to a robot with exploring left to
+  // trade against it. This robot has none, so an unbounded hold here is a cell
+  // that runs to the harness wall clock with one robot standing still.
+  //
+  // Measured from the LATCH, not from state entry: `waited` starts when the
+  // robot entered RETURN_SYNC, which is before it finished, and charging the
+  // hold for that time would cut it short by however long the robot waited
+  // while it was still exploring.
+  if (coverage_latched_ && coverage_latch_hold_start_sec_ >= 0.0 &&
+      rendezvous_latched_hold_sec_ > 0.0) {
+    const double t_hold_now = missionElapsed();
+    const double held = (t_hold_now >= 0.0)
+                            ? t_hold_now - coverage_latch_hold_start_sec_
+                            : 0.0;
+    if (held >= rendezvous_latched_hold_sec_) {
+      RCLCPP_WARN(get_logger(),
+          "Rendezvous: finished robot held the agreed cell %.0fs (cap %.0fs) "
+          "with %d/%d present and the team never completed -> ending the run.",
+          held, rendezvous_latched_hold_sec_, active,
+          rendezvous_expected_peers_);
+      coverage_latch_hold_start_sec_ = -1.0;
+      coverage_latch_teardown_ = true;
+      abandonNavGoal("latched-hold-expired");
+      if (mission_return_enabled_ && have_home_) {
+        (void)startReturnHome("latched-hold-expired");
+        return;
+      }
+      // Same presence rule the give-up path uses below: a finished idle robot
+      // is still parked and countable, so a peer that arrives late can still
+      // release its own barrier on contact.
+      if (done_action_ == "idle") {
+        publishPresenceIntent();
+      } else {
+        have_active_intent_ = false;
+      }
+      transitionTo(State::DONE, "latched-hold-expired");
+      return;
+    }
+  }
+
+  // A BLOCK THAT REWOUND `waited` TO max(arrival, t_meet) STOOD HERE, and
+  // generation 19 makes it provably a no-op rather than merely unnecessary.
+  // It existed because t_meet was a MEETING time the robot aimed to arrive
+  // before, so a punctual robot began spending its patience while the meeting
+  // was still in the future and could time out ahead of its own appointment
+  // (measured: atlas gave up at lateness_sec = -11.184). Under the countdown
+  // rule t_meet is the DEPARTURE time, so arrival is necessarily at or after
+  // it, `since_meet >= waited` always holds, and the min() could only ever
+  // return `waited`. Keeping it would leave a reader believing the barrier
+  // still has a second clock in it.
   if (rendezvousWaitExpired(waited, wait_cap)) {
-    if (!reconnect_terminal_) {
+    if (!reconnect_terminal_ && !coverage_latched_) {
       // A mid-run attempt must never end the run: the map is not saturated
       // (the trigger only fires from an unsaturated PLAN tick), so give the
       // manoeuvre back its time and go explore. The cooldown stamps in
       // transitionTo when reconnect_active_ falls.
+      //
+      // ...which is why coverage_latched_ disqualifies this branch (2026-09-17).
+      // The premise stated above — "the map is not saturated" — is exactly what
+      // the at-the-rendezvous hold falsifies: it keeps a SATURATED robot inside
+      // a mid-run manoeuvre on purpose. Sending that robot back to PLAN would
+      // re-explore a finished map and emit a second exploration_complete at the
+      // step budget (see the release path above for why that corrupts the
+      // endpoint). A latched robot falls through to the escalate/give-up ladder
+      // instead, which ends the run the way every other ending does.
       RCLCPP_INFO(get_logger(),
           "Reconnect (mid-run): gave up after %.0fs at the barrier "
           "(%d/%d present) -> resuming exploration.",
@@ -8116,23 +13440,46 @@ void ExploPlannerNode::doReturnSync() {
     if (hold_escalate_ && !hold_escalated_) {
       hold_escalated_ = true;  // sticky: an unreachable target must not
                                // re-escalate on every expiry forever
-      // Escalate to the SAME point the dispatch picked — the midpoint of the
-      // pair THIS manoeuvre was armed from (reconnect_rec_, not a re-read:
-      // a packet heard while we waited must not move the target off the one
-      // the peer is driving to). Escalating to this robot's own anchor sent a
+      // Escalate to the SAME point the dispatch picked, never to a freshly
+      // derived one: a packet heard while we waited must not move the target
+      // off the one the peer is driving to. (The point the dispatch picked
+      // WAS the midpoint of the pair this manoeuvre was armed from, held in
+      // reconnect_rec_, until 2026-09-16; it is now the appointment cell, and
+      // the branch below reads it off the leg's own goal for exactly the same
+      // no-re-derivation reason.) Escalating to this robot's own anchor sent a
       // waiting robot to a point one comms range from where its waiting peer
       // would go, which is the non-convergence documented in dispatchReconnect;
       // it has to be fixed in both places or a hold reintroduces it after the
       // dispatch avoided it.
       //
-      // EXCEPT under pure PURSUIT, which has no agreed fallback point BY
-      // DESIGN — that absence is the A/B against hybrid (see dispatchReconnect
-      // and pursuitFallback, which both say so). A mode-blind escalation makes
-      // pursuit perform hybrid's fallback ~300 s later and erases the contrast
-      // the arm exists to measure, so pursuit keeps the own-anchor escalation
-      // it had before the meeting point existed and is unchanged by it.
-      const bool use_meeting =
-          reconnect_mode_ != ReconnectMode::PURSUIT && have_reconnect_rec_;
+      // THE MIDPOINT ESCALATION IS GONE FOR EVERY ARM (2026-09-16), which
+      // leaves the two branches below: the agreed point if one was agreed, and
+      // this robot's own last-connected anchor otherwise.
+      //
+      // It used to run for RENDEZVOUS and HYBRID but not PURSUIT, on the
+      // grounds that "pursuit has no agreed fallback point by design — that
+      // absence is the A/B against hybrid". That reasoning survived the
+      // removal of the midpoint from the dispatch paths and should not have:
+      // with the dispatch midpoint gone from both arms, this was the last
+      // place a midpoint could still be driven to, and leaving it here would
+      // have preserved the exact defect in a slower form. A robot reaches this
+      // line ~300 s into a hold, and a place with no time is no better agreed
+      // then than it was at the separation.
+      //
+      // It also broke the composition the four-arm design rests on. Hybrid is
+      // meant to be pursuit plus rendezvous and nothing else; an escalation
+      // target hybrid could drive to and pursuit could not is a third
+      // behaviour, so any hybrid-vs-pursuit contrast would have carried it.
+      // Now all three arms escalate identically, and the ONLY thing hybrid can
+      // do that pursuit cannot is keep an appointment — which is the contrast
+      // the arm exists to measure.
+      //
+      // The own-anchor escalation has a known weakness (two waiting robots go
+      // to two points up to a comms range apart, the non-convergence noted in
+      // dispatchReconnect). That weakness is unchanged for pursuit, which has
+      // always had it, and for the other two arms it is now the fallback of a
+      // fallback: the appointment branch below covers every case where the
+      // team actually agreed on somewhere to be.
       Eigen::Vector3f esc_target = Eigen::Vector3f::Zero();
       const char* esc_what = nullptr;
       // P5: an appointment that was departed already HAS an agreed point, and
@@ -8141,13 +13488,15 @@ void ExploPlannerNode::doReturnSync() {
       // the cell is already there, so the tolerance test below falls through
       // and it gives up on the spot, which is correct: there is nowhere
       // better to go. One that never reached it re-attempts the same drive.
-      if (appointment_armed_ && appointment_departed_) {
-        esc_target = appointmentPoint();
+      if (appointment_manoeuvre_) {
+        // The leg's own destination, not a re-derivation: appointmentPoint()
+        // reads appointment_, which closeAppointment() blanks — and closing on
+        // the departure tick is routine (see appointment_manoeuvre_). Asking
+        // again would answer "nowhere" for the one case this branch exists to
+        // serve. current_goal_ is where this leg was sent and RETURN_SYNC does
+        // not overwrite it.
+        esc_target = current_goal_.position;
         esc_what   = "appointment";
-      } else if (use_meeting) {
-        esc_target = meetingPoint(reconnect_rec_.self_pose,
-                                  reconnect_rec_.peer_pose);
-        esc_what = "meeting point";
       } else if (have_anchor_) {
         esc_target = last_connected_anchor_;
         esc_what = "last-connected anchor";
@@ -8210,11 +13559,63 @@ void ExploPlannerNode::doReturnSync() {
 // ==================================================================
 
 bool ExploPlannerNode::startReturnHome(const char* reason) {
+  // Two re-entry guards, and they answer different questions. Both matter
+  // because every assignment below is a RESET and transitionTo re-stamps
+  // state_enter_time_: a re-entry puts a robot that had escalated to ESCAPE
+  // back to DIRECT with its escape budget refilled and its approach/frozen
+  // windows zeroed — it forgets that it is stuck and the graduated response
+  // starts over from the bottom — grants a second full mission_return_max_sec,
+  // and emits a second mission_complete whose homing_duration_sec and
+  // homing_distance_m restart from zero, so both read short.
+  //
+  // GUARD 1, run-scoped: the mission return already RESOLVED. Measured on
+  // ts1b: 16 DONE->RETURN_HOME re-entries and 16 robot-runs carrying two
+  // mission_complete rows, all in the treatment arm. The request itself is
+  // legitimate — the coverage latch runs off the metrics tick, which measures
+  // in every state, so a robot that ended on barrier-gave-up at t=1189 can
+  // genuinely saturate its map at t=1900 while parked at home. Only the
+  // response is wrong. What that latch stamps is kept: recordExplorationComplete
+  // runs in the caller BEFORE this call and nothing here gates it, so the 16
+  // genuine late exploration endpoints survive; it is the redundant homing leg
+  // — asked of a robot that is already home — that is refused.
+  //
+  // Returning true, not false: the caller's question is "is this robot heading
+  // home?", and it went home and arrived.
+  if (mission_return_done_) {
+    ++mission_return_reentries_;
+    if (mission_return_reentries_ == 1) {
+      RCLCPP_WARN(get_logger(),
+          "MISSION-RETURN: the return already resolved [%s -> %s]; this later "
+          "request [%s] is REFUSED so the run keeps ONE homing leg and ONE "
+          "mission_complete. Counted into run_end.mission_return_reentries.",
+          return_home_reason_.c_str(),
+          mission_home_result_.empty() ? "?" : mission_home_result_.c_str(),
+          reason);
+    }
+    return true;
+  }
+  // GUARD 2, leg-scoped: a homing leg is still IN FLIGHT. The one already
+  // running is strictly further along than the one this call would start.
+  // DEBUG rather than WARN because this fires on ordinary tick-loop re-entry,
+  // where nothing has gone wrong — and it is not the guard the ts1b defect
+  // needed, which is why guard 1 exists above it.
+  if (state_ == State::RETURN_HOME) {
+    RCLCPP_DEBUG(get_logger(),
+        "MISSION-RETURN: already homing [%s]; ignoring re-entry [%s].",
+        return_home_reason_.c_str(), reason);
+    return true;
+  }
   standDownExploitation();
   return_home_reason_        = reason;
   return_home_goal_sent_     = false;
   return_home_retries_       = 0;
   return_home_dist_at_start_ = cumulative_distance_;
+  // Same instant, same leg: see the declarations. Stamped here rather than
+  // read from state_enter_time_ at the end because this is the only point that
+  // is guaranteed to be the leg's start — transitionTo re-stamps
+  // state_enter_time_ on every proximity hold and release.
+  return_home_start_time_    = this->now();
+  return_home_hold_at_start_ = prox_hold_total_sec_;
   home_mode_                 = HomeMode::DIRECT;
   home_trail_idx_            = -1;
   home_escapes_used_         = 0;
@@ -8223,6 +13624,7 @@ bool ExploPlannerNode::startReturnHome(const char* reason) {
   pose_jump_seen_            = false;
   approach_check_time_       = this->now();
   approach_check_metric_     = (latest_pos_ - home_pos_).head<2>().norm();
+  near_home_armed_           = false;
   // 0.3 s (3 ticks) covers the cancel-all round trip from this call site AND
   // from transitionTo below, whichever fires it.
   home_pub_not_before_ = this->now() + rclcpp::Duration::from_seconds(0.3);
@@ -8237,8 +13639,10 @@ bool ExploPlannerNode::startReturnHome(const char* reason) {
   // detectable defect rather than a silent one.
   RCLCPP_INFO(get_logger(),
       "MISSION-RETURN WATCHDOG ARMED: approach %.1f m / %.0f s (suppressed "
-      "inside %.1f m), frozen %.2f m / %.0f s, escapes 0/%d.",
-      return_approach_min_m_, return_approach_window_sec_, kApproachSuppressM,
+      "inside %.1f m, where the stall cap is %.0f s), frozen %.2f m / %.0f s, "
+      "escapes 0/%d.",
+      return_approach_min_m_, return_approach_window_sec_,
+      return_approach_suppress_m_, return_near_home_stall_sec_,
       progress_min_distance_m_, progress_window_sec_,
       return_escape_max_attempts_);
   // No goal publish here — see the declaration comment. The caller's
@@ -8415,7 +13819,7 @@ void ExploPlannerNode::doReturnHome() {
       publishGoal(current_goal_);
     }
   }
-  // ---- Two independent watchdogs ----
+  // ---- Three independent watchdogs ----
   // FROZEN: gross metres travelled, the historical test, measurement UNCHANGED
   // (15 s / 0.2 m, shared with the NAVIGATE paths). It answers "is the
   // platform physically moving at all?".
@@ -8424,6 +13828,11 @@ void ExploPlannerNode::doReturnHome() {
   // and is the whole point of this generation: seed11 orbited at 0.05 m/s for
   // the full 600 s cap, passing the frozen test in every window, netting
   // -0.08 m of approach.
+  // They are evaluated together, both windows are advanced whichever fires,
+  // NEAR-HOME STALL: time spent inside the radius where APPROACH is muted. It
+  // answers the third question, "is the robot close and simply not finishing?",
+  // which neither of the others can: a robot circling 2 m from home passes
+  // frozen every window (it accumulates metres) and approach never even runs.
   // They are evaluated together, both windows are advanced whichever fires,
   // and `kind` in the log distinguishes them, so each defect stays attributable
   // to exactly one detector.
@@ -8450,10 +13859,12 @@ void ExploPlannerNode::doReturnHome() {
 
   const double appr_window = (now - approach_check_time_).seconds();
   // Suppressed in ESCAPE (an escape leg moves AWAY from home on purpose) and
-  // inside kApproachSuppressM (3.0 m) of the target, where the 1.0 m the
-  // detector demands per window is a large fraction of what remains and the
-  // frozen detector plus the nav budget still cover the robot.
-  if (home_mode_ != HomeMode::ESCAPE && metric > kApproachSuppressM &&
+  // inside return_approach_suppress_m_ of the target, where the 1.0 m the
+  // detector demands per window is a large fraction of what remains. Inside
+  // that radius the near-home stall detector below takes over -- the band is
+  // not left uncovered, which is what the previous generation assumed.
+  if (home_mode_ != HomeMode::ESCAPE &&
+      metric > static_cast<float>(return_approach_suppress_m_) &&
       appr_window > return_approach_window_sec_) {
     approach_delta = approach_check_metric_ - metric;
     no_approach = approach_delta < static_cast<float>(return_approach_min_m_);
@@ -8469,6 +13880,40 @@ void ExploPlannerNode::doReturnHome() {
     approach_check_time_ = now;
     approach_check_metric_ = metric;
     no_approach = false;
+    // Same argument for the band clock: a jump can place the robot inside the
+    // band without it having driven there, and time accumulated across one is
+    // not time spent failing to arrive. Forfeit the window rather than fire on
+    // it -- conservative is the right default for a detector whose response is
+    // to drive AWAY from a goal the robot is already close to.
+    near_home_armed_ = false;
+  }
+
+  // Band clock for the near-home stall detector, kept up to date on EVERY tick
+  // -- including the ticks where one of the other two detectors is about to
+  // fire and return below. Time inside the band is a property of where the
+  // robot is, not of which detector acted, and skipping the bookkeeping on a
+  // fire tick would silently restart the clock every time the ladder ran.
+  //
+  // Time-in-band is the right test here rather than an approach RATE: a healthy
+  // homing crosses this band once and arrives within seconds, whereas the
+  // failure is a robot that sits inside it, still moving, for minutes. Rate is
+  // the wrong question so close to the goal -- the robot is decelerating, and
+  // demanding 1.0 m of approach per window with 1.5 m left would fire on a
+  // perfectly healthy arrival. That is exactly why the approach detector is
+  // muted in here, and why re-using it was not an option.
+  bool near_home_stalled = false;
+  if (home_mode_ != HomeMode::ESCAPE &&
+      metric <= static_cast<float>(return_approach_suppress_m_)) {
+    if (!near_home_armed_) {
+      near_home_armed_ = true;
+      near_home_since_ = now;
+    } else if (return_near_home_stall_sec_ > 0.0 &&
+               (now - near_home_since_).seconds() >
+                   return_near_home_stall_sec_) {
+      near_home_stalled = true;
+    }
+  } else {
+    near_home_armed_ = false;
   }
 
   if (frozen || no_approach) {
@@ -8482,6 +13927,25 @@ void ExploPlannerNode::doReturnHome() {
     // exactly the ticks where both fired.
     homeWatchdogFire(frozen ? "frozen" : "approach", metric, dist,
                      frozen ? frozen_delta : approach_delta);
+    return;
+  }
+
+  // Last of the three, deliberately: frozen and approach are the more specific
+  // diagnoses and each picks a response tuned to its own failure, so a tick on
+  // which either is also due belongs to them. In practice they rarely collide
+  // -- frozen fires after 15 s of standing still and would already have run
+  // long before a 60 s band dwell matures -- so reaching here means the robot
+  // really is moving, really is close, and still is not arriving.
+  //
+  // Response is homeWatchdogFire's existing graduated ladder (resend, retrace,
+  // escape), which is what an unreachable home needs: ESCAPE routes away and
+  // back, and is capped at return_escape_max_attempts_. Disarm before firing,
+  // not after: the ladder can leave the robot inside the band (a resend does),
+  // and re-arming from the next tick is what stops one stall from firing on
+  // every tick thereafter.
+  if (near_home_stalled) {
+    near_home_armed_ = false;
+    homeWatchdogFire("near-home-stall", metric, dist, metric);
     return;
   }
 
@@ -8693,28 +14157,37 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
   const char* mode = homeModeName(home_mode_);
   const char* response = "resend";
   const bool is_frozen = std::strcmp(kind, "frozen") == 0;
-  // `kind` is a two-valued enum spelled as a string, and everything below
-  // treats "not frozen" as "approach". That is true today because there is
-  // exactly one call site and it passes a ternary over the two literals — but
-  // a third kind added later would inherit approach's window AND threshold
-  // silently, and the row would then log a test_threshold_m the detector never
-  // compared against. That is worse than not logging one: the whole point of
-  // the field is that the fired inequality is re-derivable from the row.
-  if (!is_frozen && std::strcmp(kind, "approach") != 0) {
+  const bool is_stall  = std::strcmp(kind, "near-home-stall") == 0;
+  // `kind` is a three-valued enum spelled as a string, and the selections below
+  // are exhaustive over it rather than "frozen vs everything else". The third
+  // kind is the one this comment used to warn about: it would have inherited
+  // approach's window AND threshold silently, and the row would then log a
+  // test_threshold_m the detector never compared against. The whole point of
+  // the field is that the fired inequality is re-derivable from the row alone.
+  if (!is_frozen && !is_stall && std::strcmp(kind, "approach") != 0) {
     RCLCPP_ERROR(get_logger(),
         "home watchdog fired with unknown kind '%s' — logging it against the "
         "approach window/threshold, which is almost certainly wrong. The "
         "test_threshold_m on this row must not be trusted.", kind);
   }
   const double window = is_frozen ? progress_window_sec_
+                      : is_stall  ? return_near_home_stall_sec_
                                   : return_approach_window_sec_;
   // Selected by `kind` for the same reason `window` is: one event type carries
-  // two detectors, and the threshold that was compared against differs between
-  // them. Logged beside the delta so the fired inequality
+  // three detectors, and the threshold that was compared against differs
+  // between them. Logged beside the delta so the fired inequality
   // (test_delta_m < test_threshold_m) is re-derivable from the row alone,
   // without joining to run_start params and without knowing which detector
   // owns which param.
+  //
+  // The stall detector fits that convention rather than breaking it: the
+  // inequality it fired on is `metric < return_approach_suppress_m_`, held
+  // continuously for `window` seconds. Band membership, in metres, in the same
+  // direction as the other two — so a reader who knows nothing about the third
+  // detector still reads the row correctly. The duration is carried by
+  // `window`, which is exactly what that column means on every other row.
   const double test_threshold = is_frozen ? progress_min_distance_m_
+                              : is_stall  ? return_approach_suppress_m_
                                           : return_approach_min_m_;
 
   if (home_mode_ == HomeMode::ESCAPE) {
@@ -8754,8 +14227,12 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
     return;  // resumeRetrace emits its own event and republishes
   }
 
-  const bool want_escape =
-      std::strcmp(kind, "frozen") == 0 || home_mode_ == HomeMode::RETRACE;
+  // A stall deliberately takes the `else` ladder, not this one, when the robot
+  // is still heading straight at home: the first thing an unfinished approach
+  // deserves is a fresh goal, and only after that the heavier moves. In RETRACE
+  // it escapes immediately for the same reason approach does — a retrace that
+  // is not converging has already had its resend.
+  const bool want_escape = is_frozen || home_mode_ == HomeMode::RETRACE;
 
   if (want_escape) {
     if (home_escapes_used_ >= return_escape_max_attempts_) {
@@ -8786,11 +14263,15 @@ void ExploPlannerNode::homeWatchdogFire(const char* kind, float metric,
     response = "escape";
   } else {
     ++return_home_retries_;
+    // `kind` and test_threshold, not the words "no approach" and
+    // return_approach_min_m_: two detectors reach this ladder now, and a stall
+    // fire printed against the approach detector's threshold is a console line
+    // that contradicts the jsonl row written four lines below it.
     RCLCPP_WARN(get_logger(),
-        "MISSION-RETURN: no approach toward home (%.2f m away, metric moved "
-        "%.2f m in %.0f s, need %.1f m) — retry %d/2: %s.",
-        dist_home, test_delta, window,
-        return_approach_min_m_, return_home_retries_,
+        "MISSION-RETURN: %s watchdog fired %.2f m from home (tested %.2f m "
+        "against %.2f m over %.0f s) — retry %d/2: %s.",
+        kind, dist_home, test_delta, test_threshold, window,
+        return_home_retries_,
         return_home_retries_ >= 2 ? "retracing the outbound trail"
                                   : "braking and re-sending the home goal");
     if (return_home_retries_ >= 2) {
@@ -8835,8 +14316,20 @@ bool ExploPlannerNode::finishMissionReturn(const char* result,
   const float dx = latest_pos_.x() - home_pos_.x();
   const float dy = latest_pos_.y() - home_pos_.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
-  const double homing_sec = (now - state_enter_time_).seconds();
-  const double homing_m   = cumulative_distance_ - return_home_dist_at_start_;
+  // Both off the leg's own baselines, so the ratio of the two is a speed.
+  // NOT state_enter_time_, which a proximity hold backdates to keep the nav
+  // budget running across the hold — see return_home_start_time_'s doc.
+  const double homing_sec  = (now - return_home_start_time_).seconds();
+  const double homing_m    = cumulative_distance_ - return_home_dist_at_start_;
+  const double homing_held = prox_hold_total_sec_ - return_home_hold_at_start_;
+  // Spend the leg BEFORE anything can re-open it. Set here and not in
+  // finishNow because it is the mission RETURN specifically that is spent:
+  // finishNow also ends runs that never homed at all, and latching there would
+  // silently forbid a homing leg those runs are still entitled to. Set
+  // unconditionally, ahead of the `exp_log_` block, because the damage a
+  // re-entry does — a second homing budget, a reset escape ladder — is
+  // behavioural and happens in a build with no event log at all.
+  mission_return_done_  = true;
   mission_home_result_  = result;
   mission_home_sim_sec_ = now.seconds();
   if (exp_log_) {
@@ -8850,14 +14343,17 @@ bool ExploPlannerNode::finishMissionReturn(const char* result,
     e.dist_to_home_m      = dist;
     e.homing_duration_sec = homing_sec;
     e.homing_distance_m   = homing_m;
+    e.homing_held_sec     = homing_held;
     e.latched             = coverage_latched_;
+    e.occurrence          = ++mission_complete_count_;
     exp_log_->logMissionComplete(expCtx(), e);
   }
   RCLCPP_INFO(get_logger(),
       "MISSION-RETURN %s [%s]: %.2f m from home after %.1f s / %.2f m of "
-      "homing.", result, end_reason, dist, homing_sec, homing_m);
-  // Stop the platform before parking: on the give-up paths nav2 still holds
-  // the unreachable goal, and an arrival-by-tolerance lands before nav2
+      "homing (%.1f s of that held for proximity).",
+      result, end_reason, dist, homing_sec, homing_m, homing_held);
+  // Stop the platform before parking: on the give-up paths the navigator still
+  // holds the unreachable goal, and an arrival-by-tolerance lands before it
   // finishes driving to the exact pose (same rationale as doReturnNav).
   abandonNavGoal(end_reason);
   return finishNow(end_reason);
@@ -8868,15 +14364,16 @@ bool ExploPlannerNode::finishMissionReturn(const char* result,
 // ==================================================================
 
 // The teammate the barrier is actually waiting on: among the peers we have
-// EVER heard (last_contact_), the one not currently live, freshest record
-// first. Liveness is the raw claim expiry — the same presence semantics as
-// livePeerCount, and deliberately not the exploit grace window.
+// EVER heard (last_contact_), the one not currently accounted for, freshest
+// record first. Liveness is peerAccounted — THE predicate, so the peer this
+// nominates is the peer the barrier is actually blocked on, and deliberately
+// not the exploit grace window.
 const ExploPlannerNode::LastContact*
 ExploPlannerNode::missingPeerRecord(std::string* peer_id_out) {
   const auto now = this->now();
   const LastContact* best = nullptr;
   for (const auto& [id, rec] : last_contact_) {
-    if (coord_ && coord_->peerLive(id, now)) continue;
+    if (peerAccounted(id, now)) continue;
     if (best == nullptr || rec.stamp > best->stamp) {
       best = &rec;
       if (peer_id_out) *peer_id_out = id;
@@ -8958,11 +14455,19 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
   // What it replaces is exactly the FIRST waypoint, and nothing else. The
   // legacy trail is kept behind it, so a missed intercept still sweeps the leg
   // the peer was last known to be driving — the floor is a real fall-through,
-  // not a promise. In particular it does NOT get to touch the budget: that is
-  // computed below from the legacy trail either way, so the mdp and trail arms
-  // of the §5 factorial differ in where the chase drives and in nothing else.
-  // A model that also bought itself more chase time would confound the one
-  // comparison this arm exists to make.
+  // not a promise.
+  //
+  // IT DOES RESIZE THE WATCHDOG, and this comment denied it ("does NOT get to
+  // touch the budget ... the mdp and trail arms differ in where the chase drives
+  // and in nothing else") until 2026-09-18. When the swap fires, `budget` is
+  // recomputed from the intercept route at the swap site below. That is not the
+  // model buying itself chase time — the CEILING is untouched, the same
+  // pursuit_budget_max_sec_ the trail is priced against, and the affordability
+  // test the swap must pass is asked at the same measured rate as the trail's
+  // own refusal. What it prevents is a watchdog sized for one route killing a
+  // drive down a longer one, which would have scored as the model losing on an
+  // endpoint it never reached. The confound the old sentence guarded against is
+  // still guarded against; it is the cap that does it, not the budget.
   //
   // have_dispatch_predict_ is armed at the COMMIT point far below, not here.
   // Everything between this line and there can still decline the chase, and a
@@ -8993,14 +14498,16 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
   }
 
   // Path length of a waypoint list from here, and the model seconds that buys
-  // at the NAV speed estimate — the conservative one, deliberately: this is the
-  // watchdog's question ("how long before I call this leg dead"), not the
-  // predictor's ("when will I actually be there"). The two want to be wrong in
-  // opposite directions and that is why they use different speeds. Factored out
-  // because the budget rule and the intercept's affordability test below must
-  // ask it identically; a second copy of this arithmetic could drift, and the
-  // symptom would be a chase dispatched with a budget sized for a different
-  // route than the one it drives.
+  // at the NAV speed estimate — the conservative one, deliberately: modelSec
+  // answers the watchdog's question ("how long before I call this leg dead"),
+  // not the predictor's ("when will I actually be there"). The two want to be
+  // wrong in opposite directions, which is why travelSec below exists and uses
+  // a different speed; until P1 there was only this one and the refusal gate
+  // was reading it as if it were the other. Factored out because the budget
+  // rule and the intercept's affordability test below must ask it identically;
+  // a second copy of this arithmetic could drift, and the symptom would be a
+  // chase dispatched with a budget sized for a different route than the one it
+  // drives.
   auto trailMetres = [&](const std::vector<Eigen::Vector3f>& t) {
     double m = 0.0;
     Eigen::Vector3f prev = latest_pos_;
@@ -9013,6 +14520,14 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
   auto modelSec = [&](double metres) {
     return metres * nav_safety_factor_ / std::max(nav_speed_est_mps_, 1e-3);
   };
+  // P1 / §3.8. The OTHER question: not "when do I give up on this leg" but
+  // "can this chase be done at all". Measured speed, no safety factor — see
+  // pursuit_speed_measured_mps_ for why the watchdog's inflated rate is the
+  // wrong yardstick for a refusal, and why neither correcting that rate nor
+  // raising the cap is the fix.
+  auto travelSec = [&](double metres) {
+    return metres / std::max(pursuit_speed_measured_mps_, 1e-3);
+  };
 
   double budget = 0.0;
   if (goal_stale) {
@@ -9021,20 +14536,34 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     // the full model time — but ONLY if the cap covers the whole trail. A
     // partial chase ends at an arbitrary disconnected point, which is worse
     // than the mode's fallback (meeting point / hold-and-beacon).
+    //
+    // "The cap covers the trail" is now asked in real seconds. The two
+    // quantities below are deliberately different and neither substitutes for
+    // the other: trail_travel_sec decides WHETHER to chase, trail_model_sec
+    // sizes the watchdog that will end the chase if it goes wrong.
     const double trail_m = trailMetres(trail);
-    const double trail_model_sec = modelSec(trail_m);
-    if (trail_model_sec > pursuit_budget_max_sec_) {
+    const double trail_model_sec  = modelSec(trail_m);
+    const double trail_travel_sec = travelSec(trail_m);
+    if (trail_travel_sec > pursuit_budget_max_sec_) {
       RCLCPP_INFO(get_logger(),
           "Pursuit: record of '%s' is %.0fs old (goal stale) and the contact "
-          "pose is %.1f m away (needs %.0fs > cap %.0fs) — chase would die "
-          "mid-trail, skipping to the fallback.",
-          peer_id.c_str(), staleness, trail_m, trail_model_sec,
-          pursuit_budget_max_sec_);
+          "pose is %.1f m away (%.0fs of travel at %.2f m/s > cap %.0fs) — "
+          "chase would die mid-trail, skipping to the fallback.",
+          peer_id.c_str(), staleness, trail_m, trail_travel_sec,
+          pursuit_speed_measured_mps_, pursuit_budget_max_sec_);
       reconnect_decline_reason_ = "trail-exceeds-budget-cap";
       return false;
     }
-    budget = std::max(std::min(nav_min_timeout_sec_, pursuit_budget_max_sec_),
-                      trail_model_sec);
+    // The upper clamp is load-bearing now, where before it was implied by the
+    // refusal above: the model rate can price a feasible trail well past the
+    // cap, and an unclamped budget would let one chase outspend the absence
+    // bound a waiting teammate is relying on. This matches what the non-stale
+    // branch already does — pursuitBudgetSec() clamps to max_sec — so the two
+    // branches hand out budgets under the same ceiling. lo <= hi holds by
+    // construction (lo is a min() against the same hi), so the clamp is not UB.
+    budget = std::clamp(trail_model_sec,
+                        std::min(nav_min_timeout_sec_, pursuit_budget_max_sec_),
+                        pursuit_budget_max_sec_);
   } else {
     const float dx = rec.peer_goal.x() - latest_pos_.x();
     const float dy = rec.peer_goal.y() - latest_pos_.y();
@@ -9076,10 +14605,54 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
     if ((rec.peer_pose - mdp_trail.front()).head<2>().norm() > 1.0f)
       mdp_trail.push_back(rec.peer_pose);
 
-    const double mdp_m   = trailMetres(mdp_trail);
-    const double mdp_sec = modelSec(mdp_m);
-    if (mdp_sec <= budget) {
+    const double mdp_m      = trailMetres(mdp_trail);
+    const double mdp_travel = travelSec(mdp_m);
+    const double mdp_model  = modelSec(mdp_m);
+    // PRICED IN TRAVEL SECONDS AGAINST THE CAP, NOT IN MODEL SECONDS AGAINST
+    // THE WATCHDOG (2026-09-18). The test used to be `modelSec(mdp_m) <=
+    // budget`, and with the campaign's constants that comparison was dead
+    // arithmetic — the swap could not fire, so `_mdp` and the legacy trail were
+    // the same arm wearing two names.
+    //
+    // The arithmetic, at nav_speed_estimate 0.15 / safety 3.0 / measured 0.40:
+    // modelSec is 20 s per metre and travelSec is 2.5. In the stale branch
+    // `trail` is exactly [peer_pose], so trail_m is the straight line to the
+    // contact pose, while mdp_trail is [intercept, peer_pose] — so mdp_m >=
+    // trail_m by the triangle inequality, with equality only for an intercept
+    // sitting on that very line. budget is clamp(20*trail_m, 30, 600), which
+    // makes the old test `mdp_m <= trail_m` in the whole mid-range
+    // (trail_m in [1.5, 30] m), `mdp_m <= 1.5 m` below it, and `mdp_m <= 30 m`
+    // above it — against an mdp_m that is >= trail_m > 30 in that last case.
+    // Every branch is unsatisfiable except the degenerate collinear one. The
+    // non-stale branch is the same story with a staleness discount making it
+    // harder still.
+    //
+    // It was also the wrong question twice over. `budget` is the WATCHDOG — how
+    // long before this leg is called dead — and P1/§3.8 established that a
+    // refusal must be asked at the measured rate against pursuit_budget_max_sec,
+    // which is exactly what the stale branch's own trail refusal above does.
+    // Asking the intercept the same question on the same yardstick is what
+    // makes the two aims comparable; asking it a harsher one is how the model
+    // was silently disabled.
+    if (mdp_travel <= pursuit_budget_max_sec_) {
       trail = std::move(mdp_trail);
+      // AND RESIZE THE WATCHDOG TO THE ROUTE ACTUALLY DRIVEN. Leaving `budget`
+      // sized for the trail while driving the (longer) intercept route is how a
+      // swapped-in intercept dies mid-drive at a place the peer never was —
+      // worse than both aims, and it would have shown up as the model losing on
+      // an endpoint it never reached. modelSec is the right rate here for the
+      // same reason it sizes every other watchdog in this file: it is the
+      // conservative estimate, and a watchdog wants to be wrong long.
+      //
+      // The non-stale branch's staleness discount is deliberately NOT carried
+      // over. That discount prices how little a stale trail HEAD is worth
+      // chasing — a question already answered `yes` by the budget > 0 test
+      // above — and the intercept is the model's replacement for that head, so
+      // discounting it for the staleness it was computed to absorb would size
+      // the watchdog below the drive it is watching.
+      budget = std::clamp(mdp_model,
+                          std::min(nav_min_timeout_sec_, pursuit_budget_max_sec_),
+                          pursuit_budget_max_sec_);
     } else {
       // Report it as a refusal so the dispatch event says the model was asked,
       // answered, and lost — distinct from the model having nothing to say. The
@@ -9088,8 +14661,10 @@ bool ExploPlannerNode::startPursuit(const std::string& peer_id,
       dispatch_predict_.refused = "intercept exceeds the chase budget";
       RCLCPP_INFO(get_logger(),
           "Pursuit: intercept for '%s' at cell %d (p=%.2f, %.1f m, needs "
-          "%.0fs > budget %.0fs) — falling back to the trail.",
-          peer_id.c_str(), mdp.cell, mdp.p, mdp_m, mdp_sec, budget);
+          "%.0fs of travel at %.2f m/s > cap %.0fs) — falling back to the "
+          "trail.",
+          peer_id.c_str(), mdp.cell, mdp.p, mdp_m, mdp_travel,
+          pursuit_speed_measured_mps_, pursuit_budget_max_sec_);
     }
   }
 
@@ -9202,16 +14777,26 @@ void ExploPlannerNode::armPursuitWaypoint() {
 // 2 can be reachable when waypoint 1 is not.
 void ExploPlannerNode::doPursue() {
   const auto now = this->now();
-  // livePeerCount — presence semantics, same note as finishOrRendezvous().
-  const int active =
-      coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+  // accountedPeerCount — presence semantics, same note as finishOrRendezvous().
+  const int active = accountedPeerCount(now);
   // Release when the whole team is back — or when the CHASED peer alone is:
   // the chase has done its job either way, and on a 3+ team burning the rest
   // of the budget driving at a teammate that is already in comms only delays
   // dispatching on whoever is still missing (PLAN re-runs finishOrRendezvous
   // once saturation re-confirms, and missingPeerRecord picks the next one).
-  const bool quarry_heard = coord_ && !pursue_peer_id_.empty() &&
-                            coord_->peerLive(pursue_peer_id_, now);
+  //
+  // teamComplete AND NOT teamSettled, DELIBERATELY (generation 23). The
+  // contagion belongs to the appointment and only to the appointment: pursuit
+  // is defined as "an individual robot goes looking for another robot when IT
+  // deems it necessary", so a third robot's report that IT cannot hear someone
+  // is not this chase's business, and folding it in would make one robot's
+  // outage hold every other robot's chase open. The trigger site keeps the same
+  // predicate for the same reason, so pursuit's arm and release still agree
+  // with each other — which is what the five-site rule actually demands. Note
+  // the `|| quarry_heard` below already makes this release looser than its
+  // trigger; that asymmetry predates generation 23 and is unchanged here.
+  const bool quarry_heard = !pursue_peer_id_.empty() &&
+                            peerAccounted(pursue_peer_id_, now);
   if (releaseConfirmed(teamComplete(active, rendezvous_expected_peers_) ||
                        quarry_heard)) {
     RCLCPP_INFO(get_logger(),
@@ -9222,7 +14807,7 @@ void ExploPlannerNode::doPursue() {
         active, rendezvous_expected_peers_);
     // PURSUE is a driving state: stop the platform before PLAN. doPlan can
     // spend ticks retrying (map load, all candidates rejected) with the
-    // proximity guard off, and nav2 would keep driving at the missing
+    // proximity guard off, and the navigator would keep driving at the missing
     // teammate's own last pose underneath it (see abandonNavGoal).
     abandonNavGoal("pursuit-released");
     // Re-confirm saturation against the post-merge map instead of finishing
@@ -9240,14 +14825,29 @@ void ExploPlannerNode::doPursue() {
   // boundary; if the budget or an exhausted trail could fire first, the chase
   // would hand off to pursuitFallback and the appointment would be kept — or
   // missed — as a side effect of whichever timer happened to expire, which is
-  // exactly the arbitration this design removed. The deadline is recomputed
-  // from the robot's CURRENT position each tick (appointmentTravelMs), so a
-  // chase that has driven AWAY from the meeting cell is cut off earlier, and
-  // one that happened to drive toward it is allowed to run longer.
+  // exactly the arbitration this design removed.
+  //
+  // THE MEETING IS A SHARED INSTANT; THE BREAK-OFF IS NOT (2026-09-19).
+  // appointment_.t_meet_ms is stamped once at arming and never moves, so the
+  // ARRIVAL every robot aims at is one instant on the agreed lattice. The
+  // moment each robot has to stop chasing to make it is its own, because
+  // appointmentDue() now leaves early enough to arrive: a chase that has driven
+  // this robot AWAY from the meeting cell grows its live lead and cuts the
+  // chase off sooner.
+  //
+  // THIS COSTS HYBRID'S CHASE WINDOW ITS INDEPENDENCE, knowingly. A shared
+  // instant made the window a fixed dose; a lead-adjusted one makes a longer
+  // chase buy itself less time to chase. That is the correct direction once
+  // t_meet is an arrival target — a chase that would make the robot miss the
+  // meeting is a chase it cannot afford — and it is the trade Kalhan's
+  // punctuality rule asks for (2026-09-19). What it means for analysis is that
+  // hybrid's chase duration is no longer exogenous to chase distance, so
+  // `travel_sec` below is a covariate on the break-off and not just on the
+  // no-show.
   if (appointment_armed_ && !appointment_departed_ && appointmentDue()) {
     RCLCPP_INFO(get_logger(),
-        "Pursuit: departure deadline for cell %d reached after %.0fs of chase "
-        "(t_meet t+%.0fs, my travel %.0fs) -> breaking off for the "
+        "Pursuit: time to leave for cell %d after %.0fs of chase "
+        "(meeting at t+%.0fs, my travel %.0fs) -> breaking off for the "
         "appointment.",
         appointment_.cell, (now - pursue_start_time_).seconds(),
         appointment_.t_meet_ms / 1000.0, appointmentTravelMs() / 1000.0);
@@ -9256,6 +14856,9 @@ void ExploPlannerNode::doPursue() {
     // of the chase waypoint; abandon the old one first, same reason the
     // release path above does.
     abandonNavGoal("appointment-due");
+    // Mid-run, for the same reason as doPlan's departure -- see the long note
+    // there. A chase broken off for the deadline has not finished exploring.
+    reconnect_terminal_ = false;
     startReturnTo(appointmentPoint(), "appointment", "appointment-due");
     return;
   }
@@ -9334,9 +14937,10 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
   // reliably needs the veto was the one running without it.
   //
   // It is also the more expensive of the two actions. The trigger site arms a
-  // chase along a trail; this one commits to a meeting point (HYBRID) or parks
-  // at a barrier (PURSUIT), so a mistake here costs travel to a fixed location
-  // plus the wait once the robot arrives.
+  // chase along a trail; this one falls back to exploring on the fallback
+  // allowance and then parks at a barrier — in BOTH arms, identically, since
+  // the hybrid meeting-point branch was deleted on 2026-09-16 — so a mistake
+  // here costs the fallback allowance plus an open-ended wait in place.
   //
   // Same freshness bound and same debounce as the trigger-site veto, on
   // purpose: two different notions of "the radio is up" in one node would make
@@ -9384,15 +14988,18 @@ void ExploPlannerNode::pursuitFallback(const char* why) {
     resumeExploring(why);
     return;
   }
-  if (reconnect_mode_ == ReconnectMode::HYBRID) {
-    // pursue_rec_ is the pair the chase was armed from (snapshotted in
-    // startPursuit): the midpoint must come from the SAME contact event the
-    // peer computes its own midpoint from, not from a record a mid-chase
-    // one-way packet may have refreshed on our side only.
-    startReturnTo(meetingPoint(pursue_rec_.self_pose, pursue_rec_.peer_pose),
-                  "meeting point", why);
-    return;
-  }
+  // NO HYBRID BRANCH HERE ANY MORE (2026-09-16). An exhausted chase used to
+  // park hybrid at meetingPoint(pursue_rec_.self_pose, pursue_rec_.peer_pose)
+  // — the midpoint of the pose pair the chase was armed from — while pursuit
+  // fell through to the two lines below. That was the third and last of the
+  // midpoint drives, and it goes for the same reason as the other two: a place
+  // with no agreed time, in an arm whose only licensed behaviours are pursuit
+  // and the rendezvous.
+  //
+  // What reaches here is a hybrid chase that ran out of budget or trail with
+  // NO appointment standing (the block above returns for the standing case).
+  // With no appointment there is no agreed place either, so hybrid is doing
+  // pure pursuit at that moment and takes pursuit's ladder unchanged.
   if (pursuitExploreFallback(why)) return;
   holdForTeam(why);
 }
@@ -9478,7 +15085,7 @@ bool ExploPlannerNode::pursuitExploreFallback(const char* why) {
 // endings and by the no-record corner of the pursuit dispatch. PURSUE is a
 // driving state, so the platform must be stopped explicitly (the guard's
 // stationary-state assumption; see abandonNavGoal) — ceasing to publish
-// goal_pose alone leaves nav2 finishing the last accepted goal. The presence
+// goal_pose alone leaves the navigator finishing the last goal it accepted. The presence
 // intent (kept fresh by the heartbeat, which fires in RETURN_SYNC) is what
 // lets the pursued teammate count us whenever it comes into range.
 void ExploPlannerNode::holdForTeam(const char* why) {
@@ -9525,8 +15132,9 @@ void ExploPlannerNode::publishPresenceIntent() {
     // runs SLOWER, so shrink the disc for the duration of the coast.
     //
     // A token 0.5 m rather than 0.0: the receiver treats 0.0 as "unset" and
-    // substitutes its own match radius (coord_claim_radius_m auto-resolves to
-    // fov_max_range = 10 m), so zero would restore the very disc being removed.
+    // substitutes its own match radius (coord_claim_radius_m, which the yaml now
+    // states outright at 10.0 instead of auto-resolving to fov_max_range), so
+    // zero would restore the very disc being removed.
     // The beacon itself must keep going out — teamComplete counts presence, and
     // a silent finisher ages out of every peer's table within seconds.
     const double claim_r =
@@ -9555,16 +15163,325 @@ void ExploPlannerNode::heartbeatTick() {
   // conservative direction (a starved clock looks older, so the gate waits).
   if (coord_) {
     const auto pres_now = this->now();
-    if (teamComplete(static_cast<int>(coord_->livePeerCount(pres_now)),
+    // How long since the PREVIOUS heartbeat. hb_last_tick_ is not updated until
+    // the bottom of this function, so this is the real inter-tick interval and
+    // it is read here, before the anchor, because the anchor is the thing it
+    // invalidates. See the starvation note below; the WARN for the same
+    // condition stays at the bottom with the rest of the suppression
+    // accounting.
+    const double hb_gap_sec =
+        hb_last_tick_.nanoseconds() > 0 ? (pres_now - hb_last_tick_).seconds()
+                                        : 0.0;
+    if (teamComplete(accountedPeerCount(pres_now),
                      rendezvous_expected_peers_)) {
       team_last_complete_time_ = pres_now;
       team_seen_complete_ = true;
-      // P5: freeze the problem while the team is confirmed complete. HERE and
-      // nowhere else, for the same reason the clock above lives here — this is
-      // the last instant at which both robots are known to be looking at the
-      // same world, and an appointment derived from anything later is one the
-      // peer never computed. No-op unless the schedule is enabled.
-      refreshRendezvousSnapshot();
+    }
+    // THE RENDEZVOUS RUNS ON A STRICTER CLOCK THAN team_last_complete_time_,
+    // and the difference is one-way contact.
+    //
+    // teamComplete() counts RECEIVED intents. That is "I can hear them" and
+    // says nothing about whether they can hear me — and doc/limitations.md §10
+    // records one-way contact as a real observed mode, not a hypothetical. Run
+    // the appointment machinery off that count and a single healed direction
+    // is enough to break the design's central claim: the robot that can hear
+    // re-stamps its anchor mid-outage, clears rendezvous_spent_ and re-arms on
+    // a NEW anchor, while the robot that cannot hear keeps the old one. The
+    // two t_meets then differ by the whole length of the outage so far —
+    // unbounded, against a 240 s wait — and each robot's log says it kept the
+    // agreement.
+    //
+    // TeamModel::Peer::direct is exactly the missing half: it is true only
+    // when we received from the peer inside the TTL AND the in_range_mask it
+    // sent named us back. Both ends evaluate a symmetric condition, so both
+    // stop stamping on the same physical event rather than on their own half
+    // of it. Under healthy comms it is true continuously and this costs
+    // nothing; the divergence is exactly the case it exists to catch.
+    const bool rzv_mutual = rendezvousTeamMutual();
+    // P5: FREEZE THE PROBLEM **BEFORE** THE HANDSHAKE READS IT (2026-09-17).
+    //
+    // This call used to sit below, inside the `if (rzv_mutual)` block, i.e.
+    // AFTER the handshake round that consumes what it produces. The cost was a
+    // whole wasted mutual tick, and not by a subtle route:
+    // deriveRendezvousProposal's second line is `if (!have_rendezvous_snapshot_)
+    // return out;`, so on the first mutual tick of a run the derive returned
+    // empty, the snapshot was taken immediately afterwards, and the earliest a
+    // proposal could exist was the NEXT tick.
+    //
+    // At N=2 that is one heartbeat and nobody would notice. At N=4 it is the
+    // difference between having a window and not having one: the whole-team
+    // mutual condition holds for about two seconds at coord_heartbeat_hz=1, so
+    // spending the first of them refreshing a snapshot nobody got to read is
+    // spending half the window. (It does not, by itself, make the N=4 rung
+    // tour-informed — at t<2 s the map has no tours to argmin over and the
+    // fallback is the centroid either way. It stops the ordering from being a
+    // SECOND reason for the same outcome, which is worth having precisely
+    // because the first one is a property of the radio regime and this one is
+    // not.)
+    //
+    // Nothing else moves. Both calls run on the same tick, off the same
+    // `pres_now`, under the same gate, so the instant the snapshot describes is
+    // unchanged — this is a reorder within one instant, not a relaxation of
+    // when the freeze may happen. In steady state it is a no-op in the literal
+    // sense: refreshRendezvousSnapshot early-returns on every tick inside the
+    // proposal period, so the order only has any effect on the ticks where a
+    // refresh actually lands, and there it makes the derive read this tick's
+    // world instead of the previous period's.
+    //
+    // The anchor is deliberately NOT moved up with it. maintainRendezvousProposal
+    // does not read rendezvous_anchor_time_ — the three anchor refusals that
+    // used to matter are gone (see armAppointment) and t_meet is now the
+    // committed integer rather than anchor+interval — so the stamp stays with
+    // the rest of the mutual-tick bookkeeping below, where it is read.
+    if (rzv_mutual) refreshRendezvousSnapshot();
+    // ONE ROUND OF THE HANDSHAKE, EVERY HEARTBEAT, whatever the team looks
+    // like. The gate moved INSIDE (it is the argument) because the three steps
+    // this runs do not share a gate: deriving and committing still require the
+    // whole team to be mutually in contact, but echoing the proposer's pair
+    // must not, or the fleet can never converge in time to use the windows
+    // when it is. See the declaration for the N>=3 deadlock this fixes.
+    maintainRendezvousProposal(rzv_mutual);
+    if (rzv_mutual) {
+      // THE ANCHOR. Both robots will convert the agreed INTERVAL into a t_meet
+      // by adding it to their own last stamp of this line, so this assignment
+      // is the shared origin the whole appointment hangs off. It is stamped in
+      // the same breath as the snapshot and the handshake because all three
+      // describe the same instant: the last moment the team was confirmed
+      // whole.
+      rendezvous_anchor_time_ = pres_now;
+      have_rendezvous_anchor_ = true;
+      // Freshly sampled under mutual contact, so whatever doubt a previous
+      // starved tick raised about the anchor is settled.
+      rendezvous_anchor_starved_ = false;
+      // THE SNAPSHOT USED TO BE TAKEN HERE. It now runs a few lines above, on
+      // the same tick and under the same `rzv_mutual` condition, so that the
+      // handshake round can actually read it — see the comment at that call for
+      // why the ordering was costing a whole mutual tick. The property this
+      // spot existed to defend is unchanged: the freeze happens only while the
+      // team is confirmed mutually in contact, which is the last instant at
+      // which every robot is known to be looking at the same world, and an
+      // appointment derived from anything later is one the peers never
+      // computed.
+      //
+      // The handshake used to be called HERE, inside this guard. It now runs
+      // above it on every heartbeat, with this same condition passed in as an
+      // argument. What the move buys is that the ECHO does not take the gate,
+      // which is what lets an N>=3 fleet ever converge: a follower that can
+      // hear the proposer but not yet every sibling has to be able to adopt and
+      // re-publish, or the mask never closes and nobody converges. Whatever was
+      // last COMMITTED is still exactly what the outage inherits.
+      //
+      // WHICH STEPS STILL REQUIRE WHAT, precisely, because "they take this gate
+      // internally" was written here when it was true of both and is not:
+      //
+      //   derive  takes exactly this gate. The snapshot it argmins over is only
+      //           meaningful if every robot is looking at the same world.
+      //   commit  does NOT test the mask. It requires something strictly
+      //           stronger and of a different kind: a matching echo from every
+      //           other robot, each one first-hand evidence that THAT robot
+      //           holds THESE three integers. The mask is a claim about
+      //           connectivity at one instant; the echoes are the agreement
+      //           itself. Re-adding a mutual test there would only be able to
+      //           veto commits the echoes had already proved sound.
+      //
+      // The outage is over, so the one-appointment-per-outage guard is
+      // released. THIS IS THE ONLY SITE THAT CLEARS IT — closeAppointment does
+      // not, deliberately (see its declaration): closing an appointment is
+      // what SPENDS the outage's one arming, so releasing the flag there would
+      // hand out a second one inside the same outage.
+      //
+      // The consequence is that the flag outlives the reunion by up to one
+      // heartbeat period, because the reunion paths run on the 10 Hz planning
+      // tick and this runs at coord_heartbeat_hz. That lag is in the safe
+      // direction: while the flag is still set armAppointment refuses, so the
+      // worst case is one missed arming in a window where the team is already
+      // back together and no reconnect manoeuvre is wanted anyway.
+      //
+      // THE ONE-APPOINTMENT-PER-OUTAGE RELEASE MOVED OUT OF THIS BLOCK
+      // (2026-09-18). It used to be `if (!appointment_armed_)
+      // rendezvous_spent_ = false;` right here, and being here is what broke
+      // the rendezvous arm at N>=3.
+      //
+      // The condition on this block is rendezvousTeamMutual() — EVERY pair in
+      // the fleet in direct contact. At N=2 that is just "the link is up" and
+      // recurs constantly. At N>=3 in this radio regime it holds for a few
+      // seconds at spawn and then never again, because it needs all N(N-1)/2
+      // links up simultaneously and the forest takes them down independently.
+      // So the flag latched true after the FIRST appointment and every later
+      // separation refused with "the agreed pair has already been used in this
+      // outage" — measured in the ts4 N=3 cell as five refusals on bestla and
+      // two on husky, leaving the arm inert from t~170 s to the end of a 604 s
+      // run. 70% of the cell, on the arm the cell exists to measure.
+      //
+      // The release now lives below this block, on
+      // teamComplete(accountedPeerCount)
+      // — the same predicate the barrier releases on and the same one that ends
+      // an outage everywhere else in the node. "The outage is over" gets ONE
+      // definition instead of two, and it is the weaker, recurring one, which
+      // is the correct one here: what the flag guards against is re-arming
+      // INSIDE an outage, and an outage has ended as soon as I can hear
+      // everyone again — whether or not every pair is in contact, and whether
+      // or not they can hear me.
+    } else if (hb_gap_sec >= team_model_.config().direct_ttl_sec) {
+      // THE ANCHOR MAY HAVE BEEN MISSED ENTIRELY.
+      //
+      // This function is a timer on a single-threaded executor, serialised
+      // behind the state machine and the metrics sampler — hb_late_count_ at
+      // the bottom of this function exists because those genuinely do overrun.
+      // Everywhere else in this node a starved tick is conservative: a clock
+      // that stops reads OLDER, and the gates wait. The anchor is the one place
+      // it is not. It is a LATCH of the last instant mutual contact was
+      // observed, so a gap that straddles the mutual -> not-mutual transition
+      // leaves it pointing at the last tick BEFORE the gap rather than at the
+      // separation, and t_meet = anchor + interval is then wrong by up to the
+      // whole gap — on this robot only. The peer, whose executor was not
+      // blocked, holds the right one. Both keep an exact appointment, at two
+      // different times, and both logs record it as kept.
+      //
+      // There is no way to recover the instant after the fact, so the answer is
+      // to stop claiming to know it, and the flag clears on the next healthy
+      // stamp above. The threshold is the TeamWorld direct TTL because that is
+      // the window in which `direct` can go false unobserved: a gap shorter
+      // than it cannot have hidden the whole transition.
+      //
+      // THIS NO LONGER AFFECTS THE APPOINTMENT (2026-09-17), and the text below
+      // used to say it did — "Refusing to arm an appointment until mutual
+      // contact is observed again", describing a refusal armAppointment had
+      // already stopped performing. Both halves of the old claim died with the
+      // triple: t_meet is adopted verbatim off the wire rather than computed as
+      // anchor + interval, so a suspect anchor can neither move this robot's
+      // meeting instant nor be a reason to refuse. What it still spoils is the
+      // `anchor_sec` COLUMN, which is how the analysis separates an early
+      // agreement from a late commit — so the WARN stays, saying only what is
+      // true. An operator triaging a bad meeting must not read this line as
+      // evidence that no appointment was armed: one almost certainly was.
+      if (!rendezvous_anchor_starved_ && have_rendezvous_anchor_) {
+        RCLCPP_WARN(get_logger(),
+            "Rendezvous anchor SUSPECT: %.2f s heartbeat gap (>= direct TTL "
+            "%.1f s) and the team is no longer in mutual contact. The "
+            "separation instant may lie inside the gap, so the anchor_sec "
+            "logged by this robot may be up to that much too early. The "
+            "appointment is UNAFFECTED and will still arm — t_meet is the "
+            "committed integer, not anchor + interval — so treat this as a "
+            "caveat on the anchor column alone.",
+            hb_gap_sec, team_model_.config().direct_ttl_sec);
+      }
+      rendezvous_anchor_starved_ = true;
+    }
+
+    // THE ONE-APPOINTMENT-PER-OUTAGE RELEASE (2026-09-18), moved out of the
+    // rzv_mutual branch above — see the note there for the N>=3 failure that
+    // forced it. Deliberately OUTSIDE that branch and keyed on
+    // teamComplete(accountedPeerCount): every robot I can currently hear.
+    //
+    // THERE IS NO RELAY. Until 2026-09-18 this line, and three others in the
+    // file, said the count included "every robot reachable, directly or by
+    // relay". That was never true, and it is the wrong mental model to carry
+    // into an N>=3 result. Three independent confirmations, none of them a
+    // comment: Coordination's claim table is filled only by onIntent(), which
+    // runs on the coord_intent_sub_topics_ subscriptions — the emulator's
+    // per-link copies /<self>/rx/<peer>/... , one per PEER, republished only
+    // while that ORDERED PAIR's link is up; hmr_comms_sim_node computes one row
+    // per unordered pair and forwards nothing, so a message never traverses a
+    // third robot; and RobotIntent carries no peer list, no in_range_mask and
+    // no hop count, so a claim cannot arrive second-hand even in principle.
+    // Transitive closure exists in exactly one place in this system —
+    // TeamModel::inComms(), fed by the in_range_masks on TeamWorld — and
+    // accountedPeerCount is not it.
+    //
+    // WHAT IT ACTUALLY IS: for every peer still running, a FIRST-HAND read that
+    // needs contact in at least ONE direction. "I have heard each of them within
+    // one TTL" — on the claim table, which is one-way, or on TeamWorld's
+    // `direct` flag, which is the two-way handshake — "or they told me their run
+    // is over", and THAT last clause is neither first-hand nor TTL'd: the
+    // `finished` bit relays through third robots and never clears, so a finished
+    // peer is counted present on no contact at all. It is still not a relay of
+    // REACHABILITY, which is what the paragraph above is about, and it is why
+    // the sentence says "for every peer still running". Silent on
+    // whether a claim-only peer has heard me, so the union is still strictly
+    // weaker than rendezvousTeamMutual(), and every argument built on this
+    // predicate stands. It is weaker for a different reason than the old
+    // comment claimed, and the difference is observable. At N>=3 with A and B
+    // out of contact while C hears both: under the relay reading A would count
+    // B through C and would NOT arm; under what this count does, C's team reads
+    // complete while A's and B's do not. A reader predicting the run's
+    // behaviour from the old sentence would predict the wrong robots.
+    //
+    // WHAT HAPPENS IN THAT TOPOLOGY NOW (generation 23) IS A THIRD THING, and
+    // it is not a relay: A and B announce their own broken reads on
+    // TeamWorld/team_incomplete, C hears them first-hand, and teamSettled folds
+    // that in, so all three arm. The contagion sits BESIDE the count, not
+    // inside it: accountedPeerCount unions two first-hand CHANNELS for the same
+    // question ("can I reach this peer") — plus the `finished` channel, which
+    // answers "is this peer worth reaching" and is the one exception to
+    // first-hand — while peerReportsTeamBreak answers a third question ("does a
+    // peer I can reach say someone else cannot").
+    // Keeping them separate is what makes the paragraph above a correct
+    // description of the COUNT.
+    //
+    // WHY THE WEAKER PREDICATE IS THE RIGHT ONE. The flag's whole job is to
+    // stop a second arming INSIDE one outage — without it the closed
+    // appointment re-arms on the next tick and the robot drives back to the
+    // cell it just left. That hazard ends the moment I can hear the team again,
+    // which is what this predicate says. Requiring every pair to be in DIRECT
+    // contact was asking for evidence of something the guard never needed, and
+    // at N>=3 that evidence essentially never arrives.
+    //
+    // It is also the same predicate as the barrier release's mesh half and
+    // the outcome classifiers' mesh half, so "the outage is over" has one
+    // meaning here. (The generation-27 reachable door is deliberately ABSENT
+    // from this site: this is the LATCH release, and clearing it on the
+    // weaker count would let the arm re-fire inside the outage — the next
+    // paragraph is the argument, and its holding is exactly what makes the
+    // door safe at the barrier.) Two definitions of one event is what
+    // produced a robot logging a no-show in the same millisecond as its own
+    // reconnection.
+    //
+    // AND SINCE GENERATION 23 THAT ONE MEANING IS teamSettled — teamComplete
+    // plus "no peer I can currently hear is announcing a break". It has to move
+    // with the other four sites, and here the direction matters: this is the
+    // LATCH RELEASE, so a predicate weaker than the arming site's would clear
+    // the latch while the arming site still reads the team broken, and the arm
+    // would re-fire inside the same outage — one appointment per outage becomes
+    // one per tick. That is the generation-18 polarity of the same defect, and
+    // it is why the test above must be the complement of the arming test rather
+    // than merely close to it.
+    //
+    // NOT WHILE ONE IS STILL STANDING. Unchanged, and still the second lock:
+    // an appointment that is armed has not been closed yet, and releasing the
+    // flag under it would hand out a second arming while the first is live.
+    // closeAppointment still does not clear it — closing is what SPENDS the
+    // arming — so the only path back is a reunion observed here.
+    //
+    // AND IT DWELLS (generation 23), for the same reason the barrier does and
+    // with the same parameter. Matching the arming site's PREDICATE is only half
+    // the complement argument; the other half is the evidence threshold, and
+    // until now this site had none. teamSettled can read true for one heartbeat
+    // on a single claim arriving inside the 5 s TTL — and the arming site, which
+    // runs at 10 Hz on a predicate that is false the moment one beacon is
+    // missed, will then re-fire inside the same outage. That is exactly the
+    // one-per-outage guard failing open, on a flicker. Releasing the latch six
+    // seconds late costs at most a delayed NEXT arming in a window where the
+    // team is genuinely back; releasing it on a flicker is the generation-18
+    // defect returning.
+    //
+    // THIS IS THE SOLE WRITER of the team-back window, and it is deliberately
+    // outside every test below it — including the `!appointment_armed_` one.
+    // dwellConfirmed measures a CONTINUOUS run, and a window that is not ticked
+    // does not decay, it FREEZES: written as `!appointment_armed_ &&
+    // dwellConfirmed(...)` the clock would stop for the whole life of a standing
+    // appointment, and the first heartbeat after closeAppointment would find
+    // `now - since` already far past the confirm time and release on one sample.
+    // A guard that skips its own clock is worse than no guard, because it reads
+    // as one. Here it is stepped once per heartbeat unconditionally, so the run
+    // it reports is a real one, and doPlan's P5 supersede test reads the same
+    // window through dwellHeld without disturbing it.
+    const bool team_back_dwelt =
+        dwellConfirmed(teamSettled(accountedPeerCount(pres_now)),
+                       pres_now.seconds(), reconnect_release_confirm_sec_,
+                       &team_back_ok_armed_, &team_back_ok_since_sec_);
+    if (!appointment_armed_ && team_back_dwelt) {
+      rendezvous_spent_ = false;
     }
   }
   // Suppression accounting (comms experiments). The beacon is STATE-GATED, so
@@ -9616,13 +15533,60 @@ void ExploPlannerNode::heartbeatTick() {
     }
     const double held = (hb_now - hb_suppress_start_).seconds();
     // One WARN per episode, at the moment peers can first read us as gone.
+    //
+    // NOT IN WAIT_FOR_MAP (2026-09-17, generation 22). That state is entered
+    // once, at construction, and never re-entered — line 2223 is the only
+    // assignment and there is no transitionTo(WAIT_FOR_MAP) anywhere — so
+    // `state_ == WAIT_FOR_MAP` means exactly "this robot has not started its
+    // mission yet". Two things follow, and both say the WARN has nothing to
+    // report here. First, the claim is vacuous: a robot that has never
+    // published an intent is not a robot peers have STOPPED hearing, and the
+    // episode it opens cannot overlap any peer-missing window, because
+    // peer_belief_ is populated from the intent stream (expPeerHeard) and is
+    // still empty on every robot in the team — expPeerSweep returns on
+    // `peer_belief_.empty()` before it can measure anything. Second, and the
+    // reason this became a defect rather than a curiosity: gen 22's
+    // mission_start_hold_sec holds every robot here for sixty seconds, twelve
+    // claim TTLs, so before this gate the WARN fired once on EVERY robot of
+    // EVERY cell. A line that fires unconditionally is not a diagnostic; it is
+    // noise that trains an operator to skip the string, and the string is the
+    // only in-node evidence that separates executor-induced suppression from a
+    // radio outage. Suppressing it in the one state where it is guaranteed and
+    // uninformative is what keeps it meaningful everywhere else.
+    //
+    // THE EPISODE ITSELF IS NOT SUPPRESSED, only this WARN. hb_suppressed_,
+    // hb_suppress_start_ and the "Heartbeat resumed after %.1f s suppressed"
+    // INFO below are all untouched, so the hold still leaves exactly one line
+    // in the log marking its length — which is the line worth having.
+    //
+    // THE EXEMPTION IS EPISODE-SCOPED, NOT INSTANT-SCOPED, and that distinction
+    // is the whole of the 2026-09-18 fix. A first cut tested `state_ !=
+    // WAIT_FOR_MAP` at the WARN site and nothing else, which was wrong by about
+    // one second: the state leaves WAIT_FOR_MAP when the hold expires, but the
+    // heartbeat does not resume until the executor next runs, so there is a
+    // window in which the robot is already in PLAN while `held` is still the
+    // sixty-second hold. A tick landing in that window found a passing state
+    // guard, an unset latch, and held >= TTL, and fired the exact line the gate
+    // existed to prevent — reported as "suppressed 60.1 s in state PLAN". It
+    // was intermittent, which is worse than always: it fired in 2 of 6 banked
+    // gen-22 cells, so a reader who checked one clean cell would have concluded
+    // the gate worked.
+    //
+    // CONSUMING the latch instead of skipping the WARN closes it, because the
+    // latch already has exactly the right lifetime. hb_suppress_warned_ is
+    // reset when an episode BEGINS (above), not when one ends, so marking it
+    // spent here silences this episode and only this episode; the next
+    // suppression clears it again and warns normally. No clock, no second
+    // member, no reliance on the ordering of two asynchronous transitions.
     if (!hb_suppress_warned_ && held >= coord_claim_ttl_sec_) {
       hb_suppress_warned_ = true;
-      RCLCPP_WARN(get_logger(),
-          "Heartbeat suppressed %.1f s in state %s (>= claim TTL %.1f s): "
-          "peers now read this robot as MISSING with the link up. Classify "
-          "any peer-missing window overlapping this as suppression, not "
-          "outage.", held, stateName(state_), coord_claim_ttl_sec_);
+      if (state_ != State::WAIT_FOR_MAP) {
+        RCLCPP_WARN(get_logger(),
+            "Heartbeat suppressed %.1f s in state %s (>= claim TTL %.1f s): "
+            "peers now read this robot as MISSING with the link up. Classify "
+            "any peer-missing window overlapping this as suppression, not "
+            "outage.", held, stateName(state_), coord_claim_ttl_sec_);
+      }
     }
   } else if (hb_suppressed_) {
     hb_suppressed_ = false;
@@ -9660,9 +15624,12 @@ void ExploPlannerNode::heartbeatTick() {
   // conflict — and it breaks it in the harmful direction: as we close on our
   // own claimed goal we keep advertising the far-away pose we held at claim
   // time, a peer computes that it is the closer robot, and it poaches a goal
-  // under active pursuit. nav_max_timeout_sec (60 s) is 12x the claim TTL
-  // (5 s), and the heartbeat exists precisely to hold a claim across a long
-  // hop, so the stale pose was broadcast for that entire window.
+  // under active pursuit. nav_max_timeout_sec is 180 s in every campaign
+  // (shared_params.yaml:260, and run_explo_sim_rviz.sh passes it explicitly;
+  // the 60.0 at the dp() site below is a fallback default no campaign uses),
+  // which is 36x the claim TTL (5 s) — and the heartbeat exists precisely to
+  // hold a claim across a long hop, so the stale pose was broadcast for that
+  // entire window.
   current_intent_msg_.robot_pos.x = latest_pos_.x();
   current_intent_msg_.robot_pos.y = latest_pos_.y();
   current_intent_msg_.robot_pos.z = latest_pos_.z();
@@ -9677,8 +15644,9 @@ void ExploPlannerNode::heartbeatTick() {
 // ==================================================================
 //
 // While driving (NAVIGATE / RETURN_NAV), yield to a higher-priority teammate
-// moving nearby: cancel the in-flight nav2 goal, hold still, and resume the
-// same goal once the teammate has cleared off (hysteresis) or parked. Right of
+// moving nearby: brake with a goal at the robot's own pose, hold still, and
+// resume the same goal once the teammate has cleared off (hysteresis) or
+// parked. Right of
 // way is the lexicographically SMALLER robot_name — the same total order as
 // the MinPos tiebreak — computed from ids alone, so both robots always agree
 // on who yields: exactly one of any pair stops, never both (standoff) and
@@ -9686,10 +15654,11 @@ void ExploPlannerNode::heartbeatTick() {
 //
 // This is a best-effort COORDINATION layer, not a certified safety function:
 // it needs live peer pose data (intents at 1 Hz + the optional localiser
-// topics at ~10 Hz), both planners alive, and a nav2 that honours the cancel.
-// The right-of-way robot does NOT stop — its costmap sees the held robot as an
-// ordinary obstacle — and the crewed 1.5 m panic stop from the experiment
-// script remains the hard backstop.
+// topics at ~10 Hz) and both planners alive, and the stop rests on the brake
+// goal alone — the nav2 cancel attempted beside it has no server here and never
+// fires. The right-of-way robot does NOT stop; it relies on its own local
+// obstacle grid seeing the held robot as an ordinary obstacle. The crewed 1.5 m
+// panic stop from the experiment script remains the hard backstop.
 
 bool ExploPlannerNode::checkProximityHold() {
   if (!prox_guard_ || !prox_guard_->enabled() || !have_pose_) return false;
@@ -9715,17 +15684,18 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
       prox_hold_count_, d.peer_id.c_str(), d.dist_m,
       prox_guard_->config().hold_dist_m, prox_guard_->config().resume_dist_m);
 
-  // Stop the platform. Ceasing to publish goal_pose does NOT stop nav2 — the
-  // last accepted NavigateToPose goal runs to completion — so the in-flight
-  // goal is cancelled through the action interface (bt_navigator's server
-  // honours cancel-all from any client, including for the goals it sent
-  // itself off the goal_pose topic). The cancel is fire-and-forget on the
-  // wire, so a brake goal at the robot's own pose goes out AS WELL: a lost or
-  // rejected cancel must not leave nav2 driving while the planner believes it
-  // holds, and whichever order bt_navigator processes the pair, the robot
-  // ends with either no goal or a zero-travel goal. The cancel response is
-  // checked async below purely to say out loud when it did not land.
-  // current_goal_ is left untouched; the resume re-publishes it fresh.
+  // Stop the platform. Merely CEASING to publish goal_pose does not stop the
+  // robot: simple_nav_3d's navigator latches the last goal it accepted and keeps
+  // feeding it to the planner and controller until the robot arrives. The stop
+  // is therefore commanded, by a brake goal at the robot's own pose — which
+  // reads as an immediate arrival, empties the path within ~100-150 ms and puts
+  // a zero Twist on cmd_vel.
+  //
+  // The cancel below is a nav2 leftover and NEVER FIRES on this stack; see the
+  // block at nav_cancel_client_'s construction. It is not a second, independent
+  // stop mechanism, so do not read this as belt-and-braces: the brake goal is
+  // the only thing stopping the robot, and the else-branch WARN says so every
+  // time. current_goal_ is left untouched; the resume re-publishes it fresh.
   if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
     nav_cancel_client_->async_cancel_all_goals(
         [this](auto resp) {
@@ -9768,10 +15738,10 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
 // stationary. So
 // any transition out of a driving state that does not IMMEDIATELY publish a
 // replacement goal must stop the platform itself — because ceasing to publish
-// goal_pose does NOT stop nav2: the last accepted NavigateToPose goal runs to
-// completion. Without this, the robot keeps rolling in a state the guard has
-// been told is standing still, which is the one combination the coordination
-// layer cannot see.
+// goal_pose does NOT stop the robot: simple_nav_3d's navigator latches the last
+// goal it accepted and drives it to completion. Without this, the robot keeps
+// rolling in a state the guard has been told is standing still, which is the one
+// combination the coordination layer cannot see.
 //
 // That is not hypothetical. In a 2-robot run both robots' rendezvous-synced
 // dwells ended 3 ms apart, both re-planned in the same instant, and both picked
@@ -9779,16 +15749,15 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
 // 1 Hz claim. The loser took the cross-pick yield in doNavigate, hopped to
 // EXPLOIT_PLAN — and its re-plan found NOTHING selectable (two vantages
 // visited, the third claimed by the winner), so it never published another
-// goal. nav2 spent the next 29 s driving a robot the guard believed was
+// goal. The navigator spent the next 29 s driving a robot the guard believed was
 // "planning" 6.6 m across the ring into the peer standing on the very vantage
 // it had just yielded. They collided.
 //
-// Belt and braces, for the same reason enterProximityHold uses both: the cancel
-// is fire-and-forget on the wire (a dropped or rejected cancel must not leave
-// nav2 driving), so a brake goal at our own pose goes out as well, and
-// whichever order bt_navigator processes the pair the robot ends with either no
-// goal or a zero-travel one. The brake is harmlessly preempted the moment a
-// later tick does select a real goal — it costs one goal_pose message.
+// The brake goal is the stop. The cancel attempted alongside it is a nav2
+// leftover that never fires here (no action server — see nav_cancel_client_'s
+// construction), so this is ONE mechanism, not two, and the INFO line below no
+// longer claims otherwise. The brake is harmlessly superseded the moment a later
+// tick does select a real goal — it costs one goal_pose message.
 //
 // Call sites are exits from DRIVING states, plus holdForTeam's barrier entry
 // (reachable from PLAN/LOG_STEP via the pure-pursuit no-chase corner, where
@@ -9877,9 +15846,11 @@ void ExploPlannerNode::doProximityHold() {
     prox_guard_->armEscape(d.peer_id, now);
   }
 
-  // Resume the interrupted drive on the SAME goal. The re-publish is
-  // mandatory — the cancel consumed nav2's goal, so only a fresh goal_pose
-  // restarts it. state_enter_time_ is backdated by the drive time the goal
+  // Resume the interrupted drive on the SAME goal. The re-publish is mandatory,
+  // though not for the reason originally written here ("the cancel consumed the
+  // goal"): the cancel never fires. It is mandatory because the BRAKE goal
+  // replaced the real one at the navigator, and the navigator is now parked on
+  // it — only a fresh goal_pose restarts the drive. state_enter_time_ is backdated by the drive time the goal
   // had already consumed, so the nav budget CONTINUES across the hold; the
   // progress window starts fresh (held time is not lack of progress). The
   // exploit give-up timer gets the held time back for the same reason: a
@@ -9961,12 +15932,11 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
   m.step              = step_;
   m.sim_time_sec      = now.seconds();
   m.distance_traveled = cumulative_distance_;
-  // livePeerCount: the column documents "peers heard within one TTL", and
-  // grace-retained exploit claims must not inflate it (CSV schema unchanged,
-  // only the count's honesty restored).
-  m.coord_active_peers  = coord_
-      ? static_cast<int>(coord_->livePeerCount(now))
-      : 0;
+  // accountedPeerCount, so the column and the decisions cannot disagree. As of
+  // schema 8 it documents "peers heard within one TTL on EITHER the claim table
+  // or TeamWorld, plus peers that announced their run is over"; grace-retained
+  // exploit claims still must not inflate it.
+  m.coord_active_peers  = accountedPeerCount(now);
   // Cumulative proximity-hold columns.
   m.prox_hold_count     = prox_hold_count_;
   m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
@@ -9983,6 +15953,7 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
   m.plan_rej_map       = pending_plan_rej_map_;
   m.plan_rej_unreach   = pending_plan_rej_unreach_;
   m.plan_rej_blacklist = pending_plan_rej_blacklist_;
+  m.plan_rej_visited   = pending_plan_rej_visited_;
   m.plan_rej_minpos    = pending_plan_rej_minpos_;
   m.plan_stall_ticks   = pending_plan_stall_ticks_;
 
@@ -10005,6 +15976,56 @@ void ExploPlannerNode::fillCommonMetrics(StepMetrics& m) {
       const float dy = current_goal_.position.y() - latest_pos_.y();
       m.reconnect_range_to_goal_m = std::sqrt(dx * dx + dy * dy);
     }
+  }
+
+  // R5: the two predicates of §3.4, side by side, on every row.
+  //
+  // team_complete is written whenever there IS a coordination table to ask,
+  // not only during a manoeuvre — the disagreement is about what the team
+  // looked like at the moment a chase released, and a row that only exists
+  // inside the manoeuvre cannot show the tick after it. -1 stays "there was no
+  // peer table", which is a third thing and not a zero.
+  //
+  // Both use accountedPeerCount / peerAccounted, the calls the release predicate
+  // and the outcome classifier make, so the CSV cannot disagree with either.
+  // The expected-peers test is here and not left to teamComplete(), which
+  // folds "not configured" into "not complete": planner_util.cpp returns
+  // `expected_peers > 0 && active >= expected`, so with the yaml default of 0
+  // ("0 = inert") every row would read a clean, measured-looking 0 and
+  // mean(team_complete) would come out 0.0 on a run where the question was
+  // never asked. -1 is "there was no team to ask about", a third thing, and the
+  // same sentinel discipline the pursuit columns above use. Invisible on the
+  // campaign path -- the harness always passes N-1 -- and live for any bare
+  // `ros2 run`, which is exactly the case with nobody watching.
+  if (coord_ && rendezvous_expected_peers_ > 0) {
+    const int live_now = accountedPeerCount(now);
+    m.team_complete =
+        teamComplete(live_now, rendezvous_expected_peers_) ? 1 : 0;
+  }
+  // Gated on the pursuit being LIVE, not on the state being PURSUE. A
+  // proximity hold taken mid-chase parks the robot in PROXIMITY_HOLD while the
+  // chase is still running — this file says so itself where the release
+  // refunds the held time to pursue_start_time_, "yielding to a teammate is not
+  // evidence the chase hypothesis is wrong". Keying on state_ alone wrote
+  // pursue_quarry_live=-1 ("not pursuing") on those rows, and they are not a
+  // random sample of the chase: a hold needs a MOVING peer inside hold_dist_m,
+  // i.e. it concentrates in the closing seconds, exactly where the §3.4 case
+  // (quarry live, team still incomplete) has to be read. Worse, right-of-way
+  // goes to the lexicographically smaller robot_id, so the blindness is
+  // deterministic by NAME — atlas chasing bestla never holds, bestla chasing
+  // atlas does — and the bias is unbalanced across id pairs rather than noise.
+  //
+  // pursue_peer_id_ is never cleared once set (see startPursuit), so a
+  // non-empty test on its own would keep writing the column for the rest of the
+  // run; the state pair is what bounds it to a live chase.
+  const bool pursuit_live =
+      !pursue_peer_id_.empty() &&
+      (state_ == State::PURSUE ||
+       (state_ == State::PROXIMITY_HOLD &&
+        prox_resume_state_ == State::PURSUE));
+  if (pursuit_live) {
+    m.pursue_peer = pursue_peer_id_;
+    m.pursue_quarry_live = peerAccounted(pursue_peer_id_, now) ? 1 : 0;
   }
 
   // Coverage-termination measure, on every row. This is the primary endpoint
@@ -10264,7 +16285,7 @@ void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
     e.peer = peer_id;
     e.silent_sec = 0.0;
     e.first_contact = true;
-    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.peers_live = accountedPeerCount(now);
     e.expected_peers = rendezvous_expected_peers_;
     exp_log_->logPeerSeen(expCtx(), e);
     return;
@@ -10275,7 +16296,7 @@ void ExploPlannerNode::expPeerHeard(const std::string& peer_id) {
     // The outage this message ends, measured from the last one that preceded
     // it — NOT from when the sweep noticed, which lags by up to a claim TTL.
     e.silent_sec = (now - it->second.last_heard).seconds();
-    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.peers_live = accountedPeerCount(now);
     e.expected_peers = rendezvous_expected_peers_;
     exp_log_->logPeerSeen(expCtx(), e);
     it->second.live = true;
@@ -10294,7 +16315,7 @@ void ExploPlannerNode::expPeerSweep() {
     PeerEvent e;
     e.peer = peer_id;
     e.silent_sec = silent;
-    e.peers_live = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+    e.peers_live = accountedPeerCount(now);
     e.expected_peers = rendezvous_expected_peers_;
     exp_log_->logPeerLost(expCtx(), e);
   }
@@ -10303,7 +16324,7 @@ void ExploPlannerNode::expPeerSweep() {
 // One event per manoeuvre DECISION, emitted by the leaf that commits the
 // action. The alternative — logging inside dispatchReconnect's branch walk —
 // cannot see the hold-escalation dispatch (which re-enters startReturnTo
-// straight from the barrier) or the hybrid chase -> meeting-point handoff, and
+// straight from the barrier) or the hybrid chase -> appointment handoff, and
 // would drift out of step with the behaviour the first time a branch moved.
 // dispatchReconnect stashes the peer context at the top of its branch walk, so
 // the leaf it reaches reports exactly what the decision saw. Two leaves are
@@ -10370,7 +16391,7 @@ void ExploPlannerNode::logReconnectDispatch(const char* action,
     e.predict_refused = "not a chase";
   }
   e.attempt        = reconnect_terminal_ ? 0 : midrun_attempts_;
-  e.peers_live     = coord_ ? static_cast<int>(coord_->livePeerCount(now)) : 0;
+  e.peers_live     = accountedPeerCount(now);
   e.expected_peers = rendezvous_expected_peers_;
   // Gate diagnostics belong to the manoeuvre (same lifetime as
   // reconnect_rec_, NOT consumed-per-event like decline_reason): an
@@ -10403,8 +16424,7 @@ void ExploPlannerNode::logRunEnd(const char* reason) {
   // most one metrics period old.
   e.unknown_fraction = last_unknown_fraction_;
   e.coverage_source  = last_coverage_source_;
-  e.peers_live =
-      coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
+  e.peers_live = accountedPeerCount(this->now());
   e.expected_peers = rendezvous_expected_peers_;
   // Configured vs REALISED CSV sampling rate. The realised value needs two rows
   // to be a period at all; -1 says "not measurable", never a fabricated 0.
@@ -10429,6 +16449,11 @@ void ExploPlannerNode::logRunEnd(const char* reason) {
   e.final_y   = latest_pos_.y();
   e.mission_home_result  = mission_home_result_;
   e.mission_home_sim_sec = mission_home_sim_sec_;
+  // Evidence that the once-per-run guard is a guard and not a comment. Zero in
+  // a healthy run; non-zero says the second request came and was refused, and
+  // names how many times. Read it next to mission_complete's `occurrence`.
+  e.mission_return_reentries = mission_return_reentries_;
+  e.midrun_attempts_used     = midrun_attempts_;
   exp_log_->logRunEnd(expCtx(), e);
 }
 
@@ -10775,7 +16800,8 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
 //     open — its own give-up timer closes it PARTIAL, which is the honest
 //     outcome for a trunk we could never see.
 //   - An approach waypoint's z is inert: it feeds inRoi (XY-only), isCellFree
-//     and reachable (both 2D), the failed-goal disc (XY) and then a nav2 goal,
+//     and reachable (both 2D), the failed-goal disc (XY) and then a navigator
+//     goal,
 //     which is a 2D navigator. So the robot's own z is a fine stand-in there,
 //     and rejecting would be actively harmful — the approach march exists to
 //     go MAP the unmapped ground, so refusing to drive anywhere the ground is
@@ -11462,8 +17488,35 @@ void ExploPlannerNode::doExploitDwell() {
         // while it drives. It arrives, or it goes silent and its claim ages out
         // of the table on the receipt-time TTL, or its own per-target give-up
         // closes the trunk and it stops claiming it. All three release us.
+        // The per-target give-up clock is the OUTER bound, and it applies
+        // whether or not max_wait is set. The paragraph above is right that
+        // every release it lists eventually fires -- but every one of them
+        // depends on the PEER: it arrives, it goes silent, or it closes the
+        // trunk. None of them is a clock this robot owns. A peer that keeps
+        // republishing a live claim it will never stage on (wedged in a
+        // proximity hold, say, which still heartbeats) satisfies none of the
+        // three, and with max_wait at its default 0.0 this robot holds a
+        // vantage until the mission cap.
+        //
+        // exploit_target_timeout_sec_ already exists for exactly this class of
+        // failure and already runs during the hold -- it is simply never READ
+        // here, only in doExploitPlan, which a holding robot never re-enters.
+        // Reading it costs no new parameter and no new default to get wrong.
+        //
+        // Release rather than abandon. doExploitPlan answers this deadline with
+        // finishActiveTarget(false) because there it means "this trunk cannot
+        // be reached"; here the robot is standing ON a valid vantage with a
+        // capture pending, so the honest response is the one the max_wait path
+        // already takes -- stop waiting, dwell solo, keep the capture. The
+        // same latch is used, so the warning below explains it once and the
+        // barrier stays down for the rest of this dwell.
+        const bool target_deadline_hit =
+            exploit_target_timeout_sec_ > 0.0 &&
+            (now.seconds() - exploit_target_started_sec_) >=
+                exploit_target_timeout_sec_;
         const bool wait_bounded = exploit_dwell_sync_max_wait_sec_ > 0.0;
-        if (!wait_bounded || waited < exploit_dwell_sync_max_wait_sec_) {
+        if (!target_deadline_hit &&
+            (!wait_bounded || waited < exploit_dwell_sync_max_wait_sec_)) {
           state_enter_time_ = now;
           if (wait_bounded) {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -11487,34 +17540,56 @@ void ExploPlannerNode::doExploitDwell() {
         // complete. transitionTo clears the latch on the next EXPLOIT_DWELL
         // entry, so one timed-out barrier does not disable the feature.
         dwell_sync_timed_out_ = true;
-        RCLCPP_WARN(get_logger(),
-            "dwell-sync: barrier timed out after %.0fs waiting for '%s' on "
-            "target %u (limit %.0fs) — DWELLING SOLO. This capture is not "
-            "simultaneous with the team's; check that peer for a proximity hold "
-            "or an unreachable ring.",
-            waited, waiting_on->robot_id.c_str(), synced_target->id,
-            exploit_dwell_sync_max_wait_sec_);
+        // Which deadline fired is worth saying out loud: the max_wait one is a
+        // tuning question, the per-target one means this robot has spent its
+        // whole budget for the trunk sitting still, which is a different thing
+        // to go and look at.
+        if (target_deadline_hit) {
+          RCLCPP_WARN(get_logger(),
+              "dwell-sync: per-target budget spent after %.0fs of waiting for "
+              "'%s' on target %u (exploit_target_timeout %.0fs) — DWELLING "
+              "SOLO. That peer is claiming the trunk without ever staging on "
+              "it; check it for a proximity hold or an unreachable ring.",
+              waited, waiting_on->robot_id.c_str(), synced_target->id,
+              exploit_target_timeout_sec_);
+        } else {
+          RCLCPP_WARN(get_logger(),
+              "dwell-sync: barrier timed out after %.0fs waiting for '%s' on "
+              "target %u (limit %.0fs) — DWELLING SOLO. This capture is not "
+              "simultaneous with the team's; check that peer for a proximity "
+              "hold or an unreachable ring.",
+              waited, waiting_on->robot_id.c_str(), synced_target->id,
+              exploit_dwell_sync_max_wait_sec_);
+        }
       }
     }
   }
 
   // NO goal re-send during the dwell. The dwell is only ever entered from
-  // NAVIGATE *after* arrival, so nav2 has already reported the goal reached and
-  // the controller has stopped — there is nothing to keep alive, and every
-  // re-send is a fresh NavigateToPose that preempts nothing and re-drives a
-  // goal the robot is standing on.
+  // NAVIGATE *after* arrival, so the goal has already been reached and there is
+  // nothing to keep alive; re-sending would re-arm the navigator on a goal the
+  // robot is standing on.
   //
-  // Throttling it was not enough. goal_republish_sec 5.0 against
-  // exploit_dwell_sec 8.0 puts exactly one re-navigation at t~5 s of every
-  // capture — the midpoint — and the widened goal_yaw_tolerance (0.4, needed so
-  // the planner's arrival gate stays looser than nav2's 0.25 checker) means the
-  // pose nav2 stopped at can be up to 0.4 rad off the vantage yaw, so the
-  // re-send is a real rotation, not a no-op. controller_server::computeControl()
-  // also calls computeAndPublishVelocity() BEFORE isGoalReached(), so even an
-  // exactly-satisfied goal emits at least one velocity command. That is a
-  // rotation through the middle of the RGB-D/LiDAR capture the dwell exists to
-  // take, i.e. motion blur and a viewpoint shift in the one window where the
-  // platform is supposed to be still.
+  // The original argument for this was nav2's (a re-send is a fresh
+  // NavigateToPose, and controller_server::computeControl() calls
+  // computeAndPublishVelocity() before isGoalReached(), so even a satisfied goal
+  // emits a velocity command). That mechanism is not in this stack, and the
+  // honest version is weaker: on simple_nav_3d an identical re-send is inert —
+  // the intake drops it while driving, and after arrival it re-arms for one 50 ms
+  // tick and commands nothing. So this is hygiene, not a defence.
+  //
+  // WHAT THE DWELL IS ACTUALLY EXPOSED TO, since the old comment implied the
+  // absence of a re-send made it still: the controller's rotate-to-goal latch is
+  // independent of anything the planner publishes. The planner's arrival gate
+  // (goal_yaw_tolerance 0.4) is deliberately looser than the controller's
+  // (ugv.goal_yaw_tol_rad 0.2) — it has to be, or the planner would wait on a
+  // heading the controller has already declared good enough — so on entry to the
+  // dwell the controller may still be closing the last 0.2 rad. Against the
+  // 0.5 rad/s clamp that is a few tenths of a second of in-place rotation at the
+  // START of an 8 s capture window, bounded by the tolerance gap rather than by
+  // anything this function does. Stated because a reader who needs a strictly
+  // still capture should know where the residual motion comes from — and that
+  // closing the gap would trade it for the arrival deadlock the gap prevents.
   if (elapsed < exploit_dwell_sec_) return;
 
   // Dwell complete. Re-confirm line-of-sight from the pose we actually settled
@@ -11740,10 +17815,12 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   goal.header.frame_id = map_frame_;
   goal.pose.position.x = vp.position.x();
   goal.pose.position.y = vp.position.y();
-  // Nav2's 2D planners consume only (x, y, yaw) and ignore z, so the true
-  // 3D waypoint z rides along by default (terrain mode makes it the ground
-  // + clearance elevation). flatten_goal_z zeroes it for consumers that
-  // choke on a non-zero z; markers/logs keep the 3D value either way.
+  // simple_nav_3d's UGV role plans and checks arrival in the plane and ignores
+  // z, so the true 3D waypoint z rides along by default (terrain mode makes it
+  // the ground + clearance elevation). flatten_goal_z zeroes it for consumers
+  // that choke on a non-zero z; markers/logs keep the 3D value either way.
+  // NOTE for any future UAV run: the UAV role's arrival test IS 3D, so there a
+  // wrong goal z is a wrong goal — not a harmless passenger.
   goal.pose.position.z = flatten_goal_z_ ? 0.0 : vp.position.z();
   goal.pose.orientation = yawToQuat(vp.yaw);
   // No navigator listening: the goal goes nowhere and, with no action
@@ -11764,13 +17841,15 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
 // Keep-alive re-send used by the states that are still DRIVING toward a goal
 // across ticks (NAVIGATE, RETURN_NAV). Publishes when the pose changed, when a
 // subscriber has just appeared, or when goal_republish_sec_ has elapsed — never
-// at the tick rate. See goal_republish_sec_ for why the old unthrottled 10 Hz
-// re-send actively provoked nav2 aborts.
+// at the tick rate. The throttle was introduced against a nav2 failure mode that
+// does not exist on this stack; see goal_republish_sec_ for what it is really
+// worth here (recovering a goal published while the navigator was down) and why
+// setting it to 0 is not the improvement the old comment claimed.
 //
 // Deliberately NOT called from EXPLOIT_DWELL: that state is entered only after
-// nav2 has reported arrival, so there is no in-flight goal to keep alive and a
-// re-send just re-drives a satisfied goal through the capture window. See
-// doExploitDwell().
+// arrival, so there is no in-flight goal to keep alive and a re-send would
+// re-arm the navigator on a goal the robot is standing on. See doExploitDwell()
+// for what does and does not hold the platform still during a capture.
 void ExploPlannerNode::republishGoal(const CandidateViewpoint& vp) {
   const bool has_sub = goal_pub_->get_subscription_count() > 0;
   const bool sub_appeared = has_sub && !goal_had_subscriber_;
@@ -12086,6 +18165,22 @@ double ExploPlannerNode::missionElapsed() {
   return std::max(0.0, this->now().seconds() - mission_t0_sec_);
 }
 
+double ExploPlannerNode::missionElapsedAt(const rclcpp::Time& when) const {
+  // Deliberately NOT latching: this is const because it only ever reads a
+  // baseline that missionElapsed() must already have set. A caller that gets
+  // here before the first live tick gets -1 and has to say so, rather than
+  // silently anchoring an appointment on a baseline invented from a past
+  // stamp.
+  if (mission_t0_sec_ < 0.0) return -1.0;
+  if (when.nanoseconds() <= 0) return -1.0;
+  const double e = when.seconds() - mission_t0_sec_;
+  // Negative means `when` predates the baseline, which for the rendezvous
+  // anchor means the team was already complete before this node's clock went
+  // live. Refusing is right: the interval would be anchored before the mission
+  // started and every deadline computed from it would be in the past.
+  return e < 0.0 ? -1.0 : e;
+}
+
 void ExploPlannerNode::publishTeamWorld() {
   if (!team_world_pub_ || !cell_world_.configured()) return;
 
@@ -12125,6 +18220,41 @@ void ExploPlannerNode::publishTeamWorld() {
   // with neither having heard the other. See TeamModel::inCommsMask.
   m.in_range_mask = team_model_.directMask();
 
+  // Generation 23, the contagion bit: THIS robot's OWN first-hand answer to
+  // "is the team whole?", never its derived armed state — announcing the armed
+  // state makes A and C hold each other armed off their own echo forever. The
+  // argument in full, and the A—B—C bridge it exists for, is in TeamWorld.msg.
+  //
+  // Published in all four arms, like my_tour: it is what this robot's PEERS
+  // need, and whether they act on it is their local mode's business.
+  //
+  // Guarded on a positive expectation because teamComplete() is false whenever
+  // it is 0, so an inert configuration (a single-robot run, where 0 is the
+  // documented default in shared_params.yaml) would otherwise broadcast a
+  // permanent, unclearable "the team is broken" to a fleet of nobody. No
+  // expectation means the question has no answer here, and the honest wire
+  // value for that is "I am not reporting a break".
+  m.team_incomplete =
+      rendezvous_expected_peers_ > 0 &&
+      !teamComplete(
+          accountedPeerCount(this->now()),
+          rendezvous_expected_peers_);
+
+  // Generation 23: "I am still driving to the agreed cell", so a robot already
+  // standing there does not call the meeting over while its partner is on the
+  // way. Keyed on the DRIVING state and not on an arrival test on purpose — the
+  // bit has to clear however the drive ended, or an unreachable meeting point
+  // would hold the team at an unbounded barrier. See TeamWorld.msg.
+  m.appointment_inbound =
+      appointment_manoeuvre_ && state_ == State::RETURN_NAV;
+
+  // Generation 27: the one-hop report that lets the closure door's inbound
+  // veto reach the peers the door admits through a bridge. Derived from the
+  // RAW first-hand bits only — publishing the wider peer-report predicate
+  // here would let A say "seen" because B says "seen", a relayed echo with
+  // nothing able to clear it. See TeamWorld.msg.
+  m.appointment_inbound_seen = peerInboundToAppointment();
+
   const std::vector<CellWorld::WireCell> wire = cell_world_.toWire();
   m.cells.reserve(wire.size());
   for (const CellWorld::WireCell& w : wire) {
@@ -12150,7 +18280,54 @@ void ExploPlannerNode::publishTeamWorld() {
   // Broadcast whether or not the local predictor is enabled: it is what THIS
   // robot's peers need, and gating the send on our own setting would make an
   // mdp/trail mixed fleet fail in a way that looks like the model refusing.
+  //
+  // BUT ONLY WHILE THIS ROBOT IS ACTUALLY DRIVING THAT ROUTE (2026-09-18).
+  // `my_tour_` had exactly one writer — the allocator solve in doPlan — so it
+  // was only ever refreshed inside the exploration loop. (It has two now: the
+  // clear a few lines below is the other, and it is what this block adds.
+  // Nothing else assigns it; grep my_tour_ to confirm.) The moment the robot
+  // leaves that loop for a manoeuvre (PURSUE, RETURN_NAV, RETURN_SYNC), for
+  // the homing leg (RETURN_HOME), or for good (DONE / coverage latched), the
+  // solve stops running and this heartbeat kept re-sending the last route
+  // FOREVER, at a receiver-stamped age of zero. There is no age or stamp
+  // field on TeamWorld.my_tour, so the consumer cannot tell a route the peer
+  // is driving from one it abandoned four minutes ago — and the receive path
+  // anchors the tour at the position from the SAME message, which is now the
+  // peer's live pose on its way somewhere else entirely. That is the exact
+  // failure my_tour_'s own declaration says the model "has no way to detect",
+  // arrived at by a different door: not a refused solve leaving a stale route
+  // on the air, but no solve at all.
+  //
+  // It is not hypothetical for this campaign. A robot that departs for an
+  // appointment typically stays in comms for a few seconds before the link
+  // drops, so the LAST tour its peers hold is the frozen exploration route,
+  // anchored at a pose already heading for the meeting point — and the mdp
+  // predictor (non-inert since FIX 7) then extrapolates it along ground it
+  // has stopped driving, aiming the chase away from where it actually went.
+  //
+  // Sending an EMPTY tour is the designed encoding for "I have no route", not
+  // a hole: the receive path overwrites unconditionally on an accepted
+  // message "including with an EMPTY tour ... Absence is information here",
+  // and a peer that hears no tour falls back to the trail chase, which is the
+  // documented safe degradation. So this narrows the predictor's input to the
+  // cases where it is true rather than removing it.
+  //
+  // PROXIMITY_HOLD defers to prox_resume_state_ because the hold is a pause,
+  // not a decision: it cancels the goal and resumes THE SAME ONE, so a hold
+  // taken out of NAVIGATE is still driving the tour while one taken out of
+  // PURSUE is not. Same treatment, and for the same reason, as the homing
+  // attribution below at the mission_return sites.
+  const State tour_state = (state_ == State::PROXIMITY_HOLD)
+                               ? prox_resume_state_
+                               : state_;
+  const bool tour_is_live =
+      phase_ == Phase::EXPLORE && !coverage_latched_ &&
+      (tour_state == State::PLAN || tour_state == State::NAVIGATE ||
+       tour_state == State::INTEGRATE || tour_state == State::LOG_STEP);
   m.my_tour.clear();
+  if (!tour_is_live) {
+    my_tour_.clear();
+  }
   m.my_tour.reserve(my_tour_.size());
   for (int cid : my_tour_) {
     if (cid < 0 || cid > static_cast<int>(
@@ -12164,21 +18341,109 @@ void ExploPlannerNode::publishTeamWorld() {
     m.my_tour.push_back(static_cast<uint16_t>(cid));
   }
 
-  // P5 fields, written explicitly at their "absent" values rather than left to
-  // the struct's zero-init. -1 is the documented no-proposal encoding and 0 is
-  // a valid cell id; leaving it defaulted would broadcast a standing proposal
-  // to meet in cell 0 at mission time zero the moment P5's consumer lands, and
-  // it would be a receiver-side bug when it was written here.
-  m.rendezvous_cell_id  = -1;
-  m.rendezvous_time_sec = -1.0f;
+  // P5: the pair this robot currently holds — its own derivation if it is the
+  // proposer, the proposer's pair echoed verbatim otherwise. Written explicitly
+  // at -1/-1 when there is none rather than left to the struct's zero-init,
+  // because 0 is a valid cell id and a zero-init pair would broadcast a
+  // standing proposal to meet in cell 0 immediately after separation.
+  //
+  // Publishing is NOT driving: this says "I hold this pair", and the commit
+  // rule downstream is what turns a pair everyone holds into one anyone acts
+  // on. The two are separate on purpose — a robot that drove its held pair
+  // would leave before its peers had even seen it.
+  m.rendezvous_cell_id     = rendezvous_held_.cell;
+  m.rendezvous_interval_ms = -1;
+  m.rendezvous_t_meet_ms   = -1;
+  // THE FLAG TRAVELS WITH THE TRIPLE, and it is false whenever the triple is
+  // absent. A peer must be able to tell "I am publishing nothing" from "I am
+  // publishing a placeholder", and the refusal path below rewrites the cell to
+  // -1 without unwinding this line, so it is set from the held state and then
+  // cleared with the cell if the triple turns out not to fit the wire.
+  m.rendezvous_provisional =
+      rendezvous_held_.valid() && rendezvous_held_provisional_;
+  if (rendezvous_held_.valid()) {
+    // int32 ms tops out at ~24 days, so this cannot fire on any mission this
+    // planner will run — but the value is produced by arithmetic over graph
+    // distances and a nonsense speed would make it enormous, and the failure
+    // mode of a silent truncation is a peer meeting at the wrong TIME while
+    // agreeing perfectly on the cell. Refuse the triple whole instead: a robot
+    // publishing (cell, -1, -1) advertises "no proposal", which the commit rule
+    // already handles, where a truncated instant would be believed.
+    //
+    // BOTH TIME FIELDS ARE CHECKED TOGETHER and refused together. t_meet is the
+    // larger of the two — it is the interval plus a mission clock that only
+    // grows — so it is the one that overflows first, and a check that covered
+    // only the interval would broadcast a truncated meeting INSTANT beside a
+    // perfectly valid interval. That is the exact failure this guard exists to
+    // prevent, one field further along.
+    constexpr long long kMaxMs =
+        static_cast<long long>(std::numeric_limits<int32_t>::max());
+    if (rendezvous_held_.interval_ms <= kMaxMs &&
+        rendezvous_held_.t_meet_ms <= kMaxMs) {
+      m.rendezvous_interval_ms =
+          static_cast<int32_t>(rendezvous_held_.interval_ms);
+      m.rendezvous_t_meet_ms =
+          static_cast<int32_t>(rendezvous_held_.t_meet_ms);
+    } else {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 30000,
+          "TeamWorld: rendezvous interval %lld ms / t_meet %lld ms does not fit "
+          "the int32 wire field; broadcasting 'no proposal' rather than a "
+          "truncated meeting time the peers would believe.",
+          rendezvous_held_.interval_ms, rendezvous_held_.t_meet_ms);
+      m.rendezvous_cell_id     = -1;
+      m.rendezvous_provisional = false;   // "no proposal" is never provisional
+    }
+  }
 
-  // The done LATCH, not State::DONE. DONE is reached at the end of the
-  // mission-return leg, minutes after this robot's map stopped gaining, and a
-  // peer keyed on it would keep planning around a robot that had already
-  // finished exploring. Under done_criterion=streak this stays false for the
-  // whole run — that criterion has no latch to report — which is honest and
-  // costs only the optimisation a `finished` peer would have enabled.
-  m.finished = coverage_latched_;
+  // THE LATCH **OR** THE ENDING, and it took both to make the bit honest.
+  //
+  // The latch is the EARLY signal and stays first: DONE is reached at the end
+  // of the mission-return leg, minutes after this robot's map stopped gaining,
+  // and a peer keyed on DONE alone would keep planning around a robot that had
+  // already finished exploring.
+  //
+  // But the latch ALONE was a censoring bug (2026-09-18, generation 23). It is
+  // written at exactly one site — maybeLatchCoverageDone, first touch only —
+  // and NONE of the other run endings touch it: step-budget, coverage-saturated
+  // and barrier-gave-up all route through startReturnHome and end at
+  // finishNow() with coverage_latched_ still false. publishTeamWorld has no
+  // state gate and its timer is a bare lambda, so such a robot went on
+  // publishing finished=false AND team_incomplete=true, once a second, from
+  // wherever it had parked, for the rest of the run. Every peer then read a
+  // live teammate announcing a broken team: peerReportsTeamBreak's
+  // `if (p.finished) continue;` exemption — written for exactly this case,
+  // see its own comment — could not fire, teamSettled was pinned false
+  // fleet-wide, and the appointment barrier (unbounded on purpose,
+  // rendezvous_appointment_wait_sec = 0) held every other robot at the meeting
+  // point until the duration cap. One robot finishing early censored the cell.
+  //
+  // State::DONE is the ending every one of those paths reaches, and it is a
+  // strictly later and strictly stronger statement than the latch, so ORing it
+  // in cannot make the bit fire too early. Under done_criterion=streak the
+  // latch half stays false for the whole run — that criterion has no latch to
+  // report — and the DONE half now carries the bit on its own, which is the
+  // case that used to have no signal at all.
+  //
+  // LATCHED, NOT RECOMPUTED, and that is what makes the bit safe to RELAY
+  // (TeamWorld.msg/robot_finished). Relay depends on monotonicity: a relayed
+  // copy is only sound if the bit can never go back to false, because nothing
+  // downstream clears it. `coverage_latched_` is monotonic — one write site,
+  // never reset — but `state_ == State::DONE` on its own is NOT: the DONE
+  // branch in tick() says so itself, since the exploit sub-loop can pull the
+  // planner back out to EXPLORE -> PLAN and land in DONE again. That path is
+  // unreachable for this campaign (exploitation_enabled: false), and relying on
+  // a config value to hold a wire invariant is exactly the kind of coincidence
+  // that stops being true without anything looking wrong. Latching it here
+  // makes the guarantee local to the publisher and independent of the config.
+  if (coverage_latched_ || state_ == State::DONE) finished_announced_ = true;
+  m.finished = finished_announced_;
+
+  // A robot whose run is over has no opinion worth acting on about whether the
+  // TEAM is whole, and announcing one is how the censoring above propagated.
+  // Belt and braces with the `finished` bit above on purpose: that bit is what
+  // peerReportsTeamBreak reads, but team_incomplete is a public wire field and
+  // any future consumer reading it directly must not be handed a stale yes.
+  if (state_ == State::DONE) m.team_incomplete = false;
 
   // --- gossip ---------------------------------------------------------
   //
@@ -12189,9 +18454,11 @@ void ExploPlannerNode::publishTeamWorld() {
   const size_t n = static_cast<size_t>(fleet_.size());
   m.robot_positions.assign(n, geometry_msgs::msg::Point());
   m.robot_last_heard_sec.assign(n, -1.0f);
+  m.robot_finished.assign(n, false);
   for (size_t i = 0; i < n; ++i) {
     const int id = static_cast<int>(i);
     if (id == fleet_.self_id) {
+      m.robot_finished[i] = m.finished;
       // Our own entry is our publish time, and it is the reference point the
       // whole array is read against — the receiver recovers each peer's age as
       // (our entry - that entry), an interval, which is the only thing that
@@ -12218,6 +18485,18 @@ void ExploPlannerNode::publishTeamWorld() {
       m.robot_positions[i].y    = p.position_y;
       m.robot_positions[i].z    = p.position_z;
     }
+    // RELAYED WITHOUT THE PAIRING RULE AND WITHOUT THE FRESHNESS RULE that
+    // govern the two arrays above, because neither applies to a monotonic bit.
+    // There is no companion field to keep it consistent with, and no age at
+    // which it stops being true. It is also relayed whether we hold it
+    // first-hand or by relay ourselves — unlike position, which is deliberately
+    // first-hand-only to bound relay to one hop. That bound exists so a
+    // consumer cannot hold a POSITION for a robot the model cannot place; a
+    // finished bit places nothing and only ever removes a robot from the set
+    // the team waits for, so propagating it further is the point rather than a
+    // hazard. Its own idempotence is what makes that safe: re-relaying a bit
+    // that is already true changes nothing anywhere.
+    if (p.finished) m.robot_finished[i] = true;
   }
 
   team_world_pub_->publish(m);
@@ -12244,6 +18523,32 @@ void ExploPlannerNode::drainTeamWorld() {
   // order. See the declaration and TeamModel::tick.
   std::vector<TeamExchangeEvent> rows;
   rows.reserve(batch.size());
+
+  // THE SILENCE THIS MESSAGE ENDED, captured before a single observe() runs.
+  //
+  // Through v7 the row reported team_model_.lastKnownAgeSec(sender) taken in
+  // the second pass, which is structurally 0.0: observe() sets the sender's
+  // last_known_sec to this same `t`, and a row only exists for a sender. It
+  // read 0.0 on 757,677 of 757,677 rows across the banked campaigns — a column
+  // that could not have reported anything else.
+  //
+  // The quantity that was wanted is the one just above: how stale our
+  // knowledge of this peer had become at the instant its message landed, i.e.
+  // the receiver-side inter-arrival gap. That is a direct per-peer measure of
+  // dropout length, and it is the only place in the log where a dropout's
+  // duration is observed by the robot that suffered it rather than inferred
+  // by joining two files.
+  //
+  // A SEPARATE PRE-PASS, not a read at the top of the drain loop, and the
+  // distinction is load-bearing: observe() gossips third-party last-heard
+  // times, so the first sender's message can refresh the SECOND sender's
+  // last_known_sec before the loop reaches it. Reading inline would silently
+  // shrink the gap of every peer but the first, in arrival order — the exact
+  // shape of bias that survives into a result.
+  std::map<int, double> pre_known_age;
+  for (const auto& kv : batch) {
+    pre_known_age[kv.first] = team_model_.lastKnownAgeSec(kv.first, t);
+  }
 
   for (auto& kv : batch) {
     const int sid = kv.first;
@@ -12289,6 +18594,13 @@ void ExploPlannerNode::drainTeamWorld() {
       o.sender_id     = sid;
       o.in_range_mask = msg.in_range_mask;
       o.finished      = msg.finished;
+      // The sender's own first-hand break bit, copied verbatim and never
+      // re-broadcast as ours (TeamModel::observe stores it first-hand only).
+      o.team_incomplete = msg.team_incomplete;
+      // Likewise first-hand only: "I am still driving to the agreed cell".
+      o.appointment_inbound = msg.appointment_inbound;
+      // And the sender's one-hop report of that bit seen in ITS peers.
+      o.appointment_inbound_seen = msg.appointment_inbound_seen;
       o.have_position = true;   // mandatory field; the sender withholds the
                                 // whole message rather than send a fake pose
       o.x = msg.position.x;
@@ -12297,6 +18609,15 @@ void ExploPlannerNode::drainTeamWorld() {
       o.last_heard_sec.reserve(msg.robot_last_heard_sec.size());
       for (float v : msg.robot_last_heard_sec)
         o.last_heard_sec.push_back(static_cast<double>(v));
+      // Copied on its own, not folded into the position loop below: it is
+      // sized independently on the wire and TeamModel merges it without any of
+      // the freshness rules that loop applies. An old producer that predates
+      // the field sends it EMPTY, which reads through as "no relayed evidence"
+      // and degrades to the first-hand-only behaviour rather than to a wrong
+      // answer — though the type hash makes that fleet unmatched anyway.
+      o.finished_gossip.reserve(msg.robot_finished.size());
+      for (bool v : msg.robot_finished)
+        o.finished_gossip.push_back(v ? 1u : 0u);
       const size_t gn = msg.robot_positions.size();
       o.gx.resize(gn); o.gy.resize(gn); o.gz.resize(gn);
       // The wire carries no have_gossip_pos flag; the message defines a
@@ -12348,6 +18669,10 @@ void ExploPlannerNode::drainTeamWorld() {
       const CellWorld::MergeStats st = cell_world_.mergeWire(sid, wire, centre);
       e.drop_reason    = st.refused;   // "" unless refused wholesale
       e.applied        = st.applied;
+      // Accumulated as well as logged per message: the rendezvous release needs
+      // "did anything arrive between these two instants", and reconstructing
+      // that from the event rows would make a live decision depend on a file.
+      team_merge_applied_total_ += st.applied;
       e.known_by_only  = st.known_by_only;
       e.agreed_noop    = st.agreed_noop;
       e.refused_guard  = st.refused_guard;
@@ -12381,6 +18706,60 @@ void ExploPlannerNode::drainTeamWorld() {
       // now() would credit the message with a freshness the drain delay
       // already spent, and drainTeamWorld runs on the planning tick.
       pt.stamp = kv.second.received;
+
+      // --- the peer's rendezvous proposal (P5) ------------------------
+      //
+      // Gated on the same checks and for a stronger reason than the tour: a
+      // cell id from a mismatched grid names different ground, and the whole
+      // protocol turns on comparing this robot's cell id to the peer's for
+      // EQUALITY. Two robots on different grids would find their integers
+      // matching and stand in different places — the exact failure the
+      // exchange exists to remove, reintroduced by trusting an unchecked
+      // sender.
+      //
+      // Overwrites unconditionally, empty pair included: a peer that has
+      // dropped its proposal is telling us so, and holding its last one would
+      // let this robot commit a pair no one is offering any more.
+      if (sid >= 0 && sid < static_cast<int>(rendezvous_peer_.size()) &&
+          sid < static_cast<int>(rendezvous_peer_at_sec_.size()) &&
+          sid < static_cast<int>(rendezvous_peer_provisional_.size())) {
+        RendezvousProposal& rp = rendezvous_peer_[sid];
+        rp.cell        = msg.rendezvous_cell_id;
+        rp.interval_ms = msg.rendezvous_interval_ms;
+        rp.t_meet_ms   = msg.rendezvous_t_meet_ms;
+        // Stored beside the pair, and cleared with it on every path below that
+        // drops one. A flag surviving the pair it qualified would say "the peer
+        // holds a placeholder" about a peer holding nothing, and the follower
+        // adopt rule reads exactly that conjunction.
+        rendezvous_peer_provisional_[sid] =
+            msg.rendezvous_provisional ? 1 : 0;
+        // BOUND THE CELL ID AGAINST OUR OWN GRID. RendezvousProposal::valid()
+        // only asks cell >= 0, and this is the one wire->geometry path in the
+        // node with no other bound on it: an adopted cell flows to
+        // appointment_.cell and then to grid().centre(), which its own header
+        // documents as undefined for an id the caller has not screened. The
+        // grid_hash check above makes a wrong-but-in-range id unlikely and
+        // does nothing at all about an out-of-range one, because a hash match
+        // says the grids agree on GEOMETRY, not that the sender's id is inside
+        // it. A sender whose grid is larger than ours passes the geometry
+        // check on the cells we share and can still name a cell we do not have.
+        if (rp.cell >= 0 && !cell_world_.grid().valid(rp.cell)) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+              "TeamWorld from %s proposes cell %d, which is outside this "
+              "robot's grid — dropping the proposal.", e.peer.c_str(), rp.cell);
+          rp = RendezvousProposal{};
+        }
+        if (!rp.valid()) rp = RendezvousProposal{};   // normalise partial pairs
+        if (!rp.valid()) rendezvous_peer_provisional_[sid] = 0;
+        // Dated by LOCAL receipt on the local mission clock, which is the only
+        // scale on which this robot can ask "is that still current?". The
+        // producer's own clock never enters it — that is the whole reason the
+        // wire field is an interval and not a time. Falls back to the drain
+        // instant if the stamp predates the mission baseline, which costs at
+        // most the drain delay and never dates a message into the future.
+        const double at = missionElapsedAt(kv.second.received);
+        rendezvous_peer_at_sec_[sid] = at >= 0.0 ? at : t;
+      }
     }
 
     rows.push_back(std::move(e));
@@ -12407,7 +18786,11 @@ void ExploPlannerNode::drainTeamWorld() {
       e.one_way   = p.heard_one_way;
       e.via_relay = p.via_relay;
       e.last_direct_age_sec = team_model_.lastDirectAgeSec(e.peer_id, t);
-      e.last_known_age_sec  = team_model_.lastKnownAgeSec(e.peer_id, t);
+      // NOT re-read here — see the pre-pass. This is the age as it stood
+      // BEFORE this message was believed; reading the model now would give
+      // 0.0 on every row, which is what v7 did.
+      const auto it = pre_known_age.find(e.peer_id);
+      if (it != pre_known_age.end()) e.last_known_age_sec = it->second;
     }
     e.peers_lost      = lost;
     e.self_direct_mask = self_mask;

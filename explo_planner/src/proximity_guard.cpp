@@ -101,7 +101,8 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     const double age = (now - p.last_seen).seconds();
     const bool fresh = age >= 0.0 && age <= max_age;
 
-    // Parked peers are the costmap's job, and holding against one deadlocks
+    // Parked peers are the navigator's obstacle grid's job (not a nav2
+    // costmap — there is none here), and holding against one deadlocks
     // — but only beyond parked_keep_dist_m. Inside the floor "it parked" is
     // no licence to drive even closer; the caller's max-hold escape hatch is
     // the deadlock breaker there.

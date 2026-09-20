@@ -23,6 +23,12 @@ What it compares instead is the structure a run CANNOT vary by chance:
                                   default compiled into the child's own source
   3. the set of event kinds       nothing outside the declared pre-v4
                                   vocabulary may appear at defaults
+  3b. the shape of each kind      a kind both sides emit carries the same
+                                  top-level fields, at the same JSON types.
+                                  Names alone are not the schema: a child that
+                                  keeps every kind and rewrites its contents is
+                                  a writer change, and checking 3 without 3b
+                                  passes it clean.
   4. the armed comms-gate names   the same checks were armed on both sides
   5. the manifest arm block       the two campaigns were configured alike
 
@@ -41,6 +47,16 @@ A default this file cannot parse is a HARD FAILURE, never a skip. That is the
 whole reason the parser is allowed to be simple: it does not have to understand
 every C++ initialiser, it only has to refuse to guess.
 
+Two kinds of param defeat that read, and both are registered rather than
+guessed at. A DERIVED field has no dp() call at all, so DERIVED_DEFAULTS
+supplies it — as a constant, or as a function of the same run's other params
+where one is available. An AUTO-SENTINEL field has a dp() call whose second
+argument is not a default: the node reads "<= 0" as "resolve this from another
+knob" and does so in the constructor, before the dump is written, so no
+at-defaults run ever logs it. Testing those against the sentinel would fail
+every honest run; AUTO_RESOLVED_PARAMS marks them UNRESOLVED instead, which is
+the truthful answer and not a pass.
+
 Populations
 -----------
 An empty side is UNRESOLVED, not PASS. "I found no cells to compare" and "I
@@ -57,13 +73,20 @@ Env:    EQUIV_NODE_SRC   explo_planner_node.cpp (default: alongside this file)
                                 in the child. For the phase that turns a
                                 mechanism ON, so the same file can score a
                                 treatment arm; NEVER for a defaults run.
+        EQUIV_ALLOW_NEW_FIELDS  comma-separated `kind.field` names permitted to
+                                appear on a kind both sides emit (check 3b).
+                                Same rule: for a phase that deliberately widens
+                                an existing event, NEVER for a defaults run.
 Exit:   0  equivalent
         1  a difference that defeats the default-off claim
         2  usage, or a default the parser refused to guess at
-        3  a population was empty — nothing was actually compared
+        3  something was not actually compared: a population was empty, or an
+           invariant could not be checked (a param whose compiled "default" is
+           an AUTO sentinel, or a derived one whose inputs the run did not log)
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -86,9 +109,50 @@ LOG_HPP = os.environ.get(
 # loudly rather than silently: it is consulted only for params dp() did not
 # supply, and a param in neither place is a hard failure. Forgetting to add an
 # entry cannot make the gate quietly accept something.
+#
+# A value may be a plain constant, or a callable taking the child's own param
+# dump and returning the expected value. The callable form exists for fields
+# derived from OTHER logged params: pinning such a field to a constant would
+# make this gate fail an honest pair the day that input legitimately changes,
+# and a gate that fails honest pairs is a gate somebody widens until it passes
+# everything. Deriving it instead is strictly stronger — it checks the field
+# against the geometry the same run recorded, so a binary that logged a flag
+# inconsistent with its own FOV fails here even at defaults.
 DERIVED_DEFAULTS = {
     "robot_id": -1.0,    # fleet_.self_id with team_robot_names empty
     "team_hash": 0.0,    # fleet_.team_hash likewise
+    # Not a dp() knob at all: the node computes it from the ray comb, at
+    # explo_planner_node.cpp "FOV model is omnidirectional" —
+    #     h_step = h_rays > 0 ? hfov / h_rays : 0
+    #     omnidirectional = hfov >= 2*pi - h_step
+    # one h_step of slack being the honest tolerance for a circle the comb
+    # cannot distinguish from a closed one. Mirrored rather than pinned to
+    # True: D1 ships a 360 deg FOV, but a directional pair must still be
+    # scoreable, and this way the copy is checkable against the same run's
+    # fov_hfov/fov_h_rays instead of against a remembered verdict.
+    "fov_is_omnidirectional": lambda cp: (
+        float(cp["fov_hfov"]) >= 2.0 * math.pi - (
+            float(cp["fov_hfov"]) / float(cp["fov_h_rays"])
+            if float(cp.get("fov_h_rays") or 0) > 0 else 0.0)
+    ) if "fov_hfov" in cp and "fov_h_rays" in cp else UNDERIVABLE,
+}
+
+# Params whose dp() second argument is a SENTINEL rather than a default: the
+# node reads "<= 0" as AUTO and resolves the field from another knob in its
+# constructor, BEFORE the param dump is written. So an at-defaults run never
+# logs the compiled 0.0, and testing against it would report every honest
+# defaults run as "NOT at its default" — a hard failure nobody can clear, which
+# is how a gate gets deleted rather than fixed.
+#
+# Registering one here does NOT make it pass. It makes the gate say it cannot
+# certify the field, which is the truthful answer and which exit 3 exists for.
+# Two of the three resolve from params the node does not log at all
+# (vantage_visited_tol_m, candidate_max_radius), so no stronger check is
+# available from the log; inventing one would be a guard that cannot check.
+AUTO_RESOLVED_PARAMS = {
+    "coord_claim_radius_m":         "fov_max_range",
+    "coord_vantage_claim_radius_m": "vantage_visited_tol_m (not logged)",
+    "cost_grid_radius_cap_m":       "candidate_max_radius + 2.0 (not logged)",
 }
 
 # Params whose value is EXPECTED to differ between two campaigns and says
@@ -210,7 +274,14 @@ GATED_MANIFEST_GROUPS = {
     # global_alloc_comms_mask: false. A child reading "missing" fails here
     # rather than relaxing — correct, because a missing params file is the very
     # failure these witnesses were added to expose.
-    "coord_claim_radius_m_in_params": ("0.0", set()),
+    # Re-pinned 0.0 -> 10.0 by D1, which stops relying on the AUTO path: the
+    # node reads <= 0 as "use fov_max_range", and D1 doubles fov_max_range to
+    # 20.0, so leaving the yaml at 0.0 would have silently doubled the claim
+    # disc as a side effect of a sensor change. Pinning 10.0 holds the disc
+    # where gen-8 actually ran it. The value here must track the yaml, per the
+    # rule stated above; it was 0.0 and the yaml now says 10.0, so an honest
+    # gen-9 child would have failed this rung on a stale pin.
+    "coord_claim_radius_m_in_params": ("10.0", set()),
     "global_alloc_comms_mask_in_params": ("false", set()),
 }
 
@@ -290,6 +361,11 @@ def declared_vocabulary(path):
 # ----------------------------------------------------------------------------
 
 UNPARSEABLE = object()
+# A DERIVED_DEFAULTS callable returns this when the run did not log the inputs
+# it derives from. Distinct from UNPARSEABLE: that one means this file cannot
+# read the source, which is a refusal to score (exit 2); this one means the
+# LOG lacks the inputs, which is an honest "not checkable here" (exit 3).
+UNDERIVABLE = object()
 
 
 def _default_expr(src, i):
@@ -406,6 +482,7 @@ def read_side(root, label):
                 continue
             robot = f[:-len(".events.jsonl")]
             params, schema, kinds = None, None, set()
+            shape = {}
             for ln in open(os.path.join(d, f), errors="replace"):
                 try:
                     e = json.loads(ln)
@@ -414,6 +491,15 @@ def read_side(root, label):
                 kind = e.get("event")
                 if kind:
                     kinds.add(kind)
+                    # Top-level keys only, and the JSON type of each. run_start's
+                    # nested `params` is compared field-by-field in check 2
+                    # already; re-flattening it here would report every param
+                    # twice and bury the one thing this check adds.
+                    s = shape.setdefault(kind, {})
+                    for k, v in e.items():
+                        s.setdefault(k, set())
+                        if v is not None:
+                            s[k].add(type(v).__name__)
                 if kind == "run_start" and params is None:
                     params = e.get("params", {})
                     schema = e.get("schema_version")
@@ -425,6 +511,7 @@ def read_side(root, label):
                     f"— its configuration cannot be compared")
             runs.append({"cell": os.path.basename(d), "robot": robot,
                          "params": params, "schema": schema, "kinds": kinds,
+                         "shape": shape,
                          "manifest": manifest, "gates": gates})
     return runs
 
@@ -457,8 +544,9 @@ def _agreed(runs, pick, what, label, fails):
     return pick(runs[0])
 
 
-def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
-    fails, notes = [], []
+def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new,
+            allow_fields=frozenset()):
+    fails, notes, unresolved = [], [], []
 
     # 1. schema -------------------------------------------------------------
     ps = _agreed(parent, lambda r: r["schema"], "schema_version", "parent",
@@ -500,6 +588,17 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                          f"in, it is not only the binary.")
     new = sorted(set(cp) - set(pp))
     for k in new:
+        # Checked BEFORE the dp() lookup, because these params do have a dp()
+        # call — its second argument is just a sentinel rather than a default,
+        # so the lookup would succeed and then compare against the wrong thing.
+        if k in AUTO_RESOLVED_PARAMS:
+            unresolved.append(
+                f"param {k!r} is new in the child at {cp[k]!r}, and its dp() "
+                f"second argument is an AUTO sentinel, not a default: the node "
+                f"resolves it from {AUTO_RESOLVED_PARAMS[k]} before the param "
+                f"dump is written. This gate cannot certify it from the log, "
+                f"and will not pretend the sentinel is the expectation.")
+            continue
         if k not in defaults and k not in DERIVED_DEFAULTS:
             fails.append(
                 f"param {k!r} is new in the child but no dp(\"{k}\", ...) call "
@@ -509,6 +608,14 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                 f"DERIVED_DEFAULTS; do not delete this check.")
             continue
         d = defaults.get(k, DERIVED_DEFAULTS.get(k))
+        if callable(d):
+            d = d(cp)
+            if d is UNDERIVABLE:
+                unresolved.append(
+                    f"param {k!r} is new in the child at {cp[k]!r} and is "
+                    f"DERIVED, but this run did not log the params it derives "
+                    f"from, so there is nothing to check it against.")
+                continue
         if d is UNPARSEABLE:
             # Exit 2, not 1: the phase may well be fine. What failed is this
             # file's ability to say so, and that is not a verdict.
@@ -522,9 +629,13 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
                 f"{cp[k]!r}, the source compiles in {d!r}. This run is a "
                 f"treatment arm, not a defaults run, and proves nothing about "
                 f"default-off equivalence.")
-    if new:
-        notes.append(f"{len(new)} new param(s) at defaults: "
-                     f"{', '.join(new)}")
+    # Only the ones actually CHECKED. Counting the auto-resolved and underivable
+    # ones here would report them as "at defaults" in the same breath the
+    # unresolved list says they could not be checked.
+    checked_new = [k for k in new if k not in AUTO_RESOLVED_PARAMS]
+    if checked_new:
+        notes.append(f"{len(checked_new)} new param(s) at defaults: "
+                     f"{', '.join(checked_new)}")
 
     # 3. the event vocabulary ----------------------------------------------
     # Against the DECLARED legacy set, not against what the parent runs happened
@@ -555,6 +666,69 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
         notes.append(f"kind(s) in the parent and not the child: {missing} "
                      f"(expected under run-to-run variation; investigate only "
                      f"if a mechanism's entire vocabulary disappeared)")
+
+    # 3b. the SHAPE of each shared kind -------------------------------------
+    # Check 3 compares the NAMES of the event kinds and stops there, so a child
+    # that keeps every name and rewrites what is inside them passes it clean.
+    # That is most of what a phase actually does: `rendezvous_commit` gaining a
+    # `provisional` flag, a field renamed, a count changing from int to string.
+    # None of it is visible above, and all of it changes what every downstream
+    # reader gets — which is the same failure as a gate that stopped checking,
+    # arriving through the one door this file left open.
+    #
+    # Direction matters and the two are not symmetric. The CHILD is what is
+    # being certified, so a field in the child and in no parent run anywhere is
+    # a FAIL: across a whole population the parent's writer never once emitted
+    # it. The reverse is a NOTE — a field the parent wrote and the child did not
+    # reach can be a conditional field on a branch the child's runs missed, and
+    # failing on that is how a gate starts failing honest pairs.
+    #
+    # Unions are taken across the whole side, never per run, for the same
+    # reason: a field written only on some branches is present in some runs and
+    # absent in others within ONE binary, and a per-run comparison would call
+    # that a difference between binaries.
+    def merge_shape(side):
+        out = {}
+        for r in side:
+            for kind, fields in r["shape"].items():
+                dst = out.setdefault(kind, {})
+                for k, types in fields.items():
+                    dst.setdefault(k, set()).update(types)
+        return out
+
+    pshape, cshape = merge_shape(parent), merge_shape(child)
+    new_fields, gone_fields, retyped = [], [], []
+    for kind in sorted(set(pshape) & set(cshape)):
+        pf, cf = pshape[kind], cshape[kind]
+        new_fields += [f"{kind}.{k}" for k in sorted(set(cf) - set(pf))]
+        gone_fields += [f"{kind}.{k}" for k in sorted(set(pf) - set(cf))]
+        for k in sorted(set(pf) & set(cf)):
+            # Empty means "seen, but only ever null", which is not a type
+            # disagreement with anything.
+            if pf[k] and cf[k] and pf[k] != cf[k]:
+                retyped.append(f"{kind}.{k} ({'/'.join(sorted(pf[k]))} -> "
+                               f"{'/'.join(sorted(cf[k]))})")
+    blocked = [f for f in new_fields if f not in allow_fields]
+    if blocked:
+        fails.append(
+            f"child writes field(s) {blocked} on an event kind both sides "
+            f"emit, and no parent robot-run wrote them. The event vocabulary "
+            f"is unchanged but its contents are not, so this is a writer "
+            f"change at defaults. Permit with EQUIV_ALLOW_NEW_FIELDS if the "
+            f"phase is meant to add them.")
+    if retyped:
+        fails.append(f"field(s) changed JSON type between the binaries: "
+                     f"{retyped}. Every downstream parse of them is now "
+                     f"reading a different thing.")
+    if gone_fields:
+        notes.append(f"field(s) the parent wrote and the child did not: "
+                     f"{gone_fields} (a conditional field on a branch the "
+                     f"child's runs did not reach looks exactly like this; "
+                     f"a field DELETED from the writer does too)")
+    if allow_fields & set(new_fields):
+        notes.append(f"permitted new field(s) present: "
+                     f"{sorted(allow_fields & set(new_fields))} "
+                     f"(EQUIV_ALLOW_NEW_FIELDS — this is NOT a defaults run)")
 
     # 4. armed gates --------------------------------------------------------
     pg = set().union(*(r["gates"] for r in parent)) if parent else set()
@@ -671,7 +845,7 @@ def compare(parent, child, legacy_kinds, v4_kinds, defaults, allow_new):
         if derived_ok:
             notes.append(f"{len(derived_ok)} new manifest key(s) restating a "
                          f"key both sides record: {', '.join(derived_ok)}")
-    return fails, notes
+    return fails, notes, unresolved
 
 
 def main(argv):
@@ -681,6 +855,9 @@ def main(argv):
     allow_new = {s.strip() for s in
                  os.environ.get("EQUIV_ALLOW_NEW_KINDS", "").split(",")
                  if s.strip()}
+    allow_fields = {s.strip() for s in
+                    os.environ.get("EQUIV_ALLOW_NEW_FIELDS", "").split(",")
+                    if s.strip()}
     try:
         legacy_kinds, v4_kinds = declared_vocabulary(LOG_HPP)
         defaults = source_defaults(NODE_SRC)
@@ -700,21 +877,37 @@ def main(argv):
         return 3
 
     try:
-        fails, notes = compare(parent, child, legacy_kinds, v4_kinds, defaults,
-                               allow_new)
+        fails, notes, unresolved = compare(
+            parent, child, legacy_kinds, v4_kinds, defaults, allow_new,
+            allow_fields)
     except GateError as e:
         print(f"REFUSING TO SCORE: {e}")
         return 2
 
     for n in notes:
         print(f"  note  {n}")
+    for u in unresolved:
+        print(f"  UNRESOLVED  {u}")
     for f in fails:
         print(f"  FAIL  {f}")
     print()
     if fails:
+        # Reported first, and alone, when both are present: an UNRESOLVED line
+        # is a question, a FAIL is an answer, and the answer already settles
+        # the verdict. Printing them both above is deliberate -- the reader
+        # still needs to know what went unchecked before acting on the FAILs.
         print(f"{len(fails)} DIFFERENCE(S) — the default-off equivalence claim "
               f"is not supported")
         return 1
+    if unresolved:
+        # The distinction this file exists to keep: "I checked it and it
+        # matched" and "I could not check it" are different answers, and a
+        # wrapper branching on $? must not read the second as the first. Same
+        # reasoning as the empty-side case above, which is why it is the same
+        # exit code.
+        print(f"UNRESOLVED  no differences found, but {len(unresolved)} "
+              f"invariant(s) could NOT be checked. This is not a pass.")
+        return 3
     print("EQUIVALENT  at defaults, on every run-invariant this gate can see")
     return 0
 

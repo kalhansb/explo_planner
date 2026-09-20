@@ -93,7 +93,8 @@ struct PursuitTarget {
   /// A prediction with `candidates == 1` is an argmax over nothing.
   int candidates          = 0;
   int rejected_invalid    = 0;  ///< cell id off the grid
-  int rejected_horizon    = 0;  ///< my drive exceeds max_horizon_sec
+  int rejected_horizon    = 0;  ///< peer.age_sec + my drive exceeds
+                                ///< max_horizon_sec — NOT the drive alone
 
   /// Non-empty when there is no prediction. The caller MUST fall back to the
   /// legacy trail; this is a normal outcome, not a fault.
@@ -113,11 +114,16 @@ public:
     double my_speed_mps   = 0.5;
 
     /// Time the peer spends WORKING a cell before moving on, seconds. This is
-    /// the I transition's whole content, and it dominates: at a 20 m cell and
-    /// 0.5 m/s the drive between two cells is ~40 s, while clearing one takes
-    /// as long as the local planner needs. Setting it to zero turns the model
-    /// into pure translation and will predict the peer far ahead of where it
-    /// is.
+    /// the I transition's whole content, and it dominates: at the 10 m cell
+    /// every campaign runs (CELL_SIZE_M:-10.0) and the 0.40 m/s the harness
+    /// passes for pursuit, the drive between two adjacent cells is ~25 s while
+    /// clearing one takes as long as the local planner needs — so a 45 s dwell
+    /// is already the larger term, and diagonally it is comparable rather than
+    /// smaller. (This read "at a 20 m cell and 0.5 m/s ... ~40 s" until
+    /// 2026-09-18: no campaign has ever run a 20 m cell, and the two errors
+    /// happened to cancel into a plausible number.) Setting it to zero turns
+    /// the model into pure translation and will predict the peer far ahead of
+    /// where it is.
     double dwell_sec = 45.0;
 
     /// Chain step, seconds. Smaller is a finer distribution and more work;
@@ -141,10 +147,15 @@ public:
     /// exact binomial; in a run it is a way to say "trust the tour".
     double offroute_half_life_sec = 180.0;
 
-    /// Candidates whose drive exceeds this are dropped rather than scored at a
-    /// clamped horizon, seconds. Scoring them at the clamp would rank a cell I
-    /// cannot reach inside the prediction against cells I can, using a
-    /// distribution that does not describe the moment I would arrive.
+    /// Bounds the PREDICTION HORIZON, seconds — `peer.age_sec + my drive`, not
+    /// my drive alone. The horizon is measured from the peer's last fix, so a
+    /// stale fix has already spent part of the budget before I move; scoring
+    /// against a report that old is the thing the bound exists to refuse.
+    /// Candidates over it are dropped rather than scored at a clamped horizon,
+    /// because scoring at the clamp would rank a cell I cannot reach inside the
+    /// prediction against cells I can, using a distribution that does not
+    /// describe the moment I would arrive. See pursuit_predictor.cpp's own note
+    /// at the rejection site: the age-inclusive form is the intended reading.
     double max_horizon_sec = 600.0;
 
     /// Refuse below this probability. The floor is the legacy trail, and a

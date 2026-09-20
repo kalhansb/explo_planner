@@ -7,9 +7,13 @@
 ///   1. Maintain the latest-per-peer claim table from incoming RobotIntent
 ///      messages, with a receipt-time TTL (local clock).
 ///   2. Provide the MinPos allocation primitive (Bautin, Simonin & Charpillet
-///      IROS 2012, restricted to N=2): given a candidate viewpoint, return
-///      whether the local robot or a peer is closer to it, with a
-///      lexicographic robot-id tiebreak.
+///      IROS 2012): given a candidate viewpoint, return whether the local
+///      robot or a peer is closer to it, with a lexicographic robot-id
+///      tiebreak. Neither the paper nor this port is restricted to two
+///      robots — claimMatching() walks every live claim and the campaigns run
+///      it at N=2, 3 and 4. What IS narrower than the paper is the objective:
+///      this is the pairwise "am I closest" test only, not the paper's full
+///      frontier-to-robot assignment.
 ///
 /// There is no soft discount, no Mode enum, no per-voxel hook. The helper is
 /// always constructed; the only thing that depends on enabled() is whether
@@ -108,15 +112,20 @@ public:
   void prune(const rclcpp::Time& now);
 
   /// MinPos lookup primitive. Returns the active peer claim whose disc
-  /// (claim.goal_pos +/- match_radius_m) overlaps `candidate_xy`, or
-  /// nullptr if no peer contests this candidate. If multiple peers
-  /// contest the same region, returns the peer whose `robot_pos` is
-  /// closest to `candidate_xy` — extending naturally to N>2 if we ever
-  /// scale up the team.
+  /// overlaps `candidate_xy`, or nullptr if no peer contests this
+  /// candidate. If multiple peers contest the same region, returns the
+  /// peer whose `robot_pos` is closest to `candidate_xy` — which is why
+  /// this works unchanged at the N=3 and N=4 the campaigns run.
   ///
-  /// `match_radius_m` is set by the caller from `coord_claim_radius_m`,
-  /// the disc radius the planner uses for both publish and subscribe.
-  /// 2D Euclidean (XY); the simulation is ground-restricted.
+  /// EACH CLAIM IS EVALUATED AT ITS OWN RADIUS, not at ours: the disc is
+  /// `claim.goal_pos +/- claim.radius_m`, because the radius is the size
+  /// of the region that peer is occupying and it is phase-dependent (~8-10 m
+  /// exploring, ~0.75 m holding a vantage). `match_radius_m` is the FALLBACK
+  /// only, used when a claim arrives with `radius_m <= 0` — an older node
+  /// that sent nothing usable — and the caller sets it from
+  /// `coord_claim_radius_m`. See the note at the top of claimMatching() in
+  /// coordination.cpp for what evaluating everything at the receiver's own
+  /// scale got wrong. 2D Euclidean (XY); the simulation is ground-restricted.
   ///
   /// `live_after`, when non-null, skips claims whose expiry is at or before
   /// that instant. Exploit claims outlive their expiry by the grace window
@@ -265,17 +274,26 @@ public:
 
   /// Number of peer claims currently stored, INCLUDING exploit claims held
   /// past expiry by the grace window. Storage diagnostic only — anything with
-  /// presence semantics must use livePeerCount().
+  /// presence semantics must use livePeerCount(), or, in the node, the wrapper
+  /// named below.
   size_t activePeerCount() const { return claims_.size(); }
 
   /// Number of peer claims that are LIVE at `now` (raw expiry, no grace).
-  /// This is the presence count: the rendezvous barrier releases on "every
-  /// teammate has been HEARD within one TTL", and the CSV `coord_active_peers`
-  /// column documents the same thing. With grace retention in the table,
-  /// claims_.size() stopped meaning that — a peer 10 s silent would have kept
-  /// counting as present at the rendezvous anchor for the whole grace window,
-  /// releasing the return barrier on a teammate that may be face-down in a
-  /// ditch.
+  /// This is the CLAIM-TABLE presence count. With grace retention in the
+  /// table, claims_.size() stopped meaning that — a peer 10 s silent would
+  /// have kept counting as present at the rendezvous anchor for the whole
+  /// grace window, releasing the return barrier on a teammate that may be
+  /// face-down in a ditch.
+  ///
+  /// IT IS NO LONGER THE NODE'S PRESENCE COUNT, and this comment claimed it was
+  /// until 2026-09-18 ("the rendezvous barrier releases on ... and the CSV
+  /// `coord_active_peers` column documents the same thing"). Since generation
+  /// 23 both of those read ExploPlannerNode::accountedPeerCount, which unions
+  /// this table with TeamWorld's `direct` handshake and with a peer's
+  /// `finished` bit; the raw call survives at exactly one site, the
+  /// TeamModel-not-yet-configured fallback inside that wrapper. Coordination
+  /// cannot see the wrapper, so this stays the right thing for the LIBRARY to
+  /// expose — it is just not what the barrier or the column now record.
   size_t livePeerCount(const rclcpp::Time& now) const;
 
   /// Per-peer liveness on the same raw-expiry semantics as livePeerCount().

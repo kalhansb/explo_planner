@@ -91,12 +91,20 @@ forever. `max_steps` still ends a run directly, independent of the barrier.
 MinPos deconflicts *goals*, not *paths*: two robots' commanded routes can still
 cross (the forest trial's routes cross with 0.0 m closest approach). While a nav
 goal is in flight, the planner therefore watches its teammates' live poses and
-**yields when a higher-priority teammate is moving nearby**: it cancels the
-in-flight Nav2 goal through the `NavigateToPose` action interface (no nav2
-configuration is touched) **and** publishes a brake goal at its own pose — the
-cancel is verified only through its async response, so the zero-travel goal
-covers a cancel that is lost or rejected — then parks in a `PROXIMITY_HOLD`
-state and resumes the same goal once the peer has cleared off or parked.
+**yields when a higher-priority teammate is moving nearby**: it publishes a
+brake goal at its own pose — which the navigator reads as an immediate arrival,
+emptying the path and zeroing `cmd_vel` within ~100–150 ms — then parks in a
+`PROXIMITY_HOLD` state and resumes the same goal once the peer has cleared off or
+parked. Simply ceasing to publish `goal_pose` would *not* stop the robot: the
+navigator latches the last goal it accepted and drives it to completion.
+
+The planner also attempts a `NavigateToPose` cancel alongside the brake, but
+**that path is dead on this stack and has never fired**: the navigator is
+`simple_nav_3d`, which serves no action server, so the cancel client never
+becomes ready and every call site skips it. The brake goal is the *only* stop
+mechanism — read it as one mechanism, not two. See the block at
+`nav_cancel_client_`'s construction in `explo_planner_node.cpp` for why the
+client is kept anyway.
 
 Right of way is the **lexicographically smaller `robot_name`** — the same total
 order as the MinPos tiebreak. It is computed from ids alone, so both robots of a
@@ -104,11 +112,11 @@ pair always agree on who yields: exactly one stops, never both (standoff) and
 never neither (race). The hold enters below `proximity_hold_dist_m` (5 m) and
 releases beyond `proximity_resume_dist_m` (6 m, hysteresis). The 5 m is sized
 against the **reaction budget**, not just the documented 1.5 m panic line: pose
-age + tick + cancel propagation + braking exceeds a second while the pair keeps
+age + tick + brake-goal propagation + braking exceeds a second while the pair keeps
 closing at the peer's speed, which consumed the whole margin of the earlier 3 m
 default at field closing speeds. A peer that has stopped moving for
 `proximity_peer_static_sec` is treated as **parked** and released — a stationary
-robot is an ordinary costmap obstacle for the navigator, and holding against one
+robot is an ordinary mapped obstacle for the navigator, and holding against one
 would deadlock (e.g. a teammate waiting at its rendezvous anchor) — **unless it
 sits inside `proximity_parked_keep_dist_m`** (1.5 m): a peer parked closer than
 the panic line keeps the hold until it moves off or `proximity_max_hold_sec`
@@ -136,9 +144,10 @@ refund the nav budget: the resume continues the goal's drive-time clock where
 the hold interrupted it, so repeated holds cannot grant one goal unbounded time.
 
 This is best-effort **coordination, not a certified safety stop**: it needs live
-peer data, both planners alive, and Nav2 honouring the cancel; the right-of-way
-robot keeps driving and relies on its costmap to skirt the held robot. The
-crewed 1.5 m panic-stop procedure remains the hard backstop in the field.
+peer data and both planners alive, and it rests on the brake goal alone (the
+cancel never lands — see above); the right-of-way robot keeps driving and relies
+on its own local map to skirt the held robot. The crewed 1.5 m panic-stop
+procedure remains the hard backstop in the field.
 
 ## Perceptive exploitation
 
@@ -189,7 +198,7 @@ map and talks to peers only through the shared intent topic:
 
 ```
                          (per robot)
-  dscovox merger ──ScovoxMap──▶ ┌───────────────────┐ ──PoseStamped──▶ Nav2
+  dscovox merger ──ScovoxMap──▶ ┌───────────────────┐ ──PoseStamped──▶ navigator
   target producer ──TreeTarget▶ │ explo_planner_node │ ──MarkerArray──▶ RViz
   tf: map → base_link ────────▶ │  (10 Hz tick)      │ ──CSV──▶ output_csv
                                 └─────────┬─────────┘
@@ -306,17 +315,24 @@ that window can sit (see the KEEP-IN-SYNC comment in the yaml).
 
 Two settings must be matched to the navigator on each platform:
 
-- `goal_xy_tolerance` / `goal_yaw_tolerance` must be strictly **looser** than
-  nav2's goal checker (shipped defaults: 0.25 / 0.25). If they are tighter, nav2
-  stops inside its own tolerance but outside the planner's, the planner never
-  registers arrival, and it blacklists a goal the robot is standing on. The node
-  warns at startup if either is below 0.3.
-- `goal_republish_sec` throttles the keep-alive re-send of an unchanged goal.
-  Nav2 turns every `goal_pose` message into a fresh `NavigateToPose` goal, so an
-  unthrottled re-send makes `GoalUpdated` fire continuously, which halts the
-  recovery subtree while still consuming `RecoveryNode`'s retries — transient
-  failures become aborts instead of recoveries. Set `0` for publish-on-change
-  only once nav2 bringup is reliable enough not to need the keep-alive.
+- `goal_xy_tolerance` / `goal_yaw_tolerance` must be strictly **looser** than the
+  navigator's own stop condition. If they are tighter the navigator stops inside
+  its tolerance but outside the planner's, the planner never registers arrival,
+  and it blacklists a goal the robot is standing on. The node warns at startup if
+  either is below 0.3. The navigator here is `simple_nav_3d`, whose UGV stop
+  condition is `ugv.goal_xy_tol_m` / `ugv.goal_yaw_tol_rad` (both 0.2 as
+  shipped) — *not* nav2's `general_goal_checker`, which has never been in the
+  loop for any campaign in this repo. The shipped 0.4 is not sized off either
+  tolerance: four stacked grid roundings put the median ts1b arrival 0.269 m from
+  the commanded point, so the gate has to clear the measured park *distribution*.
+- `goal_republish_sec` throttles the keep-alive re-send of an unchanged goal. The
+  throttle was added against a nav2 failure mode (`GoalUpdated` firing
+  continuously and burning `RecoveryNode`'s retries) that **cannot occur on this
+  stack**, and the old advice to set `0` inverts here: on `simple_nav_3d` an
+  unchanged re-send is a genuine no-op, while a goal published while the
+  navigator is *down* is lost in silence with no action feedback to notice it
+  with. Keep it non-zero; 5.0 s is cheap insurance against a navigator that
+  restarts mid-run.
 
 ### Key topics
 

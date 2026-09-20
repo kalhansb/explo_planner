@@ -95,6 +95,50 @@ def run_checked(cmd, timeout=15):
         return "", f"could not exec: {e}"
 
 
+def topic_list(attempts=3):
+    """(set of topic names, err) — ONE listing, shared by every gate that needs it.
+
+    THREE THINGS THIS FIXES, all of them the same mistake in different places.
+
+    (1) A FAILED LISTING USED TO BE A FAIL, NOT AN UNRUN. `ros2 topic list` was
+    called through run(), which collapses a non-zero exit, a timeout and a stale
+    ros2 daemon into the same "". Three call sites then read that "" as an
+    OBSERVATION: the setup precondition reported "no ROS graph visible", gate_qos
+    reported "no /rx/ topics — the relay never formed", and gate_relay_set
+    reported every single expected relay absent. All three are fail(), and a
+    non-zero FAIL count scores the whole cell INVALID. So a CLI that timed out on
+    a loaded box — or a stale daemon, which is the documented way this happens
+    here and cannot be cleared with SIGTERM — threw away a perfectly good run and
+    did it with a message asserting something about the radio that was never
+    observed. That is the exact inversion the STATS_WALL_TIMEOUT_S note and the
+    gate_qos UNRUN block already argue against; those two were fixed and these
+    three were not.
+
+    The distinction that matters is not "empty vs non-empty", it is "the command
+    worked and the graph is empty" (evidence: FAIL) against "the command did not
+    work" (no evidence: UNRUN). Only run_checked can tell those apart, so err is
+    returned rather than swallowed and callers are expected to branch on it.
+
+    (2) RETRIED, for the same reason gate_qos retries its per-topic reads: one
+    timeout while a sim saturates the box says nothing. Only a listing that stays
+    unreadable is worth a verdict.
+
+    (3) ONE LISTING, NOT THREE. The three call sites each ran their own, seconds
+    apart, so they could legitimately disagree — a relay appearing between the
+    setup check and gate_relay_set made the expected-set gate fail against a
+    graph that no longer existed by the time gate_qos looked. Sharing the read
+    makes the three gates' verdicts refer to the same observed graph.
+    """
+    out, err = "", None
+    for _ in range(max(1, attempts)):
+        out, err = run_checked(["ros2", "topic", "list"])
+        if err is None:
+            break
+    if err is not None:
+        return set(), err
+    return set(out.split()), None
+
+
 # Sim-time safety factor for CLI reads that wait on a sim-clock publisher.
 #
 # /hmr_comms_sim/stats is published on a ROS timer at stats_period_s (10.0) with
@@ -191,8 +235,23 @@ def gate_leakage(robots, allow, rep):
         if not suffix.startswith("exploration/"):
             continue
         bus = f"/{suffix}"
-        out = run(["ros2", "topic", "info", "-v", bus])
-        if not out:
+        out, err = run_checked(["ros2", "topic", "info", "-v", bus])
+        if err is not None or not out:
+            # "The bus is gone" and "the bus could not be read" are OPPOSITE
+            # findings and this was `if not out: continue` — a silent skip that
+            # produced no note, no unrunnable and no failure, so the only trace
+            # of it was the ABSENCE of the "no live subscribers" note, and
+            # nothing downstream reads an absence. A non-zero exit is the normal,
+            # expected case under COMMS=1 (the topic genuinely does not exist
+            # because every planner moved off the shared bus), so that stays
+            # quiet-but-recorded as a note; a timeout is not, and it means this
+            # half of the leakage gate did not run.
+            if err and "timed out" in err:
+                rep.unrunnable("leakage",
+                               f"could not read {bus} ({err}) — cannot certify "
+                               f"the shared bus has no subscribers")
+            else:
+                rep.note("leakage", f"{bus} does not exist ({err or 'no output'})")
             continue
         subs = [n for n, _ in parse_endpoints(out, "Subscription")
                 if not any(a in n for a in allow)]
@@ -264,7 +323,7 @@ def parse_endpoints(info_out, kind):
 # Gate 2 — QoS match
 # ---------------------------------------------------------------------------
 
-def gate_qos(robots, rep):
+def gate_qos(robots, rep, present):
     """Relayed topics must have a compatible publisher/subscriber QoS pair.
 
     An incompatible pair does not error anywhere — the subscription simply never
@@ -274,15 +333,43 @@ def gate_qos(robots, rep):
     property of the current code, not a guarantee, and the failure is
     indistinguishable from a result.
     """
-    rx = [t for t in run(["ros2", "topic", "list"]).split()
-          if "/rx/" in t]
+    # The caller's listing, not a fresh one. It was `run(["ros2","topic","list"])`
+    # here, which meant a timeout emptied `rx` and tripped the fail() below with
+    # "the relay never formed" — a statement about the radio, made from a CLI
+    # that did not run. main() now reads the graph once through topic_list() and
+    # returns 2 (UNRUN) if that read fails, so by the time control is here the
+    # listing is known to have succeeded and an empty `rx` is a real observation.
+    rx = [t for t in present if "/rx/" in t]
     if not rx:
         rep.fail("qos", "no /rx/ topics — the relay never formed")
         return
     bad = 0
+    unreadable = []          # (topic, reason) for topics whose QoS never loaded
     for topic in rx:
-        out = run(["ros2", "topic", "info", "-v", topic])
-        if not out:
+        # NOT a silent skip any more, and read through run_checked (2026-09-18).
+        #
+        # This used to call `run()` and `continue` on a falsy return. `run()`
+        # collapses a non-zero exit, a timeout and a stale ros2 daemon into the
+        # same "", which is exactly the ambiguity its own docstring warns
+        # callers not to swallow: the topic was dropped on the floor while the
+        # summary below still counted it in `len(rx)` and called it compatible.
+        # That is how this gate came to emit zero FAILs across 896 cells — not
+        # because the QoS always matched, but because nothing forced it to have
+        # looked.
+        #
+        # Retried because a single miss is not evidence of anything. The CLI
+        # competes with a live sim for the box, and a one-off timeout on a
+        # loaded machine says nothing about QoS; only a topic that stays
+        # unreadable is worth a verdict. Reasons are kept, not just the count,
+        # so "timed out after 15s" (slow box) stays distinguishable from
+        # "exit 1: ..." (genuinely absent) when this fires.
+        out, err = "", None
+        for attempt in range(3):
+            out, err = run_checked(["ros2", "topic", "info", "-v", topic])
+            if err is None and out:
+                break
+        if err is not None or not out:
+            unreadable.append((topic, err or "empty output, exit 0"))
             continue
         blocks = parse_blocks(out)
         pubs = [b for b in blocks if b["kind"] == "PUBLISHER"]
@@ -327,8 +414,39 @@ def gate_qos(robots, rep):
                              f"{topic}: publisher VOLATILE vs "
                              f"{s['ns']}/{s['node']} TRANSIENT_LOCAL — "
                              f"incompatible durability")
-    if bad == 0:
-        rep.note("qos", f"{len(rx)} relay topic(s) QoS-compatible")
+    # REPORT THE DENOMINATOR. An unread topic is UNRUNNABLE, not a failure.
+    #
+    # The old summary said "{len(rx)} relay topic(s) QoS-compatible" regardless
+    # of how many were actually inspected, so a run in which every single
+    # `ros2 topic info -v` came back empty produced the same reassuring line as
+    # a run in which every pair was genuinely checked. Those are opposite
+    # findings. `checked` is the only number that makes the note mean anything.
+    #
+    # UNRUNNABLE and not fail(), for the reason STATS_WALL_TIMEOUT_S is written
+    # up top: "the gate's job is to detect overflow, not slowness, so ... the
+    # 'could not read' case is reported as UNRUNNABLE (exit 2) rather than as a
+    # failed gate". The same holds here. A topic whose QoS would not load is not
+    # evidence of a QoS defect — calling it FAIL would state something about the
+    # cell that was never observed, and FAIL scores the run INVALID. UNRUN
+    # scores it SUSPECT, which is the honest classification and still surfaces:
+    # `qos` is not in gate_g8's REPORT_ONLY_GATES, so this cannot be ignored
+    # downstream the way a report-only gate can.
+    #
+    # Note the wholesale-stale-daemon case never reaches here — `ros2 topic
+    # list` returning nothing empties `rx` and trips the fail() above — so this
+    # path is specifically "the listing worked but an individual topic would not
+    # load", which is narrower and genuinely anomalous. (2026-09-18)
+    checked = len(rx) - len(unreadable)
+    if unreadable:
+        shown = ", ".join(f"{t} ({why})" for t, why in unreadable[:3])
+        rep.unrunnable("qos",
+                       f"QoS UNREAD for {len(unreadable)}/{len(rx)} relay "
+                       f"topic(s) after 3 attempts each: {shown}"
+                       f"{' ...' if len(unreadable) > 3 else ''}. These topics "
+                       f"are UNCHECKED, which is not the same as compatible")
+    if bad == 0 and checked:
+        rep.note("qos", f"{checked}/{len(rx)} relay topic(s) inspected and "
+                        f"QoS-compatible")
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +465,7 @@ def expected_relays(robots):
     return out
 
 
-def gate_relay_set(robots, rep):
+def gate_relay_set(robots, rep, present):
     """Assert the relays that MUST exist do exist.
 
     gate_qos only inspects whichever /rx/ topics happen to be present, so it is
@@ -359,7 +477,12 @@ def gate_relay_set(robots, rep):
     topic list, so a typo in coord_intent_pub_topic or a peer_bin_topic_pattern
     that resolved wrong produces exactly this and nothing logs it.
     """
-    present = set(run(["ros2", "topic", "list"]).split())
+    # The caller's listing. This ran its own `run(["ros2","topic","list"])`, and
+    # the failure mode was the loudest of the three: an unreadable listing gave
+    # an empty set, so EVERY expected relay was reported absent and the cell was
+    # scored INVALID with a message naming topics that were in fact present. It
+    # also meant this gate and gate_qos could disagree about the graph, having
+    # sampled it seconds apart.
     missing = [t for t in expected_relays(robots) if t not in present]
     if missing:
         rep.fail("relay_set",
@@ -392,6 +515,54 @@ def read_stats(timeout=STATS_WALL_TIMEOUT_S):
     return None
 
 
+# The two counters everything downstream of the emulator's stats message is
+# decided from: drop_overflow is gate 3's whole subject, and drop_disconnected
+# is the ONLY evidence that the independent variable varied. Both are read with
+# `.get(name, 0)` — which is correct for arithmetic and catastrophic as a
+# schema assumption, because a renamed or dropped field reads as a clean zero on
+# every link of every run. Gate 3 would then pass forever and the outage gate
+# would answer "no outage" without ever having looked at an outage counter.
+#
+# So the schema is asserted ONCE, here, against the same dict both gates read.
+# `checks-that-stopped-checking`, third occurrence in this file: t_wall_sec in
+# rendezvous_agreement.py and the leakage gate's `checked == 0` are the other two.
+REQUIRED_LINK_KEYS = ("drop_overflow", "drop_disconnected")
+
+
+def stats_schema_problem(s):
+    """Why this stats message cannot decide the link gates, or None if it can.
+
+    THE DENOMINATOR IS THE POINT. An empty `links` array is not "no overflow",
+    it is "nothing was examined", and the two used to print the same PASS line
+    (`0 link(s), no overflow`). The emulator publishing a well-formed message
+    that describes no links at all is a real state — a mis-parsed roster, a
+    robot list that never expanded — and it is indistinguishable, in the report,
+    from a healthy two-robot run whose queues never overflowed.
+    """
+    links = s.get("links")
+    if links is None:
+        return ("the stats message carries no `links` field at all — the "
+                "emulator's schema changed and neither the overflow gate nor "
+                "the outage gate has anything to read")
+    if not links:
+        return ("the stats message describes ZERO links. Nothing was examined, "
+                "which is not the same as nothing being wrong: with no link "
+                "the overflow counter cannot trip and the outage counter "
+                "cannot rise, so both gates would pass on an empty denominator")
+    missing = {}
+    for link in links:
+        for k in REQUIRED_LINK_KEYS:
+            if k not in link:
+                missing.setdefault(k, []).append(
+                    f"{link.get('from', '?')}->{link.get('to', '?')}")
+    if missing:
+        return ("the stats links are missing counter(s) the gates read as "
+                "zero: " + "; ".join(
+                    f"{k} absent on {len(v)} link(s) ({', '.join(v[:3])})"
+                    for k, v in sorted(missing.items())))
+    return None
+
+
 def gate_overflow(rep, stats=None):
     """drop_overflow > 0 on any link invalidates the run.
 
@@ -399,6 +570,12 @@ def gate_overflow(rep, stats=None):
     map deltas, and a dropped delta permanently holes the receiver's merged map:
     the receiver cannot detect the gap, and total_observed_voxels — the primary
     endpoint's input — is quietly wrong for the rest of the run.
+
+    Returns the stats dict on success, and None when the run cannot be judged
+    from it — INCLUDING when the message arrived but says nothing usable. The
+    caller must treat None as "no reading", never as "a reading of zero": the
+    watch loop's `outage_seen(stats)` reads the same dict, so a schema break
+    here is a schema break there.
     """
     s = stats if stats is not None else read_stats()
     if s is None:
@@ -409,6 +586,20 @@ def gate_overflow(rep, stats=None):
                        f"no /hmr_comms_sim/stats within "
                        f"{STATS_WALL_TIMEOUT_S}s wall — overflow NOT checked "
                        f"(is the emulator up? is RTF very low?)")
+        return None
+    # THE MESSAGE ARRIVED; THAT IS NOT THE SAME AS IT BEING READABLE. Checked
+    # before the loop rather than inside it, because a loop over an empty list
+    # and a loop over links whose counter is absent both finish with tripped
+    # still False and fall into the `no overflow` note below. Unrunnable is the
+    # honest verdict for both: the gate did not decline to trip, it never had a
+    # number to trip on. Returning None also withdraws the dict from the caller,
+    # so the outage gate is not handed a message this one just rejected.
+    problem = stats_schema_problem(s)
+    if problem is not None:
+        rep.unrunnable("overflow",
+                       f"/hmr_comms_sim/stats arrived but cannot be read: "
+                       f"{problem} — overflow NOT checked, and the outage gate "
+                       f"reads the same message")
         return None
     tripped = False
     for link in s.get("links", []):
@@ -456,7 +647,14 @@ def gate_odom(robots, rep, timeout_s):
 # ---------------------------------------------------------------------------
 
 def outage_seen(stats):
-    """True if any link has ever refused traffic for being disconnected."""
+    """True if any link has ever refused traffic for being disconnected.
+
+    A False here means "this message showed no outage", NOT "this message was
+    readable and showed no outage" — an empty links list and a link dict with
+    no drop_disconnected key both return False. Callers must gate on
+    `stats_schema_problem` (gate_overflow does, and withholds the dict when it
+    fails) before letting a False accumulate into `ever_seen`.
+    """
     if not stats:
         return False
     return any(link.get("drop_disconnected", 0) > 0
@@ -464,19 +662,50 @@ def outage_seen(stats):
 
 
 def gate_outage_occurred(rep, ever_seen, polls):
-    """A COMMS=1 run in which the link never dropped is a control run.
+    """A COMMS=1 run in which NO link ever dropped is a control run.
 
     Nothing else in the stack checks this. The radio model is monotone in
-    separation and tree count, so if the two robots simply never got far enough
+    separation and tree count, so if the robots simply never got far enough
     apart, the emulator relays everything, no peer ever reads MISSING, no
     reconnect manoeuvre fires, and the result is a complete, plausible dataset
     in which the treatment arm and the control arm are the same experiment.
     drop_disconnected is the direct evidence: it increments once per message
     refused because the link was down.
+
+    IT IS AN ANY(), OVER ALL N*(N-1) DIRECTIONAL LINKS, and until 2026-09-18
+    this docstring said "the two robots" as though there were one pair. At N=2
+    the two readings coincide; at N=3 there are 6 links and at N=4 there are 12,
+    and ONE of them dropping once passes the gate for the whole run. So a PASS
+    means "the independent variable was varied SOMEWHERE in the fleet", not
+    "every pair was exercised" and not "this robot was ever isolated" — an N=4
+    run where robot 3 drifted off alone and robots 0-2 stayed in a tight
+    triangle all run passes exactly like one where everybody separated. The
+    all-pairs statement is not recoverable from here; it is in link_states.csv,
+    which is per-link. Read it there before claiming a pair was exercised.
+
+    The FAIL direction is the sound one and is the direction that matters: zero
+    drops across every link really does mean nothing was varied anywhere.
     """
     if ever_seen:
         rep.note("outage", "link outage(s) observed (drop_disconnected > 0)")
         return True
+    # ZERO POLLS IS NOT ZERO OUTAGES. This gate's claim is about the LINK, and
+    # the only support for it is a run of polls that each looked and saw
+    # nothing. With polls == 0 nobody looked: the watcher was killed before its
+    # first period elapsed, or every read timed out, and the FAIL text below
+    # would read "NO link outage in 0 poll(s)" — a sentence that blames the
+    # radio for the watcher's death and sends the operator to check separation
+    # against tx_power_dbm, which is exactly the wrong place. FAIL and UNRUN
+    # are both non-CLEAN, so nothing banks either way; what changes is that the
+    # report names the real defect.
+    if polls <= 0:
+        rep.unrunnable("outage",
+                       "NOBODY LOOKED: 0 usable poll(s) of "
+                       "/hmr_comms_sim/stats for the whole run, so whether the "
+                       "link ever dropped is unknown — this says nothing about "
+                       "the radio. Check that the emulator stayed up and that "
+                       "the watcher was not killed at t=0")
+        return False
     rep.fail("outage",
              f"NO link outage in {polls} poll(s): drop_disconnected == 0 on "
              f"every link for the whole run. The comms arm never differed from "
@@ -535,7 +764,44 @@ def main():
             GATED_SUFFIXES.append(s)
     rep = Report(args.report)
 
-    if not run(["ros2", "topic", "list"]):
+    # Read the graph ONCE, here, and hand it to the gates that need it.
+    present, list_err = topic_list()
+    if list_err is not None:
+        # UNRUN, not FAIL. Nothing was observed about this cell's radio, so
+        # nothing may be asserted about it; see topic_list's docstring for why
+        # this used to be a FAIL and what that cost. The return stays 2 — it
+        # always was 2 here, which is itself the tell that the author meant
+        # "unrunnable" while writing fail().
+        #
+        # WHAT FAIL->UNRUN ACTUALLY CHANGES DOWNSTREAM, traced rather than
+        # assumed. No caller reads this number: run_explo_sim_rviz.sh tests
+        # `GATE_RC = 0` and nothing else, so rc 1 and rc 2 are the same thing to
+        # every consumer, and both die() under GATES_STRICT — which defaults to
+        # $COMMS, i.e. 1 for every campaign cell. The die is not the end of the
+        # cell though: `trap teardown EXIT` is already installed by then, so the
+        # verdict block still runs and still banks a run_gates_verdict. That is
+        # where the change lands. This report line used to make NFAIL non-zero
+        # and bank INVALID; it now makes NUNRUN non-zero and banks SUSPECT.
+        #
+        # The consequence, which is real and is the price: run_campaign.sh
+        # auto-redoes an INVALID cell on resume and does NOT auto-redo a
+        # SUSPECT one (REDO_SUSPECT is opt-in, deliberately — re-rolling
+        # conditions the retained sample on whatever made the cell fail). So a
+        # stale daemon that used to be retried for the wrong reason is now
+        # skipped for the right one. It is skipped LOUDLY — named, counted into
+        # n_susp and repeated in the campaign summary — and the abort happens at
+        # bring-up, before any sim time is spent, so the cost of noticing late
+        # is seconds rather than an hour. Taking the retry back would mean
+        # asserting a finding about a radio nobody observed, which is the defect
+        # this whole path was rewritten to stop.
+        rep.unrunnable("setup",
+                       f"`ros2 topic list` did not run ({list_err}) after 3 "
+                       f"attempts — the ROS graph could not be read, so no gate "
+                       f"below could be evaluated. This is NOT a finding about "
+                       f"the run; a stale ros2 daemon does exactly this")
+        rep.flush()
+        return 2
+    if not present:
         rep.fail("setup", "`ros2 topic list` returned nothing — no ROS graph "
                           "visible (wrong ROS_DOMAIN_ID, or nothing running)")
         rep.flush()
@@ -543,8 +809,8 @@ def main():
 
     if args.mode == "check":
         gate_leakage(robots, allow, rep)
-        gate_relay_set(robots, rep)
-        gate_qos(robots, rep)
+        gate_relay_set(robots, rep, present)
+        gate_qos(robots, rep, present)
         gate_overflow(rep)
         gate_odom(robots, rep, args.odom_timeout)
         rep.flush()
@@ -558,6 +824,16 @@ def main():
           f"(pid {os.getpid()}); Ctrl-C to stop", flush=True)
     tripped = False
     polls = 0
+    # POLLS AND USABLE POLLS ARE DIFFERENT NUMBERS, and the outage gate is
+    # entitled to the second one. `polls` counts times round the loop, which is
+    # a measure of how long the watcher lived; it says nothing about whether any
+    # of those iterations obtained a readable stats message. A run where the
+    # emulator never publishes increments `polls` on every period and then ends
+    # with "no link outage in 240 poll(s), as expected" — 240 pieces of evidence
+    # claimed from 240 timeouts. gate_overflow returns the dict only when the
+    # message arrived AND passed stats_schema_problem, so a non-None return is
+    # exactly "this poll could have seen an outage and did not".
+    usable_polls = 0
     ever_outage = False
     # SIGINT must be registered EXPLICITLY, and the reason is not obvious.
     #
@@ -591,6 +867,8 @@ def main():
             polls += 1
             r2 = Report(args.report)
             stats = gate_overflow(r2)
+            if stats is not None:
+                usable_polls += 1
             ever_outage = ever_outage or outage_seen(stats)
             gate_odom(robots, r2, args.odom_timeout)
             if r2.failures:
@@ -603,8 +881,37 @@ def main():
     except (KeyboardInterrupt, _Stop):
         pass
     summary = Report(args.report)
-    if args.expect_outage == "yes":
-        if not gate_outage_occurred(summary, ever_outage, polls):
+    tripped = watch_summary(summary, args.expect_outage, ever_outage,
+                            polls, usable_polls, tripped)
+    summary.flush()
+    print(f"[gates] stopped; polls={polls} tripped={tripped}", flush=True)
+    return 1 if tripped else 0
+
+
+def watch_summary(summary, expect_outage, ever_outage, polls, usable_polls,
+                  tripped):
+    """The watcher's closing verdict. Returns the final `tripped`.
+
+    A FUNCTION AND NOT A TAIL OF main() FOR ONE REASON: everything decided here
+    is decided from five scalars, and while it sat inline no known-answer case
+    could reach it without a ROS graph, an emulator and a real run. That is the
+    condition every inert guard in `checks-that-stopped-checking` was in. See
+    comms_gates_calib.py — the zero-poll branches below are the ones that used
+    to read as all-clears, so they are the ones that must stay provably live.
+    """
+    if expect_outage == "yes":
+        # TRIP ON A GATE THAT FAILED, NOT ON ONE THAT RETURNED False.
+        # gate_outage_occurred returns "was an outage seen", which is False on
+        # BOTH of its negative paths — the link genuinely never dropped, and
+        # nobody ever looked. Reading that bool as "trip" collapses the
+        # distinction the unrunnable path was added to draw: a watcher killed at
+        # t=0 set tripped, and the `watch` line below then read `gates tripped
+        # during the run (0 polls)`, blaming tripped gates for a watcher that
+        # never ran and making the cell INVALID where it should be SUSPECT.
+        # The failure list is the gate's own statement of which it meant.
+        before = len(summary.failures)
+        gate_outage_occurred(summary, ever_outage, usable_polls)
+        if len(summary.failures) > before:
             tripped = True
     elif ever_outage:
         # Not a failure, but it means the "control" was degraded, so the
@@ -614,17 +921,42 @@ def main():
                      "(--expect-outage no) — tx_power_dbm may be too low for a "
                      "control arm; the floor/makespan from this run are not a "
                      "clean reference")
+    elif usable_polls <= 0:
+        # The same "nobody looked" condition as the yes-branch, and it has to be
+        # said on this branch too. A control arm is the one place where "no
+        # outage" is the expected reading, which makes it the one place where an
+        # unreadable run looks most like a healthy one — and the note this
+        # replaces asserted the expectation had been met.
+        summary.unrunnable("outage",
+                           "0 usable poll(s) of /hmr_comms_sim/stats, so the "
+                           "control arm's link was never actually observed to "
+                           "stay up — this is not the expected reading, it is "
+                           "no reading")
     else:
         summary.note("outage",
-                     f"no link outage in {polls} poll(s), as expected for a "
-                     f"control arm (--expect-outage no)")
+                     f"no link outage in {usable_polls} usable poll(s), as "
+                     f"expected for a control arm (--expect-outage no)")
     if tripped:
         summary.fail("watch", f"gates tripped during the run ({polls} polls)")
+    elif polls <= 0:
+        # THE `watch` LINE IS LOAD-BEARING IN THE TEARDOWN, which treats a
+        # comms_gates.txt with no `\twatch\t` line in it as SUSPECT precisely so
+        # that a watcher which died silently cannot bank a clean cell. Writing
+        # the note below on polls == 0 satisfied that check with a sentence
+        # meaning the opposite of what it appeared to mean: "0 polls, no gate
+        # tripped" reads as an all-clear and is produced by a watcher that never
+        # completed one period. UNRUN still carries the `watch` token, so the
+        # teardown finds its line — and then counts an UNRUN and lands SUSPECT,
+        # which is the verdict a run with no run-time supervision has earned.
+        summary.unrunnable("watch",
+                           "the watcher completed 0 poll(s) — it was killed or "
+                           "died before its first period elapsed, so NO gate "
+                           "supervised this run at run time. Not an all-clear")
     else:
-        summary.note("watch", f"{polls} polls, no gate tripped")
-    summary.flush()
-    print(f"[gates] stopped; polls={polls} tripped={tripped}", flush=True)
-    return 1 if tripped else 0
+        summary.note("watch",
+                     f"{polls} polls ({usable_polls} with readable stats), "
+                     f"no gate tripped")
+    return tripped
 
 
 if __name__ == "__main__":

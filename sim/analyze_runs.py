@@ -100,6 +100,111 @@ def read_link_trace(run_dir):
     return trace
 
 
+def read_link_mask(run_dir):
+    """link_logger.py's tally sidecar, or None when the run has no link trace.
+
+    THE TRACE IS THE SURVIVORS AND ONLY THE SURVIVORS. link_logger drops every
+    row the emulator published without computing -- before a pair has both
+    poses, and on a stale pose since generation 9 -- and read_link_trace() above
+    then drops more against PATH_LOSS_FLOOR. Neither drop leaves a trace in
+    link_states.csv, so a file that is 95 % missing looks exactly like a short
+    run, and every duty cycle and outage count derived from it reads as a clean
+    measurement of a trace that barely exists.
+
+    The counts were always collected; until 2026-09-18 they went to stderr, the
+    harness redirected stderr to <cell>/link_logger.log, and nothing in the tree
+    ever opened that file. This reads the sidecar link_logger now writes
+    alongside the CSV. Absent sidecar is not an error: every banked cell
+    predates it, and there the honest answer is "unknown", not "fine".
+    """
+    p = os.path.join(run_dir, "link_states.mask")
+    try:
+        with open(p) as fh:
+            kv = dict(ln.strip().split("=", 1) for ln in fh
+                      if "=" in ln)
+    except (OSError, ValueError):
+        return None
+    if "mask_verdict" not in kv:
+        # A sidecar with no verdict in it grades nothing, so it is the same
+        # answer as no sidecar at all: unknown. This is not a hypothetical
+        # input -- write_sidecar() rewrites the file in place as the run goes,
+        # so a cell killed at teardown can leave a truncated or zero-byte one,
+        # and an empty file parses to an empty dict without raising anything.
+        # Returning the partial dict instead would make it a GRADED run whose
+        # verdict is None, which is not flagged and therefore gets counted in
+        # the "all N graded run(s) OK" line: the unreadable case reported as
+        # the clean one.
+        return None
+    try:
+        kv["masked_frac"] = (float(kv["masked_frac"])
+                             if kv.get("masked_frac") else None)
+    except ValueError:
+        kv["masked_frac"] = None
+    return kv
+
+
+def report_link_mask(runs):
+    """HOW MUCH OF EACH LINK TRACE ACTUALLY EXISTED.
+
+    The duty / nout / ncon columns, and every reconnection number derived from
+    them, come from link_states.csv -- which holds only the rows that survived
+    link_logger's validity mask. A trace that is 95 % missing parses, plots and
+    summarises exactly like a clean short one, so without this block a run whose
+    connectivity was never measured reads as a run that was well connected.
+
+    Three states, and "unknown" is deliberately NOT folded into "fine": a run
+    with no sidecar is ungraded, not passed. Every cell banked before
+    2026-09-18 is in that bucket, and an all-OK line computed over just the runs
+    that happen to have the file is exactly the shape of a check that has
+    stopped checking.
+
+    Split out of main() so it can be driven with synthetic run dicts; main()
+    calls it with the real ones.
+    """
+    # A run is graded only if its sidecar actually carries a verdict. The
+    # partition is written on that one expression twice rather than as
+    # "graded and not graded", so a run can never fall out of both lists and
+    # go unreported: len(graded) + len(ungraded) == len(runs) by construction.
+    def verdict(r):
+        return (r.get("link_mask") or {}).get("mask_verdict")
+
+    graded = [r for r in runs if verdict(r)]
+    ungraded = [r for r in runs if not verdict(r)]
+    # `!= "OK"` rather than `in ("SUSPECT", "UNUSABLE", "NO_ROWS")`: a sidecar
+    # written by a future link_logger with a verdict this script has never
+    # heard of must land in the flagged list and be looked at, not be silently
+    # counted as clean because it matched no known bad label.
+    flagged = [r for r in graded if verdict(r) != "OK"]
+    if flagged:
+        print(f"\n!! {len(flagged)} of {len(graded)} run(s) have a link trace "
+              f"that is substantially rows the emulator never computed:")
+        for r in sorted(flagged, key=lambda x: x["run"]):
+            m = r["link_mask"]
+            frac = m.get("masked_frac")
+            print(f"    {r['run']:<28} {m.get('mask_verdict')}: "
+                  f"{'n/a' if frac is None else f'{frac * 100:.1f} %'} of "
+                  f"{m.get('published', '?')} published row(s) masked "
+                  f"(by_valid={m.get('masked_by_valid', '?')}, "
+                  f"by_path_loss={m.get('masked_by_path_loss', '?')})")
+        print(f"  Their duty / nout / ncon above, and every reconnection number "
+              f"derived from them,\n  are computed over what was left. "
+              f"UNUSABLE means most of the trace was never measured.")
+    elif graded:
+        # `or 0.0` covers a graded run whose masked_frac would not parse; it is
+        # a floor on the worst case, and the run is still counted in the n.
+        worst = max(float(r["link_mask"].get("masked_frac") or 0.0)
+                    for r in graded)
+        print(f"\nlink-trace mask: all {len(graded)} graded run(s) OK "
+              f"(worst {worst * 100:.1f} % masked).")
+    if ungraded:
+        print(f"{'' if graded else chr(10)}link-trace mask: {len(ungraded)} of "
+              f"{len(runs)} run(s) have NO usable link_states.mask and are "
+              f"ungraded — their mask rate is unknown, not zero. On a campaign "
+              f"run after 2026-09-18 that means link_logger never started (it "
+              f"writes the sidecar before its first message); on an older one "
+              f"it means only that the sidecar did not exist yet.")
+
+
 def run_t0(run_dir, planners, trace):
     """Absolute sim time at which the run's clock started (the harness's T0).
 
@@ -370,6 +475,10 @@ def analyse_run(run_dir, thresh):
         "makespan": makespan,
         "per_robot": per_robot,
         "realised_duty": duty,
+        # The caveat that belongs to `realised_duty`, `n_outages`, `n_contacts`
+        # and every reconnection-derived number below it: how much of the trace
+        # they were computed from actually existed. See read_link_mask().
+        "link_mask": read_link_mask(run_dir),
         "n_outages": len(eps),
         "median_outage": med_out,
         "n_contacts": len(contacts),
@@ -435,6 +544,8 @@ def main():
                   f"log {r['n_firings_log']}")
         print("  The CSV timer cannot see episodes shorter than its period, and"
               "\n  those are the fast reconnections. Use nfire.")
+
+    report_link_mask(runs)
 
     print()
     # Group by the CELL, not the arm alone. Keying on reconnect_mode_requested

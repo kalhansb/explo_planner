@@ -107,12 +107,39 @@ def launch_setup(context):
                     # 0 = wait forever (STAY until all connected).
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
+                    # THE ORDERED FLEET. Position in this list IS the robot id
+                    # that the in_range_mask, the knowledge bitmasks and the
+                    # rendezvous proposer rule (robot 0 proposes) all address
+                    # by. It is the same `robots` list this loop iterates, so
+                    # every node in one launch agrees on it by construction.
+                    #
+                    # Added 2026-09-16. Without it fleet identity is
+                    # unconfigured, and the rendezvous scheduler below calls
+                    # requireFleetIdentity and refuses to start — so this launch
+                    # could not actually run the `hybrid` arm it declares as its
+                    # default. Unconfigured remains legal in the node (it is
+                    # what a single-robot launch does); it is just not something
+                    # a multi-robot launch should ever leave to chance.
+                    "team_robot_names": robots,
                     # Mesh reconnection manoeuvre on a robot-carried radio
-                    # team: rendezvous (return to own anchor), pursuit (chase
-                    # the missing peer's trail on a budget), or hybrid
-                    # (pursue, then meet at the deterministic midpoint). The
-                    # pursuit_* budgets come from shared_params.yaml.
+                    # team: rendezvous (drive to the cell and time the whole
+                    # team agreed while still connected), pursuit (chase the
+                    # missing peer's trail on a budget), or hybrid (chase while
+                    # the agreed meeting is not due yet, keep it when it is).
+                    # The pursuit_* budgets come from shared_params.yaml.
                     "reconnect_mode": reconnect_mode,
+                    # REQUIRED BY rendezvous AND hybrid, and interlocked in the
+                    # node: both arms ARE the agreed meeting, so with the
+                    # scheduler off there is no agreement to make and the cell
+                    # silently runs as a different arm (rendezvous degrades to
+                    # the off arm, hybrid to the pursuit arm). The node treats
+                    # that combination as fatal rather than let it produce a
+                    # healthy-looking run carrying no treatment, so this has to
+                    # be passed here — it defaults to false in the node, where
+                    # false is correct for the arms that do not schedule.
+                    "rendezvous_schedule_enable":
+                        reconnect_mode.strip().lower() in ("rendezvous",
+                                                           "hybrid"),
                     # Coordinated proximity stop: yield (cancel the nav goal,
                     # hold) when a lex-smaller teammate is moving nearby. In
                     # sim the guard runs off the 1 Hz intent heartbeats; on
@@ -144,7 +171,9 @@ def generate_launch_description():
                               description="Start configuration id (for CSV filename)"),
         DeclareLaunchArgument("world", default_value="flatforest",
                               description="World name (for CSV filename)"),
-        DeclareLaunchArgument("max_steps", default_value="100",
+        # C4: 500. This is the campaign launch path, and 100 was a fifth of
+        # the budget every reported run actually had.
+        DeclareLaunchArgument("max_steps", default_value="500",
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
@@ -162,13 +191,17 @@ def generate_launch_description():
         DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
                               description="Barrier give-up seconds (0 = wait forever)"),
         DeclareLaunchArgument("reconnect_mode", default_value="hybrid",
-                              description="Mesh reconnection manoeuvre at "
-                                          "exploration exhaustion: rendezvous "
-                                          "(return to own anchor), pursuit "
-                                          "(budgeted chase of the missing "
-                                          "peer's trail), or hybrid (chase, "
-                                          "then the deterministic meeting "
-                                          "point)"),
+                              description="Mesh reconnection manoeuvre when a "
+                                          "teammate goes out of comms: "
+                                          "rendezvous (the whole team agreed a "
+                                          "cell and a time while connected; "
+                                          "drive there to arrive then), "
+                                          "pursuit (budgeted chase of the "
+                                          "missing peer's trail), or hybrid "
+                                          "(chase while the agreed meeting is "
+                                          "not due yet, keep it when it is). "
+                                          "There is no 'off' mode — the off "
+                                          "arm is reconnect_enabled:=false"),
         DeclareLaunchArgument("proximity_stop_enabled", default_value="true",
                               description="Coordinated proximity stop: the "
                                           "lex-larger robot of a close pair "

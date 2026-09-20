@@ -92,8 +92,17 @@ SECONDARY, in the order they are worth reading:
   dist_team  total metres driven by both robots -- the cost side. A mode that
              buys completion time by driving a lot further is a real trade, and
              this column is the only place it shows up.
-  unk_floor  final unknown fraction of the laggard. Guards the comparison: an arm
-             is not faster if it stopped at less coverage.
+  unk_floor  the LAGGARD robot's unknown fraction at END OF RUN -- max of the two
+             final rows, not the value at t_team, so it includes whatever the
+             drain and the homing tail still mapped. Feeds the COVERAGE GUARD
+             printed above the deltas, which is where the comparison actually
+             happens: an arm is not faster if it stopped at less coverage. Read
+             the guard, not this column -- the per-arm median printed in the
+             summary table pools censored runs, whose unknown sits above the
+             threshold by definition, and the guard deliberately does not.
+             (This legend claimed the column itself was the guard from the day
+             it was added until 2026-09-18. It was not; nothing compared it
+             across arms. The guard below is that sentence made real.)
   fire       reconnect-manoeuvre episodes, and seconds spent in them, as far as
              the CSV can see them. The mechanism check, and a LOWER BOUND on
              both counts -- see firings(). An arm whose manoeuvre never fired is
@@ -386,18 +395,48 @@ def declared_of(run_dir):
 
 
 def midrun_count(run_dir):
-    """Mid-run reconnect dispatches in this cell, both robots.
+    """Mid-run reconnect dispatches in this cell, across every robot.
 
     Exists so the MECHANISM WINDOW block can tell a terminal-only campaign from
-    a generation-8 one instead of asserting the former. The pattern is kept
-    identical to manoeuvre_events.RE_MIDRUN_DISPATCH -- if that one drifts, this
-    silently reads 0 and the block reverts to printing the false claim, so the
-    two are meant to be changed together.
+    one with a mid-run trigger instead of asserting the former. NOT "from a
+    generation-8 one", which is what this said until 2026-09-18: the mid-run
+    trigger arrived in generation 8 and has been in every generation since, up
+    to and including the one that runs today, so naming 8 reads as though the
+    caveat were about one archived campaign. It is about all of them from 8 on.
+    The distinction the block needs is not a generation at all — it is whether
+    THESE cells dispatched, which is why the caller branches on this count and
+    not on a version.
+
+    "Both robots" until the same date, too. The glob is planner_*.log and the
+    campaigns run N=2, 3 and 4.
+
+    THE PATTERN IS NOW IMPORTED, not copied. It used to be a hand-kept duplicate
+    of manoeuvre_events.RE_MIDRUN_DISPATCH under a comment saying the two "are
+    meant to be changed together" -- an intention with nothing enforcing it, and
+    the failure was silent in the worst direction: a drifted copy reads 0, the
+    caller's `if n_mid:` takes the else branch, and the block prints THE MANOEUVRE
+    IS TERMINAL HERE as a positive finding. That is the same silent-undercount
+    bug manoeuvre_events already fixed once in its own parser (see the
+    MIDRUN_LINE_MARKER guard there); there is no reason to keep a second copy
+    alive to catch it again. manoeuvre_events imports only the standard library
+    and guards its main, so this costs nothing.
     """
     import glob
     import re as _re
-    pat = _re.compile(r"Reconnect \(mid-run\): (?:team incomplete|peer silent) "
-                      r"(\d+)s >= (?:gate )?\d+s")
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import manoeuvre_events
+        pat = manoeuvre_events.RE_MIDRUN_DISPATCH
+    except Exception as e:
+        # Loud, and on stderr so it survives a redirect of the report. The
+        # fallback is the old literal: refusing to count would make the caller
+        # print the terminal claim, which is the failure being avoided.
+        print(f"!! modes_compare: cannot import manoeuvre_events "
+              f"({type(e).__name__}: {e}); falling back to a LOCAL COPY of "
+              f"RE_MIDRUN_DISPATCH, which may have drifted. A 0 in the `mid` "
+              f"column is not trustworthy in this run.", file=sys.stderr)
+        pat = _re.compile(r"Reconnect \(mid-run\): (?:team incomplete|peer silent) "
+                          r"(\d+)s >= (?:gate )?\d+s")
     n = 0
     for p in glob.glob(os.path.join(run_dir, "planner_*.log")):
         try:
@@ -406,6 +445,55 @@ def midrun_count(run_dir):
         except OSError:
             pass
     return n
+
+
+def group_by_reason(pairs):
+    """Collapse (cell, reason) pairs to (reason_shape, [cells]) groups.
+
+    An N>=3 campaign run through this pairwise tool excludes EVERY cell for the
+    same reason, and the reason is a 200-character paragraph explaining why
+    gap_trace has no value above two robots. Printed one line per cell that is
+    80 identical paragraphs -- 16000 characters of screen saying one thing --
+    and the reader scrolls past the ONE line that matters (which arms are short
+    a cell, and whether the shortfall is balanced).
+
+    Grouped by the reason's SHAPE, not its exact text, using the same
+    normalisation as the completion cross-check below: paths and seed numbers
+    vary per cell and would otherwise defeat the grouping entirely.
+    """
+    by_reason = {}
+    for cell, why in pairs:
+        key = re.sub(r"/\S+", " <path>", str(why))
+        key = re.sub(r"\bseed\d+\b", "seed<N>", key)
+        by_reason.setdefault(key, []).append(cell)
+    return sorted(by_reason.items())
+
+
+def print_excluded(dropped, indent="    "):
+    """Print the exclusions grouped, with EVERY cell named.
+
+    One printer for both call sites on purpose. They used to format
+    differently -- one truncated the names at six, the other listed them all --
+    and the truncating one is the branch an N>=3 campaign always lands in,
+    because there every cell is excluded and no arm matches. So the path that
+    most needed the names was the path that dropped them.
+
+    Names are WRAPPED, never truncated: the only question a reader can still
+    ask of an excluded set is whether the shortfall is balanced across arms,
+    and a count with an ellipsis cannot answer it.
+    """
+    for key, cells in group_by_reason(dropped):
+        print(f"{indent}{len(cells)}x {key}")
+        # 100 rather than 78. Cell names in this project run to ~37
+        # characters, and at 78 the wrap fits exactly one per line -- which is
+        # the one-line-per-cell shape this whole function exists to replace.
+        line = indent + "    "
+        for c in cells:
+            if len(line) + len(c) + 2 > 100:
+                print(line.rstrip(", "))
+                line = indent + "    "
+            line += c + ", "
+        print(line.rstrip(", "))
 
 
 def measure(run_dir, thresh):
@@ -419,7 +507,26 @@ def measure(run_dir, thresh):
         # infrastructure failure exactly like a dead sim, and dropping it without
         # a word while scoring its half-written sibling as censored gave two
         # identical failures opposite treatment.
-        return dict(excluded=f"{len(paths)} planner CSV(s), expected 2")
+        #
+        # 2 is NOT a missing generalisation here, and the message says which of
+        # the two cases it is so a reader of an N>=3 campaign does not go looking
+        # for lost logs. Most of what measure() computes would generalise by
+        # index (t_team is a max, t_lead a min, dist_team a sum), but gap_trace
+        # is genuinely pairwise -- inter-robot map divergence between a and b --
+        # and at N>=3 it has no single value: worst pair, mean pair and
+        # first-vs-rest are three different endpoints with three different
+        # answers. Choosing one silently inside a ranking tool is how an
+        # endpoint gets redefined without anyone deciding to redefine it.
+        # event_log.py reads every team size and is the pre-registered reader;
+        # use it for N>=3 completion times.
+        return dict(excluded=(
+            f"{len(paths)} planner CSV(s), expected 2 — "
+            + ("modes_compare is pairwise (gap_trace measures a-vs-b map "
+               "divergence, which has no single value above two robots); use "
+               "event_log.py for this team size"
+               if len(paths) > 2 else
+               "a robot wrote no planner CSV, which is an infrastructure "
+               "failure, not a slow run")))
     a, b = (load(p) for p in paths)
     if not a or not b:
         return dict(excluded="planner CSV present but empty")
@@ -686,10 +793,18 @@ def noise_floor(null_dirs, thresh, summary, ctl):
 
     Every delta in the table above is meaningless until compared against how much
     this pipeline moves when NOTHING is changed. That number is measurable here
-    because `seed` reaches only the comms emulator (run_explo_sim_rviz.sh:651, in
-    the `if COMMS = 1` block), so an ideal-comms campaign run at three different
-    seeds is three runs of ONE configuration. Its t_team came out 890 / 1429 /
-    2700 -- a 3.03x spread, CV 45 %, from runs that differ in nothing at all.
+    because `seed` reaches only the comms emulator, and that is checkable rather
+    than asserted. grep SEED in run_explo_sim_rviz.sh: there are four hits, and
+    exactly ONE of them hands the value to a node -- `seed:="$SEED"` on the
+    `ros2 launch hmr_sim comms_sim.launch.py` line, which sits inside the
+    `if [ "$COMMS" = "1" ]` block that guards `start comms`. The other three are
+    the default (`SEED="${SEED:-42}"`), the "comms emulator started" log line,
+    and the `echo "seed=$SEED"` into run_manifest.txt -- a default, a log and a
+    record, none of which reach a running node. So with COMMS=0 the seed is
+    inert, and an ideal-comms campaign run at three different seeds is three
+    runs of ONE configuration. Its t_team
+    came out 890 / 1429 / 2700 -- a 3.03x spread, CV 45 %, from runs that differ
+    in nothing at all.
 
     That band is wider than any arm difference this campaign has produced. It is
     not physics: the same three runs agree to within 20 % at unknown<=0.65 and
@@ -936,17 +1051,17 @@ def main():
     if not arms:
         print("no runs matched <tag>_<arm>_seed<n>")
         if dropped:
-            print("(runs found but excluded: "
-                  + ", ".join(f"{n} [{w}]" for n, w in dropped) + ")")
+            print(f"(runs found but excluded: {len(dropped)} cell(s))")
+            print_excluded(dropped)
         return 1
 
     if dropped:
         # Named, never silent. These are infrastructure failures and runs still
         # in flight -- neither is evidence about a policy, but a reader must be
         # able to see that an arm is short a cell and why.
-        print("EXCLUDED (not evidence about any arm — infrastructure or in flight):")
-        for n, w in dropped:
-            print(f"    {n}: {w}")
+        print(f"EXCLUDED — {len(dropped)} cell(s), not evidence about any "
+              f"arm (infrastructure or in flight):")
+        print_excluded(dropped)
         print()
 
     print(f"threshold: unknown_fraction <= {args.threshold}   "
@@ -1044,9 +1159,26 @@ def main():
         s = summary[arm]
         med = f"{st.median(tt):.0f}" if tt else "--"
         rng = f"[{min(tt):.0f}..{max(tt):.0f}]" if tt else "--"
+
+        # `lag` and `unk` are the two lists here that can come out EMPTY -- lag
+        # is None on a censored run and unk_floor is None when neither robot's
+        # last row carried an unknown_fraction -- and st.median([]) raises.
+        # An arm in which every run censored is not an exotic input: it is what
+        # a short smoke campaign looks like, which is precisely the run this
+        # tool gets pointed at first. It used to abort mid-row with a
+        # StatisticsError, taking down the coverage guard, the power block, the
+        # mechanism window and the whole delta table with it -- a crash where
+        # "--" was the answer.
+        def m(xs, w, p):
+            # Width is passed rather than baked into a format spec so the "--"
+            # is padded to the SAME column as the number it replaces. A bare
+            # "--" spliced into the f-string shifts every field to its right,
+            # which is how a table stops being readable one row at a time.
+            return f"{st.median(xs):>{w}.{p}f}" if xs else f"{'--':>{w}}"
+
         print(f"{arm:<{aw}}{s['n']:>3}{s['cens']:>6}{med:>12}{rng:>18}"
-              f"{st.median(s['lag']):>10.0f}{st.median(s['dist']):>10.0f}"
-              f"{st.median(s['unk']):>9.3f}{st.median(s['peak']):>10.2f}{s['fire']:>7}")
+              f"{m(s['lag'], 10, 0)}{m(s['dist'], 10, 0)}"
+              f"{m(s['unk'], 9, 3)}{m(s['peak'], 10, 2)}{s['fire']:>7}")
 
     # --- guards that must be read BEFORE any delta ---------------------------
     builds = {}
@@ -1076,6 +1208,99 @@ def main():
         print(f"\n!! IN THE MEDIANS DESPITE A FAILED GATE VERDICT: "
               f"{', '.join(sorted(bad_verdict))}. Their manipulation check did "
               f"not pass, so it is unverified that the comms treatment applied.")
+
+    # THE COVERAGE GUARD. The legend has described `unk_floor` as a guard --
+    # "an arm is not faster if it stopped at less coverage" -- since the column
+    # was added, and until 2026-09-18 the entire consumption of that column was
+    # one median printed in the table above. Nothing compared it across arms,
+    # nothing flagged anything, nothing could fail. The sentence described a
+    # check that did not exist, which is the failure mode this whole review
+    # pass is about, and it described it on the one threat that can reverse the
+    # headline of a completion-time campaign.
+    #
+    # Two questions, and only the second is a comparison.
+    #
+    #   (1) Did every run CREDITED with a t_team still hold that coverage when
+    #       it stopped? t_team is the first crossing of unknown <= thresh and
+    #       the robot keeps mapping afterwards, so a non-censored run has to
+    #       end at or below thresh. One that ends above it did not hold the
+    #       crossing, and it sits in the median as a completion anyway.
+    #
+    #   (2) Does an arm's speed advantage come with less of the map? This is
+    #       computed over the runs that actually ENTER the delta -- non-censored
+    #       only -- and NOT over the median printed above. That median pools
+    #       censored runs, whose unknown is above thresh by definition, so
+    #       comparing it across arms would re-report every censoring-heavy arm
+    #       as a coverage problem when censoring already has its own guard two
+    #       screens down. Same column, different denominator, different claim.
+    unheld = [(arm, r["seed"], r["unk_floor"])
+              for arm, rs in arms.items() for r in rs
+              if not r["censored"] and r["unk_floor"] is not None
+              and r["unk_floor"] > args.threshold + 1e-9]
+    if unheld:
+        print(f"\n!! CREDITED WITH A COMPLETION THEY DID NOT HOLD: "
+              f"{len(unheld)} non-censored run(s) crossed unknown <= "
+              f"{args.threshold} and then ENDED ABOVE it — "
+              + ", ".join(f"{a}/seed{s} ({u:.3f})"
+                          for a, s, u in sorted(unheld)) + ". Each contributes "
+              f"a t_team to the medians above. Either the crossing was a "
+              f"transient and the endpoint is not the one the campaign "
+              f"pre-registered, or the ROI moved under the run.")
+
+    # Non-censored only, per the note above.
+    cov = {arm: [r["unk_floor"] for r in rs
+                 if not r["censored"] and r["unk_floor"] is not None]
+           for arm, rs in arms.items()}
+    cov = {a: v for a, v in cov.items() if v}
+    if args.control not in cov or len(cov) < 2:
+        print(f"\nCOVERAGE GUARD: not run — needs the control arm "
+              f"'{args.control}' and at least one other to have a non-censored "
+              f"run with a readable final unknown_fraction "
+              f"({len(cov)} arm(s) qualify). The 'unk med' column above is "
+              f"therefore unguarded here; read it yourself.")
+    else:
+        # The margin is taken FROM THE DATA rather than picked. A between-arm
+        # difference only means something once it clears the spread the same
+        # measurement shows WITHIN an arm, and that spread is a property of this
+        # campaign's forest and threshold, not a number that can be carried in
+        # from another one. Arms with a single non-censored run contribute no
+        # spread and are still compared -- they just cannot widen the band.
+        spreads = [st.pstdev(v) for v in cov.values() if len(v) >= 2]
+        band = st.mean(spreads) if spreads else 0.0
+        c_unk = st.median(cov[args.control])
+        c_tt = (st.median(summary[args.control]["tt"])
+                if summary[args.control]["tt"] else None)
+        hits = []
+        for arm in sorted(a for a in cov if a != args.control):
+            d_unk = st.median(cov[arm]) - c_unk
+            tt = summary[arm]["tt"]
+            d_tt = (st.median(tt) - c_tt
+                    if (tt and c_tt is not None) else None)
+            # The confound is directional: a FASTER arm that ended with MORE
+            # unknown. Slower-and-worse is not a confound, it is just worse,
+            # and faster-and-better needs no caveat.
+            if d_tt is not None and d_tt < 0 and d_unk > 0:
+                hits.append((arm, d_tt, d_unk))
+        print(f"\nCOVERAGE GUARD: final unknown_fraction across the "
+              f"{sum(len(v) for v in cov.values())} non-censored run(s); "
+              f"control '{args.control}' median {c_unk:.3f}; within-arm band "
+              f"{band:.3f}"
+              + (f" (pooled sd over {len(spreads)} arm(s))" if spreads
+                 else " (no arm has two non-censored runs — band is 0, so "
+                      "every difference below reads as material)"))
+        if not hits:
+            print(f"    clean — no arm is both faster than '{args.control}' on "
+                  f"t_team and ended with more of the map unknown.")
+        for arm, d_tt, d_unk in hits:
+            material = d_unk > band
+            print(f"    {'!!' if material else '  '} {arm}: {-d_tt:.0f} s "
+                  f"FASTER but ended +{d_unk:.3f} unknown"
+                  + (f" — past the {band:.3f} band, so the speed-up is "
+                     f"CONFOUNDED WITH COVERAGE and the t_team delta below is "
+                     f"not a like-for-like comparison."
+                     if material else
+                     f" — inside the {band:.3f} band, i.e. within what one arm "
+                     f"varies by on its own. Noted, not disqualifying."))
 
     pooled = []
     for rs in arms.values():

@@ -259,3 +259,65 @@ TEST(CostGrid, PositiveCapStillBoundsTheFlood) {
   EXPECT_TRUE(cg.reachable(cellCenter(grid, 2, 0)));    // 2 m out
   EXPECT_FALSE(cg.reachable(cellCenter(grid, 15, 15))); // way past the cap
 }
+
+// A reachability structure may answer "no"; it must never answer "yes" off a
+// map it has already rejected.
+//
+// build() marks every cell blocked when data.size() disagrees with the claimed
+// dims, so the flood has nowhere to go — but the source used to be seeded at
+// cost 0 unconditionally, which left it the ONLY finite cell in the grid.
+// reachable(robot_pose) then answered true and reachedCellCount() answered 1
+// on a map where nothing whatsoever is reachable.
+TEST(CostGrid, MalformedMapLeavesNothingReachableIncludingTheSource) {
+  auto grid = makeGrid(10, 10, 1.0f);
+  grid.data.resize(10);  // metadata still claims 100 cells
+  CostGrid cg;
+  cg.build(grid);
+  cg.floodFrom(cellCenter(grid, 5, 5), 100.0f);
+
+  EXPECT_EQ(cg.reachedCellCount(), 0u)
+      << "a rejected map must not report a reached cell";
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 5, 5)))
+      << "the source is not reachable on a map with no data";
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 0, 0)));
+}
+
+// The case that must NOT regress: a robot standing on an inflated cell.
+//
+// The planning map is inflated by the body radius, so a robot in a dense stand
+// genuinely stands on a blocked cell. That is routine, not malformed, and the
+// flood must still start from there — the relaxation refuses to pass through
+// any OTHER blocked cell, so seeding on inflation cannot route a path through
+// it. The seed test is therefore "does the flood have anywhere to go", not "is
+// the source traversable".
+TEST(CostGrid, BlockedSourceWithAFreeNeighbourStillFloods) {
+  auto grid = makeGrid(10, 10, 1.0f);
+  block(grid, 5, 5);  // robot sits on inflation; everything else is free
+  CostGrid cg;
+  cg.build(grid);
+  cg.floodFrom(cellCenter(grid, 5, 5), 100.0f);
+
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 5, 5)));
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 5, 5)), 0.0f, 1e-6f);
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 0, 0)))
+      << "seeding on inflation must not cost the robot the rest of the map";
+}
+
+// Fully walled in: the source and all eight neighbours are blocked, so there is
+// genuinely nowhere to go. Distinct from the case above by exactly one free
+// neighbour, which is the discrimination the seed test has to make.
+TEST(CostGrid, FullyEnclosedSourceReachesNothing) {
+  auto grid = makeGrid(10, 10, 1.0f);
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) block(grid, 5 + dx, 5 + dy);
+  CostGrid cg;
+  cg.build(grid);
+  cg.floodFrom(cellCenter(grid, 5, 5), 100.0f);
+
+  EXPECT_EQ(cg.reachedCellCount(), 0u);
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 5, 5)));
+  // The node's kMinReachedForFilter fallback reads this count and skips the
+  // reachability filter for the tick; 0 and the old 1 are both below it, so
+  // this change is inert there by design. Pinned so that stays true.
+  EXPECT_LT(cg.reachedCellCount(), 10u);
+}

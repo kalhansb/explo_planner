@@ -21,6 +21,41 @@ inline uint32_t robotBit(int id) {
   return (id >= 0 && id < 32) ? (1u << id) : 0u;
 }
 
+/// FNV-1a 32-bit. A second local copy of the construction in cell_world.cpp,
+/// kept local for the reason stated there: the two hash different things, and
+/// a shared helper invites folding them into one value, which would stop a
+/// reader being told WHICH half disagrees.
+///
+/// The two copies do NOT have to stay byte-compatible with each other. Nothing
+/// compares an alloc_hash to a sharedHash; the only comparison is between two
+/// PROCESSES running the same binary, where both copies are identical by
+/// construction.
+///
+/// NOTHING PINS A LITERAL, and this said "test_global_allocator pins alloc_hash
+/// to a literal" until 2026-09-18. There is not one hash constant in that file
+/// or any other. What the AllocHash group actually pins is RELATIONAL — equal
+/// problems digest equal, an unformed problem digests 0, and each of six
+/// channels shared_hash is blind to moves the digest — and every one of those
+/// statements holds under ANY injective-enough hash. Swap FNV-1a for a
+/// different multiplier here and the whole suite still passes.
+///
+/// That gap is smaller than it sounds and is not worth a literal. The value is
+/// compared only within one binary, so a silent change costs nothing live; it
+/// costs only the offline join of alloc_hash columns ACROSS binary generations,
+/// which no analysis does (they join two robots of one campaign). And a literal
+/// would have to be re-baselined on every legitimate change to the digest input
+/// — plus it would ride on route costs that reach the digest through a double
+/// and an llround, so it would be pinning the optimiser's floating-point as
+/// well as the hash. Relational tests were the right call. Just do not read
+/// this paragraph as saying the construction itself is guarded.
+struct Fnv1a {
+  uint32_t h = 2166136261u;
+  void byte(uint8_t b) { h ^= b; h *= 16777619u; }
+  void i64(int64_t v) {
+    for (int i = 0; i < 8; ++i) byte(static_cast<uint8_t>((v >> (i * 8)) & 0xff));
+  }
+};
+
 /// Shorthand for the public routeCostMm below, kept so the solve loops read
 /// the way they always did. One implementation, two names — not two
 /// implementations.
@@ -84,8 +119,117 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   out.costs_mm.assign(robots_in.size(), 0);
 
   if (!world.configured()) {
+    // The one path that leaves alloc_hash/edge_hash at 0. There was no problem
+    // to digest, so 0 here means "no problem was formed", never "the problems
+    // matched". A reader comparing two robots must skip refused solves, not
+    // treat equal zeros as agreement.
     out.refused = "cell world is not configured";
     return out;
+  }
+
+  // --- candidate set ------------------------------------------------------
+  // Scanned BEFORE the vehicle filter, not because the solve needs it here but
+  // because the R3 digest below has to cover the whole problem and has to be
+  // written on every return path that formed one. The refusal ORDER is
+  // unchanged: the `cand.empty()` and max_candidates returns stay where they
+  // always were, after the vehicle refusal, so which reason a caller sees is
+  // exactly what it was.
+  std::vector<int> cand;
+  for (int id = 0; id < world.size(); ++id) {
+    const CellStatus s = world.status(id);
+    if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
+      cand.push_back(id);
+  }
+
+  // --- R3 / §3.6: digest of the PROBLEM ------------------------------------
+  // Assembled here, once, from the same values the solve is about to use, and
+  // written before any refusal — a refused solve still had a problem, and
+  // "these two robots refused for different reasons" is only interpretable if
+  // you can first establish they were refusing the same thing.
+  //
+  // Ordering is imposed explicitly at every level, because the input vector's
+  // order is the caller's and must not reach a value two processes compare:
+  // vehicles by id, candidates ascending (the scan above already produces
+  // them that way, and it is asserted rather than assumed by construction
+  // since `world.size()` walks ids in order).
+  //
+  // The vehicle list hashed here is `robots_in` ENTIRE — including robots the
+  // filter below is about to drop as finished or unlocatable. That is
+  // deliberate: "my peer is finished" versus "my peer is still working" is a
+  // disagreement about the problem, and it is one of the two channels §3.6
+  // says nothing could see. Folding in only the survivors would hide exactly
+  // the case that matters.
+  //
+  // TWO OF Config's THREE FIELDS ARE PART OF THE PROBLEM (2026-09-18). All
+  // three were excluded before, deliberately and with a test asserting it
+  // (AllocHash.SolverConfigIsNotPartOfTheProblem), on the grounds that config
+  // is a property of the SOLVER and a mismatch is a deployment fault the run
+  // params already record. That reasoning is exactly right for one field and
+  // wrong for the other two, so the split is now drawn where the distinction
+  // actually falls rather than around the whole struct:
+  //
+  //   comms_mask     IN. It restricts which cells a disconnected robot may be
+  //                  assigned AT ALL, so it changes the feasible set — that is
+  //                  the problem, not an approach to it. And this is not a
+  //                  hypothetical misconfiguration: the flag exists so that the
+  //                  gap between a masked and an unmasked solve can be measured
+  //                  (see Config::comms_mask — "the cost gap ... IS the
+  //                  reconnection value P4 gates on"). Those two solves differ
+  //                  in NOTHING ELSE, so with comms_mask excluded the one
+  //                  comparison the flag was added to support is precisely the
+  //                  one where the digest declares both sides identical.
+  //
+  //   max_candidates IN. It decides refused versus solved. A refused solve
+  //                  carries its digest on purpose, so that "these two robots
+  //                  refused for different reasons" is interpretable — but with
+  //                  the threshold excluded, a robot that refused and a robot
+  //                  that solved the same candidate set under a laxer cap agree
+  //                  on the key, and the digest reports them as having faced
+  //                  the same thing when the cap is the entire difference.
+  //
+  //   polish_passes  OUT, and the old rationale survives intact here. 2-opt
+  //                  passes change the tours and nothing else: same vehicles,
+  //                  same candidates, same feasible set, same refusal. Two
+  //                  robots differing only in polish_passes ARE solving the
+  //                  same problem and getting different answers to it, which is
+  //                  the one thing the digest is supposed to be able to say.
+  //                  Folding it in would convert that finding into a silent
+  //                  "different problem" and lose it.
+  //
+  // Latent today either way: one launch supplies every robot in a cell, so all
+  // three are equal across the fleet by construction. That is a property of the
+  // CALLER, and it is not what the digest claims to depend on.
+  //
+  // Folded in LAST, after the world's edge hash, so the contribution order of
+  // everything already being logged is untouched. Values are not comparable
+  // across this change, which is the standing rule anyway: never join across
+  // generations.
+  {
+    Fnv1a f;
+    std::vector<const AllocRobot*> by_id;
+    by_id.reserve(robots_in.size());
+    for (const AllocRobot& r : robots_in) by_id.push_back(&r);
+    std::stable_sort(by_id.begin(), by_id.end(),
+                     [](const AllocRobot* a, const AllocRobot* b) {
+                       return a->id < b->id;
+                     });
+    f.i64(static_cast<int64_t>(by_id.size()));
+    for (const AllocRobot* r : by_id) {
+      f.i64(r->id);
+      f.i64(r->cell);
+      f.byte(r->in_comms ? 1u : 0u);
+      f.byte(r->finished ? 1u : 0u);
+    }
+    f.i64(static_cast<int64_t>(cand.size()));
+    for (int id : cand) f.i64(id);
+    const uint32_t eh = world.edgeHash();
+    f.i64(static_cast<int64_t>(eh));
+    f.byte(cfg.comms_mask ? 1u : 0u);
+    f.i64(static_cast<int64_t>(cfg.max_candidates));
+    // cfg.polish_passes is NOT folded in. See the split above; this omission is
+    // load-bearing and has a test.
+    out.edge_hash  = eh;
+    out.alloc_hash = f.h;
   }
 
   // --- vehicle set --------------------------------------------------------
@@ -116,13 +260,7 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
     return out;
   }
 
-  // --- candidate set ------------------------------------------------------
-  std::vector<int> cand;
-  for (int id = 0; id < world.size(); ++id) {
-    const CellStatus s = world.status(id);
-    if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
-      cand.push_back(id);
-  }
+  // --- candidate set: scanned above, adjudicated here ----------------------
   if (cand.empty()) return out;            // solved; nothing to do
   if (static_cast<int>(cand.size()) > cfg.max_candidates) {
     out.refused = "too many candidate cells (" +

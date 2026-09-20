@@ -17,6 +17,16 @@ uint8_t plannerTypeId(const std::string& planner_type);
 ///   budget = clamp(dist / max(speed_est, 1e-3) * safety, min_sec, max_sec)
 /// so a short hop gets a small budget and a long hop a larger one, instead of
 /// every goal sharing one fixed timeout.
+///
+/// Two properties of that clamp are guarantees, not incidental, because this is
+/// a watchdog and a watchdog that does not fire is worse than no watchdog:
+///   - max_sec < min_sec: the CEILING wins, exactly as in pursuitBudgetSec
+///     below. The two parameters come from unrelated families and nothing
+///     orders them, and std::clamp with lo > hi is undefined behaviour.
+///   - a non-finite distance (or speed, or safety factor) yields max_sec, not
+///     NaN. A NaN budget makes every `elapsed > budget` test false, so the
+///     timeout never fires and the cell runs to max_steps looking merely slow.
+/// The return value is therefore always finite and always <= max_sec.
 double navBudgetSec(double dist_m, double speed_est_mps, double safety_factor,
                     double min_sec, double max_sec);
 
@@ -51,20 +61,239 @@ bool rendezvousWaitExpired(double waited_sec, double max_wait_sec);
 // you" is a PAIR of poses (mine and the peer's advertised one), both stale the
 // moment the link drops. Three reconnection policies are built on that record.
 
-/// Reconnection policy at exploration exhaustion with a teammate out of comms.
-///   RENDEZVOUS: drive to the own-pose anchor and wait (the pre-mesh
-///     behaviour; with every robot doing this the pair distance at arrival
-///     equals the distance at last contact, i.e. within comms range).
+/// Reconnection policy when a teammate goes out of comms. Rewritten
+/// 2026-09-17 (generation 19): the previous text described a RECURRING
+/// SCHEDULE — "cell C, every P seconds" — which no longer exists. What each
+/// mode is now, in one sentence each. These sentences are the experiment's
+/// definition of its four arms, and any behaviour outside them is a defect, not
+/// a refinement.
+///
+///   (the OFF arm is reconnect_enabled=false, not a member of this enum)
+///
+///   RENDEZVOUS: the team agrees ONE meeting PLACE AND TIME while still
+///     connected — a (cell, interval, t_meet) triple proposed by robot 0,
+///     echoed verbatim, committed only once EVERY robot is holding the
+///     identical triple. The triple is a recurring appointment: meet at `cell`
+///     at mission-elapsed `t_meet`, and every `interval` thereafter. A robot
+///     whose reconnect trigger fires drives to that cell to keep the FIRST
+///     agreed occurrence not already past when it armed — not a private
+///     countdown from the moment it noticed, and since generation 25 not
+///     now-plus-notice either (the per-robot notice forked the ts4 N=3 cell) —
+///     waits there until every robot is connected, holds a further
+///     rendezvous_settle_sec so the merged map propagates, agrees the NEXT
+///     place and time with the reassembled team, and resumes exploring. An
+///     agreed schedule, or nothing: with no committed triple this arm performs
+///     no manoeuvre at all. Requires rendezvous_schedule_enable (interlocked).
 ///   PURSUIT: chase the peer's last declared goal (the trail head) on a
-///     budget; when the budget is spent, hold in place and beacon.
-///   HYBRID: pursue on the budget, then fall back to the deterministic
-///     meeting point (both sides compute the same one) and wait there.
+///     budget; when the budget is spent, explore on the fallback allowance and
+///     only then hold in place and beacon. No agreed destination ever — that
+///     absence is the A/B against hybrid.
+///   HYBRID: exactly the union of the two above and NOTHING ELSE — chase while
+///     the next agreed occurrence is not yet due, keep the appointment once it
+///     is. It has no third behaviour of its own; if it acquires one, the
+///     factorial reading of the four-arm design stops holding.
+///
+///     THE CHASE WINDOW IS NARROW AND THIS IS DELIBERATE, not an oversight to
+///     be widened. The mid-run trigger needs 90 s of continuous team-incomplete
+///     time (reconnect_midrun_silence_sec, info-gated down to 60 s), and the
+///     chase runs only until the next agreed occurrence is due — since
+///     generation 25 that is the bare lattice, no 100 s notice on top, so the
+///     window is [trigger, occurrence] and can be EMPTY when the break lands
+///     just before an occurrence. That is the arm's definition working ("do
+///     pursuit if rendezvous is not due yet"), not a defect. If a campaign
+///     measures zero reconnect_gate events fleet-wide, hybrid and rendezvous
+///     are the same arm in that run and the contrast must be REPORTED as null
+///     by construction rather than read as a null result.
+///
+///     GENERATION 23 WIDENED THE UPPER EDGE OF THAT WINDOW AND THE ANALYSIS
+///     MUST NOT KEEP QUOTING "60-100 s". The chase closes at the first agreed
+///     occurrence not already past when the trigger fired: under generation
+///     25's bare floor that is somewhere in [trigger, trigger + interval),
+///     and on generations 23-24 the 100 s notice pushed it out to
+///     [100 s, 100 s + interval) after the trigger. The spread is not slack
+///     to be tuned out: it is the price of every robot departing for the SAME
+///     instant instead of each for its own, and the extra time is spent
+///     exploring, not waiting. It does mean chase opportunity moves with the
+///     generation — gen 23-24 strictly more than gen 20-22, gen 25 up to
+///     100 s less than gen 23-24 and possibly none — which is one of several
+///     reasons generations cannot be pooled.
+///
+/// WHAT WAS REMOVED, WHY IT CAME BACK, AND WHAT ACTUALLY FIXED IT. The interval
+/// is a recurrence period and a separating robot keeps the next occurrence of a
+/// standing meeting. That is generation 18's design, it was removed in
+/// generation 19-20, and generation 23 restored it. Do not remove it a second
+/// time without reading this paragraph, because the measurement that killed it
+/// is real and the reason it no longer applies is NOT that the measurement was
+/// wrong.
+///
+/// The removal's case: three inequalities had to hold at once — worst-case
+/// drive <= period <= barrier wait cap, and arming spread <= period — and none
+/// was enforceable. The worst-case in-ROI drive is ~283 s (100x100 m at
+/// 0.5 m/s, 340 s with the safety markup) against a 240 s cap. The N=3 smoke
+/// armed at 16.1 / 52.5 / 67.4 s against a 30 s period and the three robots
+/// selected three DIFFERENT occurrences off byte-identical committed integers.
+///
+/// What replaced it was a private per-robot countdown, and THAT IS NOT A
+/// RENDEZVOUS. N robots each departing 100 s after its own notice, for a place
+/// they agree on and an instant they never discussed, is N robots visiting the
+/// same cell. The experiment's rendezvous arm is defined as an agreed place AND
+/// time, so the countdown made the arm measure something the design does not
+/// name.
+///
+/// What makes the schedule safe now is not tighter inequalities — the drive
+/// bound is still ~283 s and the arming spread is still unbounded — but that
+/// MISSING AN OCCURRENCE NO LONGER MISSES THE MEETING.
+/// rendezvous_appointment_wait_sec is 0.0 on every campaign arm, which is an
+/// unbounded barrier: a robot that selects an earlier occurrence stands at the
+/// agreed cell until the rest arrive. The 16.1 / 52.5 / 67.4 s spread costs
+/// waiting instead of costing the reunion. The
+/// generation-18 failure was a NO-SHOW on a bounded wait, and the no-show was
+/// the defect in that design, not the schedule.
 enum class ReconnectMode { RENDEZVOUS, PURSUIT, HYBRID };
 
+/// The occurrence of an agreed recurring appointment that a robot arming now
+/// should keep: the first `t_meet_ms + k*interval_ms` (k >= 0 integer) that is
+/// at or after `not_before_sec`.
+///
+/// THIS IS THE ONE PIECE OF ARITHMETIC THAT MAKES THE RENDEZVOUS ARM A
+/// RENDEZVOUS, which is why it lives here, as a pure function with executable
+/// tests, rather than as a file-static helper in a 17000-line node that no test
+/// can link against. Every robot passes the SAME agreed (t_meet_ms,
+/// interval_ms) — authored once by the proposer, adopted verbatim, compared
+/// field-by-field before the team commits — and its OWN `not_before_sec`. The
+/// shared origin is what the generation-18 attempt lacked: it indexed the
+/// recurrence from each robot's own arming instant, so identical integers
+/// produced different meetings.
+///
+/// WHAT THE CALLER MAY PUT IN THE FLOOR, because this is where the arm has been
+/// broken twice. Generations 19-24 passed `now + rendezvous_depart_delay_sec`:
+/// a lead time added UNCONDITIONALLY, so robots that could all comfortably
+/// attend the same occurrence still split across two of them, and the ts4 N=3
+/// cell forked with two robots on one instant and the third a whole interval
+/// past it. Generation 25 made it bare `now`. Generation 29 passes
+/// `now + max(0, own_marked_up_drive - rendezvous_max_lateness_sec)`.
+///
+/// The distinction that makes the third safe and the first not is the CLAMP AT
+/// ZERO, not the size of the term: a robot that can reach the nearest
+/// occurrence contributes nothing and gets the bare floor, so a team that can
+/// all attend cannot fork. Only a robot that genuinely cannot arrive in time
+/// rolls, and then by exactly its shortfall. A future caller adding anything
+/// here must preserve that property — an unconditional term, however small,
+/// re-creates the generation-19 fork.
+///
+/// Contract, exactly:
+///   - `t_meet_ms` at or after the floor is returned unchanged, so the first
+///     agreed meeting is kept as agreed rather than rolled forward.
+///   - `interval_ms <= 0` means "one meeting, not a recurrence": the agreed
+///     instant is returned even when it has already passed. The caller sees a
+///     due appointment, departs immediately, and waits at the cell — which is
+///     the same behaviour as a missed occurrence and is safe for the same
+///     reason (the barrier is unbounded). Returning something in the future
+///     would be inventing an instant the team never agreed.
+///   - No clamp on the result. A far-future floor rolls forward as far as it
+///     takes; the caller's own wait caps bound the consequences.
+/// All arithmetic is exact integer; nothing here rounds through a double except
+/// the caller-supplied seconds floor.
+long long nextAgreedOccurrence(long long t_meet_ms, long long interval_ms,
+                               double not_before_sec);
+
+/// How far above bare `now` a robot must floor its occurrence search to reach
+/// an appointment no more than `max_lateness_sec` late, given `lead_ms` — its
+/// own estimated drive, already marked up — in milliseconds.
+///
+/// THIS IS THE CLAMP nextAgreedOccurrence's floor contract is about, and it is
+/// a separate function for one reason: nothing else in the package can be
+/// tested for it. The node computes the lead from a live grid lookup that no
+/// gtest target can link against, so if the clamp lived inline there, deleting
+/// it would be a source-scan question rather than an executable one — and the
+/// generation-19 fork it prevents took a smoke run and a censored campaign to
+/// find the first time.
+///
+/// Contract, exactly:
+///   - `lead_ms < 0` means "no estimate" and returns 0.0. A robot that cannot
+///     price its own drive does not get to decide the team is unreachable; it
+///     keeps the nearest agreed occurrence.
+///   - A lead within budget returns 0.0 — EXACTLY zero, not a small positive
+///     number. This is what stops a team that can all attend from forking.
+///   - Otherwise it returns the shortfall, `lead - budget`, in seconds, so the
+///     floor rises by exactly what this robot is short and no more.
+///   - A non-finite or negative `max_lateness_sec` is treated as 0.0 rather
+///     than propagated: the caller passes it through llround() inside
+///     nextAgreedOccurrence, where a NaN is undefined behaviour, and a negative
+///     budget would demand every robot arrive EARLY by that much and fork a
+///     team that had no reason to. The node validates the parameter too; this
+///     holds for direct callers and for a future one that does not.
+double arrivalShortfallSec(long long lead_ms, double max_lateness_sec);
+
+/// FLICKER DWELL: "has `eligible` held CONTINUOUSLY for `confirm_sec`?"
+///
+/// The node reads "the team is whole again" from a claim table with a 5 s TTL,
+/// so ONE claim arriving inside one TTL is enough to make the team look complete
+/// for a single 10 Hz tick. Acting on that tick credits a reunion to a range-edge
+/// flicker that drained no map deltas. Every site that acts on the team coming
+/// BACK therefore has to see it hold, and this is the one implementation of
+/// "hold" in the package — three sites used to carry two copies and a third site
+/// carried none.
+///
+/// The caller owns the two state words. ONE WINDOW PER QUESTION, not one per
+/// call site, and the node's flicker-guarded sites divide on exactly that
+/// line: the manoeuvre barrier asks about manoeuvre release eligibility and
+/// owns its own pair; the appointment supersede, the rendezvous_spent_ release
+/// and the appointment walker's barrier conversion ask the identical
+/// teamSettled question and share a second pair. Two windows over one
+/// predicate is how "the outage is over" acquires two answers, and one of
+/// them then fires on evidence the other is still refusing.
+///
+/// WHERE SITES SHARE A WINDOW, EXACTLY ONE OF THEM MAY CALL THIS FUNCTION.
+/// `dwellHeld` below exists for the others. A second caller advancing or
+/// disarming the pair would make asking the question change its answer.
+///
+/// AND THE WRITER MUST BE THE SITE THAT RUNS UNCONDITIONALLY. This measures a
+/// continuous run, so it is only as continuous as its own sampling — and an
+/// un-ticked window does not decay, it FREEZES, holding `armed` true with an
+/// arbitrarily old `since_sec`. Put the call behind a branch that is untaken for
+/// minutes and the first sample after the gap sees `now - since` far past
+/// `confirm_sec` and fires on ONE reading, which is the failure the dwell was
+/// added to prevent, now wearing the guard's name. Tick it from the timer, read
+/// it from the branch.
+///
+/// Contract:
+///   - `eligible` false disarms and returns false. The window restarts from
+///     scratch on the next eligible tick; there is no partial credit, because a
+///     predicate that keeps dropping is exactly the flicker being filtered.
+///   - `confirm_sec <= 0` means "no dwell" and returns true immediately, so a
+///     campaign can switch the guard off with a parameter and the arithmetic
+///     below never runs.
+///   - The FIRST eligible tick arms the window and returns FALSE. `confirm_sec`
+///     is a dwell, not a deadline: the site fires on the first tick at or after
+///     `since + confirm_sec`, never on the tick that started it.
+///   - Comparison is `>=`, so a confirm window shorter than the tick period
+///     still fires on the second eligible tick rather than never.
+///
+/// TIME IS PLAIN SECONDS, deliberately. Taking rclcpp::Time here would put this
+/// out of reach of an executable test for exactly the reason the node itself is
+/// (see nextAgreedOccurrence above), and it would reintroduce a real hazard:
+/// subtracting a default-constructed rclcpp::Time from a node clock reading
+/// THROWS on mismatched clock types. Doubles cannot do that.
+bool dwellConfirmed(bool eligible, double now_sec, double confirm_sec,
+                    bool* armed, double* since_sec);
+
+/// The non-mutating twin of dwellConfirmed, for a caller that needs another
+/// site's answer without advancing that site's window.
+///
+/// It must stay a pure function of its arguments and it must stay in step with
+/// dwellConfirmed's return expression — the two answering differently is
+/// precisely the defect the split exists to remove, so a change to one is a
+/// change to both. They are adjacent in the .cpp for that reason.
+bool dwellHeld(bool eligible, double now_sec, double confirm_sec, bool armed,
+               double since_sec);
+
 /// Parse the `reconnect_mode` parameter, case-insensitively. Unknown strings
-/// map to RENDEZVOUS (the legacy behaviour); `known`, when non-null, receives
-/// whether the string matched a mode, so the caller can warn on the mismatch
-/// without duplicating the accepted-string set.
+/// map to RENDEZVOUS; `known`, when non-null, receives whether the string
+/// matched a mode. The fallback is kept here because this is a pure function
+/// with tests pinning it, but NOTE that it is not a usable policy: the node
+/// treats `known == false` as fatal, because silently retargeting a run at a
+/// different arm of the same experiment is undetectable downstream.
 ReconnectMode reconnectModeFromString(const std::string& s,
                                       bool* known = nullptr);
 
@@ -121,17 +350,30 @@ double pursuitBudgetSec(double trail_head_dist_m, double staleness_sec,
 /// anyway so it should be unreachable from the campaign harness.
 bool allocPeerPositionFresh(double age_sec, double max_age_sec);
 
-/// Meeting point for the HYBRID fallback: the midpoint of the last-contact
-/// pose pair (all three axes — on flat worlds the z average is the shared
-/// ground height; the arrival test is xy-only either way). Each side computes
-/// it from its OWN record, so no message is exchanged; determinism
-/// substitutes for negotiation exactly as in the MinPos tiebreak. The two
-/// records — and so the two midpoints — agree only as closely as the two
-/// directions' last successful receptions were simultaneous: intent traffic
-/// is state-gated, so a one-way fly-by can refresh one side's record and not
-/// the other's. The barrier releasing on COMMS (not co-location) is what
-/// absorbs the ordinary asymmetry; see planner_method.md for the failure
-/// mode when it can't.
+/// The midpoint of the last-contact pose pair (all three axes — on flat worlds
+/// the z average is the shared ground height; the arrival test is xy-only
+/// either way).
+///
+/// NO LONGER CALLED BY THE PLANNER as of 2026-09-16, and kept deliberately
+/// rather than deleted: it is a pure function with a unit test, and it is the
+/// reference implementation of a construction that three past campaign
+/// generations drove to, so an analysis reconstructing what a banked run did
+/// needs it to still exist and still mean the same thing. Do not reintroduce a
+/// call to it without reading why it went.
+///
+/// Why it went. It was the HYBRID (and briefly the RENDEZVOUS) fallback
+/// destination, justified on the grounds that each side computes it from its
+/// OWN record so determinism substitutes for negotiation, exactly as in the
+/// MinPos tiebreak. Two things were wrong with that. The construction is a
+/// place with NO TIME — nothing tells the peer when to be there or how long to
+/// wait — and an agreed time is precisely what the rendezvous arm exists to
+/// test. And the determinism argument does not survive contact: the two
+/// records agree only as closely as the two directions' last successful
+/// receptions were simultaneous, intent traffic is state-gated, and a one-way
+/// fly-by refreshes one side's record and not the other's. The `floor_won`
+/// telemetry measured the result — both ends chose the midpoint in only 2 of 6
+/// separated pairs. See planner_method.md and the removal notes in
+/// dispatchReconnect().
 Eigen::Vector3f meetingPoint(const Eigen::Vector3f& self_at_contact,
                              const Eigen::Vector3f& peer_at_contact);
 

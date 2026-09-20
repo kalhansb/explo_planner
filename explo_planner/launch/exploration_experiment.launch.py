@@ -27,7 +27,10 @@ def generate_launch_description():
         # dead and the planner silently idle. Sim/bag runs must pass true.
         DeclareLaunchArgument('use_sim_time', default_value='false',
                               description='Use /clock (sim/bag runs only)'),
-        DeclareLaunchArgument('max_steps', default_value='200',
+        # C4: 500 to match shared_params.yaml and the campaign harness. A
+        # launch-argument default is passed unconditionally and so WINS over
+        # the params file, which is why this line has to move with the yaml.
+        DeclareLaunchArgument('max_steps', default_value='500',
                               description='Maximum NBV steps'),
         DeclareLaunchArgument('output_csv', default_value='/tmp/exploration.csv',
                               description='Output CSV path'),

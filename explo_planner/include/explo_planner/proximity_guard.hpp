@@ -16,10 +16,12 @@
 ///   2. Hysteresis: a hold STARTS below hold_dist_m but only RELEASES beyond
 ///      resume_dist_m, so a peer skirting the threshold doesn't chatter the
 ///      robot between hold and drive.
-///   3. A peer that stops moving is released ("parked"): a stationary robot
-///      is an ordinary static obstacle for the navigator's costmap, and
-///      holding against one deadlocks — e.g. a teammate waiting at its
-///      rendezvous anchor, or one whose planner died mid-run. Motion is
+///   3. A peer that stops moving is released ("parked"): a stationary robot is
+///      an ordinary static obstacle in the navigator's local obstacle grid —
+///      lidar sees it, so it is mapped like any other solid thing; there is no
+///      nav2 costmap in this stack — and holding against one deadlocks, e.g. a
+///      teammate waiting at its rendezvous anchor, or one whose planner died
+///      mid-run. Motion is
 ///      measured against an anchor pose (displacement > peer_static_move_m
 ///      re-arms it), so localisation jitter doesn't count as driving. The
 ///      release has a floor, parked_keep_dist_m: inside it "the peer parked"

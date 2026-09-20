@@ -174,6 +174,7 @@ def run(parent_ev, child_ev, parent_kw=None, child_kw=None, env_extra=None,
                   **(child_kw or {}))
         env = dict(os.environ)
         env.pop("EQUIV_ALLOW_NEW_KINDS", None)   # never inherited: see below
+        env.pop("EQUIV_ALLOW_NEW_FIELDS", None)  # same rule, same reason
         env.update(env_extra or {})
         r = subprocess.run([sys.executable, GATE, p, c], capture_output=True,
                            text=True, env=env)
@@ -266,6 +267,53 @@ case("an event kind experiment_log.hpp does not declare at all", 1,
          2, {"event": "brand_new_thing", "seq": 99, "robot": r,
              "t_sim_sec": 40.0, "t_rel_sec": 13.8,
              "t_wall_sec": 1787851740.0, "state": "EXPLORE", "step": 2})))
+
+print("\n=== check 3b: the kind names are unchanged, the contents are not ===")
+
+# Every case here keeps the event VOCABULARY identical, so check 3 passes each
+# one. That is the point: before 3b existed, a child that rewrote what is inside
+# its events was indistinguishable from an identical binary.
+
+case("a field added to a kind both sides emit", 1,
+     r"child writes field\(s\) \['state_change\.reason'\]",
+     child_ev=mutate(child_side(),
+                     lambda evs, r: evs[2].update(reason="peer_lost")))
+
+case("...permitted when EQUIV_ALLOW_NEW_FIELDS declares it", 0,
+     r"permitted new field\(s\).*NOT a defaults run",
+     child_ev=mutate(child_side(),
+                     lambda evs, r: evs[2].update(reason="peer_lost")),
+     env_extra={"EQUIV_ALLOW_NEW_FIELDS": "state_change.reason"})
+
+case("...and the permission does not license a DIFFERENT field", 1,
+     r"child writes field\(s\) \['state_change\.cause'\]",
+     child_ev=mutate(child_side(),
+                     lambda evs, r: evs[2].update(cause="peer_lost")),
+     env_extra={"EQUIV_ALLOW_NEW_FIELDS": "state_change.reason"})
+
+case("a field that changed JSON type", 1,
+     r"changed JSON type.*run_end\.reason \(str -> int\)",
+     child_ev=mutate(child_side(), lambda evs, r: evs[4].update(reason=3)))
+
+case("a field the child stopped writing is a NOTE, not a failure", 0,
+     r"field\(s\) the parent wrote and the child did not: \['run_end\.reason'\]",
+     child_ev=mutate(child_side(), lambda evs, r: evs[4].pop("reason", None)))
+
+# The two ways an honest same-binary pair can look asymmetric. Both must pass,
+# or the gate fails real pairs and gets switched off — the failure mode this
+# file exists to prevent.
+case("a field on ONE side's ONE run only, present in the union of both", 0,
+     r"EQUIVALENT",
+     parent_ev=mutate(parent_side(),
+                      lambda evs, r: evs[2].update(note="x") if r == ROBOTS[0]
+                      else None),
+     child_ev=mutate(child_side(),
+                     lambda evs, r: evs[2].update(note="y") if r == ROBOTS[1]
+                     else None))
+case("a field only ever null on one side is not a type disagreement", 0,
+     r"EQUIVALENT",
+     parent_ev=mutate(parent_side(), lambda evs, r: evs[4].update(extra=None)),
+     child_ev=mutate(child_side(), lambda evs, r: evs[4].update(extra="v")))
 
 print("\n=== the param dump ===")
 
@@ -634,46 +682,188 @@ finally:
 print("\n=== the fixture must match the BINARY, not the gate's beliefs ===")
 
 
+# ---------------------------------------------------------------------------
+
+print("\n=== D1: derived and auto-sentinel params ===")
+
+# A 360 deg comb: 2*pi over 96 rays, one h_step of slack. The node's own
+# formula, so the derived flag must come out true and the pair must be clean.
+OMNI = {"fov_hfov": 6.28318, "fov_h_rays": 96, "fov_is_omnidirectional": True}
+
+case("a 360 deg FOV with a flag matching its own geometry is clean",
+     0, r"new param\(s\) at defaults",
+     child_ev=set_param(child_side(), **OMNI))
+
+# The whole reason the entry is a function of the run's params rather than a
+# pinned True: this is a binary whose logged flag contradicts the comb it
+# logged beside it, and no constant expectation could catch it.
+case("a flag contradicting the same run's FOV geometry is a difference",
+     1, r"fov_is_omnidirectional.*NOT at its default",
+     child_ev=set_param(child_side(),
+                        **dict(OMNI, fov_is_omnidirectional=False)))
+
+# A directional child DOES fail -- D1 ships 360 deg, so a 60 deg comb is not a
+# defaults run -- but it must fail on the FOV it actually changed. If the
+# derived flag were pinned to True it would fail here a SECOND time, for a
+# reason that is not true, and the real finding would be one line of noise in
+# a pile. Asserted by reading the failure list, because what is being checked
+# is the ABSENCE of a line.
+rc, out = run(parent_side(),
+              set_param(child_side(), fov_hfov=1.047, fov_h_rays=16,
+                        fov_is_omnidirectional=False))
+_bad = [l for l in out.splitlines()
+        if "FAIL" in l and "fov_is_omnidirectional" in l]
+_ok = rc == 1 and "fov_hfov" in out and not _bad
+print(f"  {'PASS' if _ok else 'FAIL'}  a directional child fails on the FOV "
+      f"itself, not on the derived flag (rc={rc})")
+if not _ok:
+    fails += 1
+    print("    " + "\n    ".join(out.splitlines()[:16]))
+
+# Derivable only if the run logged what it derives from. A child that records
+# the verdict and not the geometry cannot be checked, and "cannot be checked"
+# is not "checked and fine".
+case("the flag without the geometry it derives from is UNRESOLVED",
+     3, r"did not log the params it derives from",
+     child_ev=set_param(child_side(), fov_is_omnidirectional=True))
+
+# The AUTO sentinel. coord_claim_radius_m has a dp() call, so the lookup
+# SUCCEEDS and returns 0.0 -- which no run ever logs, because the node resolves
+# it in the constructor before the dump is written. Testing against it would
+# fail every honest defaults run, so this must be UNRESOLVED, not a failure...
+case("an AUTO-sentinel param is UNRESOLVED, not a false difference",
+     3, r"coord_claim_radius_m.*AUTO sentinel, not a default",
+     child_ev=set_param(child_side(), coord_claim_radius_m=10.0))
+
+# ...and equally must not be quietly counted as one of the params that WERE
+# checked. A gate that says "1 new param at defaults" about a param it declined
+# to check is back to printing passes for things it never looked at.
+# NOT "the note is absent": this child also carries P0's three genuine new
+# params, so the note is printed and should be. What must not appear is the
+# declined param's NAME inside it.
+rc, out = run(parent_side(),
+              set_param(child_side(), coord_claim_radius_m=10.0))
+_note = [l for l in out.splitlines() if "new param(s) at defaults" in l]
+_ok = (rc == 3 and len(_note) == 1
+       and "coord_claim_radius_m" not in _note[0]
+       and "robot_id" in _note[0])
+print(f"  {'PASS' if _ok else 'FAIL'}  ...and is not counted among the params "
+      f"checked (rc={rc})")
+if not _ok:
+    fails += 1
+    print("    " + "\n    ".join(out.splitlines()[:16]))
+
+case("the other two AUTO-sentinel knobs are registered too",
+     3, r"cost_grid_radius_cap_m.*AUTO sentinel",
+     child_ev=set_param(child_side(), cost_grid_radius_cap_m=500.0,
+                        coord_vantage_claim_radius_m=0.75))
+
+
+print("\n=== the params-file witnesses (previously uncalibrated) ===")
+
+# These three rungs of GATED_MANIFEST_GROUPS had no case at all, which is how
+# coord_claim_radius_m_in_params sat pinned at the pre-D1 0.0 without anything
+# going red. Each off value restates the SHIPPED yaml, so each is a claim about
+# a file that changes -- exactly the kind of pin that needs a test.
+def witness_case(label, expect_rc, expect_pat, line):
+    case(label, expect_rc, expect_pat,
+         child_kw={"manifest": MANIFEST + line + "\n"})
+
+witness_case("the claim radius the shipped yaml now pins is clean", 0,
+             r"new manifest key\(s\) recording a subsystem that is OFF",
+             "coord_claim_radius_m_in_params=10.0")
+# The case that would have caught the stale pin: pre-D1 the yaml said 0.0, and
+# after D1 a child still reading 0.0 is a child built against a stale installed
+# params file -- the very defect these witnesses exist to expose.
+witness_case("a child still reading the pre-D1 0.0 is a difference", 1,
+             r"coord_claim_radius_m_in_params.*declared off value is '10\.0'",
+             "coord_claim_radius_m_in_params=0.0")
+witness_case("a missing params file fails rather than relaxing", 1,
+             r"coord_claim_radius_m_in_params.*declared off value",
+             "coord_claim_radius_m_in_params=missing")
+witness_case("the comms-mask witness at its shipped false is clean", 0,
+             r"new manifest key\(s\) recording a subsystem that is OFF",
+             "global_alloc_comms_mask_in_params=false")
+witness_case("...and reading true is a treatment arm", 1,
+             r"global_alloc_comms_mask_in_params.*switch\s+is ON",
+             "global_alloc_comms_mask_in_params=true")
+
+
 def audit_fixture_against_real_cell():
     """Check the fixture's run_start shape against a banked cell.
 
     Reports UNRESOLVED — never PASS — when no banked cell is reachable. The
     fixture above is what every case is built on; if its shape is wrong, every
     case tests the wrong thing and they all still print PASS.
+
+    AND UNRESOLVED COUNTS AGAINST THE EXIT STATUS, which it did not until
+    2026-09-18. Both refusals below printed their line and `return`ed without
+    touching `fails`, so a run that compared the fixture against nothing at all
+    exited 0 — indistinguishable, to anything reading the status, from a run
+    where the audit passed. That is the whole point of the audit inverted: it
+    exists because a wrong fixture makes every other case agree with itself,
+    and an UNRESOLVED audit is precisely the state in which nobody knows
+    whether the fixture is wrong. `checks-that-stopped-checking` again, and the
+    same edit was needed in gate_g8_calib.py for the same reason.
     """
     global fails
     root = os.environ.get("EQUIV_CALIB_REAL_ROOT", "/home/kalhan/hmr_campaign")
     if not os.path.isdir(root):
         print(f"  UNRESOLVED  no campaign root at {root}; fixture shapes were "
-              f"NOT compared against real data")
+              f"NOT compared against real data, so nothing here establishes "
+              f"that the other cases are built on a real schema")
+        fails += 1
         return
     # Scan for the NEWEST schema present rather than stopping at the first cell
     # alphabetically. The fixture is written at the current schema, so auditing
     # it against the oldest banked cell in the directory would silently compare
     # it to a run_start that predates half the params it claims to copy.
-    real_start, real_params, real_schema = None, None, -1
-    for cell in sorted(os.listdir(root)):
-        d = os.path.join(root, cell)
-        if not os.path.isdir(d):
+    #
+    # AND IT WAS DOING EXACTLY THAT. The scan was one level deep, so it could
+    # only reach cells sitting loose at the top of ~/hmr_campaign -- 3467 of
+    # them, none newer than schema 4. Every campaign since then writes its cells
+    # one level further down (ts4_smoke20_n2/<cell>/), so the schema-5, -6 and
+    # -7 runs were invisible and this audit had been certifying the fixture
+    # against a four-generation-old run_start while printing PASS. The comment
+    # above was true about the loop and false about the outcome, which is the
+    # failure mode this whole review pass is about.
+    #
+    # Depth 2 is the campaign/cell layout and is where the scan stops; a deeper
+    # walk would spend minutes crossing bag directories for nothing.
+    real_start, real_params, real_schema, real_where = None, None, -1, None
+    cand = [root] + [os.path.join(root, c) for c in sorted(os.listdir(root))
+                     if os.path.isdir(os.path.join(root, c))]
+    for parent in cand:
+        try:
+            kids = sorted(os.listdir(parent))
+        except OSError:
             continue
-        for r in ROBOTS:
-            p = os.path.join(d, f"{r}.events.jsonl")
-            if not os.path.exists(p):
+        for cell in kids:
+            d = os.path.join(parent, cell)
+            if not os.path.isdir(d):
                 continue
-            for ln in open(p, errors="replace"):
-                try:
-                    e = json.loads(ln)
-                except ValueError:
+            for r in ROBOTS:
+                p = os.path.join(d, f"{r}.events.jsonl")
+                if not os.path.exists(p):
                     continue
-                if e.get("event") == "run_start":
-                    if e.get("schema_version", 0) > real_schema:
-                        real_start = set(e.keys())
-                        real_params = set(e.get("params", {}))
-                        real_schema = e.get("schema_version")
-                    break
+                for ln in open(p, errors="replace"):
+                    try:
+                        e = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if e.get("event") == "run_start":
+                        if e.get("schema_version", 0) > real_schema:
+                            real_start = set(e.keys())
+                            real_params = set(e.get("params", {}))
+                            real_schema = e.get("schema_version")
+                            real_where = os.path.relpath(d, root)
+                        break
     if not real_start:
-        print(f"  UNRESOLVED  no run_start found under {root}; fixture shapes "
-              f"were NOT compared against real data")
+        print(f"  UNRESOLVED  no run_start found under {root} for any of "
+              f"{'/'.join(ROBOTS)}; fixture shapes were NOT compared against "
+              f"real data. Note the roster is a constant here, so a campaign "
+              f"whose robots are named otherwise lands on this line too")
+        fails += 1
         return
     fixture_start = set(base_events("atlas", BASE_PARAMS)[0].keys())
     fixture_params = set(BASE_PARAMS)
@@ -682,16 +872,90 @@ def audit_fixture_against_real_cell():
     if invented:
         bad.append(f"run_start: fixture invents top-level key(s) "
                    f"{sorted(invented)}")
+    # BOTH DIRECTIONS, and only one of them used to be checked. `invented` says
+    # the fixture made something up; `missing` says the writer has moved on
+    # without it -- and a fixture that is merely BEHIND passes every subset test
+    # ever written while testing the wrong shape. The two are not symmetric in
+    # how they are treated, because the two halves of run_start are not:
+    #
+    #   top-level keys ARE a failure. There are twelve of them, the writer emits
+    #   the same twelve on every event kind plus t0_sim_sec/coverage_milestones,
+    #   and as of schema 7 the fixture has exactly that set. So equality is the
+    #   real invariant here, and a new one appearing is the writer changing
+    #   under the gate -- which is precisely what the gate exists to notice.
+    #
+    #   params are NOT. The fixture carries 16 of the 138 a real run dumps, on
+    #   purpose: the gate compares params generically, key by key, so a fixture
+    #   that copied all 138 would test the same code path 138 times and go stale
+    #   every time anyone declares a parameter. Missing params are reported as a
+    #   count for reach, never as a failure.
+    missing = real_start - fixture_start
+    if missing:
+        bad.append(f"run_start: a real schema-{real_schema} cell has top-level "
+                   f"key(s) {sorted(missing)} that the fixture does not — the "
+                   f"fixture is behind the writer, so every case above is "
+                   f"built on a run_start shape that is no longer emitted")
     invented_p = fixture_params - real_params
     if invented_p:
         bad.append(f"run_start.params: fixture invents {sorted(invented_p)}, "
                    f"which no writer emits")
-    print(f"  {'PASS' if not bad else 'FAIL'}  fixture run_start is a subset "
-          f"of a real schema-{real_schema} cell's "
-          f"({len(fixture_start)} key(s), {len(fixture_params)} param(s))")
+    print(f"  {'PASS' if not bad else 'FAIL'}  fixture run_start matches a real "
+          f"schema-{real_schema} cell's top-level shape "
+          f"({len(fixture_start)} key(s)); params are a deliberate "
+          f"{len(fixture_params)}-of-{len(real_params)} subset")
+    print(f"           | audited against {real_where}")
+    if real_schema != SCHEMA:
+        # Not a failure: SCHEMA is pinned at 4 because several cases below
+        # exercise a 4 -> 5 bump, and bumping it here would silently retarget
+        # them. Printed so the gap is visible rather than assumed.
+        print(f"           | fixture pins SCHEMA={SCHEMA}; the newest banked "
+              f"cell is schema {real_schema}. That is intentional — the bump "
+              f"cases need a fixture below current — but the shape checked "
+              f"above is the schema-{real_schema} one.")
     for b in bad:
         print(f"           | {b}")
     if bad:
+        fails += 1
+
+    # AND A TRIPWIRE ON THE REACH, separately from the shape. Everything above
+    # compares the fixture to whatever cell the scan found; none of it can tell
+    # a current reference from a stale one, because the top-level run_start keys
+    # have not changed since schema 3 and so an ancient cell agrees just as
+    # loudly. That is how the one-level scan survived four generations here: it
+    # kept finding a schema-4 cell, kept agreeing with it, and kept printing
+    # PASS. The staleness has to be its own verdict or nothing checks it.
+    #
+    # The header is the truth for the current schema — the binary stamps
+    # kSchemaVersion into every run_start and nothing else votes. Reading it
+    # here rather than pinning a number is deliberate: a second hand-kept pin is
+    # what gate_g8_calib.py had to grow an assertion to police, three drifts in.
+    #
+    # One behind is normal and stays green: the pin moves with the header, and
+    # no cell of the new generation exists until that binary has been built and
+    # run. Two behind means a whole generation was campaigned without this scan
+    # ever reaching one of its cells.
+    hdr = os.path.join(HERE, os.pardir, "explo_planner", "include",
+                       "explo_planner", "experiment_log.hpp")
+    m = (re.search(r"kSchemaVersion\s*=\s*(\d+)", open(hdr, errors="replace")
+                   .read()) if os.path.exists(hdr) else None)
+    if not m:
+        print(f"  UNRESOLVED  kSchemaVersion could not be read from {hdr}; the "
+              f"audited reference's age could not be checked, so 'schema "
+              f"{real_schema}' above is a number with nothing to compare to")
+        fails += 1
+        return
+    truth = int(m.group(1))
+    gap = truth - real_schema
+    ok = gap <= 1
+    print(f"  {'PASS' if ok else 'FAIL'}  the audited reference is within one "
+          f"schema of the header (schema {real_schema} vs kSchemaVersion "
+          f"{truth})")
+    if not ok:
+        print(f"           | {gap} generations behind. Either no campaign since "
+              f"schema {real_schema} banked a cell where this scan looks "
+              f"(depth 1 or 2 under {root}, robots {'/'.join(ROBOTS)}), or the "
+              f"layout moved again. Nothing above failed, because the "
+              f"run_start top-level shape is the same in both.")
         fails += 1
 
 
