@@ -1083,6 +1083,29 @@ TEST(Gen29ReAgreement, TheMeetingAsksForTheNextOne) {
          "the map it walked in with — which is the map the pair it is standing "
          "on was already derived from";
 
+  // AND THE RELEASE-TAIL RAISER IS GUARDED (2026-09-20). An appointment asks at
+  // the end of its settle and stands on the cell until the answer commits, so
+  // by the time it reaches the release tail the request has already been SPENT
+  // by the adoption that answered it. Raising it again buys a second derive,
+  // and deriveRendezvousProposal mints t_meet as now+interval — so the instant
+  // the fleet has just agreed to slides forward by however long the release
+  // took, and the run carries two commits for one meeting. The ts4 gen-29 N=2
+  // rendezvous smoke banked exactly that: cell 23 at t+1055s, then t+1061s.
+  // The guard confines the raise to the barriers that had no settle stage in
+  // which to ask — a pursuit reunion, and rendezvous_settle_sec 0.
+  const std::string guard = "if (!rendezvous_reagree_waiting_) {";
+  const size_t guarded = body.rfind(guard, raises.back());
+  ASSERT_NE(guarded, std::string::npos)
+      << "the release-tail re-agreement raiser has no "
+         "rendezvous_reagree_waiting_ guard before it:\n"
+      << body;
+  EXPECT_EQ(body.find_first_not_of(
+                " \t\r\n", guarded + guard.size()), raises.back())
+      << "the release-tail raiser is not the first statement of its "
+         "rendezvous_reagree_waiting_ guard, so either it is unguarded — an "
+         "appointment re-derives after its wait already committed the next "
+         "pair, and t_meet slides — or the guard now covers other writes too";
+
   const std::string drain =
       functionBody(text, "void ExploPlannerNode::drainTeamWorld(");
   ASSERT_FALSE(drain.empty()) << "the scan found no drainTeamWorld definition";

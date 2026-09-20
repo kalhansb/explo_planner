@@ -13186,13 +13186,26 @@ void ExploPlannerNode::doReturnSync() {
     // deriving is the proposer's and needs the frozen snapshot; see
     // rendezvous_reagree_due_ and the derive gate it opens.
     //
-    // An APPOINTMENT has already asked, at the end of its settle, and has
-    // stood here until the answer committed — this raise is idempotent and is
-    // what covers the barriers that reach the release without a settle stage:
-    // a pursuit reunion, and an appointment run with rendezvous_settle_sec 0.
-    // Those leave immediately and re-agree while they drive, which is the
-    // older behaviour and all that is available without a hold to do it in.
-    rendezvous_reagree_due_ = true;
+    // ONLY WHERE THE SETTLE STAGE DID NOT ALREADY ASK, which is what
+    // rendezvous_reagree_waiting_ records. This raise was unconditional and
+    // described as idempotent, and it is not: the request is SPENT by the
+    // adoption that answers it, so raising it again after an appointment's
+    // wait authorises a SECOND derive, and deriveRendezvousProposal mints
+    // t_meet as "now plus the interval" — the instant the team has just
+    // committed to slides forward by however long the release took. The ts4
+    // gen-29 N=2 rendezvous smoke measured it: cell 23 committed twice, at
+    // t+1055s and then 6 s later at t+1061s, off one meeting.
+    //
+    // Where it IS needed is the barriers that reach the release without a
+    // settle stage — a pursuit reunion, and an appointment run with
+    // rendezvous_settle_sec 0. Those never entered the wait, so they leave
+    // immediately and re-agree while they drive, which is the older behaviour
+    // and all that is available without a hold to do it in. An appointment
+    // whose wait EXPIRED needs nothing raised either: nothing adopted, so the
+    // request it made at the end of its settle is still standing.
+    if (!rendezvous_reagree_waiting_) {
+      rendezvous_reagree_due_ = true;
+    }
     rendezvous_settling_ = false;
     rendezvous_reagree_waiting_ = false;
     // A LATCHED ROBOT DOES NOT GO BACK TO EXPLORING (2026-09-17). This release

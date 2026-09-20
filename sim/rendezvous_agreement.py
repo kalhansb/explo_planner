@@ -164,6 +164,16 @@ LINE = re.compile(
 # without the gate going quiet.
 NO_AGREEMENT = "was agreed by the whole team"
 
+# A BARRIER THAT ACTUALLY RELEASED. Generation 29 lets a run hold a SEQUENCE of
+# triples — a meeting that is kept re-sites the next one — so "how many times
+# may this robot commit" stopped being a constant and became "once, plus one for
+# each meeting it kept". This is the phrase that marks a keeping. Matched as a
+# substring and deliberately on the half of the line that both variants share:
+# the settled form appends "(held Ns; the exchange applied ...)" and the
+# no-settle form "(no settle configured, ...)", and both authorise exactly one
+# re-agreement. sim/manoeuvre_events.py greps the same line's prefix.
+RELEASE = "-> re-planning against merged map"
+
 # G2b's bound, in seconds of wall clock between the first and last robot to
 # commit the cell the fleet ends on. Set to the node's mid-run maximum wait,
 # because that is the point at which the harm stops being theoretical: a robot
@@ -264,23 +274,25 @@ def main(argv):
         return 0
 
     # --- G1/G2: who committed, and to what ---------------------------------
-    # EVERY commit line is kept, not just the first. A robot may legitimately
-    # commit TWICE: the proposer can derive before the allocator has produced a
-    # single tour, in which case the argmin has one candidate (the centroid of
-    # the frozen snapshot) and the triple it yields is a placeholder rather than
-    # a choice. That triple is published with rendezvous_provisional=1 and may be
-    # replaced exactly once, by a triple that had something to choose between.
-    # The permitted shapes are therefore
+    # EVERY commit line is kept, not just the first. A robot commits more than
+    # once for two unrelated reasons, and both are legitimate:
     #
-    #     [R]          tours already existed
-    #     [P, R]       bootstrap, then upgraded
-    #     [P]          bootstrap, never upgraded (still a valid appointment)
+    #   THE UPGRADE. The proposer can derive before the allocator has produced a
+    #   single tour, in which case the argmin has one candidate (the centroid of
+    #   the frozen snapshot) and the triple it yields is a placeholder rather
+    #   than a choice. It is published with rendezvous_provisional=1 and may be
+    #   replaced exactly once, by a triple that had something to choose between.
     #
-    # and nothing else. Keying G2 on the FIRST commit — which is what this gate
-    # did when the upgrade path did not exist — fails a healthy [P, R] run as a
-    # SPLIT FLEET, because robots upgrade in whatever order the echoes land. G2
-    # therefore compares where the fleet CONVERGED, and the shape itself is
-    # checked separately below so that the relaxation cannot hide a real split.
+    #   THE RE-AGREEMENT (generation 29). A meeting the team KEEPS ends with the
+    #   fleet standing on the cell agreeing where and when to meet next, so a
+    #   run holds a sequence of triples rather than one. One per meeting kept,
+    #   which is what the shape check below counts.
+    #
+    # Keying G2 on the FIRST commit — which is what this gate did when neither
+    # path existed — fails a healthy upgraded run as a SPLIT FLEET, because
+    # robots upgrade in whatever order the echoes land. G2 therefore compares
+    # where the fleet CONVERGED, and the shape itself is checked separately
+    # below so that the relaxation cannot hide a real split.
     commits = {}        # robot -> [(cell, interval, t_meet, prov, wall), ...]
     saw_phrase = set()
     unparsed = []
@@ -304,10 +316,13 @@ def main(argv):
     # it, and that alternative is the gen-23 wording.
     echo_rows = []      # (robot, n_asserted, echoes, peers, wall) — gen-23 only
     echo_missing = []   # (robot, line) — gen-23 shape with no echo term at all
+    releases = {}       # robot -> barriers this robot actually released from
     for r, path in sorted(logs.items()):
         try:
             with open(path, errors="replace") as fh:
                 for line in fh:
+                    if RELEASE in line:
+                        releases[r] = releases.get(r, 0) + 1
                     if PHRASE not in line:
                         continue
                     saw_phrase.add(r)
@@ -570,28 +585,50 @@ def main(argv):
 
     # THE SHAPE CHECK. G2 above was relaxed from "every commit line agrees" to
     # "every robot ended in the same place"; this is what keeps that relaxation
-    # from covering for a real defect. Anything other than [R], [P, R] or [P] is
-    # a protocol violation even when the fleet happens to agree at the end: a
-    # third commit means a latch that is not a latch, and a provisional commit
-    # AFTER a final one is a downgrade off a real choice back onto a placeholder.
-    # Sits out entirely on a pre-generation-17 log, which cannot report the flag.
+    # from covering for a real defect. A commit nothing paid for is a protocol
+    # violation even when the fleet happens to agree at the end, and a
+    # provisional commit AFTER a final one is a downgrade off a real choice back
+    # onto a placeholder. Sits out entirely on a pre-generation-17 log, which
+    # cannot report the flag.
+    #
+    # THE BUDGET IS NOT A CONSTANT ANY MORE (generation 29). It was "max 2: P
+    # then R" — one pair per run, optionally upgraded once off the centroid
+    # fallback — and gen 29 makes a kept meeting re-site the next one, so a
+    # healthy two-meeting run commits three times and the old rule failed it by
+    # construction. What replaces it is the same rule with the meetings counted:
+    # one pair to start, one more if the first was the placeholder, and ONE PER
+    # BARRIER THIS ROBOT ACTUALLY RELEASED FROM. Anything above that is a derive
+    # no meeting authorised, which is not cosmetic — deriveRendezvousProposal
+    # mints t_meet as now+interval, so every unpaid-for commit slides the
+    # instant the fleet had agreed to. The ts4 gen-29 N=2 rendezvous smoke is
+    # the case: one release, four commits, cell 23 at t+1055s and then t+1061s.
+    #
+    # Per robot rather than fleet-wide because the two are not interchangeable:
+    # a follower adopts the proposer's next triple as soon as it hears it, which
+    # can be a tick before its own release, so a running comparison would race.
+    # Counted over the whole run, it cannot.
     shape = []
     for r in sorted(commits):
         provs = [c[3] for c in commits[r]]
         if any(p is None for p in provs):
             continue                      # binary predates the flag; unknowable
-        if len(provs) > 2:
-            shape.append("%s committed %d times (max 2: P then R)"
-                         % (r, len(provs)))
-        elif len(provs) == 2 and not (provs[0] and not provs[1]):
-            shape.append("%s went provisional=%d -> provisional=%d"
-                         % (r, provs[0], provs[1]))
+        met = releases.get(r, 0)
+        budget = 1 + (1 if provs[0] else 0) + met
+        if len(provs) > budget:
+            shape.append("%s committed %d times but kept %d meeting(s), which "
+                         "allows %d" % (r, len(provs), met, budget))
+        if any(provs[1:]):
+            shape.append("%s committed provisional=1 after its first commit "
+                         "(sequence %s)"
+                         % (r, "".join("P" if p else "R" for p in provs)))
     if shape:
         emit("FAIL",
-             "ILLEGAL COMMIT SEQUENCE: %s. The only permitted transitions are "
-             "empty->final, empty->provisional->final and empty->provisional; a "
-             "repeat or a downgrade means the one-upgrade rule in "
-             "maintainRendezvousProposal is not holding."
+             "ILLEGAL COMMIT SEQUENCE: %s. A robot may hold one pair, upgrade "
+             "it off the centroid fallback once, and re-agree once per meeting "
+             "it kept — nothing else. A commit no meeting paid for means the "
+             "one-pair-per-meeting rule in maintainRendezvousProposal is not "
+             "holding, and because t_meet is minted as now+interval the extra "
+             "derive slides the instant the fleet had already agreed to."
              % "; ".join(shape))
         return 0
 

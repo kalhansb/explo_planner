@@ -516,6 +516,33 @@ try:
         bad("expected FAIL ILLEGAL COMMIT SEQUENCE naming 3 commits, got: %r"
             % out)
 
+    # --- 13b. THE SAME THREE COMMITS, WITH A MEETING TO PAY FOR THE THIRD ----
+    # Generation 29's re-agreement: the fleet keeps its appointment, stands on
+    # the cell while the maps merge, and agrees the next place and time before
+    # it goes back out. That is a third commit on a healthy run, and the budget
+    # above is the ONLY thing separating it from case 13 — same commit lines,
+    # one extra release line in the log. Paired with 13 on purpose: a budget
+    # that counted nothing would pass both and a budget of two would fail both,
+    # and neither mistake is visible from one case alone.
+    cases += 1
+    rel = ["Rendezvous: team reachable (1/1) -> re-planning against merged map "
+           "(held 35.0s; the exchange applied 0 peer cell(s), the shared "
+           "census did not move, the dense map gained 386 voxel(s))."]
+    d = cell(tmp, "reagreed", proposal_lines={"atlas": rel, "bestla": rel},
+             commits={
+        "atlas":  [(1789600010.0, 2, 9, 240, 60, 1),
+                   (1789600030.0, 2, 64, 168, 201, 0),
+                   (1789600050.0, 2, 77, 168, 401, 0)],
+        "bestla": [(1789600011.0, 2, 9, 240, 60, 1),
+                   (1789600031.0, 2, 64, 168, 201, 0),
+                   (1789600051.0, 2, 77, 168, 401, 0)]})
+    out = run(d)
+    if verdict_of(out) == "PASS" and "cell 77" in out:
+        ok("a third commit that a kept meeting paid for PASSES on the "
+           "re-agreed cell")
+    else:
+        bad("expected PASS on cell 77 for the re-agreed triple, got: %r" % out)
+
     # --- 14. THE RELAXATION MUST STILL CATCH A REAL SPLIT -------------------
     # Case 10 relaxed G2 from "every commit agrees" to "every robot ends in the
     # same place". The thing that relaxation could plausibly hide is a fleet
