@@ -176,6 +176,21 @@ inline const char* stateName(State s) {
 // modes and branch on this to route correctly.
 enum class Phase { EXPLORE, EXPLOIT };
 
+// Latched QoS for "current value" topics: depth 1, reliable, transient_local,
+// so an endpoint that comes up after its counterpart is handed the CURRENT
+// sample immediately instead of waiting for the next publish. Both ends must
+// agree, which is why this is shared rather than spelled out per site.
+//
+// NOT for every transient_local topic in this file. The tree-target pair uses
+// KeepLast(50) because its contract is REPLAY A BACKLOG (each target id is
+// published exactly once, with no retry path) rather than "latest wins", and
+// the comms link-index subscription is written to mirror the emulator's own
+// profile, which is not ours to change. Those three are a different contract
+// and must not be folded in here.
+inline rclcpp::QoS latchedQos() {
+  return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+}
+
 // ==================================================================
 // ExploPlannerNode — EIG-only NBV exploration planner.
 //
@@ -654,8 +669,10 @@ private:
   /// and is pulled out earlier, so the rung it signed up to at arming stays
   /// reachable without anyone re-deciding which rung it is.
   bool appointmentDue();
-  /// Centre of the appointment cell, as a drive destination.
-  Eigen::Vector3f appointmentPoint() const;
+  /// Centre of the appointment cell, as a drive destination. Not const: it
+  /// latches appointment_unplaceable_ on the branch where no grid can place
+  /// the cell, which is the only place that fact is observable.
+  Eigen::Vector3f appointmentPoint();
   /// Close a standing appointment and emit its `rendezvous_outcome`. No-op
   /// when nothing is armed. Note it does NOT release rendezvous_spent_: the
   /// outage gets one appointment, and the release happens when the team is
@@ -1604,10 +1621,10 @@ private:
   /// `run-ended` case was added to stop; this is the same class, one branch
   /// over.
   ///
-  /// `mutable` because appointmentPoint() is const and is called from the four
-  /// departure sites. Those calls ARE the departure, so the write lands once,
-  /// at the moment the robot commits to a cell it cannot place.
-  mutable bool   appointment_unplaceable_ = false;
+  /// Written only by appointmentPoint(), which the four departure sites call.
+  /// Those calls ARE the departure, so the write lands once, at the moment the
+  /// robot commits to a cell it cannot place.
+  bool           appointment_unplaceable_ = false;
   /// "THE MANOEUVRE I AM CURRENTLY IN WAS STARTED TO KEEP AN APPOINTMENT."
   ///
   /// Separate from appointment_armed_ on purpose, and the separation is a bug
@@ -3666,6 +3683,15 @@ ExploPlannerNode::ExploPlannerNode()
   auto dp = [&](auto n, auto d) {
     return this->declare_parameter<decltype(d)>(n, d);
   };
+  // Sibling of dp for the float-typed members and configs. ROS 2 has no float
+  // parameter type, so every one of these is declared as a double and narrowed
+  // here. The default is typed `double` rather than deduced on purpose: a call
+  // site that writes a float literal then declares a parameter rclcpp cannot
+  // represent, and this converts it instead of failing to compile deep inside
+  // declare_parameter.
+  auto dp_f = [&](auto n, double d) {
+    return static_cast<float>(dp(n, d));
+  };
 
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
@@ -3876,7 +3902,7 @@ ExploPlannerNode::ExploPlannerNode()
   // Teleport guard for cumulative distance (see member doc). At the 10 Hz tick
   // this cannot reject real motion; it filters localization discontinuities so
   // they don't inflate distance_traveled or spoof the no-progress watchdog.
-  max_pose_jump_m_ = static_cast<float>(dp("max_pose_jump_m", 1.0));
+  max_pose_jump_m_ = dp_f("max_pose_jump_m", 1.0);
   // See the member: a dead TF chain keeps "succeeding" with the same stamp,
   // so freshness is checked explicitly in updatePoseFromTF. Sized for the
   // slowest healthy publisher in the map->base chain (field SLAM's map->odom
@@ -4060,23 +4086,23 @@ ExploPlannerNode::ExploPlannerNode()
   CandidateConfig ccfg;
   ccfg.n_radial   = dp("candidate_n_radial", 8);
   ccfg.n_rings    = dp("candidate_n_rings", 3);
-  ccfg.min_radius = static_cast<float>(dp("candidate_min_radius", 2.0));
-  ccfg.max_radius = static_cast<float>(dp("candidate_max_radius", 8.0));
+  ccfg.min_radius = dp_f("candidate_min_radius", 2.0);
+  ccfg.max_radius = dp_f("candidate_max_radius", 8.0);
   // 1, not the historical 4: with a full-azimuth FOV model the yaw samples at
   // one position score the same view repeatedly (see fov_hfov below), so the
   // extra three are aliasing noise the ranking would otherwise sort on.
   ccfg.n_yaw      = dp("candidate_n_yaw", 1);
-  ccfg.robot_z    = static_cast<float>(dp("candidate_robot_z", 0.3));
-  ccfg.occ_thresh = static_cast<float>(dp("candidate_occ_thresh", 0.7));
-  ccfg.ground_z   = static_cast<float>(dp("candidate_ground_z", 0.15));
+  ccfg.robot_z    = dp_f("candidate_robot_z", 0.3);
+  ccfg.occ_thresh = dp_f("candidate_occ_thresh", 0.7);
+  ccfg.ground_z   = dp_f("candidate_ground_z", 0.15);
   ccfg.enable_polar = dp("candidate_enable_polar", true);
   // Region of interest. Defaults bound the robot to a 30x30 m square
   // centred on the world origin. Must match the dscovox planning_map
   // size + origin so the global planner is constrained to the same area.
-  ccfg.roi_min_x  = static_cast<float>(dp("roi_min_x", -15.0));
-  ccfg.roi_max_x  = static_cast<float>(dp("roi_max_x",  15.0));
-  ccfg.roi_min_y  = static_cast<float>(dp("roi_min_y", -15.0));
-  ccfg.roi_max_y  = static_cast<float>(dp("roi_max_y",  15.0));
+  ccfg.roi_min_x  = dp_f("roi_min_x", -15.0);
+  ccfg.roi_max_x  = dp_f("roi_max_x",  15.0);
+  ccfg.roi_min_y  = dp_f("roi_min_y", -15.0);
+  ccfg.roi_max_y  = dp_f("roi_max_y",  15.0);
 
   // Vertical ROI band. In dscovox mode this is the z-slab the fused map is
   // clipped to on ingest, and it bounds the FOV raycast, frontier
@@ -4084,17 +4110,17 @@ ExploPlannerNode::ExploPlannerNode()
   // the spurious vertical LiDAR smear above the robot isn't scored as
   // explorable space; FOV rays leaving the band are clipped (treated as
   // empty — no info gain, no occlusion).
-  roi_min_z_ = static_cast<float>(dp("roi_min_z", -0.5));
-  roi_max_z_ = static_cast<float>(dp("roi_max_z",  2.0));
+  roi_min_z_ = dp_f("roi_min_z", -0.5);
+  roi_max_z_ = dp_f("roi_max_z",  2.0);
 
   // Terrain-relative (3D) mode — see the member doc. Off by default: flat
   // mode is bit-for-bit the legacy behaviour.
   terrain_relative_z_ = dp("terrain_relative_z", false);
   ccfg.terrain_relative    = terrain_relative_z_;
-  ccfg.z_clearance         = static_cast<float>(dp("candidate_z_clearance", 0.5));
-  ccfg.ground_search_below = static_cast<float>(dp("ground_search_below_m", 4.0));
-  ccfg.ground_search_above = static_cast<float>(dp("ground_search_above_m", 1.0));
-  ccfg.ground_stack_max_m  = static_cast<float>(dp("ground_stack_max_m", 0.6));
+  ccfg.z_clearance         = dp_f("candidate_z_clearance", 0.5);
+  ccfg.ground_search_below = dp_f("ground_search_below_m", 4.0);
+  ccfg.ground_search_above = dp_f("ground_search_above_m", 1.0);
+  ccfg.ground_stack_max_m  = dp_f("ground_stack_max_m", 0.6);
   flatten_goal_z_          = dp("flatten_goal_z", false);
   // Until the first ingest the effective band equals the configured one
   // (flat mode keeps it that way permanently).
@@ -4132,8 +4158,7 @@ ExploPlannerNode::ExploPlannerNode()
   }
 
   // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
-  frontier_cluster_radius_m_ =
-      static_cast<float>(dp("frontier_cluster_radius_m", 5.0));
+  frontier_cluster_radius_m_ = dp_f("frontier_cluster_radius_m", 5.0);
   // Narrow the FRONTIER search band relative to the ROI band, from the bottom
   // and from the top. Both 0 = search the whole ROI band (shipped behaviour).
   //
@@ -4179,13 +4204,13 @@ ExploPlannerNode::ExploPlannerNode()
   // forgets to load shared_params.yaml gets, so a stale default here is a
   // silent second sensor model -- which is what it was.
   FovConfig fcfg;
-  fcfg.hfov      = static_cast<float>(dp("fov_hfov", 6.28318));
-  fcfg.vfov      = static_cast<float>(dp("fov_vfov", 0.5236));
-  fcfg.min_range = static_cast<float>(dp("fov_min_range", 0.3));
-  fcfg.max_range = static_cast<float>(dp("fov_max_range", 20.0));
+  fcfg.hfov      = dp_f("fov_hfov", 6.28318);
+  fcfg.vfov      = dp_f("fov_vfov", 0.5236);
+  fcfg.min_range = dp_f("fov_min_range", 0.3);
+  fcfg.max_range = dp_f("fov_max_range", 20.0);
   fcfg.h_rays    = dp("fov_h_rays", 96);
   fcfg.v_rays    = dp("fov_v_rays", 16);
-  fcfg.occ_stop  = static_cast<float>(dp("fov_occ_stop", 0.7));
+  fcfg.occ_stop  = dp_f("fov_occ_stop", 0.7);
   // Full circle within one ray step. Not an exact == on 2*pi: the yaml carries
   // a rounded 6.28318 and the SDF a rounded 3.14159, so an equality test would
   // read the very configuration this is meant to recognise as directional.
@@ -4344,7 +4369,7 @@ ExploPlannerNode::ExploPlannerNode()
   // planner deaf.
   coord_intent_sub_topics_.erase(
       std::remove(coord_intent_sub_topics_.begin(),
-                  coord_intent_sub_topics_.end(), std::string("")),
+                  coord_intent_sub_topics_.end(), ""),
       coord_intent_sub_topics_.end());
   if (coord_intent_sub_topics_.empty())
     coord_intent_sub_topics_ = {coord_intent_topic_};
@@ -4877,20 +4902,15 @@ ExploPlannerNode::ExploPlannerNode()
   // robot-robot < 1.5 m closing).
   proximity_stop_enabled_ = dp("proximity_stop_enabled", true);
   ProximityGuard::Config pcfg;
-  pcfg.enabled        = proximity_stop_enabled_;
-  pcfg.hold_dist_m    = static_cast<float>(dp("proximity_hold_dist_m", 5.0));
-  pcfg.resume_dist_m  = static_cast<float>(dp("proximity_resume_dist_m", 6.0));
-  pcfg.pose_stale_sec = static_cast<float>(dp("proximity_pose_stale_sec", 3.0));
-  pcfg.peer_static_sec =
-      static_cast<float>(dp("proximity_peer_static_sec", 10.0));
-  pcfg.parked_keep_dist_m =
-      static_cast<float>(dp("proximity_parked_keep_dist_m", 1.5));
-  pcfg.peer_static_move_m =
-      static_cast<float>(dp("proximity_peer_static_move_m", 0.3));
-  pcfg.hold_release_stale_sec =
-      static_cast<float>(dp("proximity_hold_release_stale_sec", 10.0));
-  pcfg.escape_grace_sec =
-      static_cast<float>(dp("proximity_escape_grace_sec", 30.0));
+  pcfg.enabled                = proximity_stop_enabled_;
+  pcfg.hold_dist_m            = dp_f("proximity_hold_dist_m", 5.0);
+  pcfg.resume_dist_m          = dp_f("proximity_resume_dist_m", 6.0);
+  pcfg.pose_stale_sec         = dp_f("proximity_pose_stale_sec", 3.0);
+  pcfg.peer_static_sec        = dp_f("proximity_peer_static_sec", 10.0);
+  pcfg.parked_keep_dist_m     = dp_f("proximity_parked_keep_dist_m", 1.5);
+  pcfg.peer_static_move_m     = dp_f("proximity_peer_static_move_m", 0.3);
+  pcfg.hold_release_stale_sec = dp_f("proximity_hold_release_stale_sec", 10.0);
+  pcfg.escape_grace_sec       = dp_f("proximity_escape_grace_sec", 30.0);
   proximity_max_hold_sec_ = dp("proximity_max_hold_sec", 120.0);
   if (pcfg.resume_dist_m < pcfg.hold_dist_m) {
     RCLCPP_WARN(get_logger(),
@@ -5049,14 +5069,7 @@ ExploPlannerNode::ExploPlannerNode()
     // launcher believed in, and the id/hash pair says what this robot actually
     // indexed its masks by. robot_id -1 / team_hash 0 is the unconfigured
     // (legacy) run, which is what a defaults run must show.
-    {
-      std::string joined;
-      for (size_t i = 0; i < team_robot_names_.size(); ++i) {
-        if (i) joined += ",";
-        joined += team_robot_names_[i];
-      }
-      exp_log_->addParamStr("team_robot_names", joined);
-    }
+    exp_log_->addParamStr("team_robot_names", join(team_robot_names_, ","));
     exp_log_->addParamNum("robot_id", fleet_.self_id);
     exp_log_->addParamNum("team_hash", fleet_.team_hash);
     exp_log_->addParamStr("reconnect_mode", reconnectModeName(reconnect_mode_));
@@ -5545,7 +5558,7 @@ ExploPlannerNode::ExploPlannerNode()
     for (auto& t : team_world_sub_topics_) t = resolve_topic(t);
     team_world_sub_topics_.erase(
         std::remove(team_world_sub_topics_.begin(),
-                    team_world_sub_topics_.end(), std::string("")),
+                    team_world_sub_topics_.end(), ""),
         team_world_sub_topics_.end());
     if (team_world_sub_topics_.empty())
       team_world_sub_topics_ = {team_world_pub_topic_};
@@ -6278,8 +6291,7 @@ ExploPlannerNode::ExploPlannerNode()
   if (dscovox_topic.empty())
     dscovox_topic = "/" + robot_name_ + "/dscovox_node/scovox";
   scovox_map_sub_ = create_subscription<scovox_msgs::msg::ScovoxMap>(
-      dscovox_topic,
-      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      dscovox_topic, latchedQos(),
       [this](scovox_msgs::msg::ScovoxMap::SharedPtr msg) {
         onScovoxMap(msg);
       });
@@ -6293,8 +6305,7 @@ ExploPlannerNode::ExploPlannerNode()
   // published on the topic.
   if (use_planning_map_) {
     plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-        planning_map_topic,
-        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+        planning_map_topic, latchedQos(),
         [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
           // Frame check, matching the one the ScovoxMap path already does.
           // planMapCellAt/isCellFree/unknownFractionInRoi index this grid with
@@ -6402,8 +6413,7 @@ ExploPlannerNode::ExploPlannerNode()
     // the shared bus looks exactly like a run with perfect comms, and the
     // per-link relay topics are the first thing to check when every peer
     // reads present (leak) or absent (typo / QoS mismatch) for a whole run.
-    std::string subs;
-    for (const auto& t : coord_intent_sub_topics_) subs += (subs.empty() ? "" : ", ") + t;
+    const std::string subs = join(coord_intent_sub_topics_, ", ");
     RCLCPP_INFO(get_logger(),
         "Intents: pub '%s' <- KeepLast(8).reliable() -> sub [%s]%s",
         coord_intent_pub_topic_.c_str(), subs.c_str(),
@@ -6453,13 +6463,10 @@ ExploPlannerNode::ExploPlannerNode()
     // seconds off this->now(), so at RTF 0.3 a healthy peer publishing at
     // "1 Hz" would arrive every 3.3 sim-seconds and a 5 s TTL would be one
     // dropped message from declaring it lost.
-    auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(1.0 / team_world_hz_));
+    const std::chrono::duration<double> period(1.0 / team_world_hz_);
     team_world_timer_ = rclcpp::create_timer(
         this, get_clock(), period, [this]() { publishTeamWorld(); });
-    std::string subs;
-    for (const auto& t : team_world_sub_topics_)
-      subs += (subs.empty() ? "" : ", ") + t;
+    const std::string subs = join(team_world_sub_topics_, ", ");
     RCLCPP_INFO(get_logger(),
         "TeamWorld: %.2f Hz, pub '%s' -> sub [%s]%s; comms ttl %.1fs, "
         "closure %s, gossip max age %.0fs",
@@ -6513,14 +6520,7 @@ ExploPlannerNode::ExploPlannerNode()
             // completeness the mid-run trigger is written against, so the
             // restriction has been replaced by the meaning it was standing in
             // for. A team of one has no link to read and is still refused.
-            const std::string joined = [&names] {
-              std::string s;
-              for (size_t k = 0; k < names.size(); ++k) {
-                if (k) s += ", ";
-                s += names[k];
-              }
-              return s;
-            }();
+            const std::string joined = join(names, ", ");
             if (names.size() < 2) {
               if (!link_index_warned_) {
                 link_index_warned_ = true;
@@ -6810,8 +6810,7 @@ ExploPlannerNode::ExploPlannerNode()
     // Latched so a field laptop's `ros2 topic echo` shows the CURRENT state
     // immediately, not only the next transition.
     prox_state_pub_ = create_publisher<std_msgs::msg::String>(
-        "proximity_hold_state",
-        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+        "proximity_hold_state", latchedQos());
     publishProxState("clear");
   }
 
@@ -6855,8 +6854,7 @@ ExploPlannerNode::ExploPlannerNode()
   //     Shares the node's default (mutually-exclusive) callback group with
   //     tick(), so a row can never be assembled from half-updated state.
   if (metrics_period_sec_ > 0.0) {
-    auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(metrics_period_sec_));
+    const std::chrono::duration<double> period(metrics_period_sec_);
     metrics_timer_ = rclcpp::create_timer(
         this, get_clock(), period, [this] { metricsTick(); });
     RCLCPP_INFO(get_logger(),
@@ -6871,8 +6869,7 @@ ExploPlannerNode::ExploPlannerNode()
   // --- Coord heartbeat. Re-publishes the active claim while NAVIGATE-ing
   //     so peers don't lose it through TTL. Period = 1 / coord_heartbeat_hz.
   if (coord_enabled_ && coord_heartbeat_hz_ > 0.0) {
-    auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(1.0 / coord_heartbeat_hz_));
+    const std::chrono::duration<double> period(1.0 / coord_heartbeat_hz_);
     heartbeat_timer_ = rclcpp::create_timer(
         this, get_clock(), period,
         [this] { heartbeatTick(); });
@@ -12392,7 +12389,7 @@ bool ExploPlannerNode::appointmentDue() {
   return now_ms + lead_ms >= appointment_.t_meet_ms;
 }
 
-Eigen::Vector3f ExploPlannerNode::appointmentPoint() const {
+Eigen::Vector3f ExploPlannerNode::appointmentPoint() {
   float x = 0.0f, y = 0.0f;
   // THE SNAPSHOT WORLD MAY NEVER HAVE BEEN POPULATED (2026-09-17), and until
   // today that was a SIGFPE rather than a bad answer: CellGrid::col() is

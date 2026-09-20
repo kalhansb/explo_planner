@@ -6,12 +6,18 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace explo_planner {
 
 /// Map a planner_type string to the diagnostic enum used in RobotIntent:
 /// 0=eig, 1=entropy, 2=frontier, 3=random, 4=ssmi, 255=unknown.
 uint8_t plannerTypeId(const std::string& planner_type);
+
+/// Concatenate `parts` with `delim` between consecutive elements. An empty
+/// vector yields an empty string and a single element yields itself, so the
+/// delimiter never appears at either end.
+std::string join(const std::vector<std::string>& parts, const std::string& delim);
 
 /// Distance-budgeted NAVIGATE timeout (seconds):
 ///   budget = clamp(dist / max(speed_est, 1e-3) * safety, min_sec, max_sec)

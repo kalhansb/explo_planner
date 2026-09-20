@@ -19,6 +19,19 @@ TEST(PlannerUtil, PlannerTypeIdMapping) {
   EXPECT_EQ(plannerTypeId(""), 255);
 }
 
+// The delimiter goes BETWEEN elements only. The empty and single-element cases
+// are the ones the hand-rolled loops this replaced all had to special-case.
+TEST(PlannerUtil, JoinPlacesDelimiterBetweenElementsOnly) {
+  EXPECT_EQ(join({}, ", "), "");
+  EXPECT_EQ(join({"atlas"}, ", "), "atlas");
+  EXPECT_EQ(join({"atlas", "bestla"}, ", "), "atlas, bestla");
+  EXPECT_EQ(join({"atlas", "bestla", "curt"}, ","), "atlas,bestla,curt");
+  // An empty delimiter concatenates; empty elements keep their separators, so
+  // the delimiter count is always size()-1.
+  EXPECT_EQ(join({"a", "b"}, ""), "ab");
+  EXPECT_EQ(join({"", ""}, ","), ",");
+}
+
 // Mid-range distance: budget = dist/speed * safety, untouched by the clamp.
 TEST(PlannerUtil, NavBudgetMidRange) {
   // 10 m / 0.5 m/s * 2.0 = 40 s, inside [8, 60].

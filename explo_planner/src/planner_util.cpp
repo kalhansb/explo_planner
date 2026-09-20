@@ -18,6 +18,15 @@ uint8_t plannerTypeId(const std::string& planner_type) {
   return 255;
 }
 
+std::string join(const std::vector<std::string>& parts, const std::string& delim) {
+  std::string out;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (i) out += delim;
+    out += parts[i];
+  }
+  return out;
+}
+
 double navBudgetSec(double dist_m, double speed_est_mps, double safety_factor,
                     double min_sec, double max_sec) {
   double raw = (dist_m / std::max(speed_est_mps, 1e-3)) * safety_factor;
