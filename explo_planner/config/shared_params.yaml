@@ -1072,6 +1072,25 @@
     # so the outside-the-disc clause above is best-effort there, not a
     # guarantee.
     reconnect_arrive_tol_m: 4.0
+    # How far from the agreed cell a FAILED appointment drive may stop and
+    # still count as standing at the meeting (m). Clamped up to
+    # reconnect_arrive_tol_m if set below it.
+    #
+    # Deliberately looser than the arrival tolerance: that one decides when a
+    # drive has SUCCEEDED, this one decides whether a drive that GAVE UP ended
+    # somewhere the barrier still means something. Farther out than this, the
+    # node rolls the robot to the next rung of the agreed recurrence and sends
+    # it back to exploring rather than letting it join a presence count from
+    # somewhere nobody else is going -- ts4 gen-30 n2/rendezvous/seed8 wedged
+    # exactly that way, one robot at the cell and its partner's dead drive
+    # 40.0 m out, 41.3 m apart against a 30 m horizon, both stationary for
+    # 2609 s until the hang detector fired.
+    #
+    # Sized against the LINK, not the cell grid, though 10 m happens to be one
+    # coarse cell: two robots each within this of the cell are at most 2x it
+    # apart, so a whole meeting fits in a 20 m spread with the remaining 10 m
+    # of horizon spent on trunks. Widening trades that margin for fewer rolls.
+    rendezvous_present_tol_m: 10.0
     # Ceiling on ONE manoeuvre drive leg (s). <= 0 = unbounded.
     #
     # startReturnTo exempts manoeuvre legs from nav_max_timeout_sec on purpose

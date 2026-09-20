@@ -681,6 +681,14 @@ private:
   void startReturnTo(const Eigen::Vector3f& dest, const char* what,
                      const char* reason);
   void doReturnNav();
+  /// doReturnNav's two give-up watchdogs, asking whether the leg they are about
+  /// to end was an APPOINTMENT leg that died too far from the cell to hand the
+  /// barrier an honest presence. Returns true when it has taken the robot back
+  /// to PLAN for a later rung, in which case the caller must not also transition;
+  /// false leaves the watchdog's own RETURN_SYNC hand-off untouched. Shared
+  /// because the budget and the no-progress exits differ only in what tripped
+  /// them, and a rule enforced at one of two exits is a rule with a door in it.
+  bool deferAppointmentLeg(const char* what_failed, float dist);
   void doReturnSync();
   // Mission return (RETURN_HOME). startReturnHome enters the state WITHOUT
   // publishing a goal — abandonNavGoal's cancel-all is fire-and-forget, so a
@@ -2618,6 +2626,29 @@ private:
   // means grinding against an obstacle until the budget expires; 4 m means
   // arriving beside it and waiting, which is all the manoeuvre ever needed.
   double reconnect_arrive_tol_m_ = 4.0;
+  // How far from the agreed cell a FAILED appointment drive may stop and still
+  // count as standing at the meeting. Looser than reconnect_arrive_tol_m_ on
+  // purpose: that tolerance decides when a drive has SUCCEEDED, this one decides
+  // whether a drive that gave up ended somewhere the barrier still means
+  // something, and a robot wedged three metres off the cell is at the meeting in
+  // every sense that matters.
+  //
+  // It exists because the two watchdogs in doReturnNav used to hand the barrier
+  // an arbitrary pose. Their note argues a stopped robot is "at least closer to
+  // comms than where exploration stranded us" — true of the anchor return it was
+  // written for, and false of an appointment, where the OTHER robots are at the
+  // cell and nowhere else. The ts4 gen-30 N=2 rendezvous seed8 cell priced it:
+  // one robot reached the cell (1.3 m), its partner's drive died 40.0 m away and
+  // joined the barrier from there, leaving the pair 41.3 m apart with three
+  // trunks between them — past the 30 m horizon, so the presence each was
+  // waiting on could never arrive. Both stood still for 2609 s and the run was
+  // killed by the harness hang detector.
+  //
+  // Sized against the link, not the cell grid, though the two happen to agree:
+  // two robots inside this of one cell are at most 2x it apart, so 10 m keeps a
+  // whole meeting inside a 20 m spread against a 30 m horizon, with the margin
+  // spent on trunks. Wider trades that margin for fewer rolls.
+  double rendezvous_present_tol_m_ = 10.0;
   // Ceiling on ONE manoeuvre drive leg. The distance-true budget in
   // startReturnTo is deliberately exempt from nav_max_timeout_sec (see there),
   // but "exempt" was unbounded: at nav_speed_estimate 0.15 x safety 3.0 = 20 s/m
@@ -4767,7 +4798,26 @@ ExploPlannerNode::ExploPlannerNode()
   hold_escalate_                 = dp("hold_escalate", true);
   hold_escalate_wait_sec_        = dp("hold_escalate_wait_sec", 300.0);
   reconnect_arrive_tol_m_        = dp("reconnect_arrive_tol_m", 4.0);
+  rendezvous_present_tol_m_      = dp("rendezvous_present_tol_m", 10.0);
   reconnect_nav_max_sec_         = dp("reconnect_nav_max_sec", 600.0);
+  // A presence radius inside the arrival tolerance inverts the pair: every
+  // give-up short of the cell would roll, including the ones that stopped
+  // close enough to have counted as an ARRIVAL had they stopped one tick
+  // earlier. Clamped rather than warned-and-kept, because the inverted
+  // ordering has no legitimate A/B reading — unlike the windows above, where 0
+  // means "legacy behaviour" — and a robot that rolls off a meeting it was
+  // standing at is the failure this radius was added to prevent, wearing the
+  // opposite sign.
+  if (!std::isfinite(rendezvous_present_tol_m_) ||
+      rendezvous_present_tol_m_ < reconnect_arrive_tol_m_) {
+    RCLCPP_WARN(get_logger(),
+        "rendezvous_present_tol_m=%.2f is below reconnect_arrive_tol_m=%.2f: a "
+        "robot cannot be too far from the cell to wait there and close enough "
+        "to have arrived there. Clamping to %.2f.",
+        rendezvous_present_tol_m_, reconnect_arrive_tol_m_,
+        reconnect_arrive_tol_m_);
+    rendezvous_present_tol_m_ = reconnect_arrive_tol_m_;
+  }
   // A release window at or below the claim TTL is not a flicker guard: one
   // packet keeps the peer live for the whole TTL, so any window inside it is
   // satisfied without the claim ever being refreshed. Warn rather than clamp —
@@ -5178,6 +5228,7 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamBool("hold_escalate", hold_escalate_);
     exp_log_->addParamNum("hold_escalate_wait_sec", hold_escalate_wait_sec_);
     exp_log_->addParamNum("reconnect_arrive_tol_m", reconnect_arrive_tol_m_);
+    exp_log_->addParamNum("rendezvous_present_tol_m", rendezvous_present_tol_m_);
     exp_log_->addParamNum("reconnect_nav_max_sec", reconnect_nav_max_sec_);
     exp_log_->addParamNum("done_unknown_fraction", done_unknown_fraction_);
     exp_log_->addParamNum("done_min_consecutive_steps",
@@ -12948,7 +12999,16 @@ void ExploPlannerNode::doReturnNav() {
   // us). RETURN_SYNC assumes a stationary robot, so the failed drive must be
   // stopped explicitly — the meeting point in particular is a synthetic
   // coordinate that can be unreachable, making these exits routine in hybrid.
+  //
+  // "CLOSER TO COMMS" IS AN ANCHOR-RETURN ARGUMENT (2026-09-20), and it does not
+  // survive being applied to an appointment. An anchor return drives at a pose
+  // where the link once worked, so any progress toward it is progress toward the
+  // radio; an appointment drives at the one place the OTHER robots will be, and
+  // stopping short of it is not a shorter version of arriving — it is being
+  // somewhere nobody is going. deferAppointmentLeg is where that distinction is
+  // made, and it is asked before both exits.
   if (elapsed > nav_budget_sec_) {
+    if (deferAppointmentLeg("the budget", dist)) return;
     RCLCPP_WARN(get_logger(),
         "Rendezvous: %s unreachable within budget (%.1fs, dist=%.2f) "
         "-> waiting for team from current pose.",
@@ -12961,6 +13021,7 @@ void ExploPlannerNode::doReturnNav() {
   if (window_elapsed > progress_window_sec_) {
     const float delta = cumulative_distance_ - progress_check_dist_;
     if (delta < progress_min_distance_m_) {
+      if (deferAppointmentLeg("no progress", dist)) return;
       RCLCPP_WARN(get_logger(),
           "Rendezvous: no progress toward %s -> waiting for team from "
           "current pose.", return_dest_label_.c_str());
@@ -12972,6 +13033,86 @@ void ExploPlannerNode::doReturnNav() {
     progress_check_dist_ = cumulative_distance_;
   }
   republishGoal(current_goal_);
+}
+
+// A FAILED APPOINTMENT DRIVE IS NOT AN ARRIVAL (2026-09-20).
+//
+// The watchdogs above end a leg that is not getting anywhere. For an anchor
+// return, ending it at the barrier is right: the destination was this robot's
+// own last-connected pose, nobody else was going there, and standing still is
+// what the manoeuvre wanted. For an APPOINTMENT it is a false claim with
+// teeth, because the barrier is a presence count and the wait on it is
+// unbounded by design (rendezvous_appointment_wait_sec = 0.0). A robot that
+// joins it from outside the cell contributes a presence nobody can observe —
+// it is not where the others are — and then waits forever for a presence that
+// is, in turn, waiting for it. Two stationary robots cannot heal a link, so
+// the pair is wedged until the harness kills the run. That is the ts4 gen-30
+// seed8 cell in one sentence.
+//
+// THE ANSWER IS THE LATTICE, NOT A TIMEOUT, and the lattice already has the
+// machinery. armAppointment rolls a robot whose PREDICTED drive cannot make a
+// rung onto a later one and lets it explore in the meantime — "a fork here is
+// priced, not prevented", paid for by the barrier's patience. What it could not
+// see is a drive that was affordable when priced and failed anyway; that is the
+// same robot missing the same rung for the same reason, discovered late. So it
+// takes the same exit: roll to the next rung of the pair the team already
+// agreed, and go back to exploring until it is time to leave again.
+//
+// UNDEPARTED, NOT UNARMED, and the ordering matters. transitionTo's P5 block
+// closes an appointment that is `departed && !manoeuvre`, so leaving the flag
+// set would bank this as "unreachable" and delete the meeting on the way out —
+// the robot would then have no appointment at all and nothing to come back for.
+// Clearing it first puts the appointment back in the DEFERRED state the block
+// explicitly preserves, which is also the state doPlan's departure gate reads.
+// The re-agreement path is untouched: this moves the occurrence this robot
+// aims at along the agreed recurrence, it does not derive a new pair.
+bool ExploPlannerNode::deferAppointmentLeg(const char* what_failed, float dist) {
+  if (!appointment_manoeuvre_ || !appointment_armed_ || !appointment_.valid()) {
+    return false;
+  }
+  // Close enough that the barrier still means something — see
+  // rendezvous_present_tol_m_. Rolling these would spend an interval to fix a
+  // few metres, and the robot is already where the others are heading.
+  if (dist <= static_cast<float>(rendezvous_present_tol_m_)) return false;
+
+  // Strictly forward, and past NOW as well as past the rung being abandoned: a
+  // leg that failed slowly can outlive its own meeting, and a rung already in
+  // the past is due the instant it is set — which would re-dispatch this robot
+  // onto the drive that just failed, on the next PLAN tick, forever. The +1 ms
+  // is what makes it strict; nextAgreedOccurrence keeps an instant that is
+  // merely >= its floor.
+  const long long now_ms =
+      static_cast<long long>(std::llround(missionElapsed() * 1000.0));
+  const long long floor_ms = std::max(appointment_.t_meet_ms, now_ms) + 1;
+  const long long rolled =
+      nextAgreedOccurrence(appointment_.t_meet_ms, appointment_.interval_ms,
+                           floor_ms / 1000.0);
+  // No rung to roll to. nextAgreedOccurrence hands back the input for a
+  // non-recurrence, and an appointment that cannot be moved is better kept
+  // badly than dropped: fall through to the watchdog's own exit, which is the
+  // pre-2026-09-20 behaviour.
+  if (rolled <= appointment_.t_meet_ms) return false;
+  appointment_.t_meet_ms = rolled;
+
+  RCLCPP_WARN(get_logger(),
+      "Rendezvous: %s ended the drive to cell %d %.1f m out (present within "
+      "%.1f m) -> not at the meeting; rolling to t+%.0fs and exploring until "
+      "then.",
+      what_failed, appointment_.cell, dist, rendezvous_present_tol_m_,
+      rolled / 1000.0);
+
+  appointment_departed_ = false;
+  // RETURN_NAV is a driving state and PLAN can spend ticks before it publishes
+  // anything, so the navigator must be stopped explicitly or it keeps executing
+  // the abandoned meeting goal underneath the re-plan (see abandonNavGoal).
+  abandonNavGoal("appointment-unreached");
+  // Same reason as the en-route release above: the saturation streak was
+  // accumulated before the outage and must be re-confirmed against whatever the
+  // map looks like now.
+  coverage_done_streak_ = 0;
+  have_active_intent_ = false;
+  transitionTo(State::PLAN, "appointment-unreached");
+  return true;
 }
 
 // Hold at the anchor until the whole team is back in comms, then re-plan. With
@@ -14841,8 +14982,10 @@ void ExploPlannerNode::doPursue() {
   // exactly the arbitration this design removed.
   //
   // THE MEETING IS A SHARED INSTANT; THE BREAK-OFF IS NOT (2026-09-19).
-  // appointment_.t_meet_ms is stamped once at arming and never moves, so the
-  // ARRIVAL every robot aims at is one instant on the agreed lattice. The
+  // appointment_.t_meet_ms only ever moves by whole intervals of the agreed
+  // recurrence — at arming, and since 2026-09-20 when a failed drive rolls the
+  // robot onto a later rung (deferAppointmentLeg) — so the ARRIVAL every robot
+  // aims at is always an instant on the agreed lattice. The
   // moment each robot has to stop chasing to make it is its own, because
   // appointmentDue() now leaves early enough to arrive: a chase that has driven
   // this robot AWAY from the meeting cell grows its live lead and cuts the
