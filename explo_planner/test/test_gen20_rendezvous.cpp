@@ -1044,6 +1044,19 @@ TEST(Gen29ReAgreement, TheMeetingAsksForTheNextOne) {
          "gathering that did not happen; a missing one leaves some barrier "
          "releasing on the pair the team derived before its first outage:\n"
       << body;
+  // AND BOTH OF THEM RAISE IT. assignmentsOf answers "written here", not
+  // "written to what": a `true` flipped to `false` at either site keeps the
+  // count at two and the ordering below satisfied, and silently ends
+  // re-agreement — the team goes back out on the pair it just kept and keeps
+  // it for the rest of the run, which is the missing-raiser failure named
+  // above wearing the one disguise this test could not see.
+  for (const size_t at : raises) {
+    const std::string rhs =
+        assignedFrom(body.substr(at), "rendezvous_reagree_due_");
+    EXPECT_NE(rhs.find("true"), std::string::npos)
+        << "a raiser writes `" << rhs << "` rather than true, so a meeting the "
+           "team kept does not ask for the next one";
+  }
   // Five over the whole file: the member's own default initialiser, which
   // assignmentsOf cannot tell from a statement, the two raises above, and ONE
   // CLEAR PER ROLE — the proposer's, where it adopts its own derive, and the
@@ -1219,6 +1232,19 @@ TEST(Gen29ReAgreement, TheProposerReopensTheDeriveAndSpendsItOnAdoptionOnly) {
       << "the request is written " << cleared.size()
       << " times in maintainRendezvousProposal, not twice (once on the "
          "proposer's adoption, once on the follower's)";
+  // AND BOTH OF THEM CLEAR IT, which the position assertions below cannot see:
+  // a clear inverted to a raise sits exactly where a clear belongs, passes
+  // every offset comparison in this test and in the follower's, and leaves the
+  // role asking forever — on the follower, "asking forever" is adopt() taking
+  // any later generation unconditionally. Checked here rather than twice,
+  // because both clears live in this one body.
+  for (const size_t at : cleared) {
+    const std::string rhs =
+        assignedFrom(body.substr(at), "rendezvous_reagree_due_");
+    EXPECT_NE(rhs.find("false"), std::string::npos)
+        << "an adopt site writes `" << rhs << "` rather than false, so the "
+           "request outlives the adoption that was supposed to spend it";
+  }
   const size_t commit = body.find("rendezvous_held_provisional_ = now_provisional");
   ASSERT_NE(commit, std::string::npos)
       << "the provisional flag is no longer committed alongside the adopted "
