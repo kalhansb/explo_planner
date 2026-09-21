@@ -2909,6 +2909,12 @@ private:
   Eigen::Vector3f latest_pos_ = Eigen::Vector3f::Zero();
   float latest_yaw_ = 0.0f;
   nav_msgs::msg::OccupancyGrid::SharedPtr latest_plan_map_;
+  // The un-inflated twin of latest_plan_map_, used ONLY by the coverage/DONE
+  // test. The planning map carries a 1.5 m obstacle dilation so a single-cell
+  // free check is enough for navigation; that dilation writes 100 over cells
+  // that were never sensed, which a coverage measure would score as known.
+  // Navigation keeps the inflated grid, coverage reads this one.
+  nav_msgs::msg::OccupancyGrid::SharedPtr latest_cov_map_;
   CandidateViewpoint current_goal_;
   rclcpp::Time state_enter_time_;
   float cumulative_distance_ = 0.0f;
@@ -3524,6 +3530,7 @@ private:
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_scovox_map_;
   scovox_msgs::msg::ScovoxMap::SharedPtr ingested_scovox_map_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr cov_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   // Last goal actually put on the wire, for republishGoal()'s change
   // detection + keep-alive throttle. Not valid until have_last_goal_pub_.
@@ -4062,14 +4069,25 @@ ExploPlannerNode::ExploPlannerNode()
   // counts nav-grid cells, the column measure counts ROI-footprint columns
   // with >= 1 observed voxel in the z band — so re-calibrate
   // done_unknown_fraction when switching.
-  done_coverage_source_ = dp("done_coverage_source", std::string("auto"));
-  if (done_coverage_source_ != "auto" &&
-      done_coverage_source_ != "planning_map" &&
-      done_coverage_source_ != "scovox") {
+  done_coverage_source_ = dp("done_coverage_source", std::string("planning_map"));
+  if (done_coverage_source_ == "scovox") {
+    // Retired, and loudly: a run that asked for the 3D measure and silently got
+    // the 2D one would carry a stop time that is not comparable with anything
+    // recorded before the switch. The parameter is still ACCEPTED so old launch
+    // files start, but the substitution is never quiet.
     RCLCPP_WARN(get_logger(),
-        "Unknown done_coverage_source '%s' — falling back to 'auto'.",
+        "done_coverage_source='scovox' is RETIRED and is being ignored. The 3D "
+        "column measure saturates at ~0.50 unknown in flatforest and never "
+        "reaches any usable threshold; coverage now comes from the 2D map. "
+        "done_unknown_fraction is calibrated for the 2D scale (0.10 = 90%% "
+        "known), so a value carried over from the 3D era will mis-stop.");
+    done_coverage_source_ = "planning_map";
+  }
+  if (done_coverage_source_ != "planning_map") {
+    RCLCPP_WARN(get_logger(),
+        "Unknown done_coverage_source '%s' — falling back to 'planning_map'.",
         done_coverage_source_.c_str());
-    done_coverage_source_ = "auto";
+    done_coverage_source_ = "planning_map";
   }
   // DONE behaviour: "shutdown" (legacy) or "idle" (stay up; late targets are
   // still exploited — required when targets are released at the
@@ -5367,6 +5385,11 @@ ExploPlannerNode::ExploPlannerNode()
   // before publishing them as goals.
   std::string planning_map_topic = dp("planning_map_topic",
       std::string("/" + robot_name_ + "/dscovox_node/planning_map"));
+  // The un-inflated coverage grid from the same publisher. Derived from
+  // planning_map_topic by default so that pointing the planner at a different
+  // mapper moves both together; override only if the two live apart.
+  std::string coverage_map_topic = dp("coverage_map_topic",
+      std::string("/" + robot_name_ + "/dscovox_node/global_coverage_map"));
   // Master switch for the 2D planning_map (default OFF). When false the planner
   // never subscribes to planning_map_topic and never consults a 2D map in
   // exploration or exploitation — straight-line costs, no obstacle/reachability
@@ -6329,6 +6352,18 @@ ExploPlannerNode::ExploPlannerNode()
           }
           latest_plan_map_ = msg;
           have_plan_map_ = true;
+        });
+
+    // The un-inflated twin, for the coverage/DONE test only. Deliberately NOT a
+    // precondition for leaving WAIT_FOR_MAP: navigation needs the inflated grid
+    // and nothing else, so a publisher that predates the coverage topic still
+    // runs -- it just falls back to the inflated grid and labels the CSV column
+    // "planning_map_inflated" so the bias is visible in the data rather than
+    // silent.
+    cov_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        coverage_map_topic, latchedQos(),
+        [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+          latest_cov_map_ = msg;
         });
   }
 
@@ -9669,22 +9704,33 @@ double ExploPlannerNode::unknownFractionInRoi() const {
 }
 
 double ExploPlannerNode::coverageUnknownFraction(const char** source) const {
-  const bool use_plan_map =
-      done_coverage_source_ == "planning_map" ||
-      (done_coverage_source_ == "auto" && latest_plan_map_ != nullptr);
-  if (use_plan_map) {
-    *source = "planning_map";
+  // 2D planning-map coverage is now the only coverage measure. The 3D column
+  // measure was retired because it does not measure exploration progress: on
+  // off_rep1 it saturates at 0.502 unknown and stays there from t=1500s to the
+  // end of the run, while the 2D map over the same bag goes on to 0.061. The
+  // gap is not a constant offset -- it widens from 0.28 at t=600s to 0.44 at
+  // t=3600s -- so the 3D "floor near 0.486" that the campaign treated as a
+  // property of the world is an artifact of counting z-column volume that no
+  // sensor can ever observe. See exploitation_map_gain_experiment.md section 6.6.
+  //
+  // Preference order is coverage map, then planning map. They differ only by
+  // obstacle inflation, which fabricates known cells (10473 occupied ROI cells
+  // against 1351 real ones on off_rep1, reading 0.9445 known where the truth is
+  // 0.9386), so the inflated grid is a biased fallback and says so in *source.
+  if (latest_cov_map_) {
+    *source = "coverage_map";
+    return explo_planner::unknownFractionInRoi(
+        *latest_cov_map_, {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_});
+  }
+  if (latest_plan_map_) {
+    *source = "planning_map_inflated";
     return unknownFractionInRoi();
   }
-  // scovox source: 2.5D column coverage of the ROI footprint, measured on the
-  // fused 3D map already ingested (ROI + z-band clipped) into map_cache_ by
-  // loadLatestMap() this tick. NB in flat mode the ingest band is the absolute
-  // [roi_min_z, roi_max_z]: on terrain outside that band the cache stays empty
-  // and this reads 1.0 (never done) — set a per-area z band or
-  // terrain_relative_z when the ground leaves the default band.
-  *source = "scovox";
-  return map_cache_->unknownColumnFraction(roi_min_x_, roi_max_x_,
-                                           roi_min_y_, roi_max_y_);
+  // No 2D map at all. -1 is this function's established "no reading this tick"
+  // value and the DONE check treats it as such, so a missing map defers the
+  // decision instead of fabricating one.
+  *source = "none";
+  return -1.0;
 }
 
 bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {

@@ -124,7 +124,14 @@
     # invariant is that every rung sits strictly ABOVE the stopping threshold.
     # Each event also carries post_latch/sec_since_explore_done so a rung that
     # does slip past the declaration is visible as such rather than silent.
-    coverage_milestones: [0.90, 0.85, 0.80, 0.75, 0.70, 0.65]
+    # RESCALED 2026-09-21 for the 2D coverage source. The old 3D ladder
+    # [0.90 0.85 0.80 0.75 0.70 0.65] is worthless on this scale: measured on an
+    # off_rep1 replay every one of its rungs falls between t=92s and t=386s, so
+    # the whole ladder is spent in the first tenth of a run and nothing after
+    # t=386s has a milestone. The rungs below spread 158s -> 1265s over the same
+    # bag, and every one sits strictly above done_unknown_fraction (0.10) as the
+    # C1 invariant requires.
+    coverage_milestones: [0.80, 0.60, 0.40, 0.30, 0.20, 0.15, 0.12]
 
     map_resolution: 0.10
 
@@ -350,33 +357,37 @@
     # in a row, the planner declares the map saturated and transitions to
     # DONE. Set done_unknown_fraction <= 0 to disable (then only max_steps
     # stops the planner).
-    # C4: 0.64 is the campaign value, calibrated on flatforest. 0.05 is 13x
-    # tighter than the achievable floor (~0.486 unpinned), i.e. a stop criterion
-    # that can never be met -- every hand-run run ended at max_steps instead.
-    done_unknown_fraction: 0.64
+    # C4 (2026-09-21): 0.10 on the 2D coverage scale, i.e. DONE at 90 % of the
+    # ROI known. RECALIBRATED with the coverage source -- the old 0.64 is a 3D
+    # column-coverage number and means nothing here.
+    #
+    # Measured on an off_rep1 bag replay through the 2D mapper: unknown falls
+    # 0.364 (t=600s) -> 0.186 (1200) -> 0.078 (1500) -> 0.061 (3600), where it
+    # plateaus. 0.10 is crossed at t=1293s, on a steep but smooth stretch of the
+    # curve (the largest single-sample gain anywhere in the run is 0.014), so
+    # the crossing time is well determined rather than noise-sensitive.
+    #
+    # Do NOT tighten this past ~0.062 without insetting the ROI: 0.0614 is the
+    # best this world ever reaches, because 99.2 % of the residual unknown
+    # (3808 of 3837 cells) is the ROI perimeter and corners, which no sensor
+    # position can cover. A 0.05 threshold -- 95 % known -- is unreachable here
+    # and would silently degrade to max_steps.
+    done_unknown_fraction: 0.10
     done_min_consecutive_steps: 3
-    # Where that unknown fraction is measured:
-    #   planning_map — 2D unknown (-1) cells of the latched planning_map
-    #                  (legacy). INACTIVE when no planning_map is published.
-    #   scovox       — 2.5D column coverage of the fused 3D map: fraction of
-    #                  ROI-footprint x/y columns with NO observed voxel in the
-    #                  ingested z band. Works with no planning_map (the field
-    #                  config). NB: in flat mode the ingest band is the
-    #                  absolute [roi_min_z, roi_max_z] — on terrain outside
-    #                  it the map cache stays empty and coverage reads 100 %
-    #                  unknown (never done); set a per-area z band or
-    #                  terrain_relative_z there.
-    #   auto         — planning_map when one has been received, else scovox.
-    # The two sources measure different quantities; re-calibrate
-    # done_unknown_fraction when switching (calibrate scovox on an R0 bag
-    # replay: watch where the logged fraction plateaus).
-    # Pinned to scovox for field trials: we do not publish a planning_map, so
-    # "auto" would resolve to scovox anyway — but pinning it removes the one
-    # risk of "auto" (a stray/late planning_map switching the source mid-run and
-    # mixing two differently-calibrated metrics in the same coverage-done
-    # streak; see doc/limitations.md). Set back to "auto" for sim runs that do
-    # publish a planning_map and want the 2D measure.
-    done_coverage_source: "scovox"
+    # Where that unknown fraction is measured. The 2D map is now the only
+    # source; "scovox" is retired and is warned about and overridden at startup.
+    #   planning_map — 2D unknown (-1) cells of the ROI. The planner prefers the
+    #                  un-inflated coverage_map_topic and falls back to the
+    #                  inflated planning_map, recording which one it used in the
+    #                  CSV's coverage_source column.
+    #
+    # Why scovox went: its 2.5D column measure does not track exploration. Over
+    # the same off_rep1 bag it saturates at 0.502 unknown from t=1500s to the
+    # end of the run while the 2D map goes on to 0.061, and the gap widens from
+    # 0.28 (t=600s) to 0.44 (t=3600s) rather than holding as an offset. The
+    # "floor near 0.486" it reports is unobservable z-column volume, not
+    # unexplored ground.
+    done_coverage_source: "planning_map"
     # What DONE does:
     #   shutdown — stop the node (legacy sim-experiment behaviour).
     #   idle     — keep spinning; targets released after coverage-done still

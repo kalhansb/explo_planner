@@ -3268,6 +3268,7 @@ for r in $ROBOTS; do
       -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
       -p use_planning_map:=true \
       -p planning_map_topic:=/$r/dscovox_node/global_planning_map \
+      -p coverage_map_topic:=/$r/dscovox_node/global_coverage_map \
       -p done_coverage_source:=scovox \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
