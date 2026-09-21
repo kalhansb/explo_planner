@@ -3258,6 +3258,7 @@ for r in $ROBOTS; do
       -p rendezvous_latched_hold_sec:=$RDV_LATCHED_HOLD \
       -p mission_start_hold_sec:=$START_HOLD \
       -p exploitation_enabled:=$EXPLOIT_ARG \
+      -p publish_refinement_regions:=false \
       -p rendezvous_expected_peers:=$((N_ROBOTS - 1)) \
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
       -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
