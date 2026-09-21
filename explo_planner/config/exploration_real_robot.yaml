@@ -63,15 +63,37 @@
 # tf2 cannot arbitrate two publishers on one edge — lookups oscillate
 # between contradictory poses, and max_pose_jump_m will silently swallow
 # the resulting deltas as "teleports", freezing cumulative_distance_.
-# Shut down whichever publisher is wrong before any real run.
+#
+# Neither publisher is in this stack, so the fix is on the platform, not in
+# this repo. The sanctioned owner of odom->base_link is the robot_localization
+# EKF (hmr_localisation/config/ekf_odom_bunker.yaml: frequency 50.0,
+# two_d_mode false, publish_tf true); the NDT localiser runs Mode B and
+# publishes map->odom ONLY. The planar 50 Hz stream is the base driver's own
+# wheel/track odometry broadcast — turn it off there (AgileX exposes it as
+# pub_odom_tf / publish_odom_tf) and keep the 3D one, because a tracked robot
+# on terrain needs exactly the roll/pitch/z the planar publisher discards.
+# Verify before every run — one broadcaster on the edge, or do not start:
+#   ros2 run tf2_ros tf2_monitor odom base_link
+# On a recording instead: scripts/measure_bag_motion.py <bag> base_link
+# WITHOUT --only-3d, then read its EDGES section.
+# The same fault reappears in sim for a different reason: bunker.xacro loads
+# libgazebo_ros_planar_move, which broadcasts a planar odom->base_link at
+# 20 Hz, so adding the EKF on top of Gazebo doubles the edge again.
 #
 # SECOND TF CONSTRAINT — no two robots may publish the same TF edge. The
-# localiser configs (hmr_localisation/config/gt_ouster_ndt_tree_*.yaml)
-# currently BOTH declare global_frame_id: map + odom_frame_id: odom, which
-# collides the moment the two robots share a ROS domain. The bags avoid it
-# because curt was recorded as map_curt -> odom_curt -> base_link_curt.
-# Give each robot its own odom (and map, if not fusing) frame at launch,
-# and make the per-robot blocks at the bottom of this file match.
+# localiser configs (hmr_localisation/config/gt_ouster_ndt_tree_*.yaml) BOTH
+# declare global_frame_id: map + odom_frame_id: odom. That bites only on a
+# hand bring-up: coop_multi_robot_localization.launch.py overrides the frames
+# per robot (bunker `odom`, curt `odom_curt`), so those YAML values never
+# apply on that path. The shared `map` is deliberate — both robots localise
+# against the same gt_map, which is what makes one fused map meaningful and
+# what map_frame: "map" in both per-robot blocks below assumes.
+# The trap to watch: that launch currently wires an IDENTITY STATIC for
+# odom->base (its 'noekf' baseline). Swap it for the EKF stack, as its own
+# comment invites, and curt breaks — ekf_odom_curt.yaml sets odom_frame: odom
+# while the launch names curt's odom `odom_curt`, so base_link_curt would hang
+# off BUNKER's odom and odom_curt would have no children at all. Make the EKF
+# config and the launch table agree before running the EKF two-robot.
 # =======================================================================
 /**:
   ros__parameters:
@@ -179,8 +201,9 @@
 #      proximity_peer_pose_topics: ["curt:/curt/pcl_pose"]      # bunker's block
 #      proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]  # curt's block
 #
-# 3. rendezvous_max_wait_sec inherits 0.0 = WAIT FOREVER. A robot that
-#    exhausts its goals returns to its anchor and blocks until the whole
-#    team is back in comms. That is correct for a controlled trial and a
-#    field hazard otherwise — set a finite give-up if the team may not
-#    reconvene.
+# 3. rendezvous_max_wait_sec inherits 600 s (shared_params.yaml; the
+#    multi_robot launch arg default matches). A robot that exhausts its
+#    goals returns to the mission start point and waits there for the
+#    team, giving up after the timeout and parking in DONE (still
+#    beaconing its presence). Set 0 only for a controlled trial where
+#    WAIT FOREVER is intended and someone is watching.
