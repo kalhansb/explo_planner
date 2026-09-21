@@ -148,10 +148,12 @@ per-robot blocks match — see the TF banner in its header.
   link and the merged map. With the team present, robots still finish at
   home, so the mission ends with everyone parked together.
   `rendezvous_max_wait_sec` bounds the barrier wait (<= 0 = forever);
-  `return_nav_max_timeout_sec` bounds the drive home. `done_action` defaults
-  to `"shutdown"`; set it to `"idle"` so finished robots stay up and keep
-  beaconing for later finishers (the node warns at startup if rendezvous is
-  active and it is left at `"shutdown"`).
+  `return_nav_max_timeout_sec` bounds the drive home. `shared_params.yaml`
+  ships `done_action: "idle"`, which is what rendezvous needs — finished
+  robots stay up and keep beaconing for later finishers. The bare C++
+  fallback is `"shutdown"`, so a bring-up that does not load the shared file
+  kills the first robot to finish; the node warns at startup if rendezvous is
+  active and `done_action` is left there.
 - **Per-deployment keys** (set in an overlay like
   `exploration_real_robot.yaml`, layered on `shared_params.yaml`):
   `robot_name`; `base_frame` — empty resolves to `<robot_name>/base_link`,
