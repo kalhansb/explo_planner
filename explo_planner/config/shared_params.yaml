@@ -343,21 +343,31 @@
     # angles across the team. 0 = auto = vantage_visited_tol_m.
     coord_vantage_claim_radius_m: 0.0
 
-    # Rendezvous reconnection (multi-robot). ON by default: a robot that
-    # exhausts its exploration goals does NOT stop while a teammate is still out
-    # of comms: it drives back to its last-connected anchor (the pose where it
-    # last heard a teammate — inside the router's coverage bubble) and holds
-    # there until the whole team is back in range, then re-plans against the
-    # merged map. It only activates with coordination_enabled AND a positive
-    # expected-peer count, so single-robot runs are unaffected (it stays inert).
+    # Rendezvous at the mission START POINT (multi-robot). ON by default: a
+    # robot that exhausts its exploration goals drives back to where it started
+    # exploring and holds there. The team launches within one comms bubble, so
+    # every robot back at its own start pose is in radio range of the others by
+    # construction — one deterministic meeting point, used both for
+    # reconnection (teammate out of comms -> wait at home, then re-plan on the
+    # merged map) and for ending the mission (team complete -> park at home,
+    # keep beaconing, go DONE there). It only activates with
+    # coordination_enabled AND a positive expected-peer count, so single-robot
+    # runs are unaffected (it stays inert).
     # The multi_robot launch sets rendezvous_expected_peers from the team size;
     # set it here for a hand-launched hardware trial (team size - 1).
     rendezvous_enabled: true
     rendezvous_expected_peers: 0      # teammates to wait for; 0 = inert
     # Barrier give-up (seconds). 0 = wait forever (STAY until all connected).
-    # A positive value is a field escape hatch so a robot whose teammate died
-    # doesn't hold the anchor indefinitely.
-    rendezvous_max_wait_sec: 0.0
+    # Bounded in the field: a robot whose teammate died must not hold the
+    # rendezvous forever. A robot that gives up still parks in DONE beaconing its
+    # presence, so a late teammate can still find it; 600 s comfortably covers
+    # a map-length return leg plus map fusion.
+    rendezvous_max_wait_sec: 600.0
+    # Ceiling on the return-home leg (seconds). Separate from
+    # nav_max_timeout_sec (sized for short exploration hops): the return can
+    # be a map-length drive, and a hop-sized cap aborts it mid-field —
+    # exactly the long-range reconnections the return exists for.
+    return_nav_max_timeout_sec: 600.0
 
     # ----------------------------------------------------------------
     # Proximity stop (coordinated yield)
@@ -400,7 +410,7 @@
     # A peer that moved < peer_static_move_m in peer_static_sec is "parked"
     # and not held against — a parked robot is a static obstacle the
     # navigator avoids on its own, and holding against one deadlocks (e.g. a
-    # teammate waiting at its rendezvous anchor, or a dead planner). Kept
+    # teammate waiting at its rendezvous point, or a dead planner). Kept
     # ABOVE exploit_dwell_sec (8 s) so a mid-capture dwell is waited out
     # rather than driven past.
     proximity_peer_static_sec: 10.0
@@ -484,7 +494,7 @@
     # build: an older peer's intents never flag it, and its teammates then hold
     # their barriers until the give-up path below.
     # Not to be confused with rendezvous_* above: that is the COMMS-reconnection
-    # barrier at the anchor pose. This one is per-vantage capture sync.
+    # barrier at the home pose. This one is per-vantage capture sync.
     # Without it (observed, 2-robot sim, 3/3 quota): one robot finished an angle,
     # was by construction the closest robot to every remaining angle, took the one
     # its peer had been driving toward for 19 s, both converged on the same point,

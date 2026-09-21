@@ -89,7 +89,7 @@ enum class State {
   EXPLOIT_PLAN,
   EXPLOIT_DWELL,
   // Rendezvous sub-states (multi-robot). On exhausting its exploration goals a
-  // robot drives back to its last-connected anchor (RETURN_NAV) and holds there
+  // robot drives back to the mission start point (RETURN_NAV) and holds there
   // (RETURN_SYNC) until the whole team is back in comms, then re-plans against
   // the merged map. Gated by rendezvous_enabled_; see the rendezvous_* params.
   RETURN_NAV,
@@ -142,15 +142,20 @@ private:
   void doLogStep();
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
-  // exploration exhaustion, between DONE and returning to the anchor;
-  // startReturnToAnchor arms the drive back; doReturnNav drives there;
-  // doReturnSync holds at the anchor until the whole team is in comms.
+  // exploration exhaustion, between DONE and returning home;
+  // startReturnHome arms the drive back; doReturnNav drives there;
+  // doReturnSync holds at home until the whole team is in comms.
   // `reason` is the termination cause, for logging only — EVERY termination
   // path must route through here, not just coverage saturation.
   void finishOrRendezvous(const char* reason);
-  void startReturnToAnchor(const char* reason);
+  void startReturnHome(const char* reason);
   void doReturnNav();
   void doReturnSync();
+  // Presence beacon while DONE: keeps a finished robot countable at a
+  // teammate's rendezvous barrier (without it the first finisher goes
+  // invisible one claim TTL after finishing and the last finisher waits
+  // forever).
+  void publishPresenceIntent();
 
   // Exploitation. onTreeTarget ingests targets off the shared topic;
   // doExploitPlan generates + validates + selects the next vantage;
@@ -341,7 +346,7 @@ private:
   // --- Rendezvous (multi-robot reconnection) params ---
   // When true (the default), a robot that exhausts its exploration goals does
   // NOT stop while a teammate is still out of comms: it drives back to its
-  // last-connected anchor and waits until the whole team is back in range, then
+  // mission start point and waits until the whole team is back in range, then
   // re-plans against the merged map. Requires coordination_enabled (peers are
   // what the barrier waits on) and a positive expected-peer count; stays inert
   // otherwise (single-robot runs are unaffected).
@@ -350,10 +355,16 @@ private:
   // multi_robot launch sets this from the robot list; override in YAML on
   // hardware. <= 0 disables rendezvous.
   int    rendezvous_expected_peers_ = 0;
-  // Barrier give-up (seconds). 0 = wait forever (the requested default: STAY
-  // until all connected). A positive value is an escape hatch for field trials
-  // so a robot whose teammate died doesn't hold the anchor indefinitely.
+  // Barrier give-up (seconds). 0 = wait forever (STAY until all connected);
+  // the shipped default is 600 (shared_params.yaml AND the multi_robot launch
+  // arg — the launch dict layers last and must stay in sync) so a robot whose
+  // teammate died doesn't hold the rendezvous indefinitely.
   double rendezvous_max_wait_sec_  = 0.0;
+  // Return-leg nav budget ceiling (seconds). The drive back home can
+  // be map-length, so it gets its own cap instead of sharing
+  // nav_max_timeout_sec with short exploration hops — a hop-sized cap aborts
+  // exactly the long-range reconnections the return exists for.
+  double return_nav_max_timeout_sec_ = 600.0;
 
   // --- Proximity stop (coordinated yield) params ---
   // Thresholds/staleness live in the guard's Config; these are the node-side
@@ -549,13 +560,30 @@ private:
   // Coverage termination streak.
   int coverage_done_streak_ = 0;
 
-  // Rendezvous anchor: the robot pose the last time it heard a teammate. That
-  // pose sits inside the comms bubble, so it is the cheapest point to return to
-  // for reconnection. Recorded on every peer intent (see the intent callback);
-  // have_anchor_ stays false until the first peer is heard (single-robot runs
-  // never rendezvous).
-  Eigen::Vector3f last_connected_anchor_ = Eigen::Vector3f::Zero();
-  bool  have_anchor_ = false;
+  // Mission start point ("home"): where this robot began exploring, recorded
+  // once at the WAIT_FOR_MAP -> PLAN transition. Rendezvous returns HERE, for
+  // reconnection and for ending the mission: the team launches within one
+  // comms bubble, so everyone back at their own start pose is in range of
+  // everyone else by construction. (Last-contact anchors were tried first;
+  // they sit ~one comms range APART when a link dies at the edge of range,
+  // so both robots could wait forever on opposite sides of the gap.)
+  Eigen::Vector3f home_position_ = Eigen::Vector3f::Zero();
+  bool  have_home_ = false;
+  // True while the RETURN states are FINISHING at home with the team
+  // already complete (park where teammates expect us before DONE), rather
+  // than reconnecting. Skips the en-route team-complete release and the
+  // coverage-streak reset — both only make sense when a lost peer reappears.
+  bool  return_is_finish_ = false;
+  // Finish-at-home retry cap: an unreachable home must not livelock the
+  // finish (return -> watchdog -> sync release -> re-plan -> return ...).
+  // Reset when a real exploration hop starts (transitionTo NAVIGATE).
+  int   return_finish_attempts_ = 0;
+  static constexpr int kMaxReturnFinishAttempts = 3;
+  // Presence-only claim radius (m) for intents that must NOT veto teammate
+  // goals: the DONE beacon and the return-home leg. Positive so receivers
+  // don't fall back to their own match radius, tiny so claimMatching never
+  // excludes anything real.
+  static constexpr float kPresenceClaimRadiusM = 0.01f;
 
   // Proximity-hold bookkeeping: the driving state to resume into (NAVIGATE or
   // RETURN_NAV — current_goal_ is left untouched across the hold), cumulative
@@ -882,7 +910,7 @@ ExploPlannerNode::ExploPlannerNode()
   coord_heartbeat_hz_    = dp("coord_heartbeat_hz", 1.0);
   coord_vantage_claim_radius_m_ = dp("coord_vantage_claim_radius_m", 0.0);
 
-  // Rendezvous. ON by default: return-to-anchor-and-wait on exploration
+  // Rendezvous. ON by default: return-home-and-wait on exploration
   // exhaustion. It only *activates* where it is meaningful — coordination on
   // (the barrier waits on peer claims) and a positive expected-peer count. In
   // single-robot / no-coordination runs (or a one-robot team) it silently
@@ -891,6 +919,7 @@ ExploPlannerNode::ExploPlannerNode()
   rendezvous_enabled_        = dp("rendezvous_enabled", true);
   rendezvous_expected_peers_ = dp("rendezvous_expected_peers", 0);
   rendezvous_max_wait_sec_   = dp("rendezvous_max_wait_sec", 0.0);
+  return_nav_max_timeout_sec_ = dp("return_nav_max_timeout_sec", 600.0);
   if (rendezvous_enabled_ &&
       (!coord_enabled_ || rendezvous_expected_peers_ <= 0)) {
     RCLCPP_INFO(get_logger(),
@@ -898,6 +927,13 @@ ExploPlannerNode::ExploPlannerNode()
         "running as plain exploration, finishing when goals are exhausted.",
         coord_enabled_, rendezvous_expected_peers_);
     rendezvous_enabled_ = false;
+  }
+  if (rendezvous_enabled_ && done_action_ == "shutdown") {
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous is active but done_action='shutdown': the first robot to "
+        "finish exits and stops beaconing, so a teammate that finishes later "
+        "can wait at the barrier forever. Use done_action='idle' so finished "
+        "robots stay countable.");
   }
 
   // Proximity stop (coordinated yield). ON by default and deliberately NOT
@@ -961,7 +997,7 @@ ExploPlannerNode::ExploPlannerNode()
   // still driving — on a 3/3 quota the early robot can close the target solo
   // and the peer arrives to dwell an angle nobody needs. Distinct from the
   // `rendezvous_*` params above, which are the comms-reconnection barrier at
-  // the anchor pose; these two are the per-vantage capture barrier.
+  // the home pose; these two are the per-vantage capture barrier.
   exploit_dwell_sync_enabled_ = dp("exploit_dwell_sync_enabled", true);
   exploit_dwell_sync_max_wait_sec_ =
       dp("exploit_dwell_sync_max_wait_sec", 0.0);
@@ -1155,16 +1191,6 @@ ExploPlannerNode::ExploPlannerNode()
         coord_intent_topic_, qos,
         [this](explo_planner_msgs::msg::RobotIntent::SharedPtr msg) {
           if (coord_) coord_->onIntent(*msg, this->now());
-          // Rendezvous: record where we were the last time we heard a
-          // teammate. That pose is inside the comms bubble, so it is the
-          // cheapest point to return to for reconnection. onIntent already
-          // drops our own echo, but we gate on robot_id here too since we read
-          // our live pose. have_pose_ guards the very first ticks before TF.
-          if (rendezvous_enabled_ && have_pose_ &&
-              msg->robot_id != robot_name_) {
-            last_connected_anchor_ = latest_pos_;
-            have_anchor_ = true;
-          }
           // Proximity guard: the peer's advertised live pose (refreshed by
           // its 1 Hz heartbeat). Coarse but always available in multi-robot
           // runs; the dedicated pose topics below refine it when configured.
@@ -1561,6 +1587,15 @@ void ExploPlannerNode::tick() {
                 "(use_planning_map=false) — straight-line costs, no 2D "
                 "obstacle/reachability filtering. Starting exploration.");
           }
+          // Mission start point ("home"): the rendezvous target for both
+          // reconnection and mission end. Recorded once, here — the team
+          // launches within one comms bubble, so every robot back at its own
+          // start pose is in radio range of every other by construction.
+          home_position_ = latest_pos_;
+          have_home_ = true;
+          RCLCPP_INFO(get_logger(),
+              "Rendezvous home recorded at (%.2f, %.2f).",
+              home_position_.x(), home_position_.y());
           transitionTo(State::PLAN);
         } else {
           // Name the missing precondition so a stuck startup (wrong topic /
@@ -1660,7 +1695,18 @@ void ExploPlannerNode::transitionTo(State s) {
   state_enter_time_ = this->now();
   // The post-arrival rotation deadline is per-NAVIGATE-cycle and is armed
   // lazily on arrival at the XY goal; disarm it on every entry.
-  if (s == State::NAVIGATE) rotate_deadline_armed_ = false;
+  if (s == State::NAVIGATE) {
+    rotate_deadline_armed_ = false;
+    // A real exploration hop is starting again: the finish-at-home retry
+    // budget is per-exhaustion, not per-run.
+    return_finish_attempts_ = 0;
+    return_is_finish_ = false;
+  }
+  // DONE must stay discoverable: teammates count us at their rendezvous
+  // barrier through this beacon (refreshed by the heartbeat, which fires in
+  // DONE too). Without it the first finisher goes invisible one claim TTL
+  // after finishing.
+  if (s == State::DONE) publishPresenceIntent();
   // The dwell-sync barrier is per-DWELL: its wait clock starts at entry (the
   // moment the robot is physically staged on the vantage) and neither latch may
   // survive into the next capture — a timed-out barrier would otherwise disable
@@ -1751,7 +1797,7 @@ void ExploPlannerNode::doPlan() {
             "(unknown=%.3f, %d steps, %.2f m traveled).",
             unk, step_, cumulative_distance_);
         // With rendezvous on and a teammate still out of comms, return to the
-        // anchor and wait for the team instead of finishing (see below).
+        // start point and wait for the team instead of finishing (see below).
         finishOrRendezvous("coverage-saturated");
         return;
       }
@@ -2343,43 +2389,81 @@ void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
 // Rendezvous (multi-robot reconnection)
 // ==================================================================
 
-// Called at exploration exhaustion (coverage saturated). If rendezvous is on,
-// an anchor is known, and a teammate is still out of comms, return to the
-// anchor and wait for the team; otherwise finish. When the whole team is
-// already present the map is already merged, so exhaustion here means the team
-// is genuinely done — everyone reaches this together and lands in DONE.
+// Called at exploration exhaustion (coverage saturated / step budget). If
+// rendezvous is on, home is recorded, and a teammate is still out of comms,
+// drive back to the mission start point and wait for the team there. With the
+// team present, robots still FINISH at home and keep beaconing in DONE, so the
+// mission ends with the whole team parked together inside the starting comms
+// bubble, each robot countable by later finishers.
 void ExploPlannerNode::finishOrRendezvous(const char* reason) {
   // livePeerCount, not the raw table size: exploit claims are retained past
   // expiry by the grace window (vantage-contest lenience), and a graced claim
   // must not count a 10-s-silent teammate as "present" for the barrier.
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (shouldRendezvous(rendezvous_enabled_, have_anchor_, active,
+  if (shouldRendezvous(rendezvous_enabled_, have_home_, active,
                        rendezvous_expected_peers_)) {
-    startReturnToAnchor(reason);
+    return_is_finish_ = false;
+    startReturnHome(reason);
     return;
   }
   if (rendezvous_enabled_ && rendezvous_expected_peers_ > 0) {
+    if (!have_home_) {
+      // Defensive: home is recorded before the first PLAN, so this can only
+      // fire if exploration somehow ended without ever starting. Say so
+      // honestly instead of a "full team present" line that reads as success
+      // in a post-mortem.
+      RCLCPP_WARN(get_logger(),
+          "Rendezvous: exploration ended [%s] but no home position was ever "
+          "recorded (%d/%d peers) — cannot return to start, finishing here.",
+          reason, active, rendezvous_expected_peers_);
+      transitionTo(State::DONE);
+      return;
+    }
+    // Team present: end the mission AT the start point, not wherever
+    // exploration happened to exhaust. Start poses share one comms bubble, so
+    // every robot finishing at its own home is a genuine convergence — the
+    // team ends the mission parked together where the crew launched it. The
+    // DONE presence beacon keeps each parked robot countable, so a later
+    // finisher's barrier releases the moment it gets back in range. Bounded
+    // by the retry cap below in case the way home has become blocked.
+    const float dxa = latest_pos_.x() - home_position_.x();
+    const float dya = latest_pos_.y() - home_position_.y();
+    const float home_dist = std::sqrt(dxa * dxa + dya * dya);
+    if (home_dist > goal_xy_tol_) {
+      if (return_finish_attempts_ < kMaxReturnFinishAttempts) {
+        ++return_finish_attempts_;
+        return_is_finish_ = true;
+        startReturnHome(reason);
+        return;
+      }
+      RCLCPP_WARN(get_logger(),
+          "Rendezvous: exploration ended [%s] with full team present, but "
+          "home stayed unreachable after %d attempts (%.1f m away) — "
+          "finishing here.",
+          reason, return_finish_attempts_, home_dist);
+      transitionTo(State::DONE);
+      return;
+    }
     RCLCPP_INFO(get_logger(),
         "Rendezvous: exploration ended [%s] with full team present "
-        "(%d/%d peers) -> DONE.",
+        "(%d/%d peers) at the start point -> DONE.",
         reason, active, rendezvous_expected_peers_);
   }
   transitionTo(State::DONE);
 }
 
-// Arm the drive back to the last-connected anchor, reusing the NAVIGATE
+// Arm the drive back to the mission start point, reusing the NAVIGATE
 // smart-timeout + arrival test. A presence intent is published (and re-sent by
-// the heartbeat, which now fires in the RETURN states) so teammates arriving
-// later count us at the barrier — without it two robots waiting at their own
-// anchors would never see each other and would deadlock.
-void ExploPlannerNode::startReturnToAnchor(const char* reason) {
+// the heartbeat, which fires in the RETURN states) so teammates arriving
+// later count us at the barrier the moment they are back in radio range.
+void ExploPlannerNode::startReturnHome(const char* reason) {
   // The rendezvous barrier is HARD: nothing preempts it. doNavigate()
   // interrupts an exploration hop the moment a target arrives, but the RETURN
   // states deliberately do NOT check target_queue_ — with
   // rendezvous_max_wait_sec <= 0 (wait forever, the default) a robot that
   // serviced trees on the way back would leave its teammate blocked at the
-  // anchor indefinitely.
+  // rendezvous indefinitely.
   //
   // Stand the queue down rather than destroying it: the ACTIVE target is
   // demoted to PENDING and the phase reset to EXPLORE, so the exploit claim
@@ -2407,24 +2491,29 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
   }
 
   current_goal_ = CandidateViewpoint{};
-  current_goal_.position = last_connected_anchor_;
+  current_goal_.position = home_position_;
   current_goal_.yaw = latest_yaw_;
 
   RCLCPP_INFO(get_logger(),
-      "Rendezvous: exploration ended [%s], team incomplete (%d/%d peers) "
-      "-> returning to anchor (%.2f, %.2f).",
+      "Rendezvous: exploration ended [%s], %s (%d/%d peers) "
+      "-> returning home (%.2f, %.2f).",
       reason,
+      return_is_finish_ ? "finishing at home" : "team incomplete",
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0,
       rendezvous_expected_peers_,
-      last_connected_anchor_.x(), last_connected_anchor_.y());
+      home_position_.x(), home_position_.y());
 
   publishGoal(current_goal_);
 
   if (intent_pub_ && coord_) {
+    // Tiny claim radius, like the DONE presence beacon: the return goal is
+    // not an exploration claim, and at coord_claim_radius_m_ (~sensor range)
+    // it would veto a still-exploring teammate's candidates around home for
+    // the whole leg. The intent's job here is presence + live pose only.
     current_intent_msg_ = coord_->buildIntent(
         current_goal_, latest_pos_, this->now(),
         static_cast<float>(coord_claim_ttl_sec_),
-        static_cast<float>(coord_claim_radius_m_),
+        kPresenceClaimRadiusM,
         /*planner_type_id (eig)=*/0u, map_frame_);
     intent_pub_->publish(current_intent_msg_);
     have_active_intent_ = true;
@@ -2435,25 +2524,39 @@ void ExploPlannerNode::startReturnToAnchor(const char* reason) {
   const float dx = current_goal_.position.x() - latest_pos_.x();
   const float dy = current_goal_.position.y() - latest_pos_.y();
   const float dist = std::sqrt(dx * dx + dy * dy);
+  // Own ceiling: the return can be a map-length drive, and the hop-sized
+  // nav_max_timeout_sec would abort exactly the long legs this state is for.
   nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
-                                 nav_min_timeout_sec_, nav_max_timeout_sec_);
+                                 nav_min_timeout_sec_,
+                                 return_nav_max_timeout_sec_);
   progress_check_time_ = state_enter_time_;
   progress_check_dist_ = cumulative_distance_;
 }
 
-// Drive toward the anchor. If the whole team reconnects en route, the barrier
+// Drive toward home. If the whole team reconnects en route, the barrier
 // is already satisfied — re-plan without finishing the drive. On arrival (or if
-// the anchor turns out unreachable) hand off to RETURN_SYNC to wait for the
+// home turns out unreachable) hand off to RETURN_SYNC to wait for the
 // team from wherever we ended up.
 void ExploPlannerNode::doReturnNav() {
   // livePeerCount — presence semantics, same note as finishOrRendezvous().
   const int active =
       coord_ ? static_cast<int>(coord_->livePeerCount(this->now())) : 0;
-  if (teamComplete(active, rendezvous_expected_peers_)) {
+  // Finish-mode legs skip the release: there the team is complete by
+  // construction, and the whole point is to complete the drive home.
+  if (!return_is_finish_ && teamComplete(active, rendezvous_expected_peers_)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team reconnected en route (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
     have_active_intent_ = false;
+    // The re-plan must actually SEE the merged map: the streak that declared
+    // exhaustion was measured pre-reconnection, and left at threshold it
+    // re-finishes on the next PLAN tick — before the peer's 2 Hz map share
+    // can arrive and fuse.
+    coverage_done_streak_ = 0;
+    // Invariant (see abandonNavGoal): leaving a driving state without an
+    // immediate replacement goal must stop the platform — PLAN publishes
+    // nothing this tick and can dead-end straight into DONE.
+    abandonNavGoal("rendezvous-replan");
     transitionTo(State::PLAN);
     return;
   }
@@ -2464,20 +2567,29 @@ void ExploPlannerNode::doReturnNav() {
   const float dist = std::sqrt(dx * dx + dy * dy);
   if (dist < goal_xy_tol_) {
     RCLCPP_INFO(get_logger(),
-        "Rendezvous: reached anchor (dist=%.2f) -> waiting for team.", dist);
+        "Rendezvous: reached home (dist=%.2f) -> waiting for team.", dist);
+    // Same invariant as the watchdog exits: RETURN_SYNC is presumed
+    // stationary, but nav2 may still be finishing the last <goal_xy_tol_ m
+    // plus the in-place rotation — stop it so the wait clock does not run on
+    // a still-moving platform.
+    abandonNavGoal("rendezvous-arrived");
     transitionTo(State::RETURN_SYNC);
     return;
   }
 
   const auto now = this->now();
   const double elapsed = (now - state_enter_time_).seconds();
-  // Distance-budgeted timeout / no-progress watchdog: if the anchor can't be
+  // Distance-budgeted timeout / no-progress watchdog: if home can't be
   // reached, wait for the team from here rather than looping on the drive
   // (we're at least closer to comms than where exploration stranded us).
   if (elapsed > nav_budget_sec_) {
     RCLCPP_WARN(get_logger(),
-        "Rendezvous: anchor unreachable within budget (%.1fs, dist=%.2f) "
+        "Rendezvous: home unreachable within budget (%.1fs, dist=%.2f) "
         "-> waiting for team from current pose.", elapsed, dist);
+    // RETURN_SYNC is presumed stationary (the guard doesn't run there) and
+    // its wait clock starts now — stop the platform instead of letting nav2
+    // keep driving the abandoned home goal under a "waiting" state.
+    abandonNavGoal("rendezvous-home-budget");
     transitionTo(State::RETURN_SYNC);
     return;
   }
@@ -2486,8 +2598,9 @@ void ExploPlannerNode::doReturnNav() {
     const float delta = cumulative_distance_ - progress_check_dist_;
     if (delta < progress_min_distance_m_) {
       RCLCPP_WARN(get_logger(),
-          "Rendezvous: no progress toward anchor -> waiting for team from "
+          "Rendezvous: no progress toward home -> waiting for team from "
           "current pose.");
+      abandonNavGoal("rendezvous-home-stuck");  // same invariant as above
       transitionTo(State::RETURN_SYNC);
       return;
     }
@@ -2497,7 +2610,7 @@ void ExploPlannerNode::doReturnNav() {
   republishGoal(current_goal_);
 }
 
-// Hold at the anchor until the whole team is back in comms, then re-plan. With
+// Hold at home until the whole team is back in comms, then re-plan. With
 // rendezvous_max_wait_sec <= 0 the wait is unbounded (STAY until all connected,
 // the requested default); a positive value is the field escape hatch. The
 // heartbeat keeps broadcasting our presence throughout so arriving peers count
@@ -2511,6 +2624,12 @@ void ExploPlannerNode::doReturnSync() {
         "Rendezvous: full team connected (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
     have_active_intent_ = false;
+    // Reconnection releases re-measure coverage against the merged map (see
+    // doReturnNav); a finish-mode release must NOT reset the streak — the
+    // team never left comms, the map is already merged, and the next PLAN
+    // tick should fall straight through to DONE at home.
+    if (!return_is_finish_) coverage_done_streak_ = 0;
+    return_is_finish_ = false;
     transitionTo(State::PLAN);
     return;
   }
@@ -2527,9 +2646,38 @@ void ExploPlannerNode::doReturnSync() {
   }
 
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-      "Rendezvous: waiting at anchor for team (%d/%d present)%s.",
+      "Rendezvous: waiting at home for team (%d/%d present)%s.",
       active, rendezvous_expected_peers_,
       rendezvous_max_wait_sec_ > 0.0 ? "" : " (no timeout)");
+}
+
+// Presence beacon for DONE. A finished robot must keep answering the 1 Hz
+// roll call: a teammate that exhausts later counts live peers at its barrier,
+// and a silent DONE robot reads as "out of comms" forever.
+//
+// The claim radius must be a TINY POSITIVE value, not 0: claimMatching()
+// reads radius_m <= 0 on the wire as "peer sent nothing usable" and falls
+// back to the RECEIVER's own exploration disc (coord_claim_radius_m ~= 10 m),
+// which would make a parked finisher win MinPos for every candidate within
+// ~10 m of it — a permanent unwinnable hole in a still-exploring teammate's
+// candidate set, refreshed forever by this 1 Hz beat. A small advertised
+// radius makes claimMatching test at the claimer's scale, so the beacon
+// occupies essentially a point and vetoes nothing real (a candidate within
+// kPresenceClaimRadiusM of the parked robot is on top of it and the
+// too-close / proximity checks already handle that). livePeerCount is
+// radius-independent, so the barrier-counting purpose is unaffected.
+void ExploPlannerNode::publishPresenceIntent() {
+  if (!coord_enabled_ || !coord_ || !intent_pub_ || !have_pose_) return;
+  CandidateViewpoint here;
+  here.position = latest_pos_;
+  here.yaw = latest_yaw_;
+  current_intent_msg_ = coord_->buildIntent(
+      here, latest_pos_, this->now(),
+      static_cast<float>(coord_claim_ttl_sec_),
+      kPresenceClaimRadiusM,
+      /*planner_type_id (eig)=*/0u, map_frame_);
+  intent_pub_->publish(current_intent_msg_);
+  have_active_intent_ = true;
 }
 
 // Re-publish the active intent on a fixed sim-time cadence so peers
@@ -2546,10 +2694,13 @@ void ExploPlannerNode::heartbeatTick() {
   // too: the interrupted goal is resumed after the hold, so its claim must
   // survive, and the beacon (with the live robot_pos refreshed below) is what
   // feeds the right-of-way peer's view of us while we sit in its way.
+  // DONE keeps beating too, as a pure presence beacon: a finished teammate
+  // must stay countable at a peer's rendezvous barrier (publishPresenceIntent
+  // arms it on entry; this refresh keeps it alive past the claim TTL).
   if (state_ != State::NAVIGATE && state_ != State::INTEGRATE &&
       state_ != State::EXPLOIT_PLAN && state_ != State::EXPLOIT_DWELL &&
       state_ != State::RETURN_NAV && state_ != State::RETURN_SYNC &&
-      state_ != State::PROXIMITY_HOLD) {
+      state_ != State::DONE && state_ != State::PROXIMITY_HOLD) {
     return;
   }
   if (!intent_pub_) return;
@@ -2860,7 +3011,7 @@ void ExploPlannerNode::doLogStep() {
     // dominant termination path in dense terrain (the coverage threshold may
     // never be reached), and going directly to DONE meant a robot that spent
     // its step budget shut down wherever it happened to stop — never returning
-    // to last_connected_anchor_ and never releasing its teammate's barrier.
+    // to home_position_ and never releasing its teammate's barrier.
     // The return drive happens after the budget is spent, so it costs no steps.
     finishOrRendezvous("step-budget");
   } else {
@@ -3343,7 +3494,7 @@ void ExploPlannerNode::doExploitPlan() {
   // (Re)start the per-target give-up timer whenever a new target becomes
   // active, so the timeout below measures time spent on *this* trunk only.
   // The !timing_ disjunct also catches a rendezvous stand-down re-activating
-  // the SAME id (startReturnToAnchor clears timing_): the return drive and
+  // the SAME id (startReturnHome clears timing_): the return drive and
   // barrier wait must not count against the target. Progress events re-arm
   // the timer elsewhere: approach arrival (doNavigate) and completed dwell
   // (doExploitDwell); proximity holds refund it (doProximityHold release).

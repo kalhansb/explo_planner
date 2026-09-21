@@ -26,9 +26,9 @@ bool teamComplete(int active_peers, int expected_peers) {
   return expected_peers > 0 && active_peers >= expected_peers;
 }
 
-bool shouldRendezvous(bool rendezvous_enabled, bool have_anchor,
+bool shouldRendezvous(bool rendezvous_enabled, bool have_home,
                       int active_peers, int expected_peers) {
-  if (!rendezvous_enabled || expected_peers <= 0 || !have_anchor) return false;
+  if (!rendezvous_enabled || expected_peers <= 0 || !have_home) return false;
   return !teamComplete(active_peers, expected_peers);
 }
 

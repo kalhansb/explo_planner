@@ -87,11 +87,11 @@ def launch_setup(context):
                     # intents on /exploration/intents.
                     "coordination_enabled":
                         coordination_enabled.lower() in ("true", "1", "yes", "on"),
-                    # Rendezvous reconnection: on exhausting its goals a robot
-                    # returns to its last-connected anchor and waits until the
-                    # whole team is back in comms. expected_peers is the team
-                    # size minus this robot; 0 = wait forever (STAY until all
-                    # connected).
+                    # Rendezvous at the mission start point: on exhausting
+                    # its goals a robot returns to where it started exploring
+                    # and waits there until the whole team is back in comms
+                    # (start poses share one comms bubble). expected_peers is
+                    # the team size minus this robot.
                     "rendezvous_enabled":
                         rendezvous_enabled.lower() in ("true", "1", "yes", "on"),
                     "rendezvous_expected_peers": expected_peers,
@@ -136,12 +136,16 @@ def generate_launch_description():
         DeclareLaunchArgument("coordination_enabled", default_value="true",
                               description="Enable MinPos peer-claim deconfliction"),
         DeclareLaunchArgument("rendezvous_enabled", default_value="true",
-                              description="Return to the last-connected anchor and "
+                              description="Return to the mission start point and "
                                           "wait for the whole team when exploration "
                                           "goals are exhausted (default on; set "
                                           "false for independent finish-and-stop)"),
-        DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="0.0",
-                              description="Barrier give-up seconds (0 = wait forever)"),
+        # NOTE: this dict entry layers AFTER shared_params.yaml, so THIS default
+        # governs launch-driven runs — keep it in sync with the yaml (600).
+        DeclareLaunchArgument("rendezvous_max_wait_sec", default_value="600.0",
+                              description="Barrier give-up seconds (0 = wait "
+                                          "forever; bounded by default so a dead "
+                                          "teammate can't park the robot)"),
         DeclareLaunchArgument("proximity_stop_enabled", default_value="true",
                               description="Coordinated proximity stop: the "
                                           "lex-larger robot of a close pair "

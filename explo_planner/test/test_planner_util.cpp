@@ -55,10 +55,10 @@ TEST(PlannerUtil, TeamComplete) {
   EXPECT_FALSE(teamComplete(5, 0));
 }
 
-// shouldRendezvous: return-and-wait only when enabled, an anchor exists, and
+// shouldRendezvous: return-and-wait only when enabled, home is recorded, and
 // the team is NOT already whole.
 TEST(PlannerUtil, ShouldRendezvous) {
-  // Enabled, anchor known, a teammate still out -> go wait.
+  // Enabled, home recorded, a teammate still out -> go wait.
   EXPECT_TRUE(shouldRendezvous(true, true, 0, 1));
   EXPECT_TRUE(shouldRendezvous(true, true, 1, 2));
   // Team already complete -> already synced, finish instead of a pointless hop.
