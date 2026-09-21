@@ -2668,13 +2668,23 @@ log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
 log "reconnect_mode=$MODE_ARG reconnect_enabled=$RECONNECT_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
 log "reconnect gates: confirm=${RECONNECT_CONFIRM}s barrier_max_wait=${RDV_MAX_WAIT}s"
 log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field site's ROI)"
-# done_coverage_source is pinned to scovox, NOT left on "auto". auto switches to
-# the 2D planning_map the instant one is received, so enabling the planning map
-# would have silently swapped the termination metric from 2.5D column coverage
-# of the ROI to 2D cell coverage — a different number against the same
-# done_unknown_fraction threshold, changing when every run ends and invalidating
-# any comparison with runs recorded before this change.
-log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=scovox"
+# done_coverage_source is pinned to coverage_map, NOT left on "auto", and NOT
+# on scovox any more.
+#
+# It was scovox, on the reasoning that switching to the 2D map would swap the
+# termination metric mid-campaign and invalidate comparison with earlier runs.
+# The measurement that settled it went the other way: the 2.5D column measure
+# is not a measure of exploration at all. On off_rep1 it saturates at 0.502
+# unknown from t=1500s while the 2D map over the SAME sensor data keeps falling
+# to 0.061, and the gap between them widens from 0.28 to 0.44 rather than
+# holding constant. Comparability with runs recorded against an artifact is not
+# worth preserving; the banked cells are re-scored onto this scale instead
+# (ws/src/rescore_2d, plan section 6.6).
+#
+# coverage_map rather than planning_map: the planning map is dilated by the
+# body radius so the planner can drive on it, which reports inflation as
+# occupied and scores the ROI as more known than it is.
+log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=coverage_map"
 
 # --- 6a. run manifest -------------------------------------------------------
 # Everything that distinguishes this run from another one, written INTO the run
@@ -2874,7 +2884,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "voxel_resolution_m=$VOXEL_RES"
   echo "done_unknown_fraction=$DONE_UNKNOWN"
   echo "done_criterion=$DONE_CRITERION"
-  echo "done_coverage_source=scovox"
+  echo "done_coverage_source=coverage_map"
   echo "prox_hold_m=$PROX_HOLD_M"
   echo "prox_resume_m=$PROX_RESUME_M"
   echo "targets=$TARGETS"
@@ -3269,7 +3279,7 @@ for r in $ROBOTS; do
       -p use_planning_map:=true \
       -p planning_map_topic:=/$r/dscovox_node/global_planning_map \
       -p coverage_map_topic:=/$r/dscovox_node/global_coverage_map \
-      -p done_coverage_source:=scovox \
+      -p done_coverage_source:=coverage_map \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
       -p utility_cost_exponent:=$UTIL_GAMMA \

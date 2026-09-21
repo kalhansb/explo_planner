@@ -387,7 +387,7 @@
     # 0.28 (t=600s) to 0.44 (t=3600s) rather than holding as an offset. The
     # "floor near 0.486" it reports is unobservable z-column volume, not
     # unexplored ground.
-    done_coverage_source: "planning_map"
+    done_coverage_source: "coverage_map"
     # What DONE does:
     #   shutdown — stop the node (legacy sim-experiment behaviour).
     #   idle     — keep spinning; targets released after coverage-done still

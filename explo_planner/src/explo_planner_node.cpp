@@ -854,7 +854,9 @@ private:
   double unknownFractionInRoi() const;
   // Coverage unknown fraction for termination, dispatched per
   // done_coverage_source_. Sets *source to the label of the source actually
-  // used ("planning_map" / "scovox"); returns -1 when it cannot measure.
+  // used ("coverage_map" / "planning_map_inflated"); returns -1 when it cannot
+  // measure. That label is the grid actually read, not the preference asked
+  // for, so a run that fell back says so in every row.
   double coverageUnknownFraction(const char** source) const;
   bool isCellFree(const Eigen::Vector3f& pos) const;
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
@@ -4069,7 +4071,7 @@ ExploPlannerNode::ExploPlannerNode()
   // counts nav-grid cells, the column measure counts ROI-footprint columns
   // with >= 1 observed voxel in the z band — so re-calibrate
   // done_unknown_fraction when switching.
-  done_coverage_source_ = dp("done_coverage_source", std::string("planning_map"));
+  done_coverage_source_ = dp("done_coverage_source", std::string("coverage_map"));
   if (done_coverage_source_ == "scovox") {
     // Retired, and loudly: a run that asked for the 3D measure and silently got
     // the 2D one would carry a stop time that is not comparable with anything
@@ -4081,13 +4083,22 @@ ExploPlannerNode::ExploPlannerNode()
         "reaches any usable threshold; coverage now comes from the 2D map. "
         "done_unknown_fraction is calibrated for the 2D scale (0.10 = 90%% "
         "known), so a value carried over from the 3D era will mis-stop.");
-    done_coverage_source_ = "planning_map";
+    done_coverage_source_ = "coverage_map";
   }
-  if (done_coverage_source_ != "planning_map") {
+  // "coverage_map" and "planning_map" are both legal and both mean the 2D
+  // grid; they differ only in which grid is PREFERRED when both are present.
+  // coverage_map takes the un-inflated one, which is what the DONE test wants:
+  // the planning map is dilated by the body radius so the planner can drive on
+  // it, and that dilation scores the ROI as more known than it is. Either way
+  // coverageUnknownFraction falls back to whichever grid it actually has, and
+  // reports which one it used, so the label below is a preference and the
+  // per-step `coverage_source` column is the fact.
+  if (done_coverage_source_ != "planning_map" &&
+      done_coverage_source_ != "coverage_map") {
     RCLCPP_WARN(get_logger(),
-        "Unknown done_coverage_source '%s' — falling back to 'planning_map'.",
+        "Unknown done_coverage_source '%s' — falling back to 'coverage_map'.",
         done_coverage_source_.c_str());
-    done_coverage_source_ = "planning_map";
+    done_coverage_source_ = "coverage_map";
   }
   // DONE behaviour: "shutdown" (legacy) or "idle" (stay up; late targets are
   // still exploited — required when targets are released at the
