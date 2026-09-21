@@ -2527,7 +2527,12 @@ if [ "$RECORD" != "0" ]; then
   for r in $ROBOTS; do
     BAG_TOPICS+=( /$r/odom_ground_truth /$r/scovox_node/scovox_bin )
   done
-  BAG_TOPICS+=( /exploration/intents )
+  # /exploration/targets is in the BASE set, not the RECORD=1 set: it is three
+  # small messages for the whole run (one per release) and the exploitation
+  # analysis reads the release timestamps off the bag rather than trusting the
+  # scheduler's own log clock. Cost is negligible; its absence would make a
+  # RECORD=2 cell unscoreable for the matched-horizon curve.
+  BAG_TOPICS+=( /exploration/intents /exploration/targets )
   if [ "$RECORD" = "1" ]; then
     BAG_TOPICS+=( /tf )
     for r in $ROBOTS; do
@@ -2536,7 +2541,6 @@ if [ "$RECORD" != "0" ]; then
                     /$r/scovox_node/global_planning_map
                     /$r/goal_pose /$r/explo_planner/candidates )
     done
-    BAG_TOPICS+=( /exploration/targets )
   fi
   log "recording rosbag (RECORD=$RECORD, ${#BAG_TOPICS[@]} base topics + comms)"
   start bag "$OUTDIR/bag.log" \
