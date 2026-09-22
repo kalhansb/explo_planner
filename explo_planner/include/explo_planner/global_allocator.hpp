@@ -47,6 +47,25 @@ struct AllocRobot {
   int  cell     = -1;     ///< cell it is in now; -1 drops it from the problem
   bool in_comms = true;   ///< false engages the no-comms mask (see Config)
   bool finished = false;  ///< true removes it and returns its cells to the pool
+
+  /// The robot has left the frontier: homing or done, i.e. TeamWorld/mode >=
+  /// MODE_HOMING (generation 33, R4). A STRICT SUPERSET of `finished` — every
+  /// finished robot is also off the frontier — and it is a separate field
+  /// rather than a widening of that one because the two answer different
+  /// questions and the codebase asks both.
+  ///
+  /// THIS ONE decides who is IN THE ALLOCATION PROBLEM, and only that: a robot
+  /// driving home will claim no more ground, so reserving cells for it under
+  /// the makespan balance starves the robots that are still working. That is
+  /// the same argument `finished` was dropped on, extended to the window
+  /// between leaving for home and announcing the arrival — a window `finished`
+  /// cannot see, and the one where the reservation costs the most.
+  ///
+  /// `finished` KEEPS every other reader it had, deliberately. The reconnect
+  /// gate must still PRICE a homing peer rather than skip it (its map is worth
+  /// exactly as much parked as moving), and all_in_comms must still count it,
+  /// because a homing robot out of contact is a real break in the team.
+  bool off_frontier = false;
 };
 
 /// The result: one ordered tour per robot that got any cells, plus enough
@@ -74,7 +93,8 @@ struct Allocation {
   std::string refused;
 
   /// R3 / §3.6. FNV-1a over the PROBLEM this solve was given, not over its
-  /// answer: the vehicle set sorted by id as `(id, cell, in_comms, finished)`,
+  /// answer: the vehicle set sorted by id as
+  /// `(id, cell, in_comms, finished, off_frontier)`,
   /// then the candidate cell ids in ascending order, then the world's
   /// `edgeHash()`, then `cfg.comms_mask` and `cfg.max_candidates`. Two robots
   /// that solve the same problem must produce the same value; two robots that

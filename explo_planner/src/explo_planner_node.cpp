@@ -57,6 +57,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
+#include <scovox_msgs/msg/scovox_fusion_counters.hpp>
 #include <scovox_msgs/msg/refinement_region.hpp>
 #include <explo_planner_msgs/msg/robot_intent.hpp>
 #include <explo_planner_msgs/msg/team_world.hpp>
@@ -216,6 +217,14 @@ private:
   // rebuilt from it (ROI-clipped) in loadLatestMap() at the start of each PLAN
   // tick, so a full rebuild doesn't run on every incoming message.
   void onScovoxMap(const scovox_msgs::msg::ScovoxMap::SharedPtr& msg);
+  // Fold dscovox's per-source integration counters into peer_fusion_deltas_,
+  // which is the only signal in this node that can say WHICH peer's voxels are
+  // arriving. The fused map's own total cannot: it sums this robot's sensing
+  // and every peer's contribution into one number, so a robot standing at a
+  // meeting reads the same flat total whether its partner has finished sending
+  // or is not being heard at all.
+  void onFusionCounters(
+      const scovox_msgs::msg::ScovoxFusionCounters::SharedPtr& msg);
   // Rebuild map_cache_ from the latest cached ScovoxMap, clipped to the ROI.
   // Returns false if no map has been received yet.
   bool loadLatestMap();
@@ -312,8 +321,18 @@ private:
   bool finishNow(const char* reason);
   /// Latched, state-blind completion test (done_criterion == "latch"). Takes an
   /// already-measured ROI unknown fraction — every caller has just computed one
-  /// and a second ROI walk is the most expensive thing in the tick. Returns
-  /// true on the call that latched, false on every other call.
+  /// and a second ROI walk is the most expensive thing in the tick.
+  ///
+  /// RETURNS "THE CALLER MUST STOP THIS TICK", which is not the same as "the
+  /// run ended" and has not been since the gen-21 hold. doPlan is the only
+  /// caller that reads the value (`if (maybeLatchCoverageDone(...)) return;`)
+  /// and stopping is the only thing it can do with it; the metrics tick
+  /// discards it. So every path that leaves this function having already
+  /// published a goal or changed state must answer true, whether it ended the
+  /// run (the homing traverse), deferred the ending to doReturnSync
+  /// (keepAppointmentOnFinish), or merely declined to latch again. The one
+  /// path that answers false while finished is the at-the-cell hold, which is
+  /// gated on a state doPlan cannot be in.
   bool maybeLatchCoverageDone(double unk, const char* source);
   /// Publish the sample a completion decision was actually taken on into the
   /// cache that recordExplorationComplete stamps its event from.
@@ -728,6 +747,12 @@ private:
                             double leg_sec = -1.0,
                             double rolled_to_sec = -1.0);
   void doReturnSync();
+  /// Keep a standing rendezvous appointment instead of ending the run where it
+  /// finished. Returns true when this robot is now keeping one, in which case
+  /// the caller must NOT end the run: doReturnSync owns the ending from there.
+  /// Called from both endings that can find an appointment open — the coverage
+  /// latch and finishOrRendezvous — and ahead of mission return in each.
+  bool keepAppointmentOnFinish(const char* reason);
   // Mission return (RETURN_HOME). startReturnHome enters the state WITHOUT
   // publishing a goal — abandonNavGoal's cancel-all is fire-and-forget, so a
   // goal sent in the same tick can be swallowed by the still-in-flight cancel.
@@ -1427,8 +1452,30 @@ private:
     double    voxels = 0.0;   ///< dense map, own sensing included
     uint32_t  hash   = 0;     ///< cell census, shared part only
     long long merged = 0;     ///< cells a peer's census has changed, cumulative
+    /// peer_fusion_deltas_ at the stamp, by fleet id. Empty when dscovox has
+    /// not published counters yet, which is a third answer and not a zero.
+    std::vector<uint64_t> peer_deltas;
   };
   MapExchangeBaseline  rendezvous_exchange_;
+
+  // Voxel deltas this robot's dscovox has ingested from each peer, by fleet id,
+  // cumulative over the run. Fed by onFusionCounters, which is also what sizes
+  // it: EMPTY means dscovox has never published counters at all, and that is a
+  // different fact from a vector of zeros, which means it is publishing and
+  // nothing has arrived. The first is unmeasured; only the second is evidence.
+  //
+  // WHY PER-PEER AND NOT A TOTAL. A total that has stopped rising is the one
+  // observation a meeting cannot act on: a partner that has sent everything it
+  // has and a partner whose bytes are not crossing the radio at all both
+  // present a flat total, and the second is exactly the case the meeting
+  // exists to sit through. Split by source, the two separate — but only
+  // against a baseline. Neither has a rate that distinguishes it, so the test
+  // is whether this rose ABOVE what it read when the meeting started, not
+  // whether it is rising now.
+  //
+  // MONOTONE ONLY WITHIN A dscovox LIFETIME. The counters are node-local and
+  // restart at zero, so onFusionCounters treats a DECREASE as a re-baseline.
+  std::vector<uint64_t> peer_fusion_deltas_;
 
   // Cells whose local status a PEER's census has changed, over the whole run.
   // The one signal here that no amount of this robot's own driving can move, so
@@ -2415,6 +2462,46 @@ private:
   rclcpp::Time rendezvous_settle_start_;
   bool         rendezvous_settling_ = false;
 
+  // RELEASE ON THE EXCHANGE, NOT ON THE CLOCK (generation 33, R3). The settle
+  // above is a guess at how long an exchange takes, applied identically to a
+  // meeting that finished in four seconds and one that is still delivering at
+  // thirty. With Part 1's per-peer counters the exchange itself is observable,
+  // so the trigger can be the thing the hold is for. Nothing else moves: the
+  // routing after the release is untouched.
+  //
+  // DEFAULT OFF, AND IT CANNOT BE TURNED ON WITHOUT THE THRESHOLDS. R and W
+  // must come from the per-peer arrival distribution Part 1 logs, and a default
+  // for either would be a number nobody measured deciding when robots leave
+  // meetings. -1 is "not set" and configure() refuses to run with the release
+  // enabled and either unset, rather than substituting a guess.
+  bool   rendezvous_drain_release_        = false;  ///< the treatment
+  double rendezvous_drain_rate_vox_sec_   = -1.0;   ///< R, per peer
+  double rendezvous_drain_window_sec_     = -1.0;   ///< W, the trailing window
+
+  // A TUMBLING WINDOW, ON THE SETTLE'S CLOCK. Start of the window currently
+  // being measured, as an offset into the settle (same reason the re-agreement
+  // wait is measured that way: one hold, one epoch, nothing extra to keep in
+  // step). -1 while no window is open. The snapshot is peer_fusion_deltas_ as
+  // it read when the window opened; the rate is the difference over the window
+  // divided by its length, which is why a window is closed and re-opened rather
+  // than slid — a ring buffer would buy sub-W granularity on a decision whose
+  // whole point is that it is taken at the end of a quiet interval.
+  //
+  // IT IS ALSO THE HARD FLOOR. No window has elapsed before W seconds, so no
+  // drain release can happen before then, without a second mechanism saying so.
+  double                rendezvous_drain_window_start_sec_ = -1.0;
+  std::vector<uint64_t> rendezvous_drain_window_base_;
+
+  // MONOTONE WITHIN A VISIT. Once the drain fires, the hold does not re-enter
+  // on a late burst. The counters are bursty by construction — one fused
+  // message can carry thousands of voxels — so a re-entrant hold would
+  // oscillate around R and could pin a robot whose exchange was already done.
+  // A burst that lands after the release is a merge arriving while departing,
+  // which Part 1's counter still records; that is a logging concern, not a
+  // reason to stop the robot again. Cleared wherever rendezvous_settling_ is,
+  // so the next visit re-arms.
+  bool rendezvous_drain_released_ = false;
+
   // Per-run cap on mid-run attempts. Every dispatch costs exploration time;
   // after this many DISPATCHES the policy has had its chance and the robot
   // reverts to terminal-only behaviour (logged, so the analysis can see it).
@@ -3032,14 +3119,41 @@ private:
   // publishTeamWorld and TeamWorld.msg/robot_finished.
   bool   finished_announced_      = false;
 
+  // The same construction one level lower: the MONOTONIC form of "this robot
+  // has left for home", and the only thing TeamWorld/mode is ever published
+  // from at the HOMING level. Latched once (state_ == State::RETURN_HOME ||
+  // mission_return_done_) first holds and never cleared.
+  //
+  // WHY IT IS NOT JUST `state_ == State::RETURN_HOME`. The wire field is
+  // relayed and max-merged by peers, so — exactly as for finished_announced_ —
+  // it is only sound for a level that cannot go back down; a peer holding a
+  // relayed HOMING has nothing that could ever clear it. The return leg reads
+  // as monotone TODAY (doReturnHome contains no transitionTo, and
+  // startReturnHome is guarded run-scoped by mission_return_done_ and
+  // leg-scoped by the state test), and mission_return_done_ carries the level
+  // past the arrival, when state_ has already moved on to DONE. Latching it
+  // here makes the guarantee local to the publisher rather than a property of
+  // the return leg's current shape — so making homing resumable later cannot
+  // silently turn a relayed level false. See TeamWorld.msg/mode.
+  bool   homing_announced_        = false;
+
   // --- The at-the-rendezvous hold (2026-09-17, generation 21) ---
   // Saturating the map while STANDING AT the agreed cell used to end the run on
   // the spot: maybeLatchCoverageDone routed straight to startReturnHome, so a
   // robot that had already arrived walked away from the meeting — possibly
-  // seconds before the peer it was waiting for got there. That is the one place
-  // a finished robot must not leave. The appointment's whole value is that
-  // somebody is present when the other robot arrives, and the saturated map
-  // this robot is carrying is exactly what the meeting exists to hand over.
+  // seconds before the peer it was waiting for got there. The appointment's
+  // whole value is that somebody is present when the other robot arrives, and
+  // the saturated map this robot is carrying is exactly what the meeting exists
+  // to hand over.
+  //
+  // WIDENED TO EVERY FINISHED ROBOT THAT HAS AN APPOINTMENT (2026-09-21,
+  // generation 32). Standing on the cell was never the property that mattered —
+  // holding an agreement the peer is also keeping is — so a robot that
+  // saturates its map anywhere now goes to the agreed cell and homes after the
+  // meeting (keepAppointmentOnFinish). The hold below is what bounds it once it
+  // gets there, and it is therefore also the bound on the case that made the
+  // widening necessary: a peer standing at the cell for the whole run because
+  // the robot it agreed with had quietly gone home.
   //
   // THE EXPLORATION ENDPOINT IS UNTOUCHED. exploration_complete is stamped
   // before the hold is taken (same line it was always stamped on), so
@@ -3047,11 +3161,14 @@ private:
   // when the barrier let it go. What the hold changes is only what the robot
   // DOES afterwards, which no exploration metric reads.
   //
-  // `coverage_latch_hold_start_sec_` is mission-elapsed at the latch, and it is
-  // the hold's own clock: doReturnSync's `waited` runs from the tick the robot
-  // entered RETURN_SYNC, which is before the latch, and capping against that
-  // would charge the hold for time the robot spent waiting while it still had
-  // exploring left to do.
+  // `coverage_latch_hold_start_sec_` is the hold's own clock, and it is
+  // mission-elapsed at whichever came LAST of the latch and reaching the
+  // barrier: doReturnSync's `waited` runs from the tick the robot entered
+  // RETURN_SYNC, which is before the latch, and capping against that would
+  // charge the hold for time the robot spent waiting while it still had
+  // exploring left to do. The latch stamps it for a robot already standing
+  // here; doReturnSync stamps it for one that finished on the road, so that
+  // the drive to the cell is not charged to it either.
   //
   // `coverage_latch_teardown_` is what the appointment outcome classifier reads
   // to tell "the meeting failed" from "this robot's run ended at the meeting".
@@ -3602,6 +3719,11 @@ private:
   rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_sub_;
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_scovox_map_;
   scovox_msgs::msg::ScovoxMap::SharedPtr ingested_scovox_map_;
+  // Per-source integration counters from the same dscovox node, on their own
+  // topic and their own timer. Created only when the fleet is configured:
+  // without fleet ids there is nothing to key the per-peer totals by.
+  rclcpp::Subscription<scovox_msgs::msg::ScovoxFusionCounters>::SharedPtr
+      fusion_counters_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   // Last goal actually put on the wire, for republishGoal()'s change
@@ -4657,16 +4779,24 @@ ExploPlannerNode::ExploPlannerNode()
   }
   rendezvous_latched_hold_sec_   = dp("rendezvous_latched_hold_sec", 300.0);
   if (!std::isfinite(rendezvous_latched_hold_sec_) ||
-      rendezvous_latched_hold_sec_ < 0.0) {
+      rendezvous_latched_hold_sec_ <= 0.0) {
+    // ZERO IS REJECTED, NOT ACCEPTED AS "NO CAP" (2026-09-21). Every guard on
+    // this value reads `> 0.0`, so zero disables the hold rather than
+    // unbounding it — and since the coverage latch started handing finished
+    // robots to the barrier (keepAppointmentOnFinish) this cap is the ONLY
+    // thing that ends a latched keeper's wait: it is non-terminal by
+    // construction, so rendezvous_max_wait_sec cannot end it and
+    // rendezvous_appointment_wait_sec is itself 0 = forever. Zero here would
+    // therefore reproduce the exact censored cell this generation was built to
+    // remove, silently, from a parameter that looks like a disable switch.
     RCLCPP_WARN(get_logger(),
         "rendezvous_latched_hold_sec %.1f is not a usable cap -> 300 s. A "
-        "negative cap would read as 'no cap' and strand a finished robot at "
-        "the meeting for the rest of the cell.",
+        "non-positive cap would read as 'no cap' and strand a finished robot "
+        "at the meeting for the rest of the cell.",
         rendezvous_latched_hold_sec_);
     rendezvous_latched_hold_sec_ = 300.0;
   }
-  if (rendezvous_latched_hold_sec_ > 0.0 &&
-      rendezvous_latched_hold_sec_ <= rendezvous_settle_sec_) {
+  if (rendezvous_latched_hold_sec_ <= rendezvous_settle_sec_) {
     // Same incoherence rendezvous_appointment_wait_sec is checked for below: a
     // hold shorter than the settle gives up before the map exchange it is
     // holding for could finish, so the hold pays its whole cost and collects
@@ -4703,6 +4833,56 @@ ExploPlannerNode::ExploPlannerNode()
         "rendezvous_settle_sec %.1f < 0 -> 0 (no map-exchange hold).",
         rendezvous_settle_sec_);
     rendezvous_settle_sec_ = 0.0;
+  }
+  // THE DRAIN RELEASE (generation 33, R3) — see the members. Read here so the
+  // manifest carries the arm's definition whether or not it is on.
+  rendezvous_drain_release_      = dp("rendezvous_drain_release", false);
+  rendezvous_drain_rate_vox_sec_ = dp("rendezvous_drain_rate_vox_sec", -1.0);
+  rendezvous_drain_window_sec_   = dp("rendezvous_drain_window_sec", -1.0);
+  // REFUSED, NOT DEFAULTED. R and W decide when a robot stops waiting for its
+  // partner's map; picking either here would be this file choosing a number
+  // that only the measured per-peer arrival distribution can choose. A
+  // substituted default would run, log a plausible arm name, and be a
+  // different experiment from the one the label claims — which is the exact
+  // failure mode the non-finite guard above exists for, one level up.
+  //
+  // R > 0, NOT R >= 0, and the strictness is load-bearing rather than tidy.
+  // The drain test is `rate >= R -> not drained` and `rate` is clamped at zero
+  // by construction, so R = 0 makes the test true for every peer on every
+  // window: the release can never fire, every meeting ends at the cap, and the
+  // arm logs UNFINISHED EXCHANGE for exchanges that finished. That is the
+  // treatment silently not running under its own name, which is worse than a
+  // refusal and indistinguishable in the tables from a mechanism that does
+  // nothing. It is also the zero-test the design rejects on evidence: 10 of 31
+  // long gen-32 meetings were still gaining voxels at departure.
+  if (rendezvous_drain_release_ &&
+      (!std::isfinite(rendezvous_drain_rate_vox_sec_) ||
+       rendezvous_drain_rate_vox_sec_ <= 0.0 ||
+       !std::isfinite(rendezvous_drain_window_sec_) ||
+       rendezvous_drain_window_sec_ <= 0.0)) {
+    RCLCPP_ERROR(get_logger(),
+        "rendezvous_drain_release is on but the thresholds are unset "
+        "(rate=%.3f vox/s, window=%.1f s). Both must come from the measured "
+        "per-peer arrival distribution; there is no defensible default.",
+        rendezvous_drain_rate_vox_sec_, rendezvous_drain_window_sec_);
+    throw std::runtime_error(
+        "rendezvous_drain_release requires rendezvous_drain_rate_vox_sec > 0 "
+        "and rendezvous_drain_window_sec > 0");
+  }
+  // COUPLING, and it is the one that bounds the treatment. The drain hold is
+  // capped by rendezvous_latched_hold_sec (see the gate in doReturnSync), and a
+  // window longer than the cap would mean the first evaluation never happens:
+  // the hold would always end at the cap and always log an unfinished
+  // exchange, which is the treatment silently not running.
+  if (rendezvous_drain_release_ &&
+      rendezvous_drain_window_sec_ >= rendezvous_latched_hold_sec_) {
+    RCLCPP_ERROR(get_logger(),
+        "rendezvous_drain_window_sec (%.1f) >= rendezvous_latched_hold_sec "
+        "(%.1f): every meeting would hit the cap before the drain could ever "
+        "be evaluated.",
+        rendezvous_drain_window_sec_, rendezvous_latched_hold_sec_);
+    throw std::runtime_error(
+        "rendezvous_drain_window_sec must be < rendezvous_latched_hold_sec");
   }
   if (!std::isfinite(rendezvous_appointment_wait_sec_) ||
       rendezvous_appointment_wait_sec_ < 0.0) {
@@ -5256,6 +5436,16 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("rendezvous_appointment_wait_sec",
                           rendezvous_appointment_wait_sec_);
     exp_log_->addParamNum("rendezvous_settle_sec", rendezvous_settle_sec_);
+    // Generation 33's replacement for that trigger. Logged unconditionally and
+    // with its thresholds, because a cell whose hold ended on the drain and a
+    // cell whose hold ended on the clock are two different arms, and the
+    // thresholds are what make two drain cells comparable to each other.
+    exp_log_->addParamNum("rendezvous_drain_release",
+                          rendezvous_drain_release_ ? 1.0 : 0.0);
+    exp_log_->addParamNum("rendezvous_drain_rate_vox_sec",
+                          rendezvous_drain_rate_vox_sec_);
+    exp_log_->addParamNum("rendezvous_drain_window_sec",
+                          rendezvous_drain_window_sec_);
     // Generation 29's addition to that definition, and it is not optional
     // bookkeeping: it decides which rung of the agreed lattice each robot signs
     // up to, so two cells with different values are two different rendezvous
@@ -6380,6 +6570,30 @@ ExploPlannerNode::ExploPlannerNode()
   RCLCPP_INFO(get_logger(), "Subscribing to fused map (dscovox): %s",
       dscovox_topic.c_str());
 
+  // The same node's per-source counters, which answer "whose voxels are
+  // arriving" — a question the fused map above cannot be asked, because it
+  // carries one merged grid with no attribution left in it. Latched like the
+  // map, so the current totals land on connect rather than on the next tick.
+  //
+  // FLEET-GATED. peer_fusion_deltas_ is indexed by fleet id, so with no fleet
+  // list there is no index to write into and the subscription would only cost
+  // bandwidth. The vector is sized on the FIRST sample rather than here, so
+  // that "still empty" keeps meaning "dscovox has never told us anything".
+  if (fleet_.configured) {
+    std::string counters_topic = dp("dscovox_counters_topic", std::string(""));
+    if (counters_topic.empty())
+      counters_topic = "/" + robot_name_ + "/dscovox_node/fusion_counters";
+    fusion_counters_sub_ =
+        create_subscription<scovox_msgs::msg::ScovoxFusionCounters>(
+            counters_topic, latchedQos(),
+            [this](scovox_msgs::msg::ScovoxFusionCounters::SharedPtr msg) {
+              onFusionCounters(msg);
+            });
+    RCLCPP_INFO(get_logger(),
+        "Subscribing to per-source fusion counters (dscovox): %s",
+        counters_topic.c_str());
+  }
+
   // Only subscribe when the planning_map is enabled. Leaving the subscription
   // uncreated guarantees latest_plan_map_ stays null for the whole run, so
   // every planning_map use site (all guarded on latest_plan_map_) takes its
@@ -7003,6 +7217,62 @@ void ExploPlannerNode::onScovoxMap(
   // mirroring the old per-cycle GetRegion fetch and avoiding a full grid rebuild
   // on every incoming message while the robot is NAVIGATE-ing.
   latest_scovox_map_ = msg;
+}
+
+void ExploPlannerNode::onFusionCounters(
+    const scovox_msgs::msg::ScovoxFusionCounters::SharedPtr& msg) {
+  // The arrays are parallel by contract (see ScovoxFusionCounters.msg). A
+  // length mismatch is a producer that has been changed out from under this
+  // node, and reading past the shorter one would attribute a peer's traffic to
+  // whichever robot happened to sort next.
+  if (msg->source_frame.size() != msg->deltas_received.size()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "Fusion counters: %zu source_frame vs %zu deltas_received — parallel "
+        "arrays disagree, ignoring this sample.",
+        msg->source_frame.size(), msg->deltas_received.size());
+    return;
+  }
+  // SIZED ON FIRST RECEIPT, not at construction, and a sample that names no
+  // sources still sizes it. That keeps three states apart that would otherwise
+  // collapse into one: dscovox has never published (vector empty — arrival is
+  // UNMEASURED), dscovox is publishing and has heard nobody (vector of zeros —
+  // arrival is MEASURED and zero), and a peer has sent something (non-zero).
+  // Only the middle one is evidence.
+  if (peer_fusion_deltas_.size() != static_cast<size_t>(fleet_.size()))
+    peer_fusion_deltas_.assign(static_cast<size_t>(fleet_.size()), 0);
+  for (size_t i = 0; i < msg->source_frame.size(); ++i) {
+    // "<robot>/odom" is what simple_nav_3d stamps as the integration frame and
+    // what dscovox files its per-source grids under. The emulator relays the
+    // serialized bytes without deserializing, so this still names the robot
+    // that SENSED the voxels even when another robot bridged them.
+    const std::string& frame = msg->source_frame[i];
+    const size_t slash = frame.find('/');
+    const int id = fleet_.idOf(
+        slash == std::string::npos ? frame : frame.substr(0, slash));
+    // idOf returns -1 for a producer the fleet list does not name. Counting it
+    // is not possible (there is no index) and it is not an error either: a
+    // robot outside the configured team can legitimately be on the bus.
+    if (id < 0 || id >= static_cast<int>(peer_fusion_deltas_.size())) continue;
+    const uint64_t total = msg->deltas_received[i];
+    // A DECREASE IS A RE-BASELINE, NOT ARRIVAL. The counters are node-local
+    // and restart at zero when dscovox does; subtracting across that restart
+    // would read as a huge negative, and latching the old higher value would
+    // make the peer look permanently talkative. Take the new value as-is and
+    // say so once, because any baseline captured before the restart is now
+    // meaningless and a reader of the logs needs to know which side of it the
+    // numbers came from.
+    if (total < peer_fusion_deltas_[static_cast<size_t>(id)]) {
+      RCLCPP_WARN(get_logger(),
+          "Fusion counters: source '%s' went backwards (%llu -> %llu) — "
+          "dscovox restarted. Re-baselining; deltas across the restart are "
+          "unmeasured.",
+          frame.c_str(),
+          static_cast<unsigned long long>(
+              peer_fusion_deltas_[static_cast<size_t>(id)]),
+          static_cast<unsigned long long>(total));
+    }
+    peer_fusion_deltas_[static_cast<size_t>(id)] = total;
+  }
 }
 
 bool ExploPlannerNode::loadLatestMap() {
@@ -7814,6 +8084,10 @@ std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
       r.cell = g.idAt(x, y);
       r.in_comms = true;
       r.finished = false;   // we are planning, so we are not done
+      // And by the same token still on the frontier: this function is only
+      // ever called to decide where THIS robot works next. Reading our own
+      // homing latch here would delete us from our own allocation problem.
+      r.off_frontier = false;
     } else {
       const TeamModel::Peer& p = team_model_.peer(id);
       // POSITION age, not lastKnownAgeSec: a relayed status update refreshes
@@ -7846,6 +8120,17 @@ std::vector<AllocRobot> ExploPlannerNode::allocVehicles(
                    : -1;
       r.in_comms = team_model_.inComms(id);
       r.finished = p.finished;
+      // The superset (generation 33, R4): homing or done. `finished` is ORed
+      // in rather than assumed to imply it, because the two arrive by
+      // different routes — a peer heard only through the relay can carry the
+      // finished bit while its mode level has not reached us.
+      r.off_frontier =
+          p.finished ||
+          p.mode >= explo_planner_msgs::msg::TeamWorld::MODE_HOMING;
+      // all_in_comms stays on `finished` ALONE and is not widened. It answers
+      // "is the team whole", and a robot driving home out of contact is a real
+      // break in the team — it is carrying a map nobody can reach. Only a run
+      // that is OVER excuses the silence.
       if (!r.in_comms && !r.finished && all_in_comms) *all_in_comms = false;
     }
     out.push_back(r);
@@ -9115,8 +9400,13 @@ void ExploPlannerNode::doPlan() {
     alloc_ev.focus_cell        = tour.empty() ? -1 : tour.front();
     alloc_ev.all_in_comms      = all_in_comms;
     alloc_ev.reordered         = reordered;
+    // Mirrors the allocator's vehicle filter exactly, `off_frontier` included.
+    // The column's only job is to say how many vehicles the solve was actually
+    // given; a count that used a narrower test than the solve would report a
+    // robot as present in a problem it had been dropped from.
     for (const AllocRobot& r : alloc_robots)
-      if (r.cell >= 0 && !r.finished) ++alloc_ev.robots_in_problem;
+      if (r.cell >= 0 && !r.finished && !r.off_frontier)
+        ++alloc_ev.robots_in_problem;
     for (int cid : tour)
       alloc_ev.tour += (alloc_ev.tour.empty() ? "" : ",") + std::to_string(cid);
     for (size_t i = 0; i < alloc_robots.size(); ++i) {
@@ -10222,10 +10512,14 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // of the team. It has the saturated map the meeting exists to hand over, and
   // leaving turns a meeting that was going to happen into a no-show.
   //
-  // Gated on appointment_arrived_, not on appointment_manoeuvre_ alone: the
-  // return-budget and no-progress paths also enter RETURN_SYNC on an
-  // appointment manoeuvre with arrived=false, and those robots are not at any
-  // agreed place — holding them would be a hold in an arbitrary spot.
+  // Gated on appointment_arrived_, not on appointment_manoeuvre_ alone,
+  // because what this block does that the general rule below cannot is stamp
+  // the hold's clock at the latch: this robot is already standing at the agreed
+  // place, so it has no drive left that would have to sit outside the cap. A
+  // manoeuvre with arrived=false — a settle conversion, or a leg the
+  // return-budget and no-progress paths stopped short of the cell — is kept by
+  // keepAppointmentOnFinish instead, and doReturnSync starts its clock on
+  // whichever tick it comes to a stop.
   //
   // Returning false does NOT un-finish anything. coverage_latched_ is already
   // true, so the guard at the top of this function makes every re-entry a
@@ -10235,8 +10529,46 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // (and the map has settled), or when the latched hold's cap expires.
   if (state_ == State::RETURN_SYNC && appointment_manoeuvre_ &&
       appointment_arrived_) {
+    // THE CAP STARTS WHEN THE MEETING IS DUE, NOT WHEN THIS ROBOT GOT HERE
+    // (2026-09-22). appointmentDue() aims the ARRIVAL at t_meet and prices the
+    // departure at t_meet minus appointmentLeadMs, which is the travel estimate
+    // marked up by depart_safety_milli (1.2x). A robot whose estimate holds
+    // therefore arrives EARLY by a fifth of its drive, and an unclamped stamp
+    // spends that margin waiting for a team that is not yet expected.
+    //
+    // WHAT THAT BREAKS IS THE CAP'S OWN SIZING. RDV_LATCHED_HOLD is derived in
+    // run_explo_sim_rviz.sh as interval + max_lateness + 60 s of margin, so one
+    // rolled rung is always covered — and that arithmetic measures from t_meet,
+    // because it is comparing against a teammate who rolled to t_meet plus an
+    // interval. Starting early eats the margin directly: on a deadline
+    // departure the lead is at most the whole time to the rung (the robot
+    // cannot leave before now), so the early margin is at most interval/6 =
+    // 50 s of the 60 s the derivation has.
+    //
+    // THE KEEPER ARRIVES EARLIER THAN THAT, AND WITHOUT A LEAD AT ALL.
+    // keepAppointmentOnFinish departs the moment the map saturates and asks
+    // appointmentDue() nothing — its own log line says so ("this is the
+    // departure the deadline would have triggered later") — so a robot that
+    // finishes early drives straight there and stands for the whole remaining
+    // countdown. Unclamped it would spend the entire cap before the meeting
+    // was due and tear down the hold at t_meet, which is the one outcome the
+    // sizing exists to forbid. That case is the reason this floor is worth
+    // having, not a case it merely tolerates.
+    //
+    // THE CLAMP CANNOT UNBOUND THE HOLD, which is the one thing this cap exists
+    // to guarantee, and the argument holds for both departures because it does
+    // not mention either. t_meet is a rung on a fixed lattice of spacing
+    // `interval`, and nextAgreedOccurrence hands back the first rung at or
+    // after now, so t_meet minus arrival is at most one interval whatever
+    // brought the robot here. The total stand is therefore bounded by
+    // interval + cap; a schedule that ROLLS does not extend it, because the
+    // roll clears this stamp and sets the sticky teardown. The same stamp is
+    // made on the other path into this hold; see doReturnSync.
     const double t_now = missionElapsed();
-    coverage_latch_hold_start_sec_ = (t_now >= 0.0) ? t_now : 0.0;
+    double t_hold = (t_now >= 0.0) ? t_now : 0.0;
+    if (appointment_.valid())
+      t_hold = std::max(t_hold, appointment_.t_meet_ms / 1000.0);
+    coverage_latch_hold_start_sec_ = t_hold;
     RCLCPP_INFO(get_logger(),
         "Rendezvous: map saturated while holding the agreed cell -> STAYING. "
         "Exploration is recorded complete at t_sim=%.1f; this robot keeps the "
@@ -10244,6 +10576,37 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
         coverage_latch_t_sim_, rendezvous_latched_hold_sec_);
     return false;
   }
+
+  // AND GO TO THE MEETING WHEN IT HAS NOT BEEN REACHED YET (2026-09-21). The
+  // block above is this same rule for the robot already standing on the agreed
+  // cell; this is its general form — "whenever the robots finish they go to the
+  // rendezvous point". What earns the appointment its precedence over the
+  // homing traverse is that it is the only destination the PEER also knows:
+  // home is this robot's own start pose, so superseding a standing agreement to
+  // drive there converts a meeting that was going to happen into a no-show, and
+  // the peer can only discover it by waiting its barrier out. ts4_31 rendezvous
+  // seed 6 is the measured case — bestla latched 157 s before t_meet, closed
+  // cell 27 as superseded, drove home, and atlas kept the appointment and stood
+  // on it for 2275 s to the duration cap.
+  //
+  // TRUE, AND THE BLOCK ABOVE RETURNS FALSE, AND THE DIFFERENCE IS THE WHOLE
+  // SAFETY ARGUMENT. What this function returns is read by exactly one caller
+  // that acts on it — doPlan, as `if (maybeLatchCoverageDone(...)) return;` —
+  // so false there means "not finished, carry on planning this tick". The
+  // block above can afford false because it is gated on state_ ==
+  // RETURN_SYNC, which doPlan is never in; it is only ever reached from the
+  // metrics tick, which discards the value. This block has no such gate: it
+  // fires from PLAN, which is where a robot that saturates between two sampler
+  // ticks latches. Returning false here would let doPlan run on past a
+  // startReturnTo that has already published the meeting goal and entered
+  // RETURN_NAV, select a frontier, publish it over that goal, and transition to
+  // NAVIGATE — at which point the outcome classifier sees a departed
+  // appointment whose manoeuvre just ended and closes it `unreachable`. That is
+  // the abandonment this block exists to prevent, wearing a fabricated
+  // navigation failure's name, and with the coverage ending spent
+  // (first-touch-only) the run would then have nothing left to end it but
+  // max_steps_ and a SECOND exploration_complete.
+  if (keepAppointmentOnFinish("coverage-latched")) return true;
 
   // Every ending below IS a coverage-latch teardown, so the appointment outcome
   // classifier must not read one as a no-show. Set before any of them, because
@@ -10297,12 +10660,86 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   return finishNow("coverage-latched");
 }
 
+// MISSION RETURN IS DEFERRED BY THIS, NOT SKIPPED. Every ending doReturnSync
+// can take from the barrier this hands the robot to — the release once the team
+// has met and the map has settled, and the latched hold's cap when it has not —
+// routes through startReturnHome itself. So a robot that keeps its appointment
+// still drives home; it does so after the meeting rather than instead of it.
+bool ExploPlannerNode::keepAppointmentOnFinish(const char* reason) {
+  // appointment_manoeuvre_ is asked first and separately, because the
+  // appointment RECORD can be closed on the very tick its own drive departs
+  // (see startReturnTo) — so a robot already on the leg can read armed=false
+  // while it is demonstrably keeping one. It needs no dispatch: it is already
+  // going, and re-issuing the leg here would refill the escape ladder it may
+  // have spent getting this far.
+  if (appointment_manoeuvre_) {
+    RCLCPP_INFO(get_logger(),
+        "Rendezvous: run ended [%s] while already on the way to the agreed "
+        "cell -> finishing the drive. Exploration is recorded complete; this "
+        "robot homes after the meeting, not instead of it.", reason);
+    return true;
+  }
+  if (!appointment_armed_ || !appointment_.valid()) return false;
+
+  // SOLVE THE GOAL BEFORE COMMITTING TO KEEPING IT, because appointmentPoint
+  // has a branch that cannot: with neither grid able to place the agreed cell
+  // it latches appointment_unplaceable_ and returns this robot's own position.
+  // Driving there "arrives" on the next tick, so the keeper would then hold a
+  // barrier at its own feet for the full latched cap over a meeting no travel
+  // of its could ever reach. Declining hands the ending back to the caller and
+  // restores exactly the pre-2026-09-21 behaviour for this one case — home,
+  // outcome `superseded` — which is the honest row when the cell was adopted
+  // off the wire and this robot never froze a snapshot to solve it against.
+  const Eigen::Vector3f goal = appointmentPoint();
+  if (appointment_unplaceable_) return false;
+
+  // Read the agreed pair BEFORE the dispatch: the transition startReturnTo
+  // tails into is exactly where the record can be closed out from under us.
+  RCLCPP_INFO(get_logger(),
+      "Rendezvous: map saturated with agreed cell %d still to keep (meeting at "
+      "t+%.0fs) -> leaving for it now [%s]. This is the departure the deadline "
+      "would have triggered later; the deadline exists to spend the wait on "
+      "exploring, and there is none left to spend.",
+      appointment_.cell, appointment_.t_meet_ms / 1000.0, reason);
+
+  // EVERY KEEPER IS BOUNDED, AND THIS LINE IS WHAT MAKES THAT TRUE BY
+  // CONSTRUCTION. reconnect_terminal_ answers one narrow question — may a
+  // failed barrier wait end the run where it stands? — and the barrier's cap
+  // follows from it: terminal takes rendezvous_max_wait_sec, non-terminal on an
+  // appointment takes rendezvous_appointment_wait_sec, which is 0 = UNBOUNDED
+  // and is meant to be.
+  //
+  // A coverage-latched keeper is the case that unbounded patience was written
+  // for and the latched hold below is its bound, so it goes non-terminal and
+  // stays reachable right up to that cap. A robot that finished any OTHER way
+  // has no latched hold — coverage_latched_ is the hold's own gate — so an
+  // unbounded wait there would have nothing left to end it, which is the exact
+  // failure this path exists to remove. It takes the terminal cap instead.
+  //
+  // Both flags are assigned BEFORE startReturnTo for the reason the
+  // appointment-due departure states: the outcome classifier and the barrier's
+  // wait cap are read inside the transition this call tails into, so assigning
+  // after it labels the manoeuvre in the log as the opposite of what it ran as
+  // — here, specifically, as the `superseded` this whole block exists to stop.
+  reconnect_terminal_   = !coverage_latched_;
+  appointment_departed_ = true;
+  startReturnTo(goal, "appointment", reason);
+  return true;
+}
+
 bool ExploPlannerNode::finishOrRendezvous(const char* reason) {
   // accountedPeerCount, not the raw table size: exploit claims are retained
   // past expiry by the grace window (vantage-contest lenience), and a graced
   // claim must not count a 10-s-silent teammate as "present" for the barrier.
   const int active = accountedPeerCount(this->now());
   recordExplorationComplete(reason);
+  // A STANDING APPOINTMENT OUTRANKS THE HOMING TRAVERSE (2026-09-21), for the
+  // reasons written at the latch's copy of this call. Here rather than below
+  // because the mission-return branch is precisely what it has to pre-empt:
+  // that branch is why the terminal dispatch's own appointment departure
+  // (dispatchReconnect, "exploration is over, go now") is unreachable whenever
+  // homing is enabled, which is every campaign arm.
+  if (keepAppointmentOnFinish(reason)) return true;
   // Mission return replaces the TERMINAL manoeuvre outright (mid-run
   // manoeuvres, dispatched from doPlan, are untouched — they ARE the
   // treatment). Both robots' start poses are within comms range of each
@@ -10700,7 +11137,24 @@ bool ExploPlannerNode::peerReportsTeamBreak() const {
     // never coming, i.e. exactly the censoring this exemption exists to stop.
     // The exemption is deliberate at BOTH sites; only the sentence describing
     // it was wrong.
-    if (p.finished) continue;
+    //
+    // WIDENED TO THE WHOLE OFF-FRONTIER SET IN GENERATION 33 (R4), which is
+    // where the argument above was always pointing: every clause of it turns
+    // on the peer never coming to the meeting and no longer needing map to
+    // flow in, and both hold from the moment it TURNS FOR HOME, not from the
+    // moment it announces the arrival. That window is minutes wide and it is
+    // precisely when this robot is standing at the barrier waiting. The
+    // widening is safe here for the reason the paragraph above gives: this
+    // function is read by the arm and the release alike (:11129 and the
+    // contagion-hold log), so the predicate moves identically on both sides.
+    //
+    // NOT COPIED to peerAccounted or reachablePeerCount, deliberately —
+    // teamComplete() is read by the mid-run reconnect trigger and by pursuit's
+    // quarry-heard test, and exempting a homing peer there would stop the gate
+    // from ever PRICING its map, which is the opposite of what R4 wants.
+    if (p.finished ||
+        p.mode >= explo_planner_msgs::msg::TeamWorld::MODE_HOMING)
+      continue;
     if (p.team_incomplete) return true;
   }
   return false;
@@ -10846,7 +11300,18 @@ void ExploPlannerNode::refreshRendezvousSnapshot() {
   // on without exchanging it, and it costs nothing: an appointment is a place
   // to stand, not a work assignment, so including a robot that has stopped
   // exploring is exactly what we want.
-  for (AllocRobot& v : rendezvous_vehicles_) v.finished = false;
+  //
+  // `off_frontier` IS FORCED OFF WITH IT, and it has to be: it is the wider
+  // test, the scheduler applies the same filter, and it is if anything MORE
+  // asymmetric than `finished` — a robot's own homing latch flips the instant
+  // it turns for home, while its partner learns the level one TeamWorld later
+  // or, out of contact, not at all. Leaving it live would put a homing robot
+  // in one snapshot and not the other and reintroduce the disagreement this
+  // whole block exists to remove.
+  for (AllocRobot& v : rendezvous_vehicles_) {
+    v.finished     = false;
+    v.off_frontier = false;
+  }
   have_rendezvous_snapshot_   = true;
   rendezvous_snapshot_at_sec_ = missionElapsed();
 }
@@ -13338,6 +13803,37 @@ bool ExploPlannerNode::appointmentLegWatchdog(const char* what_failed,
   // close the record, and both are columns on this row.
   logAppointmentLegRow("unreached", what_failed, dist, -1.0, rolled_to_sec);
 
+  // A LATCHED ROBOT DOES NOT GO BACK TO EXPLORING (2026-09-21) — the same rule
+  // as the barrier release below, reached by a different road. That road only
+  // opened this generation: before keepAppointmentOnFinish a finished robot
+  // drove home rather than to the meeting, so no leg to the agreed cell could
+  // be carrying one and every robot this rung handed to PLAN still had its
+  // ending in front of it. One that has already spent the coverage ending does
+  // not, and first-touch latching will not give it another, so the exit below
+  // would leave nothing but max_steps_ to stop it — the second
+  // exploration_complete, in the treated arms only, that the release's comment
+  // sets out in full.
+  //
+  // The rolled rung above is written and logged before this, deliberately: the
+  // roll is what the REST of the team is still keeping, and a rung this robot
+  // abandoned is not a rung the appointment loses. What ends here is this
+  // robot's run, not the meeting.
+  if (coverage_latched_) {
+    coverage_latch_hold_start_sec_ = -1.0;
+    coverage_latch_teardown_ = true;
+    abandonNavGoal("appointment-unreached");
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous: this robot had already finished exploring when the drive "
+        "to the agreed cell ran out of rungs -> ending the run here instead of "
+        "re-planning. It has no exploring left to return to.");
+    if (mission_return_enabled_ && have_home_) {
+      (void)startReturnHome("appointment-unreached");
+      return true;
+    }
+    (void)finishNow("appointment-unreached");
+    return true;
+  }
+
   appointment_departed_ = false;
   // RETURN_NAV is a driving state and PLAN can spend ticks before it publishes
   // anything, so the navigator must be stopped explicitly or it keeps executing
@@ -13517,15 +14013,145 @@ void ExploPlannerNode::doReturnSync() {
         // between here and the release is what the meeting bought.
         rendezvous_exchange_ = MapExchangeBaseline{
             true, latest_map_voxels_, cell_world_.sharedHash(),
-            team_merge_applied_total_};
+            team_merge_applied_total_, peer_fusion_deltas_};
         RCLCPP_INFO(get_logger(),
             "Rendezvous: team reachable (%d/%d) -> holding %.0fs for the "
             "map exchange before re-planning.",
             present, rendezvous_expected_peers_, rendezvous_settle_sec_);
       }
       settled_sec = (settle_now - rendezvous_settle_start_).seconds();
-      if (settled_sec < rendezvous_settle_sec_) {
-        return;   // still settling; stay put, keep heartbeating.
+      // THE TRIGGER, AND ONLY THE TRIGGER. Everything below this block — the
+      // re-agreement wait, the exchange report, the routing — is unchanged;
+      // what moves is the question that ends the hold. On the clock path it is
+      // "has 30 s passed", which is a guess about a duration nobody measured.
+      // On the drain path it is "has every peer this robot believes is here
+      // delivered what it had", which is the thing the hold exists for.
+      if (!rendezvous_drain_released_) {
+        if (!rendezvous_drain_release_) {
+          if (settled_sec < rendezvous_settle_sec_) {
+            return;   // still settling; stay put, keep heartbeating.
+          }
+        } else {
+          if (rendezvous_drain_window_start_sec_ < 0.0) {
+            rendezvous_drain_window_start_sec_ = settled_sec;
+            rendezvous_drain_window_base_      = peer_fusion_deltas_;
+          }
+          const double win = settled_sec - rendezvous_drain_window_start_sec_;
+          if (win < rendezvous_drain_window_sec_) {
+            return;   // no full window yet — this is also the hard floor.
+          }
+          // THREE VECTORS, ALL FLEET-SIZED OR THE READING IS NOT A READING.
+          // peer_fusion_deltas_ is empty until dscovox publishes counters, and
+          // the hold-start baseline is a copy of whatever it was then — so a
+          // meeting that began before the counters came up has no interval to
+          // difference. That is UNMEASURED, and the safe reading of unmeasured
+          // is "not drained": hold to the cap and say the exchange did not
+          // finish, rather than release on the absence of evidence.
+          const size_t n = static_cast<size_t>(fleet_.size());
+          const bool measurable =
+              (peer_fusion_deltas_.size() == n &&
+               rendezvous_exchange_.peer_deltas.size() == n &&
+               rendezvous_drain_window_base_.size() == n);
+          if (!measurable) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                "Rendezvous: drain release has no per-peer counters to read "
+                "(dscovox has published none this meeting). Holding to the "
+                "%.0fs cap.", rendezvous_latched_hold_sec_);
+          }
+          // THE LOOP RUNS TO THE END EVEN ONCE IT HAS ITS ANSWER, because the
+          // count it carries out is what the log reports: a `drained &&` in
+          // the condition would stop at the first mute peer and report "1"
+          // for a team where three had gone dark.
+          bool drained = measurable;
+          int mute = 0;
+          int examined = 0;
+          for (int id = 0; measurable && id < fleet_.size(); ++id) {
+            if (id == fleet_.self_id) continue;
+            // BELIEVED PRESENT, which is what the robot actually has. The
+            // detector's false-positive rate (2.948% of scored grid points
+            // read direct while the oracle says down) is inherited here and
+            // not claimed away: a robot can hold for a peer that is not
+            // really there. The cap below is what bounds that, and it bounds
+            // it to a wasted wait rather than a stall.
+            if (!team_model_.configured() || id >= team_model_.size()) continue;
+            // DIRECT OR RELAYED. The question at this loop is "is there
+            // somebody here to trade maps with", which is a radio statement,
+            // and a two-hop peer answers it: the emulator forwards serialized
+            // bytes without deserializing, so dscovox credits the robot that
+            // SENSED the voxels rather than the one that bridged them (see
+            // ScovoxFusionCounters.msg). Gen-32's census measured relayed rows
+            // applying a merge 15.5% of the time against 0.9% overall — the
+            // most productive channel on the team — so a direct-only filter
+            // would let the busiest stream on the meeting keep arriving while
+            // this test declared the exchange finished.
+            //
+            // The two flags are disjoint, so this is the whole filter and not
+            // half of one: team_model.cpp's closure loop opens with
+            // `if (p.direct) continue;`, which is why via_relay can never be
+            // set on a direct peer.
+            const auto& p = team_model_.peer(id);
+            if (!p.direct && !p.via_relay) continue;
+            ++examined;
+            const size_t k = static_cast<size_t>(id);
+            const uint64_t nowv = peer_fusion_deltas_[k];
+            // CLAUSE 1 — DID IT SPEAK AT ALL THIS VISIT. A level against the
+            // hold-start baseline, not a rate. This is the clause that cannot
+            // be optimised away: a peer whose bytes are not crossing the radio
+            // and a peer that has sent everything it has BOTH present a rate
+            // of zero over the window, and dropping this would make the
+            // release fire fastest in exactly the blackout the hold exists to
+            // sit through.
+            if (nowv <= rendezvous_exchange_.peer_deltas[k]) {
+              ++mute;
+              drained = false;
+              continue;
+            }
+            // CLAUSE 2 — HAS IT STOPPED. A rate, not a zero test: a third of
+            // the long gen-32 N=2 meetings were still gaining when the robot
+            // departed, so "the counter has stopped moving" over-holds, while
+            // "the counter has fallen below R" does not.
+            const uint64_t wb = rendezvous_drain_window_base_[k];
+            const double rate =
+                (nowv > wb) ? static_cast<double>(nowv - wb) / win : 0.0;
+            if (rate >= rendezvous_drain_rate_vox_sec_) drained = false;
+          }
+          // NOBODY READ IS NOT EVERYBODY DRAINED. Every `continue` above is a
+          // peer this robot could not read — model unconfigured, id past its
+          // end, or believed not here — and with all of them taken the loop
+          // falls out leaving `drained` at the true it started on, releasing
+          // the hold having examined no one. That is the same absence of
+          // evidence `measurable` refuses a few lines up, arriving through a
+          // different door: the hold opens on max(active, reachablePeerCount),
+          // which counts peers this loop is entitled to skip.
+          if (examined == 0) drained = false;
+          if (!drained) {
+            // Roll the window forward and keep holding — up to the cap, which
+            // is the same knob that bounds a latched robot's hold and is
+            // already validated to exceed the settle.
+            rendezvous_drain_window_start_sec_ = settled_sec;
+            rendezvous_drain_window_base_      = peer_fusion_deltas_;
+            if (settled_sec < rendezvous_latched_hold_sec_) {
+              return;   // keep standing on the cell; keep heartbeating.
+            }
+            // A DIFFERENT OUTCOME FROM A RELEASE, AND NAMED DIFFERENTLY. The
+            // team leaves either way, but "the exchange finished" and "the
+            // exchange never happened and we gave up waiting" are not the same
+            // event, and a log that calls both a release puts the ambiguity
+            // this whole generation removes back in as a reporting bug.
+            RCLCPP_WARN(get_logger(),
+                "Rendezvous: UNFINISHED EXCHANGE — %.0fs cap reached; %d of %d "
+                "readable peer(s) delivered nothing at all since the hold "
+                "began. Leaving on the cap, not on the drain.",
+                rendezvous_latched_hold_sec_, mute, examined);
+          } else {
+            RCLCPP_INFO(get_logger(),
+                "Rendezvous: exchange drained after %.1fs (every believed "
+                "peer spoke, then fell below %.3f vox/s over %.0fs).",
+                settled_sec, rendezvous_drain_rate_vox_sec_,
+                rendezvous_drain_window_sec_);
+          }
+        }
+        rendezvous_drain_released_ = true;
       }
       // AND THEN IT WAITS FOR THE NEXT APPOINTMENT (generation 29). The maps
       // have merged; the rule's last clause is that the team agrees the next
@@ -13599,6 +14225,46 @@ void ExploPlannerNode::doReturnSync() {
           "shared census %s, the dense map gained %.0f voxel(s)).",
           present, rendezvous_expected_peers_, settled_sec, merged_cells,
           census_moved ? "moved" : "did not move", gained_voxels);
+      // WHICH PEER, not how much in total. The three numbers above are all
+      // team-wide, so a meeting where one partner delivered everything and the
+      // other delivered nothing reads exactly like a meeting where both
+      // delivered half — and at N>=3 that is the difference between a hold
+      // that is over and a hold that is waiting on a robot it cannot hear.
+      // This line is what fixes the drain-release thresholds offline: it is
+      // the per-peer arrival distribution the design says must be measured
+      // before anything is allowed to release on it.
+      //
+      // THREE OUTCOMES, KEPT APART. No counters at all is unmeasured and says
+      // so; counters present with a zero delta is a peer that did not speak
+      // during the whole meeting, which is a finding, not a missing reading.
+      if (rendezvous_exchange_.peer_deltas.size() == peer_fusion_deltas_.size()
+          && !peer_fusion_deltas_.empty()) {
+        std::ostringstream ss;
+        int silent = 0;
+        bool first = true;
+        for (int id = 0; id < fleet_.size(); ++id) {
+          if (id == fleet_.self_id) continue;
+          const size_t k = static_cast<size_t>(id);
+          // Unsigned, and re-baselined on a dscovox restart, so the baseline
+          // can legitimately exceed the current total. Clamp rather than wrap.
+          const uint64_t base = rendezvous_exchange_.peer_deltas[k];
+          const uint64_t nowv = peer_fusion_deltas_[k];
+          const uint64_t d = (nowv >= base) ? (nowv - base) : 0;
+          if (d == 0) ++silent;
+          ss << (first ? "" : ", ") << fleet_.nameOf(id) << "=+"
+             << static_cast<unsigned long long>(d);
+          first = false;
+        }
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous: voxel deltas ingested per peer over the %.1fs "
+            "meeting: %s (%d peer(s) sent nothing at all).",
+            settled_sec, ss.str().c_str(), silent);
+      } else {
+        RCLCPP_INFO(get_logger(),
+            "Rendezvous: per-peer voxel arrival is unmeasured for this "
+            "meeting — dscovox published no fusion counters to baseline "
+            "against.");
+      }
       // NOT A GATE, AND DELIBERATELY SO. An exchange that moved nothing is a
       // result — two robots that covered no ground the other needed — and
       // refusing to re-site the meeting on it would leave the team on a pair
@@ -13642,6 +14308,11 @@ void ExploPlannerNode::doReturnSync() {
       rendezvous_reagree_due_ = true;
     }
     rendezvous_settling_ = false;
+    // The drain state is the settle's, so it dies with it — including the
+    // release latch, which is what makes it per-visit rather than per-run.
+    rendezvous_drain_released_         = false;
+    rendezvous_drain_window_start_sec_ = -1.0;
+    rendezvous_drain_window_base_.clear();
     rendezvous_reagree_waiting_ = false;
     // A LATCHED ROBOT DOES NOT GO BACK TO EXPLORING (2026-09-17). This release
     // is unconditional in every earlier generation, and once
@@ -13704,6 +14375,12 @@ void ExploPlannerNode::doReturnSync() {
   // every peer's echo, so a team that has come apart cannot finish one.
   rendezvous_settling_ = false;
   rendezvous_reagree_waiting_ = false;
+  // Void with it, and the LATCH most of all: a team that came apart and
+  // re-gathered is a new visit, and a drain that fired for the old one must
+  // not release the new one on the first tick.
+  rendezvous_drain_released_         = false;
+  rendezvous_drain_window_start_sec_ = -1.0;
+  rendezvous_drain_window_base_.clear();
 
   // THE CONVERSION IS REVERSIBLE (2026-09-19, generation 28). A walker that
   // joined the barrier from the road did so on one premise — the team had
@@ -13807,6 +14484,37 @@ void ExploPlannerNode::doReturnSync() {
         active, rendezvous_expected_peers_, waited);
   }
 
+  // START THE CAP WHEN THE FINISHED ROBOT STOPS HERE, OR WHEN THE MEETING FALLS
+  // DUE, WHICHEVER IS LATER. The latch stamps it itself when it fires on a robot
+  // already standing at the cell, but one that finished on the road
+  // (keepAppointmentOnFinish) only reaches the barrier later — by arriving, or
+  // by a nav watchdog handing the leg off short of the cell — and an unstamped
+  // cap on an appointment barrier leaves the unbounded appointment wait with
+  // nothing left to end it, which is the failure that path exists to remove.
+  //
+  // The t_meet floor is the twin of the latch's own stamp and is derived there:
+  // the departure rule aims the arrival at t_meet, so an early arrival would
+  // otherwise spend the cap's sizing margin before the team is due.
+  //
+  // TRAVEL IS DELIBERATELY OUTSIDE THE CAP. The cap's size is derived from the
+  // meeting schedule — it has to outlast one rolled rung — and not from how far
+  // the robot had to come, so charging the drive to it would shorten the hold
+  // by a distance. The drive carries its own bounds: the manoeuvre leg budget
+  // and the escape ladder.
+  //
+  // coverage_latch_teardown_ is what stops a hold that has already ended from
+  // being re-armed on a later tick. Both endings below clear the stamp and set
+  // that flag before they leave, and it is sticky for the rest of the run.
+  if (coverage_latched_ && appointment_manoeuvre_ &&
+      !coverage_latch_teardown_ && coverage_latch_hold_start_sec_ < 0.0 &&
+      rendezvous_latched_hold_sec_ > 0.0) {
+    const double t_stop = missionElapsed();
+    double t_hold = (t_stop >= 0.0) ? t_stop : 0.0;
+    if (appointment_.valid())
+      t_hold = std::max(t_hold, appointment_.t_meet_ms / 1000.0);
+    coverage_latch_hold_start_sec_ = t_hold;
+  }
+
   // THE LATCHED HOLD'S OWN CAP (2026-09-17). Checked before, and independently
   // of, rendezvousWaitExpired, because the cap it has to survive is the one
   // above: on an appointment manoeuvre wait_cap is
@@ -13815,10 +14523,11 @@ void ExploPlannerNode::doReturnSync() {
   // trade against it. This robot has none, so an unbounded hold here is a cell
   // that runs to the harness wall clock with one robot standing still.
   //
-  // Measured from the LATCH, not from state entry: `waited` starts when the
-  // robot entered RETURN_SYNC, which is before it finished, and charging the
-  // hold for that time would cut it short by however long the robot waited
-  // while it was still exploring.
+  // Measured from the latch — or from the stop tick stamped just above, for a
+  // robot that finished on the road — and not from state entry: `waited`
+  // starts when the robot entered RETURN_SYNC, which is before it finished, and
+  // charging the hold for that time would cut it short by however long the
+  // robot waited while it was still exploring.
   if (coverage_latched_ && coverage_latch_hold_start_sec_ >= 0.0 &&
       rendezvous_latched_hold_sec_ > 0.0) {
     const double t_hold_now = missionElapsed();
@@ -13851,16 +14560,27 @@ void ExploPlannerNode::doReturnSync() {
     }
   }
 
-  // A BLOCK THAT REWOUND `waited` TO max(arrival, t_meet) STOOD HERE, and
-  // generation 19 makes it provably a no-op rather than merely unnecessary.
-  // It existed because t_meet was a MEETING time the robot aimed to arrive
-  // before, so a punctual robot began spending its patience while the meeting
-  // was still in the future and could time out ahead of its own appointment
-  // (measured: atlas gave up at lateness_sec = -11.184). Under the countdown
-  // rule t_meet is the DEPARTURE time, so arrival is necessarily at or after
-  // it, `since_meet >= waited` always holds, and the min() could only ever
-  // return `waited`. Keeping it would leave a reader believing the barrier
-  // still has a second clock in it.
+  // A BLOCK THAT REWOUND `waited` TO max(arrival, t_meet) STOOD HERE. It
+  // existed because a punctual robot began spending its patience while the
+  // meeting was still in the future and could time out ahead of its own
+  // appointment (measured: atlas gave up at lateness_sec = -11.184).
+  //
+  // THE NOTE THAT STOOD HERE CALLED IT A NO-OP AND WAS STALE (2026-09-22). It
+  // argued that "under the countdown rule t_meet is the DEPARTURE time, so
+  // arrival is necessarily at or after it" — true only of the bare
+  // `now >= t_meet` test that lived between 2026-09-18 and 2026-09-19.
+  // appointmentDue() now departs at t_meet minus appointmentLeadMs so that the
+  // ARRIVAL lands on t_meet, which makes early arrival the designed case, not
+  // an impossible one: `since_meet < waited` again.
+  //
+  // THE REWIND STILL STAYS OUT, for a reason that does not depend on that.
+  // `wait_cap` on an appointment manoeuvre is rendezvous_appointment_wait_sec,
+  // which is 0 = unbounded by default and deliberately so, and
+  // rendezvousWaitExpired cannot fire on an unbounded cap however early
+  // `waited` started. The bounded clock an early arrival DOES reach is the
+  // latched hold above, and that one is floored at t_meet where it is stamped
+  // rather than rewound here — a second clock in this barrier is exactly what
+  // the deleted block made hard to read.
   if (rendezvousWaitExpired(waited, wait_cap)) {
     if (!reconnect_terminal_ && !coverage_latched_) {
       // A mid-run attempt must never end the run: the map is not saturated
@@ -18900,6 +19620,21 @@ void ExploPlannerNode::publishTeamWorld() {
   if (coverage_latched_ || state_ == State::DONE) finished_announced_ = true;
   m.finished = finished_announced_;
 
+  // The same statement on three levels instead of two, latched the same way
+  // and for the same relay reason (see homing_announced_). NEITHER LEVEL IS
+  // READ FROM state_: DONE comes from the bit above, because State::DONE is
+  // leavable through the exploit sub-loop and the announced bit is not, and
+  // HOMING comes from the latch, because state_ has already moved past
+  // RETURN_HOME by the time the robot is parked at home. The ordering below
+  // is what makes the field monotone at the source — DONE outranks HOMING, so
+  // a robot that latches coverage without ever homing still only ever rises.
+  using TeamWorldMsg = explo_planner_msgs::msg::TeamWorld;
+  if (state_ == State::RETURN_HOME || mission_return_done_)
+    homing_announced_ = true;
+  m.mode = finished_announced_ ? TeamWorldMsg::MODE_DONE
+         : homing_announced_   ? TeamWorldMsg::MODE_HOMING
+                               : TeamWorldMsg::MODE_EXPLORING;
+
   // A robot whose run is over has no opinion worth acting on about whether the
   // TEAM is whole, and announcing one is how the censoring above propagated.
   // Belt and braces with the `finished` bit above on purpose: that bit is what
@@ -18917,10 +19652,14 @@ void ExploPlannerNode::publishTeamWorld() {
   m.robot_positions.assign(n, geometry_msgs::msg::Point());
   m.robot_last_heard_sec.assign(n, -1.0f);
   m.robot_finished.assign(n, false);
+  // EXPLORING is the "no evidence" fill, not a claim that the robot is
+  // exploring; see TeamWorld.msg/robot_mode.
+  m.robot_mode.assign(n, TeamWorldMsg::MODE_EXPLORING);
   for (size_t i = 0; i < n; ++i) {
     const int id = static_cast<int>(i);
     if (id == fleet_.self_id) {
       m.robot_finished[i] = m.finished;
+      m.robot_mode[i]     = m.mode;
       // Our own entry is our publish time, and it is the reference point the
       // whole array is read against — the receiver recovers each peer's age as
       // (our entry - that entry), an interval, which is the only thing that
@@ -18959,6 +19698,11 @@ void ExploPlannerNode::publishTeamWorld() {
     // hazard. Its own idempotence is what makes that safe: re-relaying a bit
     // that is already true changes nothing anywhere.
     if (p.finished) m.robot_finished[i] = true;
+    // Relayed on exactly the terms of the line above — no pairing rule, no
+    // freshness rule, relayed whether held first-hand or by relay — with MAX
+    // in place of OR because the fact has three ordered levels. Raising only
+    // is what keeps re-relaying idempotent, and so keeps it safe.
+    m.robot_mode[i] = std::max(m.robot_mode[i], p.mode);
   }
 
   team_world_pub_->publish(m);
@@ -19056,6 +19800,11 @@ void ExploPlannerNode::drainTeamWorld() {
       o.sender_id     = sid;
       o.in_range_mask = msg.in_range_mask;
       o.finished      = msg.finished;
+      // Copied verbatim and deliberately NOT validated against the MODE_*
+      // constants: the scale is open-ended upward by contract, so an
+      // unrecognised level is a level above DONE and every threshold read
+      // downstream answers correctly for it. See TeamWorld.msg/mode.
+      o.mode          = msg.mode;
       // The sender's own first-hand break bit, copied verbatim and never
       // re-broadcast as ours (TeamModel::observe stores it first-hand only).
       o.team_incomplete = msg.team_incomplete;
@@ -19080,6 +19829,9 @@ void ExploPlannerNode::drainTeamWorld() {
       o.finished_gossip.reserve(msg.robot_finished.size());
       for (bool v : msg.robot_finished)
         o.finished_gossip.push_back(v ? 1u : 0u);
+      // Same treatment, same reasons; already the right element type, so it
+      // copies rather than converting.
+      o.mode_gossip = msg.robot_mode;
       const size_t gn = msg.robot_positions.size();
       o.gx.resize(gn); o.gy.resize(gn); o.gz.resize(gn);
       // The wire carries no have_gossip_pos flag; the message defines a
@@ -19248,6 +20000,13 @@ void ExploPlannerNode::drainTeamWorld() {
       e.one_way   = p.heard_one_way;
       e.via_relay = p.via_relay;
       e.last_direct_age_sec = team_model_.lastDirectAgeSec(e.peer_id, t);
+      // R1 (generation 33). Read here with the rest of the post-tick comms
+      // picture because that is when the transition has been computed, and
+      // it is safe to read here because neither transition can occur on a
+      // tick with no packet from this peer -- so the row that exists for a
+      // transition is this one. See TeamModel::Peer::acquire_sec.
+      e.acquire_sec = p.acquire_sec;
+      e.held_sec    = p.held_sec;
       // NOT re-read here — see the pre-pass. This is the age as it stood
       // BEFORE this message was believed; reading the model now would give
       // 0.0 on every row, which is what v7 did.

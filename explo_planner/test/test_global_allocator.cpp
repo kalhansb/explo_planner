@@ -271,6 +271,28 @@ TEST(GlobalAllocatorVehicles, FinishedRobotIsRemovedAndItsCellsReturn) {
       << "the finished robot's cells must come back to the pool";
 }
 
+/// The same drop, one level earlier (generation 33, R4). A robot that has
+/// turned for home will claim no more ground, and it reads finished=false for
+/// the whole return leg — so without this the makespan balance keeps reserving
+/// work for it exactly while it drives away from the work.
+TEST(GlobalAllocatorVehicles, OffFrontierRobotIsRemovedAndItsCellsReturn) {
+  CellWorld w = world5(0);
+  for (int id : {20, 21, 22}) setSelf(w, id, CellStatus::EXPLORING);
+
+  std::vector<AllocRobot> robots = pair2(0, 24);
+  const Allocation live = GlobalAllocator::solve(w, robots, {});
+  ASSERT_FALSE(live.tours[1].empty()) << "fixture: robot 1 should get work";
+
+  // finished stays FALSE, which is the whole point: this is the window
+  // `finished` cannot see.
+  robots[1].off_frontier = true;
+  ASSERT_FALSE(robots[1].finished);
+  const Allocation home = GlobalAllocator::solve(w, robots, {});
+  EXPECT_TRUE(home.tours[1].empty());
+  EXPECT_EQ(allAssigned(home), (std::vector<int>{20, 21, 22}))
+      << "the homing robot's cells must come back to the pool";
+}
+
 /// An unlocatable robot is dropped rather than defaulted onto some cell: every
 /// cost involving it would be fiction, and fiction that moves the makespan
 /// moves the OTHER robot's tour too.
@@ -477,6 +499,19 @@ TEST(AllocHash, EveryVehicleFieldMovesTheDigest) {
   std::vector<AllocRobot> fin = pair2(0, 24);
   fin[1].finished = true;
   EXPECT_NE(base, GlobalAllocator::solve(w, fin, c).alloc_hash);
+
+  // ...one robot off the frontier. Same argument as `finished` directly
+  // above, and it needs its OWN assertion: the two fields are separate, so a
+  // digest that folded in only the first would let two robots disagree about
+  // a peer's mode while agreeing on the key — solving different vehicle sets
+  // under one hash, which is the exact failure the digest exists to expose.
+  std::vector<AllocRobot> off = pair2(0, 24);
+  off[1].off_frontier = true;
+  EXPECT_NE(base, GlobalAllocator::solve(w, off, c).alloc_hash);
+  EXPECT_NE(GlobalAllocator::solve(w, fin, c).alloc_hash,
+            GlobalAllocator::solve(w, off, c).alloc_hash)
+      << "\"it has finished\" and \"it is driving home\" are different "
+         "problems and must not collide";
 
   // ...a different fleet id
   std::vector<AllocRobot> rid = pair2(0, 24);

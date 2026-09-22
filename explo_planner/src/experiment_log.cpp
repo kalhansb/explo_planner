@@ -946,6 +946,8 @@ void ExperimentLog::logTeamExchange(const ExperimentContext& ctx,
   boolean("one_way", e.one_way);
   boolean("via_relay", e.via_relay);
   num("last_direct_age_sec", e.last_direct_age_sec);
+  num("acquire_sec", e.acquire_sec);
+  num("held_sec", e.held_sec);
   num("last_known_age_sec", e.last_known_age_sec);
   integer("peers_lost", e.peers_lost);
   // Decimal, for the same reason grid_hash is: JSON has no hex literal and a

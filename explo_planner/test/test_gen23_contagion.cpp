@@ -729,6 +729,13 @@ TEST(Gen23ContagionPredicate, BelievesOnlyAPeerItIsCurrentlyReceivingFrom) {
 /// What it does leave — deliberately — is that a finished peer still counts
 /// toward teamComplete, so if it goes SILENT the team arms on the ordinary
 /// rule.
+///
+/// WIDENED IN GENERATION 33 (R4) to the whole off-frontier set, `finished` or
+/// TeamWorld/mode >= MODE_HOMING. Every clause above turns on the peer never
+/// coming to the meeting and no longer needing map to flow in, and both are
+/// true from the moment it TURNS FOR HOME — minutes before `finished`. The
+/// assertions below pin BOTH halves: dropping either one restores the hold
+/// this test exists to prevent, for one of the two ways a robot leaves.
 TEST(Gen23ContagionPredicate, ExemptsAFinishedPeer) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -736,17 +743,26 @@ TEST(Gen23ContagionPredicate, ExemptsAFinishedPeer) {
       functionBody(text, "bool ExploPlannerNode::peerReportsTeamBreak() const");
   ASSERT_FALSE(fn.empty()) << "no peerReportsTeamBreak() definition";
 
-  const size_t exempt = fn.find("if (p.finished) continue;");
+  const size_t exempt = fn.find("if (p.finished ||");
+  const size_t homing =
+      fn.find("p.mode >= explo_planner_msgs::msg::TeamWorld::MODE_HOMING");
   const size_t read   = fn.find("if (p.team_incomplete) return true;");
   ASSERT_NE(exempt, std::string::npos)
       << "the finished-peer exemption is gone. The appointment barrier has no "
          "cap (rendezvous_appointment_wait_sec defaults to 0), so a parked "
          "robot that can never close one distant pair now holds the whole team "
          "to the duration cap and censors the cell.";
+  ASSERT_NE(homing, std::string::npos)
+      << "the HOMING half of the exemption is gone. A robot driving home is "
+         "not coming to the meeting either, and it reads finished=false for "
+         "the whole drive — so the barrier holds on it for exactly as long as "
+         "the return leg takes.";
   ASSERT_NE(read, std::string::npos);
   EXPECT_LT(exempt, read)
       << "the exemption no longer precedes the read, so a finished peer's bit "
          "is believed before it is skipped";
+  EXPECT_LT(homing, read)
+      << "the homing half no longer precedes the read";
 }
 
 // ===========================================================================

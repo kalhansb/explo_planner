@@ -219,6 +219,12 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
       f.i64(r->cell);
       f.byte(r->in_comms ? 1u : 0u);
       f.byte(r->finished ? 1u : 0u);
+      // IN, and not optional: it decides which vehicles the solve is given, so
+      // two robots disagreeing about a peer's mode are solving different
+      // problems and the digest has to say so. Leaving it out would let them
+      // agree on the key while allocating over different vehicle sets, which
+      // is the exact failure the split above exists to make visible.
+      f.byte(r->off_frontier ? 1u : 0u);
     }
     f.i64(static_cast<int64_t>(cand.size()));
     for (int id : cand) f.i64(id);
@@ -235,14 +241,17 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   // --- vehicle set --------------------------------------------------------
   // Sorted by id so the caller's vector order cannot reach the result, and
   // carrying the caller's index so the output stays index-aligned with the
-  // input the caller passed. A finished robot is removed outright and its
-  // cells return to the pool (§3.4) -- leaving it in with an empty tour would
-  // let the makespan balance keep reserving work for a robot that has stopped.
+  // input the caller passed. A robot that has left the frontier is removed
+  // outright and its cells return to the pool (§3.4) -- leaving it in with an
+  // empty tour would let the makespan balance keep reserving work for a robot
+  // that has stopped. `off_frontier` is the superset test and `finished`
+  // implies it, so the pair below is one condition written as two for the
+  // reader; see AllocRobot for why they are separate fields.
   struct Veh { int idx; int id; int cell; bool in_comms; };
   std::vector<Veh> veh;
   for (size_t i = 0; i < robots_in.size(); ++i) {
     const AllocRobot& r = robots_in[i];
-    if (r.finished) continue;
+    if (r.finished || r.off_frontier) continue;
     // An unlocatable robot is dropped rather than defaulted to some cell: every
     // cost involving it would be fiction, and a fiction that changes the
     // makespan changes the OTHER robot's tour too. Dropped, it simply gets no
@@ -256,7 +265,7 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
             [](const Veh& a, const Veh& b) { return a.id < b.id; });
 
   if (veh.empty()) {
-    out.refused = "no locatable, unfinished robot to allocate to";
+    out.refused = "no locatable robot still on the frontier to allocate to";
     return out;
   }
 

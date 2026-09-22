@@ -109,6 +109,55 @@ public:
     /// Mission-elapsed seconds when this robot last had DIRECT contact.
     /// Negative for never.
     double   last_direct_sec = -1.0;
+
+    // --- R1 instrumentation (generation 33) ---------------------------------
+    //
+    // The detector is not changed by any of the four fields below; they only
+    // TIME it. Both measurements exist today by offline reconstruction against
+    // an oracle the robot does not have, which is the gap R1 names.
+    //
+    // ALL FOUR ARE STAMPED FROM THE PACKET CLOCK (`reported_at_sec_`), never
+    // from the tick clock. A tick is a coarse, jittering sample of a link that
+    // changes on arrivals, so differencing tick times would report the planner's
+    // scheduling noise as link behaviour. Differencing the two packets that
+    // bracket the transition reports the link.
+
+    /// Packet stamp that opens the CURRENT period without a completed
+    /// handshake — the first packet of a receiving run, or the packet that
+    /// broke the last handshake while the peer stayed audible. Negative while
+    /// not receiving. This is the "first one-way packet" acquisition latency is
+    /// measured from. It is stamped whether or not that packet already
+    /// completes the handshake, so an instant handshake correctly reads 0.
+    double   one_way_since_sec = -1.0;
+    /// Packet stamp of the message that completed the CURRENT handshake.
+    /// Negative while not direct. Distinct from `last_direct_sec`, which is the
+    /// LAST mutual packet: this one is the first, and a hold's duration is the
+    /// difference between them plus whatever ends it.
+    double   direct_since_sec = -1.0;
+
+    /// ONE-SHOT, and the only two fields in this struct that are: set on the
+    /// tick that carries the transition and cleared on every other tick, so a
+    /// reader counts events by counting non-negative readings instead of
+    /// diffing a level. Negative means "no transition this tick".
+    ///
+    /// THE ONE-SHOT IS SOUND BECAUSE NEITHER TRANSITION CAN HAPPEN ON A TICK
+    /// WITH NO PACKET FROM THIS PEER. Both `receiving` and the peer's mask move
+    /// only on an arrival, so a tick with an empty batch can lower `direct` by
+    /// TTL expiry (which is not this measurement) but can never raise it and can
+    /// never break a handshake while still receiving. The value is therefore
+    /// always readable on a row that exists for this peer in the same drain.
+    ///
+    /// `acquire_sec`: seconds from the first packet of the contact run to the
+    /// packet that completed the handshake — acquisition LATENCY.
+    double   acquire_sec = -1.0;
+    /// `held_sec`: seconds a completed handshake survived, from the packet that
+    /// made it to the packet that broke it, and set ONLY on a break that
+    /// happens WHILE STILL RECEIVING — the peer is still audible and stopped
+    /// naming us back. A link that ends because the packets stopped is a
+    /// different event with a different cause (§2.7's fleet-wide blackout), it
+    /// has no closing packet to stamp, and conflating the two would average a
+    /// delivery failure into a handshake statistic.
+    double   held_sec = -1.0;
     /// Mission-elapsed seconds of the freshest information we hold about the
     /// peer, first-hand or gossiped. Negative for never. This is the field
     /// every DATA consumer keys on.
@@ -140,6 +189,25 @@ public:
     /// counting it missing forever and holds the whole team at the unbounded
     /// appointment barrier; see TeamWorld.msg/robot_finished.
     bool     finished = false;
+
+    /// What the peer is doing with the rest of its run (TeamWorld/mode), on the
+    /// ordered scale EXPLORING(0) < HOMING(1) < DONE(2). MONOTONIC and STICKY
+    /// for `finished`'s reasons exactly, merged by MAX instead of OR because
+    /// the fact has three levels rather than two. 0 means "no evidence", not
+    /// "confirmed exploring". It follows `finished`'s two-channel rule to the
+    /// letter: the FIRST-HAND assignment is authoritative and may therefore
+    /// LOWER the level (the restarted-node case `finished` documents applies
+    /// here identically), while RELAY can only ever raise it.
+    ///
+    /// WHAT IT BUYS OVER `finished`, which is the whole point of having both:
+    /// it fills the window between "left for home" and "arrived and announced
+    /// finished". A peer in that window is not coming to the meeting and will
+    /// explore no more cells, but `finished` still reads false — so a partner
+    /// waits at an unbounded barrier, and the allocator reserves frontier for
+    /// a robot that is driving the other way. Read this where the question is
+    /// "will this peer participate?"; read `finished` where it is "is its run
+    /// over?". See TeamWorld.msg/mode for the levels and their preconditions.
+    uint8_t  mode = 0;
 
     /// The peer's own FIRST-HAND answer to "is the team whole?", as it sent it
     /// (TeamWorld/team_incomplete). NOT its derived armed state — see the
@@ -198,6 +266,8 @@ public:
     int      sender_id = -1;
     uint32_t in_range_mask = 0;   ///< the sender's direct contacts, incl. itself
     bool     finished = false;
+    /// The sender's own mode level; see Peer::mode. Copied through verbatim.
+    uint8_t  mode = 0;
     /// The sender's own first-hand "the team is not whole" bit. Copied through
     /// verbatim; see Peer::team_incomplete.
     bool     team_incomplete = false;
@@ -223,6 +293,12 @@ public:
     /// gossip_max_age_sec exactly when the bit matters. A monotonic fact has no
     /// freshness to check. See Peer::finished and TeamWorld.msg/robot_finished.
     std::vector<uint8_t> finished_gossip;
+
+    /// Relayed `mode`, indexed by fleet id. Merged by MAX that never lowers,
+    /// and NOT age-gated, for finished_gossip's reasons exactly — a robot that
+    /// is homing or done ages out of gossip_max_age_sec precisely when its
+    /// level matters. See Peer::mode and TeamWorld.msg/robot_mode.
+    std::vector<uint8_t> mode_gossip;
   };
 
   /// Fold in one received message. `now_sec` is the LOCAL mission-elapsed time

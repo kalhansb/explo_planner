@@ -26,7 +26,7 @@ std::vector<Veh> vehicles(const CellWorld& world,
   std::vector<Veh> v;
   for (size_t i = 0; i < robots.size(); ++i) {
     const AllocRobot& r = robots[i];
-    if (r.finished) continue;
+    if (r.finished || r.off_frontier) continue;
     if (!world.grid().valid(r.cell)) continue;
     if (r.id < 0 || r.id >= 32) continue;
     v.push_back({i, r.id, r.cell});
@@ -119,7 +119,7 @@ RendezvousPlan RendezvousScheduler::solve(const CellWorld& world,
 
   const std::vector<Veh> veh = vehicles(world, robots);
   if (veh.empty()) {
-    out.refused = "no locatable, unfinished robot to meet";
+    out.refused = "no locatable robot still on the frontier to meet";
     return out;
   }
 
@@ -267,9 +267,11 @@ RendezvousPlan RendezvousScheduler::solve(const CellWorld& world,
   //
   // It carries `depart_safety_milli` because a floor built on the bare travel
   // time would be one nothing downstream considers achievable — the estimate is
-  // a graph distance at a nominal speed and the real drive is neither. That
-  // multiplier used to be the departure test's, and the departure test is gone
-  // (generation 19); this is now its only reader.
+  // a graph distance at a nominal speed and the real drive is neither. A note
+  // here called this the multiplier's only reader because the departure test
+  // was gone (generation 19); the test came back on 2026-09-19 and reads the
+  // same constant, deliberately — see appointmentLeadMs, which prices a robot's
+  // notice at exactly the rate this floor sized the spacing for.
   long long direct_mm = 0;
   for (const Veh& v : veh) {
     direct_mm =

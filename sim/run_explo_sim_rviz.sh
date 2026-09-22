@@ -714,17 +714,39 @@ HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
 #                     value turns the rendezvous arm into something else; it
 #                     exists so that can be MEASURED, not so it can be tuned in.
 #   RDV_LATCHED_HOLD  cap on the AT-THE-RENDEZVOUS HOLD only: how long a robot
-#                     that finished exploring WHILE STANDING ON the agreed cell
-#                     keeps standing there. Separate from RDV_APPT_WAIT on
+#                     that has FINISHED EXPLORING waits at the agreed cell for
+#                     the rest of the team. Separate from RDV_APPT_WAIT on
 #                     purpose. RDV_APPT_WAIT=0 (wait forever) is right for a
 #                     robot that still has exploring to trade against the wait;
 #                     a finished robot has none, so leaving that one unbounded
 #                     is a cell that runs to the wall clock with a robot
 #                     standing still and a censored completion time.
 #
-#                     IT MUST OUTLAST ONE ROLLED RUNG (2026-09-20). The hold is
-#                     measured from the LATCH, and a robot cannot latch before
-#                     it arrives, so the earliest teardown is arrival+cap. A
+#                     IT NOW CAPS EVERY FINISHED KEEPER, NOT JUST THE ONE THAT
+#                     HAPPENED TO SATURATE ON THE CELL (2026-09-21). Until this
+#                     generation a robot that finished anywhere else abandoned
+#                     the meeting and drove home, so this knob only ever saw
+#                     robots already standing on the agreed cell. They now keep
+#                     the appointment and travel to it, which widens WHO the cap
+#                     covers; it does not change how long for. The value below
+#                     is unchanged for that reason.
+#
+#                     THE CLOCK STARTS AT max(ARRIVAL, T_MEET) (2026-09-22). It
+#                     used to start wherever the robot came to a stop, which
+#                     this comment described and which was wrong for every
+#                     early arrival — and early arrival is the DESIGNED case,
+#                     not an edge one. The deadline departure aims the arrival
+#                     at t_meet and departs a marked-up travel estimate before
+#                     it, so a robot whose estimate holds is early by a fifth
+#                     of its drive; a keeper that saturates its map first sets
+#                     off immediately and can stand for most of the countdown.
+#                     Either way an unclamped clock spends the margin derived
+#                     below on a team that is not yet due. The floor is applied
+#                     at both stamp sites in the node.
+#
+#                     IT MUST OUTLAST ONE ROLLED RUNG (2026-09-20). The hold
+#                     runs from t_meet, so the earliest teardown is
+#                     t_meet+cap. A
 #                     teammate that could not make this rung rolls to the next
 #                     one and arrives RDV_INTERVAL later, plus up to
 #                     RDV_MAX_LATE of its own permitted lateness. At the old

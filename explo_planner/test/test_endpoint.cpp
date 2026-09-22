@@ -982,7 +982,12 @@ TEST(MissionReturnGuard, TheLatchIsSetBeforeTheEndingCommits) {
 // It never reached a campaign: every campaign sets mission_return_enabled,
 // which returns from finishOrRendezvous above the dispatch, and all 196 planner
 // logs written since the change end on [latch] / [coverage-latched] with zero
-// [step-budget]. Every one of the 39 appointment refusals in them carries the
+// [step-budget]. Generation 32 put a SECOND early return above them both —
+// keepAppointmentOnFinish, which takes any robot that finishes with a standing
+// appointment and sends it to the meeting — so the terminal dispatch's own
+// appointment branch is now shadowed twice over. The scans below are unmoved by
+// that: what they constrain is the shape of the path once it IS reached, and
+// both shadows are config-and-state accidents rather than deletions. Every one of the 39 appointment refusals in them carries the
 // mid-run reason `peer-lost`, where a `false` is correct and the caller simply
 // keeps planning. That is a config accident, not a property of the code, and
 // `--mission-return 0` is a supported flag.

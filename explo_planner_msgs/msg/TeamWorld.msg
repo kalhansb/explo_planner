@@ -114,6 +114,46 @@ uint16[] my_tour
 # latch, so the bit cannot now fire before exploration has actually stopped.
 bool finished
 
+# WHAT THE PRODUCER IS DOING WITH THE REST OF ITS RUN (generation 33, R4).
+# `finished` above answers "is this robot's run over"; this answers the
+# question every coordination decision actually asks, which is the WIDER one:
+# "will this robot participate in what I am planning?" Between leaving for home
+# and arriving there, a robot answers no to that and yes to `finished` — and
+# that window is exactly where a partner burns an unbounded appointment wait on
+# a robot that is never coming.
+#
+# THE LEVELS ARE ORDERED AND THE ORDER IS THE MERGE. EXPLORING < HOMING < DONE,
+# merged by MAX, no TTL — the same shape as robot_finished below and for the
+# same reason: each level is a monotonic statement a robot makes about itself,
+# so a relayed copy can never contradict a first-hand one and re-relaying a
+# level that is already held changes nothing.
+#
+# MONOTONICITY IS A PRECONDITION, NOT AN OBSERVATION, and it is enforced at the
+# PUBLISHER, not read off the state machine. This matters and it is the one way
+# this field can be made to lie:
+#
+#   * HOMING. doReturnHome() contains no transitionTo call and startReturnHome()
+#     carries two re-entry guards, so homing does not revert to exploring today.
+#     If anyone ever makes homing resumable, THIS FIELD BREAKS — there is no TTL
+#     to rescue it, and max-merge cannot go back down. The publisher latches the
+#     level so the guarantee is local to it rather than resting on that.
+#   * DONE. `state_ == DONE` is NOT monotone: the exploit sub-loop transitions
+#     out of it ("target-arrived-done-idle"). The DONE level is therefore
+#     derived from the publisher's `finished_announced_` latch — the same latch
+#     `finished` uses, which exists precisely because that state is not sticky.
+#     NEITHER LEVEL MAY BE READ FROM state_ DIRECTLY.
+#
+# THE SCALE IS OPEN-ENDED UPWARD AND MAY ONLY EVER BE EXTENDED AT THE TOP. That
+# is what lets consumers test it as a THRESHOLD (mode >= MODE_HOMING) with no
+# validation step and no clamp: a level a reader does not recognise is above
+# DONE, which is above HOMING, so the threshold answers correctly for it. A new
+# level inserted BETWEEN the existing ones would renumber them and break every
+# reader silently — so do not; append.
+uint8 MODE_EXPLORING = 0
+uint8 MODE_HOMING    = 1
+uint8 MODE_DONE      = 2
+uint8 mode
+
 # THE PRODUCER'S OWN ANSWER TO "IS THE TEAM WHOLE?" — that is,
 # !teamComplete(accountedPeerCount, rendezvous_expected_peers_) evaluated over
 # what it is receiving right now. Added in generation 23 to carry out the
@@ -501,3 +541,27 @@ float32[] robot_last_heard_sec
 # of gossip_max_age_sec exactly when this bit matters most. A monotonic fact
 # has no freshness to check.
 bool[] robot_finished
+
+# `mode` (above) for each robot, by id, as best the producer knows it. The
+# producer's own entry is its own level. MODE_EXPLORING means "no evidence",
+# NOT "confirmed exploring" — a robot nobody has heard from reads EXPLORING
+# everywhere, which is the conservative reading (see `mode`).
+#
+# MERGED BY MAX, NOT BY OR, and that is the only difference from
+# robot_finished. The argument for relaying is identical and is written out
+# there in full: a monotonic self-statement cannot contradict a first-hand
+# copy, cannot arrive early, and cannot feed back, so one hop needs no
+# freshness rule and no TTL. Max is simply what OR becomes when the fact has
+# three ordered levels instead of two.
+#
+# NOT AGE-GATED, for robot_finished's reason exactly: a homing robot is driving
+# away from the team and a done robot has stopped, so both age out of
+# gossip_max_age_sec precisely when the level matters most.
+#
+# CONSISTENT WITH robot_finished BY CONSTRUCTION, not by coincidence: the
+# publisher derives MODE_DONE from the same latch it derives `finished` from,
+# so a robot reading DONE here and false there would be a publisher bug, not a
+# wire state. Consumers should read whichever one their question needs —
+# "is its run over" is `finished`, "will it participate" is `mode >= HOMING` —
+# and never cross-check one against the other to infer a third thing.
+uint8[] robot_mode

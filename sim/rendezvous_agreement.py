@@ -508,6 +508,88 @@ def main(argv):
     # spends the run AND reports a defect that is not there; three of them abort
     # the campaign.
     cells = set(v[0] for v in final.values())
+    behind_txt = ""
+    if len(cells) != 1:
+        # A DISAGREEMENT NOBODY CAN STILL ACT ON IS NOT A SPLIT FLEET. The
+        # comment above calls the last commit "the only one it can still drive
+        # to"; this block checks that claim instead of assuming it. `final` is
+        # positional, so it silently assumes every robot is on the same round —
+        # and a robot that fell behind (arrived late, waited out its
+        # appointment, never committed again) gets scored against a peer that
+        # advanced two more rounds. That reports a disagreement about a meeting
+        # neither robot is waiting for, on a run where every appointment the two
+        # actually shared named the same cell.
+        #
+        # An appointment stops being actionable in exactly two ways: the node
+        # published a rendezvous_outcome for it (it came and went, whatever the
+        # outcome), or its meeting instant lands after the run's last sample so
+        # nobody could attend it. Both are read off the event log on t_rel,
+        # which is the clock t_meet is on — t_sim would manufacture 20-30 s of
+        # fake lateness and with it a fake live appointment.
+        #
+        # EVERYTHING UNPROVEN COUNTS AS LIVE. No event log, or a gen-20..22 log
+        # that prints no meeting instant, leaves every commit live and fails
+        # exactly as this gate does today. The block sits inside the FAIL branch
+        # for the same reason: it can only turn a FAIL into a pass, never create
+        # one, so it cannot invalidate a cell that used to be healthy.
+        resolved = {}
+        run_end = None
+        for r in robots:
+            seen = resolved.setdefault(r, set())
+            try:
+                with open(os.path.join(outdir, "%s.events.jsonl" % r),
+                          errors="replace") as fh:
+                    for line in fh:
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        t_rel = d.get("t_rel_sec")
+                        if t_rel is not None and (run_end is None
+                                                  or float(t_rel) > run_end):
+                            run_end = float(t_rel)
+                        if d.get("event") != "rendezvous_outcome":
+                            continue
+                        t_meet = d.get("t_meet_sec")
+                        if t_meet is not None:
+                            seen.add(round(float(t_meet)))
+            except OSError:
+                pass
+        live = {}
+        for r, rows in commits.items():
+            for c in reversed(rows):
+                if c[2] is not None:
+                    if run_end is not None and c[2] > run_end:
+                        continue        # nobody could have attended it
+                    if round(c[2]) in resolved.get(r, ()):
+                        continue        # the node says it came and went
+                live[r] = c[0]
+                break
+        if len(set(live.values())) < 2:
+            # THE FLEET IS NOT SPLIT, BUT SOMETHING STILL HAS TO NAME THE CELL.
+            # G2b and the PASS line both need one, and the positional finals
+            # disagree, so use the last appointment EVERY robot committed to:
+            # the last round the fleet was demonstrably together. Without one —
+            # no shared meeting instant at all — there is no fleet state to
+            # describe and the FAIL below stands.
+            shared = set.intersection(*[set(c[2] for c in rows
+                                            if c[2] is not None)
+                                        for rows in commits.values()])
+            agreed = set(c[0] for rows in commits.values() for c in rows
+                         if shared and c[2] == max(shared))
+            if len(agreed) == 1:
+                cells = set(agreed)
+                behind_txt = (
+                    "; ROUND SKEW: final commits named %d different cells (%s) "
+                    "but none of them was still live — %s. Scored at t_meet "
+                    "%ds, the last appointment the whole fleet committed to."
+                    % (len(set(v[0] for v in final.values())),
+                       ", ".join("%s=cell %d" % (r, final[r][0])
+                                 for r in sorted(final)),
+                       "no robot held an actionable appointment" if not live
+                       else "the live ones agree on cell %d" % live[
+                           sorted(live)[0]],
+                       max(shared)))
     if len(cells) != 1:
         # NAME THE TWO NO-BUG PRODUCERS BEFORE BLAMING THE CODE. This detail
         # used to assert the split "cannot happen without a bug in the
@@ -816,9 +898,9 @@ def main(argv):
         armed_txt = ("%d/%d arming(s) carried the agreed cell"
                      % (armed_real, armed_total))
     emit("PASS",
-         "all %d robot(s) converged on cell %d; commits span %.1fs%s; %s%s%s%s"
+         "all %d robot(s) converged on cell %d; commits span %.1fs%s; %s%s%s%s%s"
          % (len(robots), cell, last - first, split_txt,
-            armed_txt, echo_txt, how, inert_txt))
+            armed_txt, echo_txt, how, inert_txt, behind_txt))
     return 0
 
 

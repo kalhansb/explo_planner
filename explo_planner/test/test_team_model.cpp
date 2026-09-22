@@ -568,3 +568,209 @@ TEST(TeamModelPositionAge, ReconfiguringClearsIt) {
   ASSERT_EQ(m.configure(fleet3(), goodCfg()), "");
   EXPECT_LT(m.positionAgeSec(1, 100.0), 0.0);
 }
+
+// ===========================================================================
+// mode — the three-level "what is this robot doing with the rest of its run"
+// (generation 33, R4). Same two channels as `finished`, one more level, and
+// MAX in place of OR.
+// ===========================================================================
+
+/// First-hand is authoritative and is therefore the one channel that can
+/// LOWER the level. The case is a node that restarts mid-run: it genuinely
+/// un-homes, and the robot itself is the only witness worth believing.
+TEST(TeamModelMode, FirstHandIsAuthoritativeAndCanLower) {
+  TeamModel m = makeModel();
+  EXPECT_EQ(m.peer(1).mode, 0u) << "no evidence must read as EXPLORING";
+
+  TeamModel::Observation o = msg(1, robotBit(0));
+  o.mode = 1;                                   // HOMING
+  ASSERT_EQ(m.observe(o, 10.0), "");
+  EXPECT_EQ(m.peer(1).mode, 1u);
+
+  o.mode = 0;                                   // it restarted
+  ASSERT_EQ(m.observe(o, 20.0), "");
+  EXPECT_EQ(m.peer(1).mode, 0u)
+      << "a first-hand EXPLORING is the sender's own statement about itself "
+         "and must overwrite, exactly as `finished` does";
+}
+
+/// Relay can only ever raise. A relayed EXPLORING is "the sender has no
+/// evidence", never "that robot is still exploring", so it carries nothing
+/// and must not overwrite a level already held.
+TEST(TeamModelMode, RelayOnlyEverRaisesTheLevel) {
+  TeamModel m = makeModel();
+
+  TeamModel::Observation up = msg(1, robotBit(0));
+  up.mode_gossip = {0u, 0u, 2u};                // robot 2 is DONE
+  ASSERT_EQ(m.observe(up, 10.0), "");
+  EXPECT_EQ(m.peer(2).mode, 2u);
+  EXPECT_TRUE(m.peer(2).known)
+      << "a relayed level is also evidence the robot exists";
+
+  TeamModel::Observation down = msg(1, robotBit(0));
+  down.mode_gossip = {0u, 0u, 1u};              // a staler second-hand read
+  ASSERT_EQ(m.observe(down, 20.0), "");
+  EXPECT_EQ(m.peer(2).mode, 2u) << "max-merge, so a lower relay is a no-op";
+
+  down.mode_gossip = {0u, 0u, 0u};
+  ASSERT_EQ(m.observe(down, 30.0), "");
+  EXPECT_EQ(m.peer(2).mode, 2u) << "and a relayed zero carries no information";
+}
+
+/// NOT age-gated, for finished_gossip's reason exactly: a robot that is homing
+/// or done stops moving and goes quiet, so its last-heard entry ages out of
+/// gossip_max_age_sec precisely when its level starts to matter. Gating a
+/// monotonic fact on freshness switches the relay off at that moment.
+TEST(TeamModelMode, RelayIsNotAgeGated) {
+  TeamModel m = makeModel();
+  // Sender's own entry is its publish time; robot 2's is 600 s older, which is
+  // five times gossip_max_age_sec and would drop a position outright.
+  TeamModel::Observation o = gossipMsg(1, robotBit(0), {-1.0, 1000.0, 400.0});
+  o.mode_gossip = {0u, 0u, 1u};
+  ASSERT_EQ(m.observe(o, 50.0), "");
+  EXPECT_EQ(m.peer(2).mode, 1u);
+  EXPECT_FALSE(m.peer(2).have_position)
+      << "fixture: the position half of the same message IS age-gated, which "
+         "is what makes this a contrast rather than a coincidence";
+}
+
+/// The length guard refuses the whole message rather than truncating: a
+/// longer array means the sender is running a different team definition, so
+/// its ids address different robots than ours do.
+TEST(TeamModelMode, OversizedModeGossipIsRefusedWholesale) {
+  TeamModel m = makeModel();
+  TeamModel::Observation o = msg(1, robotBit(0));
+  o.mode = 2;
+  o.mode_gossip = {0u, 0u, 1u, 1u};             // four entries, three robots
+  EXPECT_NE(m.observe(o, 10.0), "");
+  EXPECT_EQ(m.peer(1).mode, 0u)
+      << "refused means nothing from the message is believed, including the "
+         "sender's own first-hand level";
+}
+
+// ---------------------------------------------------------------------------
+// R1 instrumentation (generation 33) — acquire_sec / held_sec
+//
+// Timing the detector, never changing it: every assertion below is about WHEN
+// a transition was reported, and none of them is about whether `direct` was
+// right. The one design property they exist to pin is that both readings are
+// differences of PACKET stamps rather than tick stamps, so the tests drive the
+// tick at times deliberately offset from the arrivals. A measurement that
+// picked up the tick clock would read those offsets and fail.
+// ---------------------------------------------------------------------------
+
+TEST(TeamModelR1, AcquisitionIsMeasuredFromTheFirstOneWayPacket) {
+  TeamModel m = makeModel();
+
+  // t=100: heard, but the peer's mask does not name us. One-way — the period
+  // this measurement is defined over opens here.
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 100.0), "");
+  m.tick(100.4);
+  ASSERT_TRUE(m.peer(1).heard_one_way);
+  EXPECT_LT(m.peer(1).acquire_sec, 0.0) << "nothing has been acquired yet";
+
+  // t=102: still one-way. The anchor must NOT move to this packet.
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 102.0), "");
+  m.tick(102.4);
+  EXPECT_LT(m.peer(1).acquire_sec, 0.0);
+
+  // t=103: the mask names us. Handshake complete.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 103.0), "");
+  m.tick(103.9);
+  ASSERT_TRUE(m.peer(1).direct);
+  EXPECT_DOUBLE_EQ(m.peer(1).acquire_sec, 3.0)
+      << "measured 103 - 100 from the packets; 103.9 - 100.4 would be the "
+         "tick clock and 103 - 102 would be the wrong anchor";
+
+  // ONE-SHOT. The link is still up and nothing has transitioned, so the next
+  // tick must report no event -- otherwise a reader counting non-negative
+  // readings counts one acquisition per tick for as long as the link holds.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 104.0), "");
+  m.tick(104.5);
+  ASSERT_TRUE(m.peer(1).direct);
+  EXPECT_LT(m.peer(1).acquire_sec, 0.0) << "acquire_sec latched past its tick";
+}
+
+TEST(TeamModelR1, AnInstantHandshakeAcquiresInZero) {
+  TeamModel m = makeModel();
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 100.0), "");
+  m.tick(100.4);
+  ASSERT_TRUE(m.peer(1).direct);
+  EXPECT_DOUBLE_EQ(m.peer(1).acquire_sec, 0.0)
+      << "the first packet of the run completed the handshake, so the one-way "
+         "period was empty -- 0, not -1 and not the tick offset";
+}
+
+TEST(TeamModelR1, HoldIsReportedOnlyWhenThePeerIsStillAudible) {
+  TeamModel m = makeModel();
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 100.0), "");
+  m.tick(100.1);
+  ASSERT_TRUE(m.peer(1).direct);
+
+  // The peer keeps talking and stops naming us: the §10 failure on a link
+  // that was up. That is the break this measurement is defined over.
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 107.5), "");
+  m.tick(107.9);
+  ASSERT_FALSE(m.peer(1).direct);
+  ASSERT_TRUE(m.peer(1).heard_one_way);
+  EXPECT_DOUBLE_EQ(m.peer(1).held_sec, 7.5);
+  EXPECT_LT(m.peer(1).acquire_sec, 0.0) << "a break is not an acquisition";
+}
+
+TEST(TeamModelR1, AHandshakeLostToSilenceReportsNoHoldAtAll) {
+  TeamModel m = makeModel();
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 100.0), "");
+  m.tick(100.1);
+  ASSERT_TRUE(m.peer(1).direct);
+
+  // Nothing arrives. The TTL expires and the link drops -- but this is a
+  // DELIVERY failure, and the whole §2.7 finding is that it has a different
+  // cause from a handshake that broke. Averaging it into the handshake
+  // statistic would hide exactly the distinction Part 0 exists to draw.
+  m.tick(106.0);
+  ASSERT_FALSE(m.peer(1).direct);
+  ASSERT_FALSE(m.peer(1).heard_one_way) << "fixture: this must be silence";
+  EXPECT_LT(m.peer(1).held_sec, 0.0)
+      << "a link that ended because the packets stopped has no closing packet "
+         "to stamp and must not be reported as a hold";
+}
+
+TEST(TeamModelR1, ReacquisitionAfterABreakDoesNotChargeThePrecedingHold) {
+  TeamModel m = makeModel();
+
+  // Up at t=100, broken while audible at t=110: a 10 s hold.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 100.0), "");
+  m.tick(100.1);
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 110.0), "");
+  m.tick(110.1);
+  ASSERT_DOUBLE_EQ(m.peer(1).held_sec, 10.0) << "fixture";
+
+  // Re-acquired at t=112, WITHOUT the packets ever stopping, so the receiving
+  // run is unbroken and its first packet is still the one at t=100.
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 112.0), "");
+  m.tick(112.1);
+  ASSERT_TRUE(m.peer(1).direct);
+  EXPECT_DOUBLE_EQ(m.peer(1).acquire_sec, 2.0)
+      << "measured from the break at 110, not from the run's first packet at "
+         "100 -- charging the hold to the next acquisition would report a "
+         "12 s handshake for a link that took 2";
+}
+
+TEST(TeamModelR1, ASilenceResetsTheAnchorSoTheNextRunMeasuresItself) {
+  TeamModel m = makeModel();
+
+  // One-way from t=100, then total silence past the TTL.
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 100.0), "");
+  m.tick(100.1);
+  m.tick(200.0);
+  ASSERT_FALSE(m.peer(1).heard_one_way) << "fixture: TTL must have expired";
+
+  // A new run, 100 s later, acquiring in 1 s.
+  ASSERT_EQ(m.observe(msg(1, robotBit(2)), 300.0), "");
+  m.tick(300.1);
+  ASSERT_EQ(m.observe(msg(1, robotBit(0)), 301.0), "");
+  m.tick(301.1);
+  ASSERT_TRUE(m.peer(1).direct);
+  EXPECT_DOUBLE_EQ(m.peer(1).acquire_sec, 1.0)
+      << "the dead 200 s between runs is not acquisition latency";
+}

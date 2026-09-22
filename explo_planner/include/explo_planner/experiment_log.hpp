@@ -676,6 +676,22 @@ struct TeamExchangeEvent {
   bool one_way = false;
   /// IN_COMMS only because someone else is bridging.
   bool via_relay = false;
+  /// R1's two transition measurements (generation 33), negative on every row
+  /// that does not carry the transition — which is nearly all of them. Counting
+  /// acquisitions is therefore counting non-negative `acquire_sec` values, not
+  /// diffing `direct` between consecutive rows and hoping no transition fell in
+  /// a gap between them.
+  ///
+  /// `acquire_sec`: seconds from the first packet of the one-way period to the
+  /// packet that completed the handshake. `held_sec`: seconds a completed
+  /// handshake survived, set ONLY when it was broken by a peer that stayed
+  /// audible and stopped naming us back — never by the packets stopping, which
+  /// has no closing packet to stamp and a wholly different cause. Both are
+  /// differences of PACKET stamps, so neither carries tick jitter.
+  /// See TeamModel::Peer for the full derivation.
+  double acquire_sec = -1.0;
+  double held_sec = -1.0;
+
   /// How long since the last MUTUAL direct contact with this peer, measured
   /// after the tick. Legitimately ~0 while the link is up — that is the link
   /// being up — and the interesting readings are the non-zero ones, which come
@@ -1653,7 +1669,48 @@ class ExperimentLog {
   /// all. The kind is emitted only under an armed appointment, so a run at the
   /// shipped defaults emits exactly the v10 set and the per-phase equivalence
   /// gate is unmoved.
-  static constexpr int kSchemaVersion = 11;
+  ///
+  /// v12: FIRST STAMPED BY THE GENERATION 33 BINARY, and it covers the
+  /// generation 32 behaviour change as well — gen 32 shipped and ran while the
+  /// stamp still said 11, so 11 spans two behaviours and v12 is where the fold
+  /// can start refusing to pool. No kind moved. Two columns were ADDED, both on
+  /// `team_exchange` and both additive: `acquire_sec` and `held_sec` (see
+  /// TeamExchangeEvent), negative on every row that carries no transition. A
+  /// v11 reader ignores them; a v12 reader must not assume they are present in
+  /// an 11.
+  ///
+  /// What moved BEHAVIOURALLY across this line is two generations' worth, and
+  /// either half alone would justify the refusal.
+  ///
+  /// From generation 32, the population behind `rendezvous_outcome.outcome`
+  /// moved far enough that pooling the two vintages would average two different
+  /// behaviours under one name:
+  ///
+  ///   - A robot that finishes exploring with a standing appointment now KEEPS
+  ///     it (keepAppointmentOnFinish) instead of closing it and driving home.
+  ///     `superseded` was the modal outcome of a finished robot and is now
+  ///     close to absent, replaced by `reconnected` and `run-ended`; the
+  ///     mirror-image change is that its peers stop recording the no-shows
+  ///     those abandonments caused. Every outcome-mix statistic — and any
+  ///     completion time drawn from a cell where one robot waited a barrier
+  ///     out that a v11 binary would have abandoned — is a different quantity
+  ///     across this line.
+  ///   - `appointment_leg` rows appear for the first time in practice. The kind
+  ///     is v11's, but no v11 cell ever emitted one: the ladder is only reached
+  ///     from a drive to the agreed cell, and v11 had no such drive left to
+  ///     make once exploration was over.
+  ///
+  /// From generation 33, the allocator stops reserving frontier work for a
+  /// peer that has turned for home (`off_frontier`), peers carry a `mode` on
+  /// the wire, and the at-the-rendezvous hold can be released by the measured
+  /// per-peer voxel arrival instead of a fixed settle timer. The last of those
+  /// is off at the shipped defaults; the first two are not, and they change
+  /// who explores what.
+  ///
+  /// A v11 reader parses every row correctly and needs no change. The stamp
+  /// moves so that a fold can REFUSE to pool, which no additive-compatibility
+  /// argument would have let it do.
+  static constexpr int kSchemaVersion = 12;
 
   /// Every `event` value this writer can emit, and the ONLY authority on that
   /// set. It exists because the equivalence gate has to answer "did a new kind

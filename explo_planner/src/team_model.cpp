@@ -79,7 +79,8 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   const size_t n = static_cast<size_t>(size_);
   if (obs.last_heard_sec.size() > n || obs.gx.size() > n ||
       obs.gy.size() > n || obs.gz.size() > n ||
-      obs.have_gossip_pos.size() > n || obs.finished_gossip.size() > n) {
+      obs.have_gossip_pos.size() > n || obs.finished_gossip.size() > n ||
+      obs.mode_gossip.size() > n) {
     std::snprintf(buf, sizeof(buf),
                   "gossip arrays are longer than the fleet (%d): the sender "
                   "is running a different team definition", size_);
@@ -100,6 +101,10 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   // hear the restarted robot first-hand; they are then receiving from it
   // directly, which is what peerAccounted keys on anyway.
   sp.finished       = obs.finished;
+  // Same channel, same rule, one extra level: first-hand is authoritative and
+  // is therefore the one site that can lower the level, for the restart reason
+  // spelled out directly above. The relay below can only raise it.
+  sp.mode           = obs.mode;
   // team_incomplete IS FIRST-HAND ONLY, and it does not follow `finished` above
   // into the relay. The two are not the same kind of statement. This one is a
   // NON-MONOTONIC claim a robot makes ABOUT THE TEAM, and relaying it is the
@@ -224,6 +229,27 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
     p.known    = true;
     p.finished = true;
   }
+
+  // --- relayed `mode` -------------------------------------------------------
+  //
+  // Every argument in the block above transfers verbatim: not age-gated
+  // (a homing robot goes quiet in the same way a finished one does, and its
+  // level matters most once it has), and a merge that can only ever raise
+  // (a relayed EXPLORING is "the sender has no evidence", never "that robot is
+  // still exploring"). The one difference is the operator -- MAX rather than
+  // OR, because this fact has three ordered levels instead of two.
+  //
+  // WHY IT EXISTS separately from `finished`: it covers the window between
+  // leaving for home and arriving there, where `finished` is still false and a
+  // peer is nonetheless never coming back to the frontier or to a meeting.
+  for (size_t k = 0; k < obs.mode_gossip.size(); ++k) {
+    const int r = static_cast<int>(k);
+    if (r == self_id_ || r == s) continue;   // we know ourselves; s is above
+    if (obs.mode_gossip[k] == 0) continue;
+    Peer& p = peers_[static_cast<size_t>(r)];
+    p.known = true;
+    p.mode  = std::max(p.mode, obs.mode_gossip[k]);
+  }
   return std::string();
 }
 
@@ -241,6 +267,42 @@ void TeamModel::tick(double now_sec) {
     // "reconnection" over it would share nothing.
     const bool mutual =
         receiving && maskHas(reported_mask_[static_cast<size_t>(i)], self_id_);
+
+    // --- R1 instrumentation ---------------------------------------------
+    //
+    // Read the edges BEFORE the flags are overwritten: both measurements are
+    // differences across a transition, so they need the previous state, and
+    // the previous state is exactly what the three assignments below destroy.
+    // The two outputs are cleared unconditionally first — they describe THIS
+    // tick, and a stale value left standing would be counted as a second
+    // event by a reader that counts non-negative readings.
+    p.acquire_sec = -1.0;
+    p.held_sec    = -1.0;
+    if (!receiving) {
+      // The run is over, whichever way it ended. Both anchors go with it so
+      // the next run measures itself and not the gap between runs.
+      p.one_way_since_sec = -1.0;
+      p.direct_since_sec  = -1.0;
+    } else {
+      if (p.one_way_since_sec < 0.0) p.one_way_since_sec = at;
+      if (mutual && !p.direct) {
+        p.direct_since_sec = at;
+        p.acquire_sec      = at - p.one_way_since_sec;
+      } else if (!mutual && p.direct && p.direct_since_sec >= 0.0) {
+        // STILL RECEIVING, by construction: this branch is inside the
+        // `receiving` arm. The peer is audible and has stopped naming us —
+        // the §10 one-way failure arriving on a link that was up.
+        p.held_sec         = at - p.direct_since_sec;
+        p.direct_since_sec = -1.0;
+        // AND THE NEXT ONE-WAY PERIOD STARTS HERE, not where the receiving run
+        // did. A link that breaks and re-forms without the packets ever
+        // stopping would otherwise have its second acquisition measured from
+        // the first packet of the whole run — reporting the length of the
+        // preceding HOLD as though it were acquisition latency.
+        p.one_way_since_sec = at;
+      }
+    }
+
     p.direct        = mutual;
     p.heard_one_way = receiving && !mutual;
     p.via_relay     = false;
