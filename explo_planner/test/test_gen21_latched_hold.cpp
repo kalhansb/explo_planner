@@ -83,8 +83,12 @@
 // the repair on 2026-09-21 and fails again. A scan that names a pattern rather
 // than a landmark is one edit away from testing something else.
 //
-// MUTATION STATUS: M1-M14 are the gen-21 record above; GROUP E (M15-M22) and
-// GROUP F (M23-M26) carry their own below. One sequence for the whole file.
+// MUTATION STATUS: M1-M14 are the gen-21 record above; GROUP E (M15-M22),
+// GROUP F (M23-M26) and GROUP G (M32-M34, M38-M40) carry their own below. One
+// sequence for the whole file, and it continues outside it: M27-M31 and
+// M35-M37 (and M43) are in test_exchange_drain.cpp, where the drain predicate
+// GROUP G used to scan now runs, and M41-M42 are scovox's counter-liveness
+// test.
 //
 // stripComments() is not optional here either. The hold's own comment block
 // quotes the code it is about ("Returning false does NOT un-finish anything"),
@@ -917,47 +921,47 @@ TEST(Gen33HoldClock, BothStampsFloorTheCapAtTheMeetingInstant) {
 // GROUP G. GENERATION 33 — WHAT ENDS THE MAP-EXCHANGE HOLD.
 // ===========================================================================
 
-/// THE DRAIN PREDICATE IS A LEVEL, THEN A RATE, OVER EVERY PEER IT CAN READ.
+/// THE NODE HANDS THE PREDICATE THE RIGHT VECTORS AND OBEYS WHAT IT SAYS.
 ///
-/// This is test-plan item 8's structural half. The behavioural half cannot be
-/// a gtest at all: the predicate lives in explo_planner_node.cpp, which is not
-/// in explo_planner_lib's source list, so nothing links it and a scan is the
-/// only check there is.
+/// Test-plan 8's structural half. The predicate itself — a level against the
+/// hold-start baseline, then a rate over a tumbling window, over every peer
+/// believed present — was extracted from doReturnSync into exchange_drain.cpp
+/// on 2026-09-22 and is now RUN by test_exchange_drain.cpp, which is where
+/// M27-M31 (this test's former mutations, first killed here by scan against
+/// the inline copy) were re-run and killed behaviourally. What stays here is
+/// the part a library test cannot reach: the call site in the node.
 ///
-/// THREE INDEPENDENT WAYS THIS RELEASES ON NOTHING, and each is an assertion:
+/// THREE WAYS THE WIRING RELEASES ON NOTHING OR NAMES IT WRONG, one per
+/// assertion:
 ///
-///   * DROP THE LEVEL. A peer whose bytes are not crossing the radio and a peer
-///     that has sent everything it has BOTH present a rate of zero over the
-///     window. Reduced to a rate test the release fires FASTEST in exactly the
-///     blackout the hold exists to sit through — which is how the defect
-///     entered the design in the first place, not a hypothetical.
-///   * DROP THE RATE. The complement: "the counter stopped moving" over-holds,
-///     measured, in 10 of 31 long gen-32 meetings that were still gaining
-///     voxels at departure.
-///   * READ NOBODY. Every skip in the loop is a peer this robot could not read,
-///     and with all of them taken the loop leaves `drained` at the true it was
-///     initialised to. The hold opens on max(active, reachablePeerCount()),
-///     which counts peers the loop may decline — so a relay-only team would
-///     open a hold and release it in the same breath, having examined no one.
-///     The direct-only filter this replaces made that reachable by an ordinary
-///     N=3 topology rather than an exotic one.
-///
-/// Relayed peers are IN. §4.1 of the design settles it on measurement: relayed
-/// rows applied a merge 15.5% of the time against 0.9% overall, so excluding
-/// them drops the most productive exchange channel on the team while claiming
-/// the exchange finished.
+///   * THE WRONG BASELINE. Every argument after the window is a vector of
+///     counters or a double, so a swapped pair compiles. Hand the predicate
+///     the live counters as the hold-start baseline and every peer reads
+///     mute forever: no exchange ever drains, every meeting runs to the cap,
+///     and the arm logs UNFINISHED EXCHANGE for exchanges that finished.
+///     Swap R and W, or pass the settle where the cap goes, and it runs a
+///     different experiment under the same label. So the whole call is
+///     matched, argument by argument, not just its name.
+///   * HOLD DOES NOT HOLD. kHold must return before the release latch below
+///     it; without the return every tick falls through and the robot leaves
+///     on the first one — the fixed-settle defect this generation removes,
+///     with the settle set to zero.
+///   * THE TWO OUTCOMES SWAPPED. The cap and the drain must log as the
+///     distinct events Part 2 requires, UNFINISHED EXCHANGE on kUnfinished.
+///     Swap the branch and the log calls every drained meeting unfinished and
+///     every blackout drained, which is the ambiguity of test-plan 8 moved
+///     from the control path into the tables.
 ///
 /// MUTATION-VERIFIED 2026-09-22, edit-run-restore on the node source, no
-/// rebuild (nothing links it):
+/// rebuild (the scan reads the source at run time):
 ///
-///   M27  the presence filter narrowed back to `!p.direct` alone
-///   M28  `if (examined == 0) drained = false;` deleted
-///   M29  clause 1 deleted, leaving the rate test alone
-///   M30  clause 2 deleted, leaving the level test alone
-///   M31  `bool drained = measurable;` initialised to bare `true`
+///   M38  the hold-start baseline argument replaced by `peer_fusion_deltas_`
+///   M39  the `return;` under `drain.step == DrainStep::kHold` deleted
+///   M40  the UNFINISHED branch keyed on `DrainStep::kDrained` instead
 ///
-/// Five mutations, five failures, node restored byte-exact (sha256 re-checked).
-TEST(Gen33DrainRelease, ThePredicateIsALevelThenARateOverEveryReadablePeer) {
+/// Three mutations, three failures, node restored byte-exact (sha256
+/// re-checked).
+TEST(Gen33DrainRelease, TheNodeCallsThePredicateAndObeysIt) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
 
@@ -965,42 +969,54 @@ TEST(Gen33DrainRelease, ThePredicateIsALevelThenARateOverEveryReadablePeer) {
       functionBody(text, "void ExploPlannerNode::doReturnSync(");
   ASSERT_FALSE(sync.empty()) << "the scan found no doReturnSync definition";
 
-  // Anchored on the accumulator's declaration and closed on its first read,
-  // so the window is the loop and its verdict and nothing else. Same
-  // anchor-back-from-the-landmark discipline as GROUP F.
-  const size_t begin = sync.find("bool drained = measurable;");
-  ASSERT_NE(begin, std::string::npos)
-      << "the drain verdict is no longer seeded from `measurable`, so a "
-         "meeting with no per-peer counters to difference can release on the "
-         "absence of evidence instead of holding to the cap";
-  const size_t end = sync.find("if (!drained)", begin);
-  ASSERT_NE(end, std::string::npos)
-      << "the drain verdict is never consumed after the loop";
-  const std::string window = sync.substr(begin, end - begin);
+  // Whitespace out, so a reflowed argument list is the same call. Comments
+  // are already gone (nodeSource), which matters: the block above the call
+  // names stepDrainRelease in prose.
+  std::string flat;
+  for (const char c : sync) {
+    if (c != ' ' && c != '\n' && c != '\t' && c != '\r') flat.push_back(c);
+  }
 
-  EXPECT_NE(window.find("!p.direct && !p.via_relay"), std::string::npos)
-      << "the exchange loop no longer reads relayed peers. A two-hop partner "
-         "still delivers — dscovox credits the robot that SENSED the voxels, "
-         "not the one that bridged them — and gen 32 measured relay as the "
-         "most productive channel per row, so skipping it lets the busiest "
-         "stream on the meeting keep arriving while this test calls the "
-         "exchange finished:\n"
-      << window;
-  EXPECT_NE(window.find("if (examined == 0) drained = false;"),
-            std::string::npos)
-      << "the loop can now fall out having examined no peer at all and still "
-         "report drained, which releases the hold on nothing:\n"
-      << window;
-  EXPECT_NE(window.find("rendezvous_exchange_.peer_deltas[k]"),
-            std::string::npos)
-      << "CLAUSE 1 IS GONE. Without the level against the hold-start baseline "
-         "a silent peer and a finished peer are the same observation, and the "
-         "release fires fastest in a blackout:\n"
-      << window;
-  EXPECT_NE(window.find("rendezvous_drain_rate_vox_sec_"), std::string::npos)
-      << "CLAUSE 2 IS GONE. A pure zero-test over-holds: a third of the long "
-         "gen-32 meetings were still gaining when the robot departed:\n"
-      << window;
+  const std::string call =
+      "stepDrainRelease(rendezvous_drain_window_,settled_sec,"
+      "peer_fusion_deltas_,rendezvous_exchange_.peer_deltas,team_model_,"
+      "fleet_.size(),fleet_.self_id,rendezvous_drain_rate_vox_sec_,"
+      "rendezvous_drain_window_sec_,rendezvous_latched_hold_sec_)";
+  const size_t at_call = flat.find(call);
+  ASSERT_NE(at_call, std::string::npos)
+      << "doReturnSync no longer calls the drain predicate with the live "
+         "counters, the HOLD-START baseline, and R, W and the cap in that "
+         "order. Every one of those is a vector or a double, so a swap "
+         "compiles and runs a different experiment:\n"
+      << sync;
+
+  const size_t at_hold = flat.find("if(drain.step==DrainStep::kHold){return;}", at_call);
+  EXPECT_NE(at_hold, std::string::npos)
+      << "kHold no longer returns, so the robot falls through to the release "
+         "latch on the first tick of the hold:\n"
+      << sync;
+
+  const size_t at_unfinished = flat.find(
+      "if(drain.step==DrainStep::kUnfinished){RCLCPP_WARN(get_logger(),"
+      "\"Rendezvous:UNFINISHEDEXCHANGE",
+      at_call);
+  EXPECT_NE(at_unfinished, std::string::npos)
+      << "UNFINISHED EXCHANGE is no longer what kUnfinished logs, so a meeting "
+         "that ran to the cap and one that drained are not told apart in the "
+         "log:\n"
+      << sync;
+
+  const size_t at_drained = flat.find("\"Rendezvous:exchangedrainedafter", at_call);
+  const size_t at_latch = flat.find("rendezvous_drain_released_=true;", at_call);
+  ASSERT_NE(at_drained, std::string::npos) << "the drained release is no longer logged";
+  ASSERT_NE(at_latch, std::string::npos) << "the release no longer latches";
+  // Both outcomes are decided, and named, before the latch — and the hold's
+  // return comes before any of them.
+  if (at_hold != std::string::npos && at_unfinished != std::string::npos) {
+    EXPECT_LT(at_hold, at_unfinished);
+    EXPECT_LT(at_unfinished, at_drained);
+    EXPECT_LT(at_drained, at_latch);
+  }
 }
 
 /// R AND W ARE REFUSED, NOT DEFAULTED — AND R = 0 IS A REFUSAL TOO.

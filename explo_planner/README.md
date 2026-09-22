@@ -238,9 +238,12 @@ SCovox:
 
 ```bash
 cd <ws>
-colcon build --packages-up-to explo_planner
+colcon build --packages-select explo_planner_msgs explo_planner --symlink-install
 source install/setup.bash
 ```
+
+Both packages, and not `--packages-up-to`: see the [repository
+README](../README.md#build) for why.
 
 ## Run
 

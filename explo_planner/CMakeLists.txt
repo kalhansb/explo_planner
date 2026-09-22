@@ -77,6 +77,7 @@ add_library(explo_planner_lib
   src/fleet_identity.cpp
   src/cell_world.cpp
   src/team_model.cpp
+  src/exchange_drain.cpp
   src/global_allocator.cpp
   src/reconnect_gate.cpp
   src/rendezvous_scheduler.cpp
@@ -237,6 +238,13 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_team_model test/test_team_model.cpp)
   target_link_libraries(test_team_model explo_planner_lib)
+
+  # Gen-33 drain release, run rather than scanned: test-plan 7 and the
+  # behavioural half of 8. The predicate was extracted from doReturnSync into
+  # the lib for this; the node's wiring of it stays a scan in
+  # test_gen21_latched_hold.
+  ament_add_gtest(test_exchange_drain test/test_exchange_drain.cpp)
+  target_link_libraries(test_exchange_drain explo_planner_lib)
 
   ament_add_gtest(test_global_allocator test/test_global_allocator.cpp)
   target_link_libraries(test_global_allocator explo_planner_lib)

@@ -81,6 +81,7 @@
 #include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/team_model.hpp"
+#include "explo_planner/exchange_drain.hpp"
 #include "explo_planner/separation.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
@@ -2478,19 +2479,10 @@ private:
   double rendezvous_drain_rate_vox_sec_   = -1.0;   ///< R, per peer
   double rendezvous_drain_window_sec_     = -1.0;   ///< W, the trailing window
 
-  // A TUMBLING WINDOW, ON THE SETTLE'S CLOCK. Start of the window currently
-  // being measured, as an offset into the settle (same reason the re-agreement
-  // wait is measured that way: one hold, one epoch, nothing extra to keep in
-  // step). -1 while no window is open. The snapshot is peer_fusion_deltas_ as
-  // it read when the window opened; the rate is the difference over the window
-  // divided by its length, which is why a window is closed and re-opened rather
-  // than slid — a ring buffer would buy sub-W granularity on a decision whose
-  // whole point is that it is taken at the end of a quiet interval.
-  //
-  // IT IS ALSO THE HARD FLOOR. No window has elapsed before W seconds, so no
-  // drain release can happen before then, without a second mechanism saying so.
-  double                rendezvous_drain_window_start_sec_ = -1.0;
-  std::vector<uint64_t> rendezvous_drain_window_base_;
+  // A TUMBLING WINDOW, ON THE SETTLE'S CLOCK, and the hard floor — see
+  // DrainWindow in exchange_drain.hpp. Owned here, advanced only by
+  // stepDrainRelease, and reset to a default DrainWindow wherever the settle is.
+  DrainWindow rendezvous_drain_window_;
 
   // MONOTONE WITHIN A VISIT. Once the drain fires, the hold does not re-enter
   // on a late burst. The counters are bursty by construction — one fused
@@ -14032,107 +14024,26 @@ void ExploPlannerNode::doReturnSync() {
             return;   // still settling; stay put, keep heartbeating.
           }
         } else {
-          if (rendezvous_drain_window_start_sec_ < 0.0) {
-            rendezvous_drain_window_start_sec_ = settled_sec;
-            rendezvous_drain_window_base_      = peer_fusion_deltas_;
-          }
-          const double win = settled_sec - rendezvous_drain_window_start_sec_;
-          if (win < rendezvous_drain_window_sec_) {
-            return;   // no full window yet — this is also the hard floor.
-          }
-          // THREE VECTORS, ALL FLEET-SIZED OR THE READING IS NOT A READING.
-          // peer_fusion_deltas_ is empty until dscovox publishes counters, and
-          // the hold-start baseline is a copy of whatever it was then — so a
-          // meeting that began before the counters came up has no interval to
-          // difference. That is UNMEASURED, and the safe reading of unmeasured
-          // is "not drained": hold to the cap and say the exchange did not
-          // finish, rather than release on the absence of evidence.
-          const size_t n = static_cast<size_t>(fleet_.size());
-          const bool measurable =
-              (peer_fusion_deltas_.size() == n &&
-               rendezvous_exchange_.peer_deltas.size() == n &&
-               rendezvous_drain_window_base_.size() == n);
-          if (!measurable) {
+          // The predicate itself is stepDrainRelease (exchange_drain.cpp):
+          // a level against the hold-start baseline, then a rate over a
+          // tumbling window, over every peer believed present. It lives in
+          // the library so test-plan 7 and 8 can run it; this block keeps the
+          // state, the log lines and the latch.
+          const DrainReading drain = stepDrainRelease(
+              rendezvous_drain_window_, settled_sec, peer_fusion_deltas_,
+              rendezvous_exchange_.peer_deltas, team_model_, fleet_.size(),
+              fleet_.self_id, rendezvous_drain_rate_vox_sec_,
+              rendezvous_drain_window_sec_, rendezvous_latched_hold_sec_);
+          if (drain.evaluated && !drain.measurable) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                 "Rendezvous: drain release has no per-peer counters to read "
                 "(dscovox has published none this meeting). Holding to the "
                 "%.0fs cap.", rendezvous_latched_hold_sec_);
           }
-          // THE LOOP RUNS TO THE END EVEN ONCE IT HAS ITS ANSWER, because the
-          // count it carries out is what the log reports: a `drained &&` in
-          // the condition would stop at the first mute peer and report "1"
-          // for a team where three had gone dark.
-          bool drained = measurable;
-          int mute = 0;
-          int examined = 0;
-          for (int id = 0; measurable && id < fleet_.size(); ++id) {
-            if (id == fleet_.self_id) continue;
-            // BELIEVED PRESENT, which is what the robot actually has. The
-            // detector's false-positive rate (2.948% of scored grid points
-            // read direct while the oracle says down) is inherited here and
-            // not claimed away: a robot can hold for a peer that is not
-            // really there. The cap below is what bounds that, and it bounds
-            // it to a wasted wait rather than a stall.
-            if (!team_model_.configured() || id >= team_model_.size()) continue;
-            // DIRECT OR RELAYED. The question at this loop is "is there
-            // somebody here to trade maps with", which is a radio statement,
-            // and a two-hop peer answers it: the emulator forwards serialized
-            // bytes without deserializing, so dscovox credits the robot that
-            // SENSED the voxels rather than the one that bridged them (see
-            // ScovoxFusionCounters.msg). Gen-32's census measured relayed rows
-            // applying a merge 15.5% of the time against 0.9% overall — the
-            // most productive channel on the team — so a direct-only filter
-            // would let the busiest stream on the meeting keep arriving while
-            // this test declared the exchange finished.
-            //
-            // The two flags are disjoint, so this is the whole filter and not
-            // half of one: team_model.cpp's closure loop opens with
-            // `if (p.direct) continue;`, which is why via_relay can never be
-            // set on a direct peer.
-            const auto& p = team_model_.peer(id);
-            if (!p.direct && !p.via_relay) continue;
-            ++examined;
-            const size_t k = static_cast<size_t>(id);
-            const uint64_t nowv = peer_fusion_deltas_[k];
-            // CLAUSE 1 — DID IT SPEAK AT ALL THIS VISIT. A level against the
-            // hold-start baseline, not a rate. This is the clause that cannot
-            // be optimised away: a peer whose bytes are not crossing the radio
-            // and a peer that has sent everything it has BOTH present a rate
-            // of zero over the window, and dropping this would make the
-            // release fire fastest in exactly the blackout the hold exists to
-            // sit through.
-            if (nowv <= rendezvous_exchange_.peer_deltas[k]) {
-              ++mute;
-              drained = false;
-              continue;
-            }
-            // CLAUSE 2 — HAS IT STOPPED. A rate, not a zero test: a third of
-            // the long gen-32 N=2 meetings were still gaining when the robot
-            // departed, so "the counter has stopped moving" over-holds, while
-            // "the counter has fallen below R" does not.
-            const uint64_t wb = rendezvous_drain_window_base_[k];
-            const double rate =
-                (nowv > wb) ? static_cast<double>(nowv - wb) / win : 0.0;
-            if (rate >= rendezvous_drain_rate_vox_sec_) drained = false;
+          if (drain.step == DrainStep::kHold) {
+            return;   // keep standing on the cell; keep heartbeating.
           }
-          // NOBODY READ IS NOT EVERYBODY DRAINED. Every `continue` above is a
-          // peer this robot could not read — model unconfigured, id past its
-          // end, or believed not here — and with all of them taken the loop
-          // falls out leaving `drained` at the true it started on, releasing
-          // the hold having examined no one. That is the same absence of
-          // evidence `measurable` refuses a few lines up, arriving through a
-          // different door: the hold opens on max(active, reachablePeerCount),
-          // which counts peers this loop is entitled to skip.
-          if (examined == 0) drained = false;
-          if (!drained) {
-            // Roll the window forward and keep holding — up to the cap, which
-            // is the same knob that bounds a latched robot's hold and is
-            // already validated to exceed the settle.
-            rendezvous_drain_window_start_sec_ = settled_sec;
-            rendezvous_drain_window_base_      = peer_fusion_deltas_;
-            if (settled_sec < rendezvous_latched_hold_sec_) {
-              return;   // keep standing on the cell; keep heartbeating.
-            }
+          if (drain.step == DrainStep::kUnfinished) {
             // A DIFFERENT OUTCOME FROM A RELEASE, AND NAMED DIFFERENTLY. The
             // team leaves either way, but "the exchange finished" and "the
             // exchange never happened and we gave up waiting" are not the same
@@ -14142,7 +14053,7 @@ void ExploPlannerNode::doReturnSync() {
                 "Rendezvous: UNFINISHED EXCHANGE — %.0fs cap reached; %d of %d "
                 "readable peer(s) delivered nothing at all since the hold "
                 "began. Leaving on the cap, not on the drain.",
-                rendezvous_latched_hold_sec_, mute, examined);
+                rendezvous_latched_hold_sec_, drain.mute, drain.examined);
           } else {
             RCLCPP_INFO(get_logger(),
                 "Rendezvous: exchange drained after %.1fs (every believed "
@@ -14310,9 +14221,8 @@ void ExploPlannerNode::doReturnSync() {
     rendezvous_settling_ = false;
     // The drain state is the settle's, so it dies with it — including the
     // release latch, which is what makes it per-visit rather than per-run.
-    rendezvous_drain_released_         = false;
-    rendezvous_drain_window_start_sec_ = -1.0;
-    rendezvous_drain_window_base_.clear();
+    rendezvous_drain_released_ = false;
+    rendezvous_drain_window_   = DrainWindow{};
     rendezvous_reagree_waiting_ = false;
     // A LATCHED ROBOT DOES NOT GO BACK TO EXPLORING (2026-09-17). This release
     // is unconditional in every earlier generation, and once
@@ -14378,9 +14288,8 @@ void ExploPlannerNode::doReturnSync() {
   // Void with it, and the LATCH most of all: a team that came apart and
   // re-gathered is a new visit, and a drain that fired for the old one must
   // not release the new one on the first tick.
-  rendezvous_drain_released_         = false;
-  rendezvous_drain_window_start_sec_ = -1.0;
-  rendezvous_drain_window_base_.clear();
+  rendezvous_drain_released_ = false;
+  rendezvous_drain_window_   = DrainWindow{};
 
   // THE CONVERSION IS REVERSIBLE (2026-09-19, generation 28). A walker that
   // joined the barrier from the road did so on one premise — the team had

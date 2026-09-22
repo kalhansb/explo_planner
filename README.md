@@ -46,12 +46,16 @@ so build it in a workspace overlaying SCovox:
 
 ```bash
 cd <ws>
-colcon build --packages-up-to explo_planner
+colcon build --packages-select explo_planner_msgs explo_planner --symlink-install
 source install/setup.bash
 ```
 
-`--packages-up-to`, not `--packages-select` — `explo_planner_msgs` is a sibling
-package that has to build first.
+Name both packages: `explo_planner_msgs` is a sibling package that has to build
+first, and `--packages-select explo_planner` alone skips it. Do not use
+`--packages-up-to explo_planner` instead: it also rebuilds every upstream
+dependency, SCovox included, so an unrelated upstream change can relink
+`explo_planner_node` and silently change a binary whose sha a campaign has
+pinned. SCovox is built on its own, before this.
 
 ## License
 
