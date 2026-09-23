@@ -84,11 +84,11 @@
 // than a landmark is one edit away from testing something else.
 //
 // MUTATION STATUS: M1-M14 are the gen-21 record above; GROUP E (M15-M22),
-// GROUP F (M23-M26) and GROUP G (M32-M34, M38-M40) carry their own below. One
-// sequence for the whole file, and it continues outside it: M27-M31 and
-// M35-M37 (and M43) are in test_exchange_drain.cpp, where the drain predicate
-// GROUP G used to scan now runs, and M41-M42 are scovox's counter-liveness
-// test.
+// GROUP F (M23-M26), GROUP G (M32-M34, M38-M40) and GROUP H (M44-M53) carry
+// their own below. One sequence for the whole file, and it continues outside
+// it: M27-M31, M35-M37, M43 and M54-M58 are in test_exchange_drain.cpp, where
+// the drain predicate GROUP G used to scan now runs; M41-M42 are scovox's
+// counter-liveness test; M59-M64 are in test_meeting_attendance.cpp.
 //
 // stripComments() is not optional here either. The hold's own comment block
 // quotes the code it is about ("Returning false does NOT un-finish anything"),
@@ -1068,4 +1068,228 @@ TEST(Gen33DrainRelease, TheThresholdsAreRefusedAndZeroIsRefusedWithThem) {
          "never releases and the arm reports an unfinished exchange for every "
          "meeting; W = 0 divides the window into a rate with no interval:\n"
       << window;
+}
+
+// ===========================================================================
+// GROUP H. GENERATION 33, §10 ITEM 5 — A FINISHED ROBOT STILL COMES TO THE
+// MEETING, AND ITS PARTNER WAITS FOR IT UNTIL IT SAYS IT IS LEAVING.
+// ===========================================================================
+//
+// The two rules themselves — what a robot announces, and which peer is still
+// coming — run in test_meeting_attendance.cpp, and the drain's all-leaving
+// outcome runs in test_exchange_drain.cpp. What stays here is the node's side
+// of each: the publisher's call, the veto's place in the release predicate,
+// the bound and its clock, and the log that names each ending. One sequence
+// for the whole of §10 item 5: M44-M53 are here, M54-M58 in
+// test_exchange_drain.cpp, M59-M64 in test_meeting_attendance.cpp.
+//
+// MUTATION-VERIFIED 2026-09-23, same edit-run-restore as the groups above:
+//
+//   M44  the publisher's keeping argument replaced by `false`
+//   M45  the publisher's call moved above the homing latch
+//   M46  `&& !holdingForFinishedPeer()` dropped from the appointment branch
+//   M47  the veto's appointment gate deleted
+//   M48  the bound's comparison deleted — the `if` that returns false on it
+//   M49  doReturnSync's floor at t_meet dropped (bare mission clock)
+//   M50  the manoeuvre-end clear of the stamp deleted
+//   M51  startReturnTo's clear made unconditional, so every resumed leg
+//        restarts the bound
+//   M52  the finished-peer log block moved below the release gate, where the
+//        settle returns before the expiry line is ever reached
+//   M53  the kAllPeersLeaving log branch deleted, so the outcome logs as
+//        "exchange drained"
+//
+// Ten mutations, ten failures, node restored byte-exact (sha256 re-checked).
+
+namespace {
+
+/// Whitespace out, so a reflowed expression is the same expression. Comments
+/// are already gone (nodeSource).
+std::string flatten(const std::string& s) {
+  std::string flat;
+  for (const char c : s) {
+    if (c != ' ' && c != '\n' && c != '\t' && c != '\r') flat.push_back(c);
+  }
+  return flat;
+}
+
+}  // namespace
+
+/// THE PUBLISHER SAYS DONE THROUGH THE ATTENDANCE RULE, AND ONLY THROUGH IT.
+///
+/// The defect was a keeper publishing DONE at the start of its drive to the
+/// meeting. announcedMode holds the level below HOMING while the robot keeps
+/// its appointment — but only if it is TOLD the robot is keeping it, and only
+/// if nothing else in the publisher writes the level afterwards. And the
+/// homing latch must be current when the call reads it, or the tick the robot
+/// turns for home publishes one level too low.
+TEST(Gen33MeetingAttendance, ThePublisherSaysDoneThroughTheAttendanceRule) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string pub =
+      flatten(functionBody(text, "void ExploPlannerNode::publishTeamWorld("));
+  ASSERT_FALSE(pub.empty()) << "the scan found no publishTeamWorld definition";
+
+  const std::string call =
+      "m.mode=announcedMode(finished_announced_,appointment_manoeuvre_,"
+      "homing_announced_,done_announced_);";
+  const size_t at_call = pub.find(call);
+  ASSERT_NE(at_call, std::string::npos)
+      << "the publisher no longer derives its level from announcedMode with "
+         "the appointment manoeuvre as the keeping flag, so a keeper can say "
+         "DONE on its way to the meeting and its partner stops waiting";
+  EXPECT_EQ(countOf(pub, "m.mode="), 1)
+      << "a second write of the level overrides the attendance rule";
+
+  const size_t at_homing = pub.find("homing_announced_=true;");
+  ASSERT_NE(at_homing, std::string::npos) << "the homing latch is gone";
+  EXPECT_LT(at_homing, at_call)
+      << "the level is computed before the homing latch is updated, so it "
+         "lags the robot by a tick";
+  const size_t at_finished = pub.find("finished_announced_=true;");
+  ASSERT_NE(at_finished, std::string::npos) << "the finished latch is gone";
+  EXPECT_LT(at_finished, at_call);
+}
+
+/// THE APPOINTMENT BARRIER WAITS FOR A FINISHED PEER STILL COMING — BOUNDED,
+/// AND ONLY THERE.
+///
+/// Three things, one per assertion: the veto is in the APPOINTMENT branch of
+/// the release predicate (the other branch serves mid-run and terminal
+/// reconnects, which are this robot's own business); it answers false outside
+/// an appointment manoeuvre (the classifier and doReturnNav also call the
+/// predicate); and it runs out at rendezvous_latched_hold_sec measured from
+/// its stamp, or a partner whose "leaving" the radio never delivered holds
+/// this robot to the run's end.
+TEST(Gen33MeetingAttendance, TheAppointmentBarrierWaitsForAFinishedPeerStillComing) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+
+  const std::string rel = flatten(functionBody(
+      text, "bool ExploPlannerNode::manoeuvreReleaseEligible("));
+  ASSERT_FALSE(rel.empty()) << "the scan found no manoeuvreReleaseEligible";
+  const size_t at_q = rel.find("returnappointment_manoeuvre_?");
+  const size_t at_else = rel.find(":teamComplete(live_peers,", at_q);
+  ASSERT_NE(at_q, std::string::npos) << "the predicate lost its appointment branch";
+  ASSERT_NE(at_else, std::string::npos) << "the predicate lost its other branch";
+  const size_t at_veto = rel.find("!holdingForFinishedPeer()", at_q);
+  EXPECT_TRUE(at_veto != std::string::npos && at_veto < at_else)
+      << "the appointment barrier no longer waits for a finished peer that "
+         "has not said it is leaving — the partner releases on `finished` "
+         "and the keeper walks onto an empty cell:\n"
+      << rel;
+
+  const std::string hold = flatten(
+      functionBody(text, "bool ExploPlannerNode::holdingForFinishedPeer("));
+  ASSERT_FALSE(hold.empty()) << "the scan found no holdingForFinishedPeer";
+  EXPECT_NE(hold.find("if(!appointment_manoeuvre_)returnfalse;"),
+            std::string::npos)
+      << "the veto no longer stands down outside an appointment manoeuvre:\n"
+      << hold;
+  EXPECT_NE(hold.find("t-finished_peer_wait_start_sec_>="
+                      "rendezvous_latched_hold_sec_)returnfalse;"),
+            std::string::npos)
+      << "the wait for a finished peer is no longer bounded by the latched-"
+         "hold cap from its stamp:\n"
+      << hold;
+  EXPECT_NE(hold.find("returnfinishedPeerStillComing(team_model_,"
+                      "fleet_.self_id)>=0;"),
+            std::string::npos)
+      << "the veto no longer asks the attendance rule:\n"
+      << hold;
+}
+
+/// THE WAIT'S CLOCK: STAMPED AT THE BARRIER, FLOORED AT t_meet, KEPT FOR THE
+/// MANOEUVRE, AND ITS END LOGGED WHERE IT CAN BE REACHED.
+///
+/// The floor is GROUP F's argument again: the cap is sized from t_meet, so an
+/// early arrival must not spend it before the team is due. Kept across legs,
+/// because the settle-lapsed resume re-dispatches from the barrier and a
+/// restart per leg is an unbounded wait by instalments. Cleared when the
+/// manoeuvre ends, or the next appointment inherits a spent bound. And the
+/// expiry line sits ABOVE the release gate: the expiry is what opens the gate,
+/// and the settle behind it returns before anything further down runs.
+TEST(Gen33MeetingAttendance, TheWaitIsStampedFlooredKeptAndCleared) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+
+  const std::string sync =
+      flatten(functionBody(text, "void ExploPlannerNode::doReturnSync("));
+  ASSERT_FALSE(sync.empty()) << "the scan found no doReturnSync definition";
+  const size_t at_write = sync.find("finished_peer_wait_start_sec_=t_wait;");
+  ASSERT_NE(at_write, std::string::npos)
+      << "doReturnSync no longer stamps the finished-peer wait";
+  const size_t at_clock = sync.rfind("missionElapsed()", at_write);
+  ASSERT_NE(at_clock, std::string::npos);
+  const std::string window = sync.substr(at_clock, at_write - at_clock);
+  EXPECT_NE(window.find("appointment_.valid()"), std::string::npos) << window;
+  EXPECT_NE(window.find("std::max(t_wait,appointment_.t_meet_ms/1000.0)"),
+            std::string::npos)
+      << "the wait is not floored at the meeting instant, so an early "
+         "arrival spends the bound before the partner is due:\n"
+      << window;
+
+  const size_t at_gate =
+      sync.find("if(releaseConfirmed(manoeuvreReleaseEligible(active)))");
+  ASSERT_NE(at_gate, std::string::npos) << "the release gate moved";
+  EXPECT_LT(at_write, at_gate) << "the wait is stamped after the gate reads it";
+  const size_t at_expiry = sync.find("\"Rendezvous:stoppedwaitingfor");
+  EXPECT_TRUE(at_expiry != std::string::npos && at_expiry < at_gate)
+      << "the expiry of the finished-peer wait is not logged above the "
+         "release gate, so the settle it opens returns before the line runs "
+         "and a no-show reads as a meeting";
+
+  const std::string trans =
+      flatten(functionBody(text, "void ExploPlannerNode::transitionTo("));
+  ASSERT_FALSE(trans.empty());
+  EXPECT_NE(trans.find("appointment_manoeuvre_=false;"
+                       "finished_peer_wait_start_sec_=-1.0;"),
+            std::string::npos)
+      << "the stamp outlives the manoeuvre that set it";
+
+  const std::string ret =
+      flatten(functionBody(text, "void ExploPlannerNode::startReturnTo("));
+  ASSERT_FALSE(ret.empty());
+  const size_t at_set =
+      ret.find("appointment_manoeuvre_=(std::strcmp(what,\"appointment\")==0);");
+  const size_t at_clear = ret.find(
+      "if(!appointment_manoeuvre_){finished_peer_wait_start_sec_=-1.0;");
+  EXPECT_TRUE(at_set != std::string::npos && at_clear != std::string::npos &&
+              at_set < at_clear)
+      << "startReturnTo no longer keeps the stamp across appointment legs, so "
+         "a robot cycling stop-short/resume restarts the bound forever:\n"
+      << ret;
+  // Three: the member's initialiser and the two clears above.
+  EXPECT_EQ(countOf(flatten(text), "finished_peer_wait_start_sec_=-1.0;"), 3)
+      << "a clear was added or lost; the lifetime above no longer holds";
+}
+
+/// EVERY PEER LEAVING IS ITS OWN LOGGED OUTCOME, DECIDED BEFORE THE LATCH.
+///
+/// Logged as "exchange drained" it would put a meeting nobody attended in the
+/// drained column; logged as UNFINISHED, in the other. It is neither.
+TEST(Gen33MeetingAttendance, EveryPeerLeavingIsLoggedAsItsOwnOutcome) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string sync =
+      flatten(functionBody(text, "void ExploPlannerNode::doReturnSync("));
+  ASSERT_FALSE(sync.empty());
+
+  const size_t at_unfinished =
+      sync.find("if(drain.step==DrainStep::kUnfinished){");
+  const size_t at_leaving = sync.find(
+      "elseif(drain.step==DrainStep::kAllPeersLeaving){RCLCPP_INFO(get_logger(),"
+      "\"Rendezvous:everypeerhassaiditisleaving");
+  const size_t at_drained = sync.find("\"Rendezvous:exchangedrainedafter");
+  const size_t at_latch = sync.find("rendezvous_drain_released_=true;");
+  ASSERT_NE(at_unfinished, std::string::npos);
+  ASSERT_NE(at_drained, std::string::npos);
+  ASSERT_NE(at_latch, std::string::npos);
+  ASSERT_NE(at_leaving, std::string::npos)
+      << "kAllPeersLeaving is no longer logged as its own outcome, so it "
+         "falls into the drained branch:\n"
+      << sync;
+  EXPECT_LT(at_unfinished, at_leaving);
+  EXPECT_LT(at_leaving, at_drained);
+  EXPECT_LT(at_drained, at_latch);
 }

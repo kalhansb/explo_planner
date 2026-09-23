@@ -82,6 +82,7 @@
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/team_model.hpp"
 #include "explo_planner/exchange_drain.hpp"
+#include "explo_planner/meeting_attendance.hpp"
 #include "explo_planner/separation.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
@@ -572,6 +573,14 @@ private:
   /// its classifiers run, so the classifiers see the same branch the release
   /// site saw.
   bool manoeuvreReleaseEligible(int live_peers) const;
+
+  /// THE APPOINTMENT BARRIER WAITS FOR A FINISHED PEER THAT IS STILL COMING
+  /// (2026-09-23). True while some peer has finished exploring, has not said
+  /// it is leaving, and cannot be heard — see meeting_attendance.hpp — and the
+  /// wait for it has not yet run rendezvous_latched_hold_sec from
+  /// finished_peer_wait_start_sec_. A veto inside manoeuvreReleaseEligible's
+  /// appointment branch, so the release and both classifiers read one answer.
+  bool holdingForFinishedPeer() const;
 
   /// Freeze the world the next appointment will be derived from.
   ///
@@ -2484,6 +2493,24 @@ private:
   // stepDrainRelease, and reset to a default DrainWindow wherever the settle is.
   DrainWindow rendezvous_drain_window_;
 
+  // WHEN THIS ROBOT STARTED WAITING AT THE APPOINTMENT BARRIER, on the mission
+  // clock and floored at t_meet, for holdingForFinishedPeer's bound. -1 while
+  // no appointment barrier is being waited at. Stamped on doReturnSync's first
+  // tick of an appointment manoeuvre and kept for the rest of it, across
+  // resumed legs and rolled rungs (startReturnTo says why); cleared where
+  // appointment_manoeuvre_ is, and by any leg that is not an appointment's.
+  //
+  // THE BOUND IS rendezvous_latched_hold_sec, the knob that already bounds a
+  // finished robot's own stand at the cell, and measured the same way (from
+  // the later of arrival and t_meet). A finished peer that has not arrived by
+  // then has either given up on the cell or is standing out its own cap
+  // somewhere this robot cannot hear; waiting longer buys nothing. Without a
+  // bound this would be the unbounded appointment vigil for a peer whose
+  // "leaving" the radio never delivered — at N=2 with no relay, a vigil to the
+  // run's duration cap.
+  double finished_peer_wait_start_sec_       = -1.0;
+  bool   finished_peer_wait_expired_logged_  = false;
+
   // MONOTONE WITHIN A VISIT. Once the drain fires, the hold does not re-enter
   // on a late burst. The counters are bursty by construction — one fused
   // message can carry thousands of voxels — so a re-entrant hold would
@@ -3128,6 +3155,13 @@ private:
   // the return leg's current shape — so making homing resumable later cannot
   // silently turn a relayed level false. See TeamWorld.msg/mode.
   bool   homing_announced_        = false;
+
+  // The DONE level's latch, and since 2026-09-23 NOT the same latch as
+  // `finished`. Latched once this robot is finished AND no longer keeping an
+  // appointment (announcedMode, meeting_attendance.hpp). A finished robot on
+  // its way to the meeting, or standing at it, is still taking part, and the
+  // level a partner's barrier reads as "it is leaving" must not say otherwise.
+  bool   done_announced_          = false;
 
   // --- The at-the-rendezvous hold (2026-09-17, generation 21) ---
   // Saturating the map while STANDING AT the agreed cell used to end the run on
@@ -7805,6 +7839,9 @@ void ExploPlannerNode::transitionTo(State s, const char* reason) {
     // latch's entire purpose is to outlive closeAppointment(), so clearing it
     // there would restore the bug it exists to fix.
     appointment_manoeuvre_ = false;
+    // The wait for a finished peer belonged to that manoeuvre's barrier.
+    finished_peer_wait_start_sec_      = -1.0;
+    finished_peer_wait_expired_logged_ = false;
     // The armed-from pair belongs to the manoeuvre that just ended; the next
     // dispatch takes its own snapshot from its own query.
     have_reconnect_rec_ = false;
@@ -11229,7 +11266,9 @@ bool ExploPlannerNode::manoeuvreReleaseEligible(int live_peers) const {
   // coverage equals door admission on the CLOSURE channel at every N. A
   // three-hop straggler is already excluded by the door's own count. The
   // count's `finished` disjunct is the one admission neither veto covers —
-  // the accepted residual noted in reachablePeerCount.
+  // the accepted residual noted in reachablePeerCount — and since 2026-09-23 a
+  // third veto covers it: a finished peer that has not said it is leaving and
+  // cannot be heard is still on its way here (holdingForFinishedPeer).
   //
   // RELEASING WEAKER THAN THE ARM IS SAFE HERE AND ONLY HERE. The five-site
   // rule (see the arming site) exists because gen 18/19 ratcheted when the
@@ -11242,8 +11281,40 @@ bool ExploPlannerNode::manoeuvreReleaseEligible(int live_peers) const {
              ? ((teamSettled(live_peers) ||
                  teamComplete(reachablePeerCount(), rendezvous_expected_peers_)) &&
                 !peerInboundToAppointment() &&
-                !peerReportsInboundToAppointment())
+                !peerReportsInboundToAppointment() &&
+                !holdingForFinishedPeer())
              : teamComplete(live_peers, rendezvous_expected_peers_);
+}
+
+bool ExploPlannerNode::holdingForFinishedPeer() const {
+  // A FINISHED ROBOT STILL COMES TO THE MEETING (2026-09-23), so its partner
+  // waits for it until it says it is leaving. Since generation 32 a robot that
+  // finishes with an appointment standing drives to the agreed cell
+  // (keepAppointmentOnFinish), exchanges maps there, and only then turns for
+  // home — and it announces `finished` at the start of that drive, not the
+  // end. peerAccounted counts a finished peer as "will never arrive", so a
+  // partner that heard `finished` once and then lost the radio released this
+  // barrier and left while the finished robot was still on the road; the
+  // finished robot then reached an empty cell and stood out its cap alone.
+  //
+  // A VETO HERE, NOT A CHANGE TO peerAccounted. That leaf feeds ~30
+  // teamComplete call sites, two of which (the mid-run reconnect trigger and
+  // pursuit's quarry-heard test) must not move; see DESIGN_gen33.md, the
+  // correction under the finished-consumer table. Only the appointment
+  // barrier asks "is everybody who is coming here?", so only it waits.
+  if (!appointment_manoeuvre_) return false;
+  // BOUNDED, because the radio may never deliver the "leaving": at N=2 there
+  // is no relay, and a finished peer that gave up on the cell and turned for
+  // home out of range would otherwise hold this robot for the rest of the run.
+  // An unstamped wait (a manoeuvre that never reached the barrier, asked by the
+  // classifier) is open: it has not started, so it has not run out.
+  if (finished_peer_wait_start_sec_ >= 0.0) {
+    const double t = missionElapsedAt(this->now());
+    if (t >= 0.0 &&
+        t - finished_peer_wait_start_sec_ >= rendezvous_latched_hold_sec_)
+      return false;
+  }
+  return finishedPeerStillComing(team_model_, fleet_.self_id) >= 0;
 }
 
 void ExploPlannerNode::refreshRendezvousSnapshot() {
@@ -13336,6 +13407,16 @@ void ExploPlannerNode::startReturnTo(const Eigen::Vector3f& dest,
   appointment_settle_converted_ = false;
   appointment_escape_active_    = false;
   appointment_escapes_used_     = 0;
+  // THE WAIT FOR A FINISHED PEER IS NOT RESTARTED BY A NEW LEG, only dropped
+  // by a leg that is not an appointment's. A resumed leg (the settle lapsing
+  // short of the cell) re-dispatches from the barrier itself, so a restart
+  // here would let a robot cycling stop-short/resume wait forever. One stamp
+  // per appointment manoeuvre, like the latched hold's, and the same sizing
+  // argument covers a rolled rung.
+  if (!appointment_manoeuvre_) {
+    finished_peer_wait_start_sec_      = -1.0;
+    finished_peer_wait_expired_logged_ = false;
+  }
 
   RCLCPP_INFO(get_logger(),
       "Rendezvous: dispatched [%s], team incomplete (%d/%d peers) "
@@ -13905,6 +13986,45 @@ void ExploPlannerNode::logAppointmentLegRow(const char* kind,
 void ExploPlannerNode::doReturnSync() {
   // accountedPeerCount — presence semantics, same note as finishOrRendezvous().
   const int active = accountedPeerCount(this->now());
+  // THE WAIT FOR A FINISHED PEER STARTS HERE, OR WHEN THE MEETING FALLS DUE,
+  // WHICHEVER IS LATER — the same floor the latched hold's own stamp takes, for
+  // the same reason: an early arrival must not spend the bound before the team
+  // is due. See finished_peer_wait_start_sec_ and holdingForFinishedPeer.
+  if (appointment_manoeuvre_ && finished_peer_wait_start_sec_ < 0.0) {
+    const double t_now = missionElapsed();
+    double t_wait = (t_now >= 0.0) ? t_now : 0.0;
+    if (appointment_.valid())
+      t_wait = std::max(t_wait, appointment_.t_meet_ms / 1000.0);
+    finished_peer_wait_start_sec_ = t_wait;
+  }
+
+  // THE FINISHED-PEER HOLD, NAMED IN THE LOG, for the contagion line's reason
+  // (below): without it a barrier holding for a peer it cannot hear reads as a
+  // barrier that will not release. Its END is named too, once, because a bound
+  // that expired is a meeting that did not happen, and the analysis must be
+  // able to tell it from one that did. HERE, ABOVE THE RELEASE GATE, because
+  // the expiry is what lets the gate open, and the settle that follows returns
+  // before any line further down is reached.
+  if (appointment_manoeuvre_ && finished_peer_wait_start_sec_ >= 0.0) {
+    const int coming = finishedPeerStillComing(team_model_, fleet_.self_id);
+    const double t_now = missionElapsed();
+    const double on_it =
+        (t_now >= 0.0) ? t_now - finished_peer_wait_start_sec_ : 0.0;
+    if (coming >= 0 && holdingForFinishedPeer()) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+          "Rendezvous: %s finished exploring but has not said it is leaving "
+          "-> still waiting for it here (%.0fs of %.0fs).",
+          fleet_.nameOf(coming).c_str(), std::max(0.0, on_it),
+          rendezvous_latched_hold_sec_);
+    } else if (coming >= 0 && !finished_peer_wait_expired_logged_) {
+      finished_peer_wait_expired_logged_ = true;
+      RCLCPP_WARN(get_logger(),
+          "Rendezvous: stopped waiting for %s after %.0fs: it finished "
+          "exploring but neither arrived nor said it was leaving.",
+          fleet_.nameOf(coming).c_str(), rendezvous_latched_hold_sec_);
+    }
+  }
+
   // THE BARRIER OF THE FIVE-SITE RULE (generation 23). For an APPOINTMENT this
   // is (teamSettled OR every expected peer reachable in the comms closure —
   // the generation-27 door) AND nobody still driving here. The mesh half is
@@ -14054,6 +14174,15 @@ void ExploPlannerNode::doReturnSync() {
                 "readable peer(s) delivered nothing at all since the hold "
                 "began. Leaving on the cap, not on the drain.",
                 rendezvous_latched_hold_sec_, drain.mute, drain.examined);
+          } else if (drain.step == DrainStep::kAllPeersLeaving) {
+            // NEITHER DRAINED NOR UNFINISHED: no exchange was left to happen.
+            // Every peer said it is leaving, so there is nobody to wait for —
+            // the partner protocol's "stop when it says homing".
+            RCLCPP_INFO(get_logger(),
+                "Rendezvous: every peer has said it is leaving (%d of %d "
+                "homing or done, none here) -> nothing left to exchange; "
+                "leaving after %.1fs.",
+                drain.leaving, drain.others, settled_sec);
           } else {
             RCLCPP_INFO(get_logger(),
                 "Rendezvous: exchange drained after %.1fs (every believed "
@@ -19534,15 +19663,24 @@ void ExploPlannerNode::publishTeamWorld() {
   // READ FROM state_: DONE comes from the bit above, because State::DONE is
   // leavable through the exploit sub-loop and the announced bit is not, and
   // HOMING comes from the latch, because state_ has already moved past
-  // RETURN_HOME by the time the robot is parked at home. The ordering below
-  // is what makes the field monotone at the source — DONE outranks HOMING, so
-  // a robot that latches coverage without ever homing still only ever rises.
+  // RETURN_HOME by the time the robot is parked at home. The ordering is what
+  // makes the field monotone at the source — DONE outranks HOMING, so a robot
+  // that latches coverage without ever homing still only ever rises.
+  //
+  // DONE WAITS FOR THE MEETING (2026-09-23). A finished robot keeping its
+  // appointment is still taking part, so it publishes below HOMING until the
+  // appointment manoeuvre ends, and DONE from then on (announcedMode). The
+  // partner's barrier holds for it on exactly that level; see
+  // holdingForFinishedPeer.
   using TeamWorldMsg = explo_planner_msgs::msg::TeamWorld;
+  static_assert(kModeExploring == TeamWorldMsg::MODE_EXPLORING &&
+                    kModeHoming == TeamWorldMsg::MODE_HOMING &&
+                    kModeDone == TeamWorldMsg::MODE_DONE,
+                "meeting_attendance.hpp's mode levels must match TeamWorld.msg");
   if (state_ == State::RETURN_HOME || mission_return_done_)
     homing_announced_ = true;
-  m.mode = finished_announced_ ? TeamWorldMsg::MODE_DONE
-         : homing_announced_   ? TeamWorldMsg::MODE_HOMING
-                               : TeamWorldMsg::MODE_EXPLORING;
+  m.mode = announcedMode(finished_announced_, appointment_manoeuvre_,
+                         homing_announced_, done_announced_);
 
   // A robot whose run is over has no opinion worth acting on about whether the
   // TEAM is whole, and announcing one is how the censoring above propagated.

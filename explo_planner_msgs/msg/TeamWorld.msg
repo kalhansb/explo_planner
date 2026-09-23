@@ -142,6 +142,14 @@ bool finished
 #     derived from the publisher's `finished_announced_` latch — the same latch
 #     `finished` uses, which exists precisely because that state is not sticky.
 #     NEITHER LEVEL MAY BE READ FROM state_ DIRECTLY.
+#   * DONE WAITS FOR THE MEETING (2026-09-23). A robot that finishes with an
+#     appointment standing drives to it and exchanges maps before homing
+#     (generation 32), so it is still taking part: while that appointment
+#     manoeuvre lasts it publishes below HOMING, with `finished` already true.
+#     DONE comes when the manoeuvre ends, and is latched from then on
+#     (done_announced_) — a later read of "keeping" cannot lower it. Its
+#     partner waits for it on exactly this level: a finished peer below HOMING
+#     that it cannot hear is still coming (meeting_attendance.hpp).
 #
 # THE SCALE IS OPEN-ENDED UPWARD AND MAY ONLY EVER BE EXTENDED AT THE TOP. That
 # is what lets consumers test it as a THRESHOLD (mode >= MODE_HOMING) with no
@@ -561,7 +569,12 @@ bool[] robot_finished
 # CONSISTENT WITH robot_finished BY CONSTRUCTION, not by coincidence: the
 # publisher derives MODE_DONE from the same latch it derives `finished` from,
 # so a robot reading DONE here and false there would be a publisher bug, not a
-# wire state. Consumers should read whichever one their question needs —
-# "is its run over" is `finished`, "will it participate" is `mode >= HOMING` —
-# and never cross-check one against the other to infer a third thing.
+# wire state. The converse no longer holds and was never promised: since
+# 2026-09-23 a finished robot keeping its appointment reads below HOMING (see
+# `mode`), so `finished` true with a level below HOMING is a legal wire state
+# and means "finished, still coming to the meeting". Consumers should read
+# whichever one their question needs — "is its run over" is `finished`, "will
+# it participate" is `mode >= HOMING` — and never cross-check one against the
+# other to infer a third thing. The one reader that pairs them does so on
+# purpose and says so: the appointment barrier's finished-peer wait.
 uint8[] robot_mode

@@ -52,6 +52,21 @@
 ///
 /// M43 is out of order because M41-M42 went to scovox's counter-liveness test
 /// (test-plan 9) before this control was added.
+///
+/// MUTATION-VERIFIED 2026-09-23, the all-peers-leaving outcome (§10 item 5;
+/// M44-M53 are the node scans in test_gen21_latched_hold.cpp):
+///
+///   M54  `r.leaving == r.others` relaxed to `r.leaving > 0`
+///        -> AllPeersLeaving.OnePeerStillComingKeepsTheHold
+///   M55  the `here == 0` term deleted
+///        -> AllPeersLeaving.ALeavingPeerThatIsStillHereIsReadOnItsCounter
+///           and ...IsNotSkippedWhenUnmeasured
+///   M56  `here == 0` read off `r.examined == 0` instead
+///        -> AllPeersLeaving.ALeavingPeerThatIsHereIsNotSkippedWhenUnmeasured
+///   M57  the `r.others > 0` term deleted
+///        -> AllPeersLeaving.NoPeersIsNotEveryPeerLeaving
+///   M58  leaving counted at DONE only, not HOMING
+///        -> AllPeersLeaving.EveryPeerHomingOrDoneEndsTheHoldAtN3
 
 #include <gtest/gtest.h>
 
@@ -61,12 +76,16 @@
 #include <vector>
 
 #include "explo_planner/exchange_drain.hpp"
+#include "explo_planner/meeting_attendance.hpp"
 #include "explo_planner/team_model.hpp"
 
 using explo_planner::DrainReading;
 using explo_planner::DrainStep;
 using explo_planner::DrainWindow;
 using explo_planner::FleetIdentity;
+using explo_planner::kModeDone;
+using explo_planner::kModeExploring;
+using explo_planner::kModeHoming;
 using explo_planner::makeFleetIdentity;
 using explo_planner::robotBit;
 using explo_planner::stepDrainRelease;
@@ -108,11 +127,14 @@ FleetIdentity fleet3() {
 }
 
 /// A message from `sender` naming `mask` as its direct contacts, plus itself.
-TeamModel::Observation msg(int sender, uint32_t mask, bool finished = false) {
+/// `mode` is the sender's TeamWorld level (0 exploring, 1 homing, 2 done).
+TeamModel::Observation msg(int sender, uint32_t mask, bool finished = false,
+                           uint8_t mode = 0) {
   TeamModel::Observation o;
   o.sender_id     = sender;
   o.in_range_mask = mask | robotBit(sender);
   o.finished      = finished;
+  o.mode          = mode;
   return o;
 }
 
@@ -172,6 +194,7 @@ const char* name(DrainStep s) {
     case DrainStep::kHold:       return "kHold (never ended)";
     case DrainStep::kDrained:    return "kDrained";
     case DrainStep::kUnfinished: return "kUnfinished";
+    case DrainStep::kAllPeersLeaving: return "kAllPeersLeaving";
   }
   return "?";
 }
@@ -202,15 +225,22 @@ double rateAtDecision(const Counters& counters, int peer, int at) {
 /// radio statement, and a robot that finished and drove off is not an answer
 /// to it.
 ///
-/// cerd announces it is finished at t = 0 and is never heard again; bestla is
-/// here, talks for five seconds, and goes flat. The exchange that is actually
+/// cerd announces it is finished and done at t = 0 — it has been to its
+/// meeting and turned for home — and is never heard again; bestla is here,
+/// talks for five seconds, and goes flat. The exchange that is actually
 /// happening is over by the second window. If cerd is counted, it is mute
 /// against its own baseline for the whole hold, and the robot stands on the
 /// cell to the cap waiting for a map that is not coming.
+///
+/// DONE, since §10 item 5 was decided: a finished robot below HOMING is one
+/// still on its way here, and the barrier holds for it before this hold
+/// opens (test_meeting_attendance.cpp). The case this test is for is the one
+/// that left.
 TEST(ExchangePresence, AFinishedPeerThatIsNotHereIsNotWaitedFor) {
   TeamModel m = model(fleet3());
   const Deliver deliver = [](TeamModel& tm, double t) {
-    if (t == 0.0) hear(tm, msg(kCerd, robotBit(kAtlas), /*finished=*/true), t);
+    if (t == 0.0)
+      hear(tm, msg(kCerd, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
     // bestla names atlas and not cerd, so nothing bridges cerd either.
     hear(tm, msg(kBestla, robotBit(kAtlas)), t);
   };
@@ -319,19 +349,16 @@ TEST(ExchangePresence, ARelayedPeerIsWaitedFor) {
 /// Every `continue` in the loop is a peer the robot could not read, and with
 /// all of them taken a loop seeded `true` would release having examined no
 /// one — at the first full window, on nothing. Here the only peer finished
-/// at t = 0 and has not been heard since: the robot must not call that a
-/// drained exchange. It holds to the cap and leaves UNFINISHED.
+/// at t = 0, has not said it is leaving, and has not been heard since: the
+/// robot must not call that a drained exchange. It holds to the cap and
+/// leaves UNFINISHED.
 ///
-/// THIS IS ALSO TEST-PLAN 7'S N = 2 CASE, AND IT DOES NOT MATCH ITS WORDING.
-/// The plan says a finished peer with no fresh contact does "not open a hold".
-/// At N = 2 the hold does open: the barrier counts the finished partner as
-/// accounted for (the barrier's question, where counting it is right), and
-/// the hold opens on that count. The drain then examines nobody, and this
-/// test is what happens next — a hold to the cap, logged as an unfinished
-/// exchange. That is the safe reading of the evidence the predicate has, and
-/// it is pinned here as the shipped behaviour. Whether the hold should open
-/// at all is a design decision recorded as open in DESIGN_gen33.md §10, not
-/// something this test settles.
+/// HOW A ROBOT GETS HERE, since §10 item 5 was decided (DESIGN_gen33.md). A
+/// finished partner below HOMING is one still on its way to the meeting, and
+/// the barrier holds for it (holdingForFinishedPeer) — so this hold opens only
+/// once that wait has run out its cap with the partner neither arrived nor
+/// leaving. A no-show, and UNFINISHED is the honest outcome for it. Had the
+/// partner said it was leaving, the next test applies instead.
 TEST(ExchangePresence, NobodyReadIsNotEverybodyDrained) {
   TeamModel m = model(fleet2());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -354,6 +381,141 @@ TEST(ExchangePresence, NobodyReadIsNotEverybodyDrained) {
   EXPECT_TRUE(h.reading.measurable)
       << "the counters were fleet-sized; this must fail on presence, not on "
          "an unreadable vector, or it is DrainUnmeasured again";
+}
+
+// ===========================================================================
+// EVERY PEER HAS SAID IT IS LEAVING — the partner protocol's other half
+// (§10 item 5). A robot stops waiting when its partner says homing or done.
+// ===========================================================================
+
+/// N = 2: THE PARTNER CAME, EXCHANGED, AND LEFT — or never meant to come. It
+/// said DONE and is not here. Nothing is left to trade, so the hold ends at
+/// the first full window, and as its own outcome: not drained (nobody spoke)
+/// and not unfinished (nothing was owed).
+TEST(AllPeersLeaving, APartnerThatSaidDoneAndIsGoneEndsTheHold) {
+  TeamModel m = model(fleet2());
+  const Deliver deliver = [](TeamModel& tm, double t) {
+    if (t == 0.0)
+      hear(tm, msg(kBestla, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
+  };
+  const Counters counters = [](int) { return std::vector<uint64_t>{0, 1000}; };
+
+  prerollToHoldStart(m, deliver);
+  m.tick(kHoldStartSec);
+  ASSERT_FALSE(m.peer(kBestla).direct || m.peer(kBestla).via_relay);
+
+  const Hold h = runHold(m, deliver, counters);
+  EXPECT_EQ(h.step, DrainStep::kAllPeersLeaving) << "got " << name(h.step);
+  EXPECT_EQ(h.at_sec, 10) << "the first full window, and not before it";
+  EXPECT_EQ(h.reading.examined, 0);
+  EXPECT_EQ(h.reading.others, 1);
+  EXPECT_EQ(h.reading.leaving, 1);
+}
+
+/// N = 3: ALL OF THEM, BY EITHER LEVEL. bestla is done; cerd is homing
+/// without having finished (a budget return). Both are gone, both said so.
+TEST(AllPeersLeaving, EveryPeerHomingOrDoneEndsTheHoldAtN3) {
+  TeamModel m = model(fleet3());
+  const Deliver deliver = [](TeamModel& tm, double t) {
+    if (t != 0.0) return;
+    hear(tm, msg(kBestla, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
+    hear(tm, msg(kCerd, robotBit(kAtlas), /*finished=*/false, kModeHoming), t);
+  };
+  const Counters counters = [](int) {
+    return std::vector<uint64_t>{0, 1000, 500};
+  };
+
+  prerollToHoldStart(m, deliver);
+  const Hold h = runHold(m, deliver, counters);
+  EXPECT_EQ(h.step, DrainStep::kAllPeersLeaving) << "got " << name(h.step);
+  EXPECT_EQ(h.at_sec, 10);
+  EXPECT_EQ(h.reading.others, 2);
+  EXPECT_EQ(h.reading.leaving, 2);
+}
+
+/// ALL, NOT ANY. bestla is done and gone; cerd finished but has not said it is
+/// leaving — it may still be walking in. One leaving peer does not release a
+/// hold another may still arrive at: this is the no-show case, to the cap.
+TEST(AllPeersLeaving, OnePeerStillComingKeepsTheHold) {
+  TeamModel m = model(fleet3());
+  const Deliver deliver = [](TeamModel& tm, double t) {
+    if (t != 0.0) return;
+    hear(tm, msg(kBestla, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
+    hear(tm, msg(kCerd, robotBit(kAtlas), /*finished=*/true, kModeExploring), t);
+  };
+  const Counters counters = [](int) {
+    return std::vector<uint64_t>{0, 1000, 500};
+  };
+
+  prerollToHoldStart(m, deliver);
+  const Hold h = runHold(m, deliver, counters);
+  EXPECT_EQ(h.step, DrainStep::kUnfinished)
+      << "got " << name(h.step) << " at s=" << h.at_sec
+      << ": one peer leaving released the hold another may still arrive at";
+  EXPECT_EQ(h.at_sec, 60);
+  EXPECT_EQ(h.reading.leaving, 1);
+  EXPECT_EQ(h.reading.others, 2);
+}
+
+/// LEAVING, BUT HERE: THE COUNTER STILL DECIDES. bestla says DONE — its
+/// manoeuvre ended, it is turning for home — but it is still in range and its
+/// map is still crossing at 2 vox/s until s = 30. What it said is not the
+/// exchange; the bytes are. The hold releases on the counter going flat.
+TEST(AllPeersLeaving, ALeavingPeerThatIsStillHereIsReadOnItsCounter) {
+  TeamModel m = model(fleet2());
+  const Deliver deliver = [](TeamModel& tm, double t) {
+    hear(tm, msg(kBestla, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
+  };
+  const Counters counters = [](int s) {
+    return std::vector<uint64_t>{0, 1000u + 20u * static_cast<uint64_t>(std::min(s, 30))};
+  };
+
+  prerollToHoldStart(m, deliver);
+  m.tick(kHoldStartSec);
+  ASSERT_TRUE(m.peer(kBestla).direct);
+
+  const Hold h = runHold(m, deliver, counters);
+  EXPECT_EQ(h.step, DrainStep::kDrained)
+      << "got " << name(h.step) << " at s=" << h.at_sec
+      << ": a leaving peer still delivering was cut off by what it said";
+  EXPECT_EQ(h.at_sec, 40) << "30-40 is its first quiet window";
+  EXPECT_EQ(h.reading.examined, 1);
+}
+
+/// AND WHEN ITS COUNTER CANNOT BE READ. The drain loop does not run on
+/// unmeasurable counters, so `examined` is 0 with bestla standing on the cell;
+/// "nobody here" must be the model's answer, not that zero. Unmeasured holds
+/// to the cap, as DrainUnmeasured says — being told "leaving" by a peer that
+/// is here does not change that.
+TEST(AllPeersLeaving, ALeavingPeerThatIsHereIsNotSkippedWhenUnmeasured) {
+  TeamModel m = model(fleet2());
+  const Deliver deliver = [](TeamModel& tm, double t) {
+    hear(tm, msg(kBestla, robotBit(kAtlas), /*finished=*/true, kModeDone), t);
+  };
+  const Counters counters = [](int) { return std::vector<uint64_t>{}; };
+
+  prerollToHoldStart(m, deliver);
+  const Hold h = runHold(m, deliver, counters);
+  EXPECT_EQ(h.step, DrainStep::kUnfinished)
+      << "got " << name(h.step) << " at s=" << h.at_sec;
+  EXPECT_EQ(h.at_sec, 60);
+  EXPECT_FALSE(h.reading.measurable);
+}
+
+/// AN UNCONFIGURED MODEL KNOWS NO PEERS, so "every one of them is leaving" is
+/// vacuous, not true. It holds, as it did before this outcome existed.
+TEST(AllPeersLeaving, NoPeersIsNotEveryPeerLeaving) {
+  TeamModel m;   // never configured
+  const std::vector<uint64_t> c{0, 1000};
+  DrainWindow window;
+  DrainReading r;
+  for (int s = 0; s <= 60; ++s) {
+    r = stepDrainRelease(window, s, c, c, m, 2, kAtlas, kRateVoxSec,
+                         kWindowSec, kCapSec);
+    if (r.step != DrainStep::kHold) break;
+  }
+  EXPECT_EQ(r.step, DrainStep::kUnfinished) << "got " << name(r.step);
+  EXPECT_EQ(r.others, 0);
 }
 
 // ===========================================================================

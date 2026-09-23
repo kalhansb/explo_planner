@@ -78,6 +78,7 @@ add_library(explo_planner_lib
   src/cell_world.cpp
   src/team_model.cpp
   src/exchange_drain.cpp
+  src/meeting_attendance.cpp
   src/global_allocator.cpp
   src/reconnect_gate.cpp
   src/rendezvous_scheduler.cpp
@@ -245,6 +246,13 @@ if(BUILD_TESTING)
   # test_gen21_latched_hold.
   ament_add_gtest(test_exchange_drain test/test_exchange_drain.cpp)
   target_link_libraries(test_exchange_drain explo_planner_lib)
+
+  # Gen-33 §10 item 5: a finished robot still comes to the meeting and says
+  # DONE only once it leaves; its partner waits for it until then. The two
+  # predicates run here; the node's wiring of them is a scan in
+  # test_gen21_latched_hold.
+  ament_add_gtest(test_meeting_attendance test/test_meeting_attendance.cpp)
+  target_link_libraries(test_meeting_attendance explo_planner_lib)
 
   ament_add_gtest(test_global_allocator test/test_global_allocator.cpp)
   target_link_libraries(test_global_allocator explo_planner_lib)

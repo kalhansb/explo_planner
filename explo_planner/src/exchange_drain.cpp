@@ -1,5 +1,7 @@
 #include "explo_planner/exchange_drain.hpp"
 
+#include "explo_planner/meeting_attendance.hpp"
+
 namespace explo_planner {
 
 DrainReading stepDrainRelease(DrainWindow& window, double settled_sec,
@@ -58,7 +60,9 @@ DrainReading stepDrainRelease(DrainWindow& window, double settled_sec,
     // FINISHED IS NOT PRESENT (test-plan 7). `finished` is sticky and says
     // nothing about the radio: a peer that finished and drove off is still
     // finished. Counting it would hold a drained exchange open against a robot
-    // that is not here to deliver anything.
+    // that is not here to deliver anything. (A finished peer still on its way
+    // here does not reach this loop absent: the barrier holds for it before
+    // the hold opens — meeting_attendance.hpp.)
     const auto& p = team.peer(id);
     if (!p.direct && !p.via_relay) continue;
     ++r.examined;
@@ -92,6 +96,32 @@ DrainReading stepDrainRelease(DrainWindow& window, double settled_sec,
   // up, arriving through a different door: the hold opens on
   // max(active, reachablePeerCount), which counts peers this loop is entitled
   // to skip.
+  //
+  // EXCEPT WHEN EVERY PEER HAS SAID IT IS LEAVING (2026-09-23). That is not an
+  // absence of evidence but positive evidence, first-hand or relayed: each one
+  // announced homing or done, and there is nobody left to come and trade maps
+  // with. Holding to the cap for them is the wait the partner protocol exists
+  // to end — a robot stops waiting when its partner says it is leaving. All of
+  // them, not any: one peer that has not said so could still be walking in,
+  // and that is the case this backstop is for. And NOBODY HERE, counted on its
+  // own rather than read off `examined`: the loop above does not run at all
+  // when the counters are unmeasurable, so `examined` is 0 there with a peer
+  // standing on the cell — and a peer that is here and leaving may still have
+  // bytes crossing, which is the counter's question, not this one's.
+  int here = 0;
+  if (team.configured()) {
+    for (int id = 0; id < fleet_size && id < team.size(); ++id) {
+      if (id == self_id) continue;
+      const auto& p = team.peer(id);
+      ++r.others;
+      if (p.mode >= kModeHoming) ++r.leaving;
+      if (p.direct || p.via_relay) ++here;
+    }
+  }
+  if (here == 0 && r.others > 0 && r.leaving == r.others) {
+    r.step = DrainStep::kAllPeersLeaving;
+    return r;
+  }
   if (r.examined == 0) drained = false;
   if (!drained) {
     // Roll the window forward and keep holding — up to the cap, which is the

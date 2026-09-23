@@ -50,6 +50,11 @@ enum class DrainStep {
   kHold,        ///< keep standing on the cell; keep heartbeating
   kDrained,     ///< every believed peer spoke, then fell below R over W
   kUnfinished,  ///< the cap arrived first — leave, but do not call it drained
+  /// Nobody here (direct or relayed), and every peer has said it is leaving
+  /// (mode >= HOMING): there is no exchange left to wait for. Neither drained
+  /// nor unfinished — no exchange was expected — and the node logs it as its
+  /// own event. Judged at the full-window instants only, like the rest.
+  kAllPeersLeaving,
 };
 
 /// What one step decided and what it saw. `mute` and `examined` are what the
@@ -61,6 +66,8 @@ struct DrainReading {
   bool      measurable = false;  ///< all three counter vectors were fleet-sized
   int       mute       = 0;      ///< examined peers still at the hold-start level
   int       examined   = 0;      ///< peers believed present (direct or relayed)
+  int       others     = 0;      ///< fleet peers in the model, self excluded
+  int       leaving    = 0;      ///< of those, how many said homing or done
 };
 
 /// One tick of the drain release.
