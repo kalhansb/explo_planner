@@ -8648,18 +8648,29 @@ void ExploPlannerNode::doReturnSync() {
   // together. The terms negate manoeuvreReleaseEligible's first half (change
   // both together); copy current_goal_ since startReturnTo overwrites it.
   // (notes: return-sync-conversion-reversible)
+  // A finished peer the veto holds for is not together, although
+  // reachablePeerCount counts it: without that term two finished walkers
+  // stopped short both hold and neither drives on (DESIGN_gen33 §10, known
+  // issue 2).
   if (appointment_manoeuvre_ && appointment_settle_converted_ &&
       !appointment_arrived_ && !teamSettled(active) &&
-      !teamComplete(reachablePeerCount(), rendezvous_expected_peers_)) {
+      (!teamComplete(reachablePeerCount(), rendezvous_expected_peers_) ||
+       holdingForFinishedPeer())) {
     const Eigen::Vector3f resume_target = current_goal_.position;
     const float rdx = resume_target.x() - latest_pos_.x();
     const float rdy = resume_target.y() - latest_pos_.y();
     if (std::sqrt(rdx * rdx + rdy * rdy) >
         static_cast<float>(reconnect_arrive_tol_m_)) {
+      // Name the peer when the veto is why: the count includes it.
+      const int coming = holdingForFinishedPeer()
+          ? finishedPeerStillComing(team_model_, fleet_.self_id) : -1;
+      const std::string held_for =
+          coming >= 0 ? "; " + fleet_.nameOf(coming) + " finished, unheard"
+                      : "";
       RCLCPP_WARN(get_logger(),
           "Rendezvous: the settle that stopped me here has lapsed (%d/%d "
-          "present) -> resuming the drive to the agreed cell (%.2f, %.2f).",
-          active, rendezvous_expected_peers_,
+          "present%s) -> resuming the drive to the agreed cell (%.2f, %.2f).",
+          active, rendezvous_expected_peers_, held_for.c_str(),
           resume_target.x(), resume_target.y());
       startReturnTo(resume_target, "appointment", "return-settle-lapsed");
       return;
