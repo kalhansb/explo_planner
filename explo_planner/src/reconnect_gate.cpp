@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/reconnect_gate.hpp"
 
 #include <algorithm>
@@ -53,45 +54,20 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     return v;
   }
 
-  // NOBODY TO PRICE IS AN INABILITY TO EVALUATE, NOT A DECISION TO STAY.
-  //
-  // The caller reached this gate because the mid-run trigger fired, and the
-  // trigger's notion of "missing" is not this one. The trigger reads the
-  // coordination beacon (livePeerCount / team_last_complete_time_, 1 Hz,
-  // claim-TTL'd); `missing` is built from TeamModel::inComms, a different
-  // topic with its own TTL, a two-way handshake and transitive closure. They
-  // are designed to disagree — 16-21% of mid-run fires in generation 8 fired
-  // with the radio UP — so a peer whose beacons lapsed while its TeamWorld
-  // summaries kept arriving reaches here with an EMPTY missing list.
-  //
-  // Falling through would have counted 0 unshared cells over an empty set,
-  // set knowledge=false, and returned a verdict byte-identical to the clean
-  // "the partner already knows everything" suppression — the same
-  // {false,false,0,-1,-1,-1,0,""} row, with nothing in the log able to tell
-  // the two apart. That is the one path where the gate answered "stay"
-  // about a question it never asked. Everything else it cannot evaluate
-  // fails open; so does this, and it says why.
+  // An empty missing list means the trigger's beacon view and
+  // TeamModel::inComms disagree, not that the partner knows everything: fail
+  // open with a named refusal, never a silent stay.
+  // (notes: gate-empty-missing-fails-open)
   if (missing.empty()) {
     v.refused  = "no-missing-peer-identified";
     v.dispatch = true;
     return v;
   }
 
-  // The set we are actually pricing: unfinished, addressable peers.
-  //
-  // The two ways a peer leaves this list are NOT the same answer, and
-  // collapsing them is how a config fault turns into a silent suppression:
-  //
-  //   * FINISHED is a computed no. It will never explore again, so nothing we
-  //     could tell it changes any plan. If that empties the list the gate has
-  //     genuinely decided "not worth it" — it falls through to the knowledge
-  //     count, which is 0 over an empty peer set, and returns a clean
-  //     `dispatch = false` with no `refused`.
-  //   * AN ID OUTSIDE [0,32) is not representable in a `known_by` mask at all,
-  //     so we cannot tell what that peer knows. That is an inability to
-  //     evaluate, and it fails open like every other one. Dropping it quietly
-  //     would let a fleet-identity misconfiguration read as "we are perfectly
-  //     in sync" for the whole run.
+  // Price only unfinished, addressable peers. Finished peers are a computed no
+  // and can leave a clean no-dispatch; an id outside [0,32) is not
+  // representable in known_by, so the gate fails open.
+  // (notes: gate-priced-peer-set)
   std::vector<MissingPeer> live;
   for (const MissingPeer& p : missing) {
     if (p.id < 0 || p.id >= 32) {
@@ -143,11 +119,9 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     if (leg < 0 || d < leg) { leg = d; leg_peer_id = p.id; }
   }
   if (leg < 0) {
-    // We know someone is missing but not where. Pursuit's own fallback ladder
-    // handles that case (explore on the fallback allowance, then hold in place
-    // and beacon — the last-contact midpoint it used to name was deleted on
-    // 2026-09-16); the gate has no basis to price it and must not turn "I do
-    // not know" into "do not go".
+    // Someone is missing but not located: pursuit's own fallback ladder handles
+    // that. The gate has no basis to price it and must not turn unknown into
+    // do-not-go, so it fails open. (notes: gate-peer-position-unknown)
     v.refused  = "peer-position-unknown";
     v.dispatch = true;
     return v;
@@ -155,64 +129,26 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
   v.leg_mm = leg;
 
   // --- 3. the two futures ------------------------------------------------
-  // Identical vehicle sets, identical world, ONE difference: whether the
-  // missing peers can be given cells they have never heard of. That difference
-  // is the whole measurement, which is why cfg.comms_mask arrives ignored.
-  //
-  // ONE PEER ON BOTH SIDES OF THE INEQUALITY (2026-09-18), and it is the peer
-  // `leg` was priced to. The value side used to unmask EVERY live missing peer
-  // while the cost side priced the drive to the nearest one, so the two halves
-  // of C_re described different manoeuvres: the robot paid to fetch one peer
-  // and was credited with the makespan saving of fetching all of them. At N=2
-  // the two coincide and nothing changes; at N>=3 it is a one-directional bias
-  // towards dispatch, and adding a peer with NOTHING to gain from the
-  // reconnection could flip a refusal into a dispatch purely by shortening the
-  // nearest leg. That is a defect against this file's own stated model — see
-  // the leg comment above, "the manoeuvre goes to one of them" — not a policy
-  // choice, so it is corrected here rather than parameterised.
-  //
-  // TWO MISMATCHES THIS DOES **NOT** CLOSE, both of which are design questions
-  // about the treatment rather than arithmetic errors, and both of which are
-  // written up in CODE_TODO rather than patched:
-  //   * the node's chase target is the FRESHEST-heard unaccounted peer
-  //     (missingPeerRecord), not the nearest one priced here, so `leg_mm` can
-  //     understate the drive the node actually commits to;
-  //   * a RENDEZVOUS appointment drive is not a trip to a peer at all — it
-  //     reconnects the whole team at an agreed cell — so for that arm the
-  //     single-peer model is the wrong shape in both terms, not just mis-aimed.
-  // Choosing what the gate should price in those two cases changes which
-  // dispatches happen in the arms under test, which is Kalhan's call.
+  // The two solves differ only in whether the peer leg was priced to can be
+  // given cells it has never heard of; value and cost sides must name that same
+  // peer. cfg.comms_mask is ignored. (notes: gate-two-futures-one-peer)
   std::vector<AllocRobot> apart = robots;
   for (AllocRobot& r : apart) {
     for (const MissingPeer& p : live) {
       if (r.id == p.id) r.in_comms = false;
     }
   }
-  // `re` differs from `apart` in exactly one vehicle: the peer we priced the
-  // leg to becomes reachable again. Built from `apart`, not from `robots`,
-  // because `robots` carries whatever in_comms the caller happened to set for
-  // the OTHER missing peers — and in the mid-run trigger's vehicle set that is
-  // false for all of them, which is how the old `robots` solve managed to
-  // unmask everyone.
+  // re differs from apart in exactly one vehicle, the peer leg was priced to.
+  // Built from apart, not robots, because robots carries the caller's in_comms
+  // bits for the other missing peers. (notes: gate-re-vehicle-set)
   std::vector<AllocRobot> re = apart;
   for (AllocRobot& r : re) {
     if (r.id == leg_peer_id) r.in_comms = true;
   }
 
-  // BOTH SOLVES NOW RUN WITH THE MASK ON (2026-09-18) and differ only in the
-  // vehicle set. The RE solve used to be `comms_mask = false` over the caller's
-  // unmodified `robots`, and that is the mechanism behind the defect above: the
-  // flag switches masking off wholesale (see GlobalAllocator, which skips the
-  // per-vehicle test entirely when it is clear), so no arrangement of in_comms
-  // bits could have expressed "exactly one peer comes back". Turning the flag
-  // on and restoring one bit expresses it directly, and it also makes the two
-  // solves genuinely identical in every other respect — which is what lets the
-  // difference of their makespans be read as the value of this manoeuvre.
-  //
-  // The old comment here claimed `robots` was "everyone reachable, nobody
-  // masked". The first half was not true of the vehicle set the mid-run trigger
-  // actually passes (its missing peers carry in_comms = false); it did not
-  // matter only because the second half made the first irrelevant.
+  // Both solves run with comms_mask on and differ only in the vehicle set: with
+  // the flag clear GlobalAllocator skips masking wholesale, so only this
+  // expresses exactly one peer coming back. (notes: gate-both-solves-masked)
   GlobalAllocator::Config no_cfg = cfg;
   no_cfg.comms_mask = true;
   GlobalAllocator::Config re_cfg = cfg;
@@ -231,12 +167,10 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     return v;
   }
 
-  // STRUCTURALLY ZERO, and kept only so the column does not change meaning
-  // mid-campaign. The mask exempts any in_comms vehicle from the known-by test,
-  // this robot is always built in_comms, and a vehicle exempt from the test can
-  // take any cell — so no_plan.unassigned cannot be non-empty while self is in
-  // the vehicle set. The column was meant to report comms-mask starvation and
-  // cannot; dead-column status is recorded in CODE_TODO with the rest.
+  // Structurally zero while self is in the vehicle set: this robot is always
+  // in_comms, so it is exempt from the known-by test and can take any cell.
+  // Kept so the column keeps its meaning.
+  // (notes: gate-unassigned-structurally-zero)
   v.unassigned = static_cast<int>(no_plan.unassigned.size());
   v.c_no_mm    = makespanMm(no_plan);
   v.c_re_mm    = leg + makespanMm(re_plan);

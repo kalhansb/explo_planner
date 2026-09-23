@@ -42,6 +42,7 @@
 ///
 /// The self skip is not in the ledger: TeamModel never marks its own entry
 /// finished (the gossip loop skips self), so deleting it is equivalent.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -119,10 +120,9 @@ struct Publisher {
 // announcedMode — WHAT A ROBOT SAYS.
 // ===========================================================================
 
-/// THE KEEPER'S WHOLE RUN, tick by tick. The defect this generation fixes is
-/// the second line: a robot that saturates with an appointment standing used
-/// to say DONE there, before the drive, so "will it take part?" answered no
-/// for a robot on its way to the meeting.
+/// The keeper's whole run, tick by tick. A robot that saturates with an
+/// appointment standing must not say DONE before the drive to the meeting.
+/// (notes: attendance-keeper-whole-run)
 TEST(AnnouncedMode, AKeeperSaysDoneOnlyOnceItStopsKeepingTheAppointment) {
   Publisher pub;
   // Exploring.

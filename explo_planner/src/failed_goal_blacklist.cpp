@@ -1,5 +1,6 @@
 /// @file failed_goal_blacklist.cpp
 /// @brief Definitions for FailedGoalBlacklist (see header).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include "explo_planner/failed_goal_blacklist.hpp"
 
@@ -45,12 +46,9 @@ int FailedGoalBlacklist::add(const Eigen::Vector3f& pos, double now_sec,
 }
 
 void FailedGoalBlacklist::prune(double now_sec, double ttl_sec) {
-  // Full scan rather than a pop-front-until-fresh loop. The early-break form
-  // assumed insertion order implies age order, which holds only for a
-  // monotonic clock — under sim time a bag restart or a /clock step backwards
-  // stamps a fresh entry with an *older* timestamp than the one behind it, and
-  // the break then left every expired entry after it blacklisting goals
-  // forever. Entries stamped in the future (age < 0) are treated as fresh.
+  // Full scan, not pop-front-until-fresh: under sim time the clock can step
+  // back, so insertion order is not age order. Entries stamped in the future
+  // (age < 0) count as fresh. (notes: blacklist-prune-full-scan)
   const auto is_stale = [now_sec, ttl_sec](const FailedGoalSite& s) {
     return !s.retired && now_sec - s.last_fail_time > ttl_sec;
   };
@@ -64,13 +62,10 @@ void FailedGoalBlacklist::prune(double now_sec, double ttl_sec) {
     return;
   }
 
-  // Retirement ON: expire, do not erase. prune() runs every PLAN tick, so a
-  // robot that returns to the same trap after longer than the TTL used to find
-  // the record gone and start counting from 1 again — which made retirement
-  // unreachable in exactly the case it exists for (a trap revisited every few
-  // minutes). Keeping the record costs one struct per distinct failure SITE,
-  // and a site costs a whole failed navigation to create, so the list stays in
-  // the tens over a full run.
+  // With retirement on, stale sites are marked expired, not erased, so a trap
+  // revisited after the TTL keeps its count and can reach retire_after. One
+  // record per failure site keeps the list small.
+  // (notes: blacklist-expire-not-erase)
   for (auto& s : sites_) {
     if (is_stale(s)) s.expired = true;
   }
@@ -99,15 +94,9 @@ bool FailedGoalBlacklist::isNear(const Eigen::Vector3f& pos,
 
 bool FailedGoalBlacklist::isRetiredNear(const Eigen::Vector3f& pos,
                                         double radius_m) const {
-  // ANY retired site within the radius, not the nearest one. Nearest-wins was
-  // wrong on two counts. Semantically, retirement is a veto — "held for the
-  // rest of the run" — and a veto is not overturned by a fresher record
-  // happening to sit a few centimetres closer. Mechanically, it did not even
-  // describe the same site the caller had just written: add() clusters into
-  // the FIRST site within radius, not the nearest, so failGoal could increment
-  // site A and then log the retired flag of site B. That flag is what
-  // nav_goal_failed carries into the analysis, so a mismatch there is a
-  // silently wrong event field, not just a confusing WARN.
+  // True if ANY retired site lies within the radius, not just the nearest:
+  // retirement is a veto, and add() clusters into the first site within
+  // radius, not the nearest. (notes: blacklist-any-retired-near)
   const float r2 = static_cast<float>(radius_m * radius_m);
   for (const auto& s : sites_) {
     if (s.retired && dist2_xy(s.pos, pos) < r2) return true;
@@ -117,11 +106,9 @@ bool FailedGoalBlacklist::isRetiredNear(const Eigen::Vector3f& pos,
 
 double FailedGoalBlacklist::lastFailTimeNear(const Eigen::Vector3f& pos,
                                              double radius_m) const {
-  // Expired records excluded, to match isNear. Both callers — the amnesty
-  // ordering and the amnesty log line — only ever see candidates that were
-  // SUPPRESSED this tick, so an expired site can never be the subject; letting
-  // one through would only change the answer for a candidate that is not
-  // suppressed at all.
+  // Expired records are excluded, to match isNear; its callers (amnesty
+  // ordering and the amnesty log line) only pass candidates suppressed this
+  // tick. (notes: blacklist-last-fail-excludes-expired)
   const float r2 = static_cast<float>(radius_m * radius_m);
   double latest = -std::numeric_limits<double>::infinity();
   for (const auto& s : sites_) {
@@ -134,22 +121,9 @@ double FailedGoalBlacklist::lastFailTimeNear(const Eigen::Vector3f& pos,
 bool amnestyOrderBefore(const FailedGoalBlacklist& bl,
                         const Eigen::Vector3f& a, const Eigen::Vector3f& b,
                         double radius_m) {
-  // Retired last, then least-recently-failed.
-  //
-  // The retired partition is not cosmetic. Ordering on fail time ALONE hands
-  // the amnesty valve straight back to the permanent traps that retirement
-  // exists to hold, and does so systematically rather than occasionally: a
-  // retired site is never pruned, so once the robot stops re-failing it its
-  // last_fail_time only gets older, while every ordinary site near it either
-  // gets re-failed (fresh time) or ages out of the blacklist entirely and
-  // stops being a suppressed candidate at all. Give it a few minutes and the
-  // oldest failure in the list is essentially always the confirmed trap. The
-  // one valve meant to rescue a starved planner would then aim it at the
-  // known-unreachable goal first, every single time.
-  //
-  // A retired candidate is still reachable as a last resort — that is the
-  // point of amnesty, and it is what keeps the worst case no worse than the
-  // old behaviour — but only once nothing merely-suppressed is left to try.
+  // Retired last, then least-recently-failed. On fail time alone the oldest
+  // failure is almost always a retired trap, so amnesty would aim there first;
+  // a retired site stays a last resort. (notes: blacklist-amnesty-order)
   const bool ra = bl.isRetiredNear(a, radius_m);
   const bool rb = bl.isRetiredNear(b, radius_m);
   if (ra != rb) return !ra;  // non-retired first

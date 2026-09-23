@@ -1,6 +1,7 @@
 #pragma once
 /// @file map_cache.hpp
 /// @brief Read-only Bonxai grid rebuilt from ROS map messages.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include "explo_planner/scoring.hpp"
 #include <bonxai/bonxai.hpp>
@@ -24,25 +25,10 @@ public:
   ///         the ROI overload.
   bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg);
 
-  /// Rebuild grid from a ScovoxMap, keeping only voxels whose position lies in
-  /// the inclusive AABB [roi_min, roi_max]. The fused-map topic carries the
-  /// whole map; the planner re-applies its ROI clip here so map_cache_ stays
-  /// bounded to the ROI as the old per-region GetRegion service made it (frontier
-  /// extraction and map-stats both walk the whole grid, so the clip matters).
-  /// Non-finite positions are dropped. NB: this clips on voxel position; the old
-  /// service clipped in coord space, so results match for resolution-aligned ROI
-  /// bounds and may differ by one voxel layer at a non-aligned min boundary.
-  ///
-  /// @return true if the grid was rebuilt. false means msg.resolution was
-  ///         positive but not finite (+inf), which would make Bonxai's
-  ///         inv_resolution zero and every posToCoord a float->int32 cast of a
-  ///         non-finite value — UB that surfaces as garbage coordinates, not a
-  ///         crash. Unlike the constructor and updateFromLogOddsCloud, which
-  ///         throw on a bad resolution because that is a config error, this
-  ///         value arrives over the wire mid-run: the previous grid is kept and
-  ///         the message is dropped, so one malformed publish cannot take the
-  ///         node down in the field. Callers should log it (throttled) and
-  ///         treat it as "no new map this tick".
+  /// Rebuild keeping voxels whose position is inside the inclusive AABB
+  /// [roi_min, roi_max]; non-finite positions dropped. Returns false, keeping
+  /// the previous grid, if msg.resolution is +inf; callers log it throttled.
+  /// (notes: map-cache-roi-rebuild)
   bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                            const Eigen::Vector3f& roi_min,
                            const Eigen::Vector3f& roi_max);
@@ -69,25 +55,15 @@ public:
   std::vector<Eigen::Vector3f> findFrontierCentroids(
       float min_z, float max_z, float cluster_radius) const;
 
-  /// Estimate the ground elevation at world (x, y): the z of the top FACE of
-  /// the ground voxel stack in that column. The search scans the column from
-  /// z_low upward to z_high; the FIRST (lowest) occupied voxel
-  /// (p_occ >= occ_thresh) anchors the ground, then the walk continues up
-  /// through contiguous occupied voxels for at most stack_max_m (absorbs the
-  /// residual vertical measurement smear without climbing walls/trunks) and
-  /// the top face of the last stack voxel is returned. Lowest-first anchoring
-  /// makes the estimate robust to canopy/overhangs higher in the column.
-  /// Returns NaN when the window contains no occupied voxel (unobserved or
-  /// free-only column).
+  /// Ground z at (x, y): scanning z_low up to z_high, the lowest voxel with
+  /// p_occ >= occ_thresh anchors the ground; climb its contiguous stack at most
+  /// stack_max_m, return the top face. NaN if none. (notes: map-cache-ground-z)
   float groundZAt(float x, float y, float z_low, float z_high,
                   float occ_thresh, float stack_max_m) const;
 
-  /// Aggregate per-voxel statistics over the whole (already ROI-clipped) grid:
-  /// mean expected-information-gain, mean entropy, mean Beta variance, and the
-  /// frontier-voxel count (free voxels with >=1 unknown 6-neighbour). Walks
-  /// every active cell once. Extracted from the planner's LOG_STEP so it is
-  /// unit-testable and shares the frontier-neighbour logic with
-  /// findFrontierCentroids.
+  /// Means of EIG, entropy and Beta variance over the already ROI-clipped grid,
+  /// plus the frontier-voxel count (free voxels with an unknown 6-neighbour),
+  /// sharing that test with findFrontierCentroids. (notes: map-cache-stats)
   struct MapStats {
     int   total_voxels    = 0;
     int   frontier_voxels = 0;
@@ -97,19 +73,10 @@ public:
   };
   MapStats computeStats() const;
 
-  /// Fraction of x/y columns inside [min_x, max_x] x [min_y, max_y] that
-  /// contain NO observed voxel — a 2.5D "area coverage" measure over the
-  /// (already z-clipped) fused 3D map. A column counts as observed when any
-  /// grid cell (free OR occupied) projects into it, so trunk columns and
-  /// swept free space both count as covered; only never-seen ground-plane
-  /// cells raise the fraction. This deliberately ignores volumetric unknowns
-  /// (trunk interiors, canopy shadow are never observed and would put a
-  /// permanent floor under a 3D unknown fraction), matching the semantics of
-  /// the 2D planning_map unknown fraction used for coverage termination.
-  /// Bounds are mapped to coord space with the same floor() convention as
-  /// voxel ingest. Returns a value in [0, 1]; an empty grid gives 1.0.
-  /// Returns -1.0 on a degenerate box (max <= min) or non-finite bounds —
-  /// the caller's "cannot measure" convention.
+  /// Fraction of x/y columns in the box with no observed voxel (free or
+  /// occupied), matching the 2D planning_map unknown fraction. In [0, 1]; empty
+  /// grid 1.0; -1.0 for a degenerate or non-finite box.
+  /// (notes: map-cache-unknown-columns)
   double unknownColumnFraction(float min_x, float max_x,
                                float min_y, float max_y) const;
 

@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/separation.hpp"
 
 #include <algorithm>
@@ -13,26 +14,17 @@ std::string SeparationTerm::configure(const Config& cfg) {
   cfg_ = Config{};
   enabled_ = false;
 
-  // Radius and max-age are validated UNCONDITIONALLY, including when the
-  // weight is 0 and they cannot change a decision. They are not inert even
-  // then: the planner logs the peer distance and the eligible-peer count on
-  // every tick of every arm, using this radius and this freshness bound, and
-  // that measurement is the counterfactual a treated arm gets compared
-  // against. Validating them only on the treated side would leave the control
-  // arm measuring separation on a silently different bound.
+  // Radius and max-age are validated even at weight 0: every arm logs peer
+  // distance and eligible-peer count with them, so the control arm must
+  // measure on the same bounds. (notes: separation-validate-unconditionally)
   if (!std::isfinite(cfg.radius_m) || cfg.radius_m <= 0.0) {
     return "separation_radius_m=" + std::to_string(cfg.radius_m) +
            " is not a positive distance; the term is off and its diagnostics "
            "fall back to the defaults";
   }
-  // Upper and lower bound, not just positivity. The ramp divides by the radius
-  // in FLOAT: below ~1e-38 the cast underflows to 0 and a candidate exactly on
-  // a teammate evaluates 0/0, which propagates a NaN through std::min and
-  // std::clamp into the logged discount; above ~3e38 it overflows to infinity
-  // and every candidate gets the same discount, so the term is on, costs the
-  // information it takes away, and steers nothing. The bounds are far outside
-  // any real request (1 mm to 1000 km) — their job is to make those two
-  // regimes unreachable, not to express an opinion about plot size.
+  // Radius must lie in [1e-3, 1e6] m, not just be positive: the ramp divides
+  // by it in float, so near zero the discount goes NaN and near float overflow
+  // it goes constant. (notes: separation-radius-bounds-2)
   if (cfg.radius_m < 1e-3 || cfg.radius_m > 1e6) {
     return "separation_radius_m=" + std::to_string(cfg.radius_m) +
            " is outside [1e-3, 1e6] m; the term is off. Radii near zero make "

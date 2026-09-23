@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 #include "explo_planner/fov_evaluator.hpp"
 #include "explo_planner/map_cache.hpp"
@@ -95,13 +96,9 @@ TEST(FovEvaluator, EvaluateAllSetsScores) {
 }
 
 TEST(FovEvaluator, ZBandClipsRays) {
-  // Rays leaving the [roi_min_z, roi_max_z] band must be clipped so out-of-
-  // band space is never traversed or scored. A tight z-band must yield
-  // strictly fewer scored voxels (and lower total EIG) than an unbounded one,
-  // because the FOV cone contains rays whose vertical pitch exits the band
-  // well before max_range. This guards the dscovox-mode invariant that the
-  // raycast volume matches the GetRegion fetch band (no spurious info gain
-  // from rays pointing into unfetched space above/below the robot).
+  // Rays leaving the [roi_min_z, roi_max_z] band are clipped, so a tight band
+  // scores fewer voxels and less EIG: the raycast volume must match the map's z
+  // band, with no info gain from unfetched space. (notes: fov-test-z-band-clip)
   FovConfig wide;
   wide.h_rays = 4;
   wide.v_rays = 8;
@@ -130,14 +127,9 @@ TEST(FovEvaluator, ZBandClipsRays) {
   EXPECT_GT(r_banded.total_score, 0.0f);
 }
 
-// Both ends of a ray are ROI-clipped, not just the far one. A candidate sitting
-// on an ROI face and firing outward has its ROI exit at t = 0, i.e. BEFORE the
-// sensor's min_range: such a ray observes nothing and must contribute nothing.
-// Previously only the far end was clamped, so the walk started at
-// position + dir*min_range — outside the box and PAST the clamped far end — and
-// the iterator ran backwards through voxels the map never ingests, scoring each
-// as the Beta(1,1) max-uncertainty prior. That inflated info gain precisely at
-// the ROI boundary, biasing the planner toward the edge of its own region.
+// Both ends of a ray are ROI-clipped: a candidate on an ROI face firing outward
+// exits at t = 0, before min_range, and must score nothing. Out-of-ROI voxels
+// would otherwise score as the Beta(1,1) prior. (notes: fov-roi-clip-both-ends)
 TEST(FovEvaluator, RaysLeavingTheRoiInsideTheDeadZoneScoreNothing) {
   FovConfig cfg;
   cfg.h_rays = 8;
@@ -203,18 +195,10 @@ TEST(FovEvaluator, FarEndStillClippedAtTheRoiFace) {
   EXPECT_GT(r_near.total_ray_voxels, 0);
 }
 
-// An origin OUTSIDE the ROI on an axis the ray is PARALLEL to must contribute
-// nothing. The old exit-only clip skipped any axis with d[i] == 0 entirely, so
-// it read "parallel to this slab" as "unconstrained by this slab" and walked the
-// full max_range through space the map never ingested — every cell scoring the
-// Beta(1,1) max-uncertainty prior, which is maximal.
-//
-// This is reachable in the shipped terrain-mode config, not a synthetic case:
-// addFrontierCandidates snaps a candidate to ground + z_clearance with the
-// ground search referenced to the CENTROID's own z, so a candidate can land up
-// to (ground_search_above + z_clearance) = 1.3 m above the ingested band. Rays
-// from a UGV camera are near-horizontal, i.e. d.z ~ 0. The planner would then
-// score its own blind spot above the band as the most informative place to go.
+// An origin outside the ROI on an axis the ray is parallel to must score
+// nothing: treating that axis as unconstrained walks the full max_range through
+// un-ingested space at the maximal Beta(1,1) prior.
+// (notes: fov-roi-clip-parallel-axis)
 TEST(FovEvaluator, OriginAboveTheBandWithHorizontalRaysScoresNothing) {
   FovConfig cfg;
   cfg.h_rays = 4;
@@ -294,32 +278,14 @@ TEST(FovEvaluator, NearEndIsClippedAtTheRoiEntryFace) {
 // ---------------------------------------------------------------------------
 // T1. Occlusion semantics, pinned directly.
 //
-// Five tests above (ZBandClipsRays, RaysLeavingTheRoiInsideTheDeadZone...,
-// FarEndStillClippedAtTheRoiFace, OriginAboveTheBandWithHorizontalRays...,
-// NearEndIsClippedAtTheRoiEntryFace) assert that a clipped ray scores nothing
-// or scores less. Every one of them runs against an EMPTY MapCache, so every
-// voxel on every unclipped ray is unknown -- and they only measure what they
-// claim to measure while unknown voxels stay TRANSPARENT. The moment an
-// unobserved voxel terminates a ray, all five collapse: each ray stops at its
-// first voxel, the clipped and unclipped counts converge, and the tests either
-// pass vacuously or fail for a reason that has nothing to do with ROI clipping.
-//
-// That invariant lives in one clause -- `if (ptr && ptr->p_occ >= occ_stop)` in
-// fov_evaluator.cpp -- and specifically in the `ptr &&` half. An unobserved
-// voxel carries the Beta(1,1) prior, an implied p_occ of 0.5, which sits BELOW
-// the shipped occ_stop of 0.7: so deleting `ptr &&` leaves every shipped run
-// behaving identically, and the suite would stay green. The failure only appears
-// once occ_stop drops to 0.5 or below, at which point the evaluator goes blind
-// at the first voxel of every ray. A guard whose absence is invisible under the
-// shipped configuration has to be tested under a configuration that is not the
-// shipped one, which is what UnknownVoxelsStayTransparentBelowTheirPriorPOcc
-// does.
+// The ROI-clipping tests above use an empty MapCache, so they hold only while
+// unknown voxels stay transparent: the ptr && guard in the occ_stop check in
+// fov_evaluator.cpp. The shipped occ_stop masks its loss.
+// (notes: fov-unknown-voxels-transparent)
 //
 // GEOMETRY. h_rays = v_rays = 1 puts the single ray exactly on the candidate
-// yaw with zero pitch: precomputeRays() centres the one sample in the FOV cell,
-// so h_start = -hfov/2 + hfov/2 = 0 and likewise for pitch. With yaw = 0 the
-// world direction is exactly (1, 0, 0) -- no rounding, no diagonal traversal --
-// and voxel counts along it are exact rather than approximate.
+// yaw at zero pitch; with yaw = 0 it runs along +x, so voxel counts are exact.
+// (notes: fov-test-single-ray-geometry)
 namespace {
 
 // One voxel at `pos` with the given Beta parameters, ingested through the same
@@ -373,15 +339,9 @@ CandidateViewpoint originVp() {
 constexpr int kFirstCoord = 3;    // floor(0.35 / 0.1)
 constexpr int kEndCoord = 10;     // floor(1.05 / 0.1)
 
-// scovox::RayIterator is HALF-OPEN: it visits the start coord and stops BEFORE
-// the end coord, so the last voxel actually scored is kEndCoord - 1 and the span
-// is 7 voxels rather than the 8 an inclusive walk would give. This was measured,
-// not read off the interface, and it has a consequence worth knowing outside
-// these tests: the voxel at max_range is never scored, so the evaluator's
-// effective reach is one voxel shorter than cfg.max_range says. At 0.1 m
-// resolution against a 10 m range that is a 1% bias and not worth chasing --
-// but it is also the reason an occluder has to be placed at kLastVisited, not
-// kEndCoord, for a test to see it at all.
+// scovox::RayIterator is half-open: it stops before the end coord, so the last
+// scored voxel is kEndCoord - 1 and the voxel at max_range is never scored.
+// Place occluders at kLastVisited. (notes: fov-ray-iterator-half-open)
 constexpr int kLastVisited = kEndCoord - 1;                    // 9
 constexpr int kClearSpan = kLastVisited - kFirstCoord + 1;     // 7
 
@@ -431,11 +391,9 @@ TEST(FovOcclusion, UnknownVoxelsAreTransparent) {
   EXPECT_EQ(r.observed_count, 0);
 }
 
-// The `ptr &&` guard, isolated. An unobserved voxel carries the Beta(1,1) prior,
-// i.e. an implied p_occ of 0.5, so a threshold test written without the null
-// check stops the ray at its FIRST voxel for any occ_stop <= 0.5. The shipped
-// 0.7 masks this completely, which is why it has to be tested at a threshold
-// the shipped config never uses.
+// An unknown voxel implies p_occ 0.5, so without the ptr && check any occ_stop
+// <= 0.5 stops the ray at its first voxel. The shipped 0.7 masks this, hence
+// the test runs below it. (notes: fov-test-null-guard-isolated)
 TEST(FovOcclusion, UnknownVoxelsStayTransparentBelowTheirPriorPOcc) {
   FovConfig cfg = oneRayCfg();
   cfg.occ_stop = 0.0f;   // below the 0.5 prior, and below any real p_occ
@@ -539,16 +497,9 @@ TEST(FovOcclusion, SsmiTruncatesAtTheSameVoxelAsEvaluate) {
   EXPECT_EQ(r_ssmi.observed_count, r_eig.observed_count);
 }
 
-// The SSMI "no hit" term is dropped when the ray was truncated, and this pins it
-// without reimplementing the estimator.
-//
-// The trick is to hold the MAP fixed and move only occ_stop, with the occluder
-// on the LAST voxel of the span. Both configurations then visit exactly the same
-// voxels in the same order and accumulate bit-identical per-voxel terms; the
-// only surviving difference is the trailing `if (!occluded)`. Any other
-// formulation (different map, different occluder position) changes the Beta
-// parameters or the visit set as well, and the comparison stops isolating the
-// term it is named after.
+// Pins that SSMI drops its no-hit term when the ray is truncated: same map,
+// occluder on the last visited voxel, only occ_stop changes, so the two runs
+// differ only in that term. (notes: fov-test-ssmi-no-hit-term)
 TEST(FovOcclusion, SsmiDropsTheNoHitTermOnlyWhenOccluded) {
   // On kLastVisited, the final voxel the half-open walk reaches: truncating
   // there removes nothing from the visit set, which is what makes the two runs

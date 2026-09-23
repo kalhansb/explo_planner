@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/cost_grid.hpp"
 
 #include <algorithm>
@@ -44,13 +45,10 @@ void CostGrid::build(const nav_msgs::msg::OccupancyGrid& planning_map,
   cost_.assign(n, kInfCost);
   blocked_.assign(n, 0);
 
-  // Sample the obstacle layer once. Only *known* occupied/inflated cells
-  // (value >= obstacle_threshold) are impassable. Unknown cells (value -1)
-  // are treated as traversable so the flood can path through unexplored
-  // space — the planner's per-cell isCellFree() filter already rejects
-  // candidates that sit on unknown cells, so reachability's job is only
-  // to catch free pockets sealed off by *known* obstacles, not to block
-  // paths through the exploration frontier.
+  // Only known cells with value >= obstacle_threshold are impassable. Unknown
+  // (-1) cells stay traversable so the flood can path through unexplored space;
+  // isCellFree() rejects candidates on unknown cells.
+  // (notes: costgrid-unknown-traversable)
   const auto& data = planning_map.data;
   if (data.size() != n) {
     // Defensive: malformed message. Mark everything blocked so the flood
@@ -84,26 +82,9 @@ void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m) {
     // Out-of-bounds source — leave every cell at kInfCost.
     return;
   }
-  // Seeding the source at cost 0 is conditional, and it used to be
-  // unconditional, which made this class lie on exactly the input it is
-  // supposed to be defensive about. build() marks EVERY cell blocked when the
-  // planning_map is malformed (see the data.size() != n guard there), so the
-  // flood is empty by construction — but the seed was still written, and it was
-  // then the ONLY finite cost in the grid: reachable(robot_pose) answered true
-  // and reachedCellCount() answered 1 on a map where nothing whatsoever is
-  // reachable. A reachability structure may answer "no"; it must never answer
-  // "yes" off a map it has already rejected. (2026-09-18)
-  //
-  // The test is NOT simply "is the source cell traversable", because a blocked
-  // source is a legitimate and routine state: the map is inflated by the body
-  // radius, so a robot in a dense stand genuinely stands on an inflated cell,
-  // and the flood must still start from there — the relaxation below already
-  // refuses to pass through any *other* blocked cell, so starting on inflation
-  // does not let a path run through it. The honest question is whether the
-  // flood has anywhere at all to go: seed when the source is itself traversable
-  // OR when at least one of its eight neighbours is. A malformed map fails both
-  // and leaves the whole grid at kInfCost; the robot-in-inflation case passes
-  // the second and is unchanged.
+  // Seed the source only if it or one of its 8 neighbours is unblocked. A
+  // malformed (all-blocked) map then stays all kInfCost, while a robot standing
+  // on inflation still floods. (notes: costgrid-conditional-seed)
   bool can_seed = !blocked_[idx(sx, sy)];
   for (int k = 0; !can_seed && k < 8; ++k) {
     const int nx = sx + kDx[k];
@@ -113,14 +94,10 @@ void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m) {
   if (!can_seed) return;
   cost_[idx(sx, sy)] = 0.0f;
 
-  // Effective radius cap. Negative / zero / NaN means "no bound" — genuinely
-  // unbounded, i.e. +inf. Do NOT clamp to the grid diagonal: a Dijkstra path
-  // length is a *walked* distance and routinely exceeds the straight-line
-  // diagonal (serpentine corridors, U-shaped rooms), so a diagonal clamp made
-  // reachable cells report kInfCost and the exploitation planner rejected
-  // genuinely drivable vantages as unreachable. Termination does not depend on
-  // the cap — the grid is finite and each cell is relaxed to a strictly
-  // decreasing cost.
+  // A cap <= 0 or NaN means unbounded (+inf). Do not clamp it to the grid
+  // diagonal: walked path lengths exceed it, so reachable cells would read
+  // kInfCost. Termination does not depend on the cap.
+  // (notes: costgrid-radius-cap-unbounded)
   float cap = radius_cap_m;
   if (!(cap > 0.0f)) {
     cap = std::numeric_limits<float>::infinity();

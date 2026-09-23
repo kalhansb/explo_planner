@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -55,16 +56,10 @@ std::vector<int> allAssigned(const Allocation& a) {
 // The premise: two robots must solve the SAME problem and get the SAME answer.
 // ---------------------------------------------------------------------------
 
-/// THE GATE TEST (plan §4, P3): cross-perspective determinism THROUGH THE WIRE
-/// CODEC. Not two copies of one world — that would only prove solve() is a
-/// function. The worlds are built from opposite viewpoints and reconciled by
-/// exchanging wire messages, so anything that survives the round trip as a
-/// local-only difference (a *_BY_OTHERS provenance byte, a known_by mask, a
-/// local update_id) gets a chance to reach the allocation and change it.
-///
-/// This is the test that fails if someone "improves" the allocator by reading
-/// isFirstHand(), or by preferring cells this robot discovered, or by breaking
-/// a tie on anything that is not (cell id, robot id).
+/// Worlds built from opposite viewpoints and reconciled through the wire codec
+/// must allocate identically. Fails if the allocator reads isFirstHand() or
+/// breaks ties on anything but (cell id, robot id).
+/// (notes: alloc-test-cross-perspective-gate)
 TEST(GlobalAllocatorCrossPerspective, IdenticalAllocationFromBothSides) {
   CellWorld a = world5(0);
   CellWorld b = world5(1);
@@ -366,11 +361,9 @@ TEST(GlobalAllocatorFocus, NothingToExploreIsSolvedNotRefused) {
 // Bounds
 // ---------------------------------------------------------------------------
 
-/// An oversized candidate set is refused with a reason rather than truncated.
-/// A truncation would be the one failure mode this design cannot survive: two
-/// robots whose candidate sets differ by a single cell would cut the list at
-/// different places and solve different problems while both believing they had
-/// solved the same one.
+/// An oversized candidate set is refused with a reason, never truncated: robots
+/// whose sets differ by one cell would cut at different places and solve
+/// different problems. (notes: alloc-test-oversize-refused)
 TEST(GlobalAllocatorBounds, OversizedCandidateSetIsRefusedNotTruncated) {
   CellWorld w = world5(0);
   for (int id = 0; id < w.size(); ++id) setSelf(w, id, CellStatus::EXPLORING);
@@ -450,14 +443,9 @@ TEST(GlobalAllocatorPolish, NeverLengthensATour) {
 // ---------------------------------------------------------------------------
 // R3 / §3.6 — the problem digest
 //
-// These do not test the allocator's answer; they test that the thing that will
-// be used to decide "were these two robots even solving the same problem" can
-// actually tell the difference. Every one of them is a channel that
-// `shared_hash` is blind to, and each test below is the proof of one such
-// blind channel -- which is the whole claim. (This header used to add "and
-// that is why robots with equal `shared_hash` disagreed about the peer's focus
-// 23% of the time at N=4"; that figure is withdrawn as unreproducible. These
-// tests are the evidence, not a campaign statistic.)
+// These test not the allocator's answer but that the digest can tell two
+// problems apart: each test proves one channel shared_hash is blind to.
+// (notes: alloc-hash-blind-channels)
 // ---------------------------------------------------------------------------
 
 /// Baseline: the same problem digests the same, twice, from two independently
@@ -500,11 +488,9 @@ TEST(AllocHash, EveryVehicleFieldMovesTheDigest) {
   fin[1].finished = true;
   EXPECT_NE(base, GlobalAllocator::solve(w, fin, c).alloc_hash);
 
-  // ...one robot off the frontier. Same argument as `finished` directly
-  // above, and it needs its OWN assertion: the two fields are separate, so a
-  // digest that folded in only the first would let two robots disagree about
-  // a peer's mode while agreeing on the key — solving different vehicle sets
-  // under one hash, which is the exact failure the digest exists to expose.
+  // ...one robot off the frontier. Asserted apart from finished: a digest
+  // folding in only one of the two fields would let robots disagree on a peer's
+  // mode under one key. (notes: alloc-hash-off-frontier-own-assert)
   std::vector<AllocRobot> off = pair2(0, 24);
   off[1].off_frontier = true;
   EXPECT_NE(base, GlobalAllocator::solve(w, off, c).alloc_hash);
@@ -608,19 +594,9 @@ TEST(AllocHash, RefusedSolveStillCarriesTheDigest) {
   EXPECT_NE(r.alloc_hash, 0u);
 }
 
-/// Config does not go into the digest as a struct, and does not stay out as a
-/// struct either. The line is whether a field changes the PROBLEM or only the
-/// approach taken to it, and both directions have to be asserted — an
-/// all-in-or-all-out rule is the thing this test replaced (2026-09-18), on both
-/// of the readings the digest is supposed to support:
-///
-///   "same value, different tours" => a determinism bug in the solver. Only
-///   sound if fields that change nothing but the tours are EXCLUDED, or the
-///   finding gets restated as "different problems" and lost.
-///
-///   "different values" => they were never solving the same problem. Only
-///   sound if fields that change the problem are INCLUDED, or two genuinely
-///   different problems agree on the key.
+/// A Config field enters the digest only if it changes the PROBLEM, not just
+/// the approach: equal digests with different tours must mean a solver bug,
+/// different digests different problems. (notes: alloc-hash-config-split)
 TEST(AllocHash, SolverConfigSplitsOnWhatChangesTheProblem) {
   CellWorld w = world5(0);
   for (int id : {2, 6, 10, 14}) setSelf(w, id, CellStatus::EXPLORING);

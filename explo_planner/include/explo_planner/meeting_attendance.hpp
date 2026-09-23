@@ -35,6 +35,7 @@
 /// appointment barrier's release predicate and nowhere else, because
 /// peerAccounted feeds ~30 teamComplete call sites (DESIGN §4, the correction
 /// under the finished-consumer table).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 
@@ -49,40 +50,17 @@ constexpr uint8_t kModeExploring = 0;
 constexpr uint8_t kModeHoming    = 1;
 constexpr uint8_t kModeDone      = 2;
 
-/// The level this robot publishes in TeamWorld/mode.
-///
-///   finished_announced  the publisher's `finished` latch (coverage latched,
-///                       or reached State::DONE)
-///   keeping_appointment it is in a manoeuvre started to keep an appointment
-///                       (appointment_manoeuvre_) — driving to the agreed
-///                       cell, or standing at its barrier
-///   homing_announced    the publisher's homing latch
-///   done_announced      the DONE latch, owned by the caller; set here
-///
-/// DONE IS LATCHED, like every level on this field: max-merge cannot go back
-/// down, so a level the robot later contradicts would be a permanent lie on
-/// every peer. Once finished and not keeping an appointment, the robot is DONE
-/// for the rest of the run, even if a later tick reads keeping again.
-///
-/// A FINISHED ROBOT KEEPING ITS APPOINTMENT READS EXPLORING, which on this
-/// field means "no evidence it is leaving" (TeamWorld.msg/robot_mode), not
-/// "confirmed exploring". Whether its run is over is `finished`'s question,
-/// and `finished` still says yes.
+/// Level published in TeamWorld/mode. DONE latches in done_announced once
+/// finished and not keeping an appointment (max-merged levels never go down); a
+/// finished robot keeping its appointment is not DONE.
+/// (notes: meeting-announced-mode)
 uint8_t announcedMode(bool finished_announced, bool keeping_appointment,
                       bool homing_announced, bool& done_announced);
 
-/// The first peer, by fleet id, that has finished exploring, has not said it
-/// is leaving (mode below HOMING), and that this robot cannot currently hear —
-/// not direct, not heard one way, not in the comms closure. -1 if none.
-///
-/// A PEER THIS ROBOT CAN HEAR IS NOT THIS FUNCTION'S CASE. Its mode reaches us
-/// fresh, it is accounted for by a radio channel, and the barrier's existing
-/// terms decide it — including the still-driving veto, which covers a finished
-/// robot walking in while in range. What this adds is the peer whose last word
-/// was "finished, coming", heard once and then lost to the radio.
-///
-/// An UNFINISHED absent peer is not this function's case either: the barrier
-/// already waits for it (the unbounded appointment vigil).
+/// First peer by fleet id that finished, has not said it is leaving (mode below
+/// HOMING) and cannot be heard (not direct, one-way or in the comms closure);
+/// -1 if none. Heard or unfinished peers are not its case.
+/// (notes: meeting-finished-peer-coming)
 int finishedPeerStillComing(const TeamModel& team, int self_id);
 
 }  // namespace explo_planner

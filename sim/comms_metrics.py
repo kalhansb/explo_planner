@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/comms_metrics_notes.md
 """Which metrics actually separate perfect comms from realistic comms.
 
 map_divergence.py answers "did the two maps stay equal". This answers the
@@ -134,13 +135,9 @@ METRICS = [
     ("dist_to_level",     "m to level",        "less efficient", "matched on coverage"),
     ("minpos_rej_frac",   "deconflict rej frac", "more conflict", ""),
     ("t_to_thresh",       "t LEADER cross s",  "slower",     "near-invariant"),
-    # The planner's own statement of when the team stopped trying. Prefer this
-    # over makespan: makespan is the HARNESS's run-end, it is run-relative
-    # rather than absolute sim, and it carries the done-grace drain plus one
-    # poll period of slop -- windows whose length differs by arm, so ranking on
-    # it partly ranks how long each arm idled after finishing. Blank when any
-    # robot never declared; a censored run has no completion time and imputing
-    # the horizon for it makes an unfinished run the fastest in its arm.
+    # The planner's own team completion time. Prefer it to makespan, the harness
+    # run-end, which includes grace and poll slop. Blank when any robot never
+    # declared; never impute the horizon. (notes: metrics-t-done-team)
     ("t_done_team",       "t team done s",     "slower",     "PRIMARY; blank = censored"),
     ("makespan",          "makespan s",        "slower",     "harness run-end, NOT completion"),
     ("plan_ms_p50",       "plan ms p50",       "slower CPU", "NEGATIVE CONTROL"),
@@ -225,12 +222,9 @@ def load_run(run_dir):
     # robot was censored; the metric column is blank either way, which is the
     # honest rendering of "this run has no completion time".
     t_done_team = t_explore = t_mission = None
-    # WHY the exclusion reason is kept rather than dropped: a blank metric
-    # column is the honest rendering of "censored", but it is a DISHONEST
-    # rendering of "the event log would not parse". Those are different facts
-    # and a bare `except: pass` made them identical -- a whole campaign's logs
-    # could fail to load and every column would just quietly read blank, which
-    # looks like censoring and would be reported as censoring.
+    # The exclusion reason is kept: a blank column is honest for a censored run,
+    # but an event log that would not parse must be reported as such, not read
+    # as censoring. (notes: metrics-event-log-note)
     event_log_note = None
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -304,14 +298,10 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
 
     lead = min(ua, ub)
 
-    # Effort MATCHED ON COVERAGE, not on time: when the better-informed robot
-    # first reached `level`, how long had the run taken and how far had the team
-    # driven? An earlier version divided team distance by the unknown reduction
-    # since t=200 and it separated in the WRONG DIRECTION -- because by t=200 the
-    # perfect-comms robots have already merged maps, so their denominator (the
-    # room left to improve) is smaller before any robot has done extra work. Any
-    # ratio anchored to a condition-dependent baseline measures the baseline.
-    # Anchoring on a coverage level both conditions pass through removes it.
+    # Effort matched on coverage, not time: sim time and team distance when the
+    # better-informed robot first reaches level. A ratio anchored to a
+    # condition-dependent baseline measures the baseline.
+    # (notes: metrics-coverage-matched-effort)
     t_level = dist_level = None
     for t_row, r in a:
         pb = _at(b, t_row)
@@ -324,23 +314,9 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
                          (_num(pb[1], "distance_traveled") or 0.0)
             break
 
-    # THE PRIMARY ENDPOINT: when did each robot reach the coverage criterion?
-    #
-    # Degraded comms does not slow exploration down -- the LEADER's crossing time
-    # barely moves between conditions. What it slows is exploration COMPLETION,
-    # because the run cannot end until the second robot independently reaches the
-    # criterion, and a robot that never received its partner's deltas has to go
-    # and re-learn that ground by driving over it. So the quantity that carries
-    # the effect is the gap between the two, not either one alone:
-    #
-    #   t_lead_cross   first robot to the criterion    (near-invariant)
-    #   t_team_cross   LAST robot to the criterion     (the run's real end)
-    #   laggard_lag    the difference                  (the cost of the outage)
-    #
-    # Measured over the whole run, not clipped to the matched horizon. The lag is
-    # a within-run difference, so unequal run lengths do not bias it the way they
-    # bias a level read at a fixed time -- but they DO censor it, which is
-    # handled below.
+    # Primary endpoint: each robot's first crossing of thresh; lag is the last
+    # crossing minus the first. Read over the whole run, not clipped to the
+    # horizon; censoring is handled below. (notes: metrics-primary-laggard-lag)
     crossings = []
     for series in (a, b):
         hit = None
@@ -351,13 +327,9 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
         crossings.append(hit)
 
     t_lead = min([c for c in crossings if c is not None], default=None)
-    # CENSORING, and it matters more than anything else in this file. A run whose
-    # laggard never reached the criterion is the WORST case for the condition
-    # under test, not a missing observation. Dropping it would bias the whole
-    # comparison towards "no effect" exactly when the effect is largest. So the
-    # lag is recorded as a lower bound (last logged time minus the leader's
-    # crossing) and flagged, and any group containing one reports a median that
-    # is itself a lower bound.
+    # A run whose laggard never crossed is the worst case, not missing data: lag
+    # is a lower bound (last logged time minus the leader's crossing) and the
+    # run is flagged censored, never dropped. (notes: metrics-censored-lag)
     censored = any(c is None for c in crossings)
     if t_lead is None:
         t_team = lag = None
@@ -368,10 +340,8 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
         t_team = max(crossings)
         lag = t_team - t_lead
 
-    # What the laggard actually DID with that time. It is not idling on the
-    # radio: measured at 0.357-0.364 m/s against a 0.320-0.352 m/s whole-run
-    # average, it drives at full speed the entire window. This is the cost in
-    # robot-metres of knowledge that never arrived.
+    # Distance the laggard drove during its lag window: the cost in robot-metres
+    # of knowledge that never arrived. (notes: metrics-lag-dist)
     lag_dist = None
     if t_lead is not None and lag is not None:
         slow = b if (crossings[0] is not None and
@@ -383,28 +353,9 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
 
     t_cross = t_lead
 
-    # EFFORT-MATCHED KNOWLEDGE, and the reason it exists. The coverage criterion
-    # above is measured on each robot's OWN map, so it REWARDS REDUNDANT
-    # COVERAGE: a robot cut off from its partner has cheap unknown right beside
-    # it -- the ground the partner already covered -- and drives it down fast,
-    # while a robot that already holds the union has only the hard, far-away
-    # voxels left. Measured late in a dense run that is 820-1796 voxels per metre
-    # against 126-138. So crossing times favour the degraded arm, and this metric
-    # exists to charge for the driving: what does the team KNOW once every run
-    # has spent the same robot-metres?
-    #
-    # It is a BOUND, not a measurement, and the bound leans the other way.
-    # min(u_A, u_B) is an upper bound on the union's unknown fraction (the union
-    # contains each robot's map, so it can only know more). Under perfect comms
-    # the two maps are identical and the bound is TIGHT -- it is the union. Under
-    # degraded comms it is loose, and loose in the pessimistic direction: the
-    # degraded team really knows at least this much and possibly more. So a
-    # result where the DEGRADED arm still wins on this metric is conclusive,
-    # while one where the perfect arm wins is suggestive and partly the bound.
-    #
-    # The unbiased version needs the union map itself, which means bags. These
-    # --record 0 runs cannot reconstruct it; a union-coverage re-run is the
-    # outstanding fix.
+    # Unknown fraction once the team has driven dist_match metres. The min over
+    # the two robots bounds the union's unknown from above: tight under perfect
+    # comms, pessimistic for the degraded arm. (notes: metrics-unknown-at-dist)
     u_at_dist = None
     if dist_match:
         for t_row, r in a:
@@ -453,20 +404,9 @@ def measure(run, horizon, thresh, level, dist_match=None, step=100.0, start=200.
     }
 
 
-# The permutation test is modes_compare's, imported rather than reimplemented.
-#
-# This file used to carry its own copy: a bare enumeration of C(nx+ny, nx) that
-# was fine on the 4-cell pilots it was written for and does not return at all on
-# a 30-per-arm campaign, where C(60,30) is 1.2e17. modes_compare had the same
-# defect and now samples above a threshold, with a calibration
-# (modes_compare_calib.py) pinning the sampler against exactly-known answers and
-# requiring two planted biases to be caught.
-#
-# Sharing that implementation rather than porting it is the point. Two copies of
-# a statistical procedure in one repository is two procedures: they drift, only
-# one of them is under calibration, and the campaign is scored by whichever
-# script the operator happened to run. The calibration file names modes_compare
-# in its docstring, so a reader who finds this import knows where the tests are.
+# The permutation test is modes_compare's, calibrated in modes_compare_calib.py.
+# Do not reimplement it here: a second copy would drift outside the calibration.
+# (notes: metrics-shared-perm-test)
 def perm_p(xs, ys):
     """Two-sided permutation p on |median difference|.
 
@@ -513,21 +453,9 @@ def main():
                     help="coverage level for the matched-on-coverage endpoints "
                          "(default: the deepest level EVERY run reaches)")
     ap.add_argument("--step", type=float, default=100.0)
-    # THE FLAG THE ERROR MESSAGE ALREADY TOLD PEOPLE TO PASS. load_run() calls
-    # event_log.summarise_run(), and when that refuses a cell for being below
-    # the schema floor it relays the reader's own text verbatim: "Pass
-    # --min-schema 4 to read it deliberately." This script did not have a
-    # --min-schema, so the instruction it printed was unactionable -- the
-    # operator did exactly what the output said and got
-    # `unrecognized arguments: --min-schema 4`. On every banked campaign below
-    # the current schema (which today is every campaign but one), that meant
-    # t_done_team / t_explore / t_mission came back blank with no way to
-    # recover them from here.
-    #
-    # Exposed rather than removed from the message, because the refusal is
-    # right: pooling cells from an older binary generation is the thing the
-    # floor exists to prevent, and the flag makes reading them a deliberate act
-    # with a warning attached rather than a silent default.
+    # event_log's schema-floor refusal tells the operator to pass --min-schema,
+    # so this flag must exist. Lowering the floor pools binary generations
+    # deliberately. (notes: metrics-min-schema-flag)
     ap.add_argument("--min-schema", type=int, default=None,
                     help="lower the event-log schema floor (default: the "
                          "reader's own, currently the shipped kSchemaVersion). "
@@ -639,11 +567,8 @@ def main():
           f"{'delta':>11}{'sep':>9}{'perm p':>9}  note")
     print("-" * 106)
     verdict = []
-    # Per row, because the groups are not the same size from row to row. A run
-    # whose event log would not load has None for t_done_team and drops out of
-    # those rows only; a censored run drops out of others. The footer used to
-    # compute one floor from len(groups[...]) and print it as though it applied
-    # to the whole table.
+    # Floors are per row: None filtering (unread event logs, censored runs)
+    # changes the group sizes from row to row. (notes: metrics-per-row-floor)
     floors = []
     for key, label, direction, note in METRICS:
         xs = [vals[(args.label_a, r["name"])][key] for r in groups[args.label_a]
@@ -668,11 +593,10 @@ def main():
         # certainty in a column the docstring above spends a paragraph warning
         # people not to over-read. A trailing '~' marks the sampled rows.
         pstr = mc.fmt_p(p) + ("~" if perm_sampled(xs, ys) else "")
-        # mc.perm_floor, not a closed form: 2/C(2n,n) is only right for EQUAL
-        # groups, and these are routinely unequal by the time the per-metric
-        # None-filtering above has run. It re-enters mc.perm_all, which is
-        # memoised on (xs, ys), so this is the same enumeration the p came from
-        # rather than a second one.
+        # mc.perm_floor, not the closed form 2/C(2n,n), which holds only for
+        # equal groups. It reuses mc.perm_all's memoised enumeration, so the p
+        # and its floor come from one enumeration.
+        # (notes: metrics-perm-floor-enumerated)
         floors.append((label, len(xs), len(ys), mc.perm_floor(xs, ys)))
         print(f"{label:<22}{direction:<16}{ma:>11.4f}{mb:>11.4f}{mb - ma:>11.4f}"
               f"{sep:>9}{pstr:>9}  {note}{'' if not note else ' '}"
@@ -681,11 +605,9 @@ def main():
             verdict.append((label, ma, mb, note))
 
     print()
-    # Printed BEFORE the censoring block on purpose. The t_done_team column is
-    # documented as "blank = censored", and that documentation is only true for
-    # runs whose event log actually loaded. Any run listed here has a blank for
-    # a different reason, and reading it as censoring would overstate exactly
-    # the quantity this file exists to compare.
+    # Printed before the censoring block on purpose: runs listed here have a
+    # blank t_done_team because the log was unread, not because they were
+    # censored. (notes: metrics-event-log-unread-first)
     for label in (args.label_a, args.label_b):
         notes = [(r["name"], r["event_log_note"]) for r in groups[label]
                  if r.get("event_log_note")]
@@ -708,9 +630,8 @@ def main():
             print(f"  their laggard never reached the criterion, so their lag is a "
                   f"LOWER BOUND and {label}'s median lag is a lower bound too. "
                   f"These are the worst cases for the condition, not missing data.")
-    # What the floors actually came out at, rather than the conclusion this
-    # line used to print unconditionally. Three cases, and the old text was only
-    # ever right about the first.
+    # Reports what the per-row floors came out at, not a fixed conclusion.
+    # (notes: metrics-floor-footer)
     if not floors:
         print(f"permutation p floor: not computed — no metric had two usable "
               f"values on both sides, so every p above is blank and the sep "

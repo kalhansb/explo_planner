@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/candidate_generator.hpp"
 #include "explo_planner/map_cache.hpp"
 #include <algorithm>
@@ -46,11 +47,10 @@ std::vector<CandidateViewpoint> CandidateGenerator::generate(
         pos.z() = terrainZ(pos.x(), pos.y(), robot_pos.z(), *map);
       }
 
-      // Filter occupied candidates (only when 3D map is available).
-      // Flat mode: skip the check for ground-level voxels — they are always
-      // occupied. Terrain mode: the candidate sits z_clearance above the
-      // detected ground, so an occupied voxel there is a real obstacle
-      // (canopy/overhang/wall) — always check.
+      // Filter occupied candidates when a 3D map exists. Flat mode skips
+      // ground-level voxels, which are always occupied; terrain mode always
+      // checks, since an occupied voxel z_clearance above ground is a real
+      // obstacle. (notes: candgen-occupied-filter)
       if (map && (terrain || pos.z() > cfg_.ground_z)) {
         auto voxel = map->getVoxel(pos);
         if (voxel.observed && voxel.p_occ >= cfg_.occ_thresh) continue;
@@ -90,11 +90,9 @@ void CandidateGenerator::addFrontierCandidates(
     float yaw = std::atan2(dy, dx);
 
     CandidateViewpoint vp;
-    // Terrain mode references the ground search to the centroid's OWN z (a
-    // distant frontier can sit many metres above/below the robot); the
-    // centroid z itself is the fallback — frontiers border unobserved
-    // columns, so a missing ground there is expected, and the centroid is a
-    // real free voxel at a plausible height already.
+    // Terrain mode searches for ground around the centroid's own z, not the
+    // robot's; if none is found the centroid z is kept, a real free voxel at a
+    // plausible height. (notes: candgen-frontier-ground-ref)
     const float z = terrain ? terrainZ(fc.x(), fc.y(), fc.z(), *map)
                             : cfg_.robot_z;
     vp.position = Eigen::Vector3f(fc.x(), fc.y(), z);
@@ -112,13 +110,10 @@ float CandidateGenerator::terrainZ(float x, float y, float z_ref,
       z_ref + cfg_.ground_search_above,
       cfg_.occ_thresh, cfg_.ground_stack_max_m);
   const float z = std::isfinite(gz) ? gz + cfg_.z_clearance : z_ref;
-  // Keep the candidate inside the band the map was actually ingested over — see
-  // CandidateConfig::roi_min_z. ground + z_clearance can escape it upward
-  // because the frontier path references the search window to the centroid's
-  // own z, not the robot's. Clamp rather than reject: the clamped point is
-  // still the best viewpoint for that column and its rays now walk ingested
-  // space, whereas dropping it loses a long-range frontier target outright.
-  // Guard the degenerate band (std::clamp is UB when hi < lo).
+  // Clamp, not reject, into the ingested band [roi_min_z, roi_max_z]: ground +
+  // z_clearance can escape it on the frontier path. Skip the clamp on a
+  // degenerate band; std::clamp is UB when hi < lo.
+  // (notes: candgen-clamp-ingest-band)
   if (!(cfg_.roi_max_z >= cfg_.roi_min_z)) return z;
   return std::clamp(z, cfg_.roi_min_z, cfg_.roi_max_z);
 }

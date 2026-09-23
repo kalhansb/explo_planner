@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <limits>
@@ -47,12 +48,10 @@ rclcpp::Time at(double sec) {
   return rclcpp::Time(static_cast<int64_t>(sec * 1e9), RCL_ROS_TIME);
 }
 
-/// Peer exploit claim for the rendezvous-barrier tests: the producer is holding
-/// (or driving to) vantage (gx, gy) on `target_id` while its last heartbeat put
-/// it at (rx, ry) and declared `staged` — true only if that peer was in its own
-/// dwell state on (gx, gy) when it published. The pose is still filled in
-/// because MinPos uses it; the barrier does not. `expiry_sec` is on the same
-/// local clock as at()/now.
+/// Peer exploit claim on target_id: vantage (gx, gy), last heartbeat pose (rx,
+/// ry), staged as the peer declared it. The pose is for MinPos; the barrier
+/// reads only staged. expiry_sec is on the local clock of at().
+/// (notes: coord-test-exploit-claim-fixture)
 Coordination::Claim exploitClaim(const std::string& robot_id,
                                  uint32_t target_id,
                                  float gx, float gy,
@@ -119,11 +118,10 @@ TEST(Coordination, TtlExpiry) {
   EXPECT_EQ(c.activePeerCount(), 0u);
 }
 
-// 3b. Clock-offset robustness: expiry is based on the LOCAL receipt time, not
-//     the producer's header.stamp. Field fleets are not clock-synchronised
-//     (offsets of hours have been observed), so a peer stamp far ahead of the
-//     local clock must not yield an immortal claim, and one far behind must
-//     not yield a claim that expires on arrival.
+// 3b. Claim expiry uses the local receipt time, not the producer's
+// header.stamp: fleet clocks are not synchronised, so a peer stamp far ahead or
+// behind must neither immortalise a claim nor expire it on arrival.
+// (notes: coord-test-ttl-local-receipt)
 TEST(Coordination, TtlUsesLocalReceiptTimeNotPeerStamp) {
   Coordination c(true, "atlas");
 
@@ -354,12 +352,10 @@ TEST(Coordination, ExploitFieldsRoundTrip) {
   EXPECT_FALSE(explore.staged);
 }
 
-// 14. claimMatching sizes each claim's exclusion disc by the radius the
-//     CLAIMER advertised, not by the receiver's own match radius. The radius
-//     is phase-dependent (exploration ~8-10 m, one exploit vantage ~0.75 m),
-//     so evaluating every claim at the receiver's scale made an exploring
-//     robot veto a whole 8 m disc around a peer that was merely dwelling at a
-//     trunk.
+// 14. claimMatching sizes each claim's disc by the radius the claimer
+// advertised, not the receiver's match radius, because that radius is
+// phase-dependent (exploration vs one exploit vantage).
+// (notes: coord-test-claimer-radius)
 TEST(Coordination, ClaimMatchingUsesTheClaimersRadius) {
   Coordination c(true, "atlas");
   Coordination::Claim p;
@@ -396,13 +392,10 @@ TEST(Coordination, ClaimMatchingFallsBackWhenRadiusUnset) {
 // ==================================================================
 // Peer-advertised scalars are bounded before they enter the claim table
 // ==================================================================
-// claimMatching() deliberately evaluates each claim at the radius its CLAIMER
-// advertised, because the disc size is phase-dependent (~10 m while exploring,
-// ~0.75 m while holding one vantage angle around a trunk). That is correct, but
-// it means two numbers straight off the wire decide how much of our candidate
-// set a peer can veto and for how long. Unbounded, either one is a
-// denial-of-service on our own planner from a single malformed or
-// version-skewed publish.
+// The claimer's advertised radius and TTL come straight off the wire and decide
+// how much of our candidate set a peer can veto and for how long, so both are
+// bounded before entering the claim table.
+// (notes: coord-test-peer-scalars-bounded)
 
 TEST(Coordination, HugePeerRadiusIsBoundedByOurOwnExplorationDisc) {
   // 5 m bound = what this planner considers the largest legitimate claim.
@@ -420,11 +413,9 @@ TEST(Coordination, HugePeerRadiusIsBoundedByOurOwnExplorationDisc) {
 }
 
 TEST(Coordination, InfinitePeerRadiusVetoesNothingBeyondOurOwnMatchRadius) {
-  // The specific wire value that defeated the old code: +inf passed the
-  // `radius_m > 0` test, so r2 was infinite and EVERY candidate matched — the
-  // robot yielded every goal to that peer and stopped exploring, silently.
-  // Now it is treated as "peer sent nothing usable" (0), which claimMatching
-  // already handles by falling back to our own match radius.
+  // A non-finite peer radius (+inf, NaN) is stored as 0, meaning nothing
+  // usable, so claimMatching falls back to our own match radius instead of
+  // matching every candidate. (notes: coord-test-infinite-peer-radius)
   Coordination c(true, "atlas", /*max_claim_radius_m=*/5.0f);
   const float kInf = std::numeric_limits<float>::infinity();
   c.onIntent(makeIntent("rama", 0.0f, 0.0f, 1.0f, 0.0f, 100.0,
@@ -500,11 +491,10 @@ TEST(Coordination, NonFiniteTtlExpiresOnTheNextPrune) {
 // ==================================================================
 // Rendezvous barrier: firstUnstagedExploitPeer()
 // ==================================================================
-// A robot that has reached its exploitation vantage waits in EXPLOIT_DWELL
-// until every peer holding an active exploit claim on the SAME target has
-// DECLARED itself staged on its own claimed vantage, so the whole team dwells
-// simultaneously. The barrier is up for as long as this query returns non-null,
-// and the claim it returns is the peer being waited on (logging).
+// A robot at its vantage waits in EXPLOIT_DWELL until every peer with an active
+// exploit claim on the same target declares itself staged. Non-null means the
+// barrier is up; the claim names the peer waited on.
+// (notes: coord-test-rendezvous-barrier)
 
 TEST(Coordination, FirstUnstagedExploitPeerNoClaimsIsNullptr) {
   // Solo run, or a target no peer has claimed: nothing to wait for, dwell now.
@@ -534,11 +524,9 @@ TEST(Coordination, FirstUnstagedExploitPeerNullptrOncePeerStages) {
 }
 
 TEST(Coordination, FirstUnstagedExploitPeerFlagBeatsGeometry) {
-  // The contract: staging is what the PRODUCER declares, and the barrier reads
-  // nothing else. Position used to decide it, and could not tell "on the
-  // vantage" from "arrived in XY, still rotating beside it" (released ~5 s
-  // early, so the team's dwells no longer overlapped) or from "parked at an
-  // approach waypoint", which is an exploit hop but not a vantage at all.
+  // The contract: staging is what the producer declares, and the barrier reads
+  // nothing else, never the pose in the claim.
+  // (notes: coord-test-staged-flag-contract)
   Coordination c(true, "atlas");
 
   // Sitting EXACTLY on its own goal and still not staged -- the peer has
@@ -579,12 +567,10 @@ TEST(Coordination, FirstUnstagedExploitPeerIgnoresOtherTargets) {
 }
 
 TEST(Coordination, FirstUnstagedExploitPeerIgnoresExpiredClaimWithoutPrune) {
-  // Dead-peer release path. The caller queries this from EXPLOIT_DWELL, where
-  // the PLAN tick -- and therefore prune() -- never runs, so the stale claim of
-  // a peer that died on its way in is still in the table, still unstaged.
-  // There is deliberately NO prune() call in this test: the query must step
-  // over the expired claim itself, otherwise the robot that did arrive dwells
-  // forever.
+  // Dead-peer release path: the caller queries from EXPLOIT_DWELL, where
+  // prune() never runs. Deliberately no prune() here: the query must skip
+  // expired claims itself, or the robot that arrived dwells forever.
+  // (notes: coord-test-barrier-dead-peer)
   Coordination c(true, "atlas");
   c.injectClaimForTest(exploitClaim("rama", 7u, 10.0f, 0.0f, 0.0f, 0.0f,
                                     /*staged=*/false, /*expiry_sec=*/100.0));
@@ -622,15 +608,10 @@ TEST(Coordination, FirstUnstagedExploitPeerReturnsTheUnstagedOfTwo) {
 // ==================================================================
 // Selection-time parked-peer contest: stagedExploitPeerWinning()
 // ==================================================================
-// When the team's synchronised dwells end, both robots re-plan within
-// milliseconds and both see the SAME single remaining un-dwelled vantage. Their
-// claims on it cross in the air — the intent heartbeat is only ~1 Hz — so both
-// drove at the same angle and, in the last field run, collided. This probe
-// decides the contest at selection time from claims already in the table: a
-// candidate a parked same-target peer would win under MinPos's total order is
-// not selectable, so the yield happens before either robot moves. Only PARKED
-// (staged) peers contest this way; a driving peer contests through its claim
-// disc alone.
+// Decided at selection time from claims already in the table: a candidate a
+// parked (staged) same-target peer would win under MinPos's total order is not
+// selectable. A driving peer contests only through its claim disc.
+// (notes: coord-test-parked-peer-contest)
 
 TEST(Coordination, StagedExploitPeerWinningNoClaimsIsNullptr) {
   // Solo run, or a target no peer has claimed: nothing contests the angle.
@@ -659,11 +640,10 @@ TEST(Coordination, StagedExploitPeerWinningBlocksCandidateWhenPeerCloser) {
 }
 
 TEST(Coordination, StagedExploitPeerWinningNullptrWhenSelfCloser) {
-  // Mirror of the case above — rama is parked on the far side of the trunk and
-  // we are the one standing next to the free angle, so it is ours to take. Our
-  // id is deliberately the LEXICOGRAPHICALLY LARGER one ("zulu" > "rama"): the
-  // tiebreak must not be reached at all when the distances differ, or the
-  // farther robot could steal an angle it is nowhere near.
+  // Mirror of the case above: we stand next to the free angle. Our id is
+  // deliberately the lexicographically larger (zulu > rama): the id tiebreak
+  // must not be reached when the distances differ.
+  // (notes: coord-test-contest-self-closer)
   Coordination c(true, "zulu");
   c.injectClaimForTest(exploitClaim("rama", 7u, 3.0f, 0.0f, 3.0f, 0.0f,
                                     /*staged=*/true));
@@ -674,11 +654,10 @@ TEST(Coordination, StagedExploitPeerWinningNullptrWhenSelfCloser) {
 }
 
 TEST(Coordination, StagedExploitPeerWinningExactTieLexTiebreak) {
-  // Exactly equidistant, which happens for real whenever the two robots park on
-  // vantages symmetric about the free angle. Candidate at the origin, we at
-  // (4, 0), the parked peer at (-4, 0): powers of two, so both squared distances
-  // are the SAME float and the comparison genuinely falls through to the id
-  // tiebreak rather than being decided by rounding.
+  // Exactly equidistant, as when two robots park symmetric about the free
+  // angle. Coordinates are powers of two so both squared distances are the same
+  // float and the id tiebreak, not rounding, decides.
+  // (notes: coord-test-contest-exact-tie)
   Coordination self_wins(true, "atlas");
   self_wins.injectClaimForTest(exploitClaim("rama", 7u, -4.0f, 0.0f,
                                             -4.0f, 0.0f, /*staged=*/true));
@@ -701,14 +680,10 @@ TEST(Coordination, StagedExploitPeerWinningExactTieLexTiebreak) {
 }
 
 TEST(Coordination, StagedExploitPeerWinningDrivingPeerNeverBlocks) {
-  // Identical geometry to BlocksCandidateWhenPeerCloser — the peer is still the
-  // closer robot — but its heartbeat says staged=false, so it is DRIVING and
-  // this probe ignores it entirely. A moving peer contests only through its
-  // claim disc (claimMatching), because a position contest against a mover would
-  // deny an approaching robot every angle on the ring at once: arriving from far
-  // away it is farther from all of them than a peer already circling the trunk,
-  // and exploitation would serialise instead of running in parallel. The mover's
-  // pose on the wire is up to a heartbeat stale anyway.
+  // Same geometry as BlocksCandidateWhenPeerCloser but staged=false: this probe
+  // ignores a driving peer, which contests only through its claim disc
+  // (claimMatching), or an approaching robot would lose every angle.
+  // (notes: coord-test-contest-driving-peer)
   Coordination c(true, "atlas");
   c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 0.0f, 3.0f,
                                     /*staged=*/false));
@@ -720,12 +695,10 @@ TEST(Coordination, StagedExploitPeerWinningDrivingPeerNeverBlocks) {
 
 TEST(Coordination, StagedExploitPeerWinningIgnoresOtherTargetAndExploreClaims) {
   Coordination c(true, "atlas");
-  // Both of these peers are staged and both are much closer to the candidate
-  // than we are (they sit on it), so only the target/exploit filters can save
-  // the candidate. Neither peer is on OUR ring: one is parked at a vantage of a
-  // different trunk that happens to be nearby, the other is not exploiting at
-  // all. Contesting an angle of trunk 7 against either would strand us with no
-  // vantage to take on a trunk nobody else is working.
+  // Both peers are staged and sit on the candidate, so only the target and
+  // exploit filters can admit it: a parked peer on another trunk, or one not
+  // exploiting, must not contest an angle of trunk 7.
+  // (notes: coord-test-contest-filters)
   c.injectClaimForTest(exploitClaim("rama", 8u, -3.0f, 0.0f, -3.0f, 0.0f,
                                     /*staged=*/true));
   auto explore = exploitClaim("ravana", 7u, -3.0f, 0.0f, -3.0f, 0.0f,
@@ -768,15 +741,10 @@ TEST(Coordination, StagedExploitPeerWinningIgnoresExpiredClaimWithoutPrune) {
 }
 
 // ---------------------------------------------------------------------------
-// Exploit-claim grace window. The TTL is sized for a 1 Hz heartbeat HEARD at
-// 1 Hz, but the receiver is a single-threaded executor whose EXPLOIT_PLAN
-// ticks can starve the intent subscription for seconds at a stretch. In a
-// 2-robot sim run the driving winner's claim aged out of the parked loser's
-// table twice — between plan ticks 7 ms apart — and the loser re-selected the
-// winner's vantage both times. Grace keeps exploit claims RETAINED (and the
-// vantage contests closed) one extra window past expiry, while everything
-// with presence semantics — the dwell barrier, rendezvous counting — stays
-// on the raw TTL.
+// Exploit-claim grace window: intent delivery can starve on the single-threaded
+// executor, so exploit claims stay retained (vantage contests closed) one
+// window past expiry. Presence semantics keep the raw TTL.
+// (notes: coord-test-exploit-claim-grace)
 // ---------------------------------------------------------------------------
 
 TEST(Coordination, ExploitClaimGraceRetainsThroughPrune) {
@@ -839,11 +807,10 @@ TEST(Coordination, LivePeerCountExcludesGracedClaims) {
 }
 
 TEST(Coordination, PeerLiveMatchesPresenceSemantics) {
-  // peerLive is the per-id form of livePeerCount's presence test — it is what
-  // missingPeerRecord() keys the reconnect manoeuvres on (WHICH teammate the
-  // barrier waits on), so it must share the raw-expiry semantics exactly: a
-  // graced-but-expired exploit claim proves table retention, not presence,
-  // and an id never heard is simply not live.
+  // peerLive is the per-id form of livePeerCount's presence test, used by
+  // missingPeerRecord(); it must share raw-expiry semantics: a graced exploit
+  // claim proves retention, not presence, and a never-heard id is not live.
+  // (notes: coord-test-peer-live-presence)
   Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
   c.injectClaimForTest(exploitClaim("rama", 7u, 5.0f, 0.0f, 5.0f, 0.0f,
                                     /*staged=*/false, /*expiry_sec=*/100.0));
@@ -898,11 +865,9 @@ TEST(Coordination, StagedExploitPeerWinningHonoursGrace) {
 }
 
 TEST(Coordination, BarrierIgnoresGracedClaims) {
-  // THE regression guard for the barrier: grace lengthens how long a claim
-  // can VETO a vantage, and must not lengthen how long a silent peer can
-  // HOLD a dwell barrier. firstUnstagedExploitPeer releases on the raw TTL
-  // exactly as before — a dead teammate frees the dwelling robot in one TTL,
-  // not TTL + grace.
+  // Grace lengthens how long a claim can veto a vantage, never how long a
+  // silent peer holds a dwell barrier: firstUnstagedExploitPeer releases on the
+  // raw TTL, not TTL + grace. (notes: coord-test-barrier-ignores-grace)
   Coordination c(true, "atlas", 0.0f, /*exploit_claim_grace_sec=*/10.0f);
   c.injectClaimForTest(exploitClaim("rama", 7u, 0.0f, 3.0f, 6.0f, 6.0f,
                                     /*staged=*/false, /*expiry_sec=*/100.0));

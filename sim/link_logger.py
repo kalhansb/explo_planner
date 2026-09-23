@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/link_logger_notes.md
 """Log hmr_comms_sim's ~/link_states to CSV, one row per pair per tick.
 
 Exists because the calibration sweep (plan §4) needs the raw connectivity trace
@@ -67,16 +68,10 @@ FIELDS = 10
 FIELDS_LEGACY = 9
 VALID_NOT_REPORTED = -1   # sentinel: a pre-generation-9 emulator, not a reading
 
-# Mask-rate bands for the sidecar's verdict. Not tuning knobs -- they are the
-# docstring's own sentence ("if MOST of a trace is masked, the trace is not
-# evidence of anything") turned into a number a reader can branch on, plus a
-# lower band for the case that is merely worth knowing about.
-#
-# A nonzero rate is EXPECTED and is not by itself a problem: every pair is
-# masked until both its endpoints have published a pose, so a run always opens
-# with a burst of invalid rows. What the bands separate is that startup burst,
-# which is a fixed cost and shrinks as a fraction of any real trace, from a
-# pose pipeline that stayed broken.
+# Mask-rate bands for the sidecar verdict, not tuning knobs. Some masking is
+# expected (every pair is masked until both endpoints have a pose); the bands
+# separate that startup burst from a pose pipeline that stayed broken.
+# (notes: link-logger-mask-bands)
 MASK_SUSPECT = 0.10
 MASK_UNUSABLE = 0.50
 
@@ -102,14 +97,10 @@ class LinkLogger(Node):
         # variant of the CSV and would be picked up by anything globbing
         # link_states* for traces.
         self.mask_path = os.path.splitext(out_path)[0] + ".mask"
-        # Written once at startup, before a single message has arrived, so that
-        # on a cell where this node ran the sidecar EXISTS no matter how the
-        # cell ends -- including a SIGKILL at teardown, which reaches neither
-        # destroy_node() nor the periodic write in cb(). That makes the absent
-        # sidecar mean exactly one thing to a reader of a new campaign: this
-        # node never started. The initial contents are rows=0 masked=0 ->
-        # NO_ROWS, which is the correct reading of a cell that died before the
-        # emulator published anything, and it is overwritten from then on.
+        # Written at startup so the sidecar exists however the cell ends (a
+        # SIGKILL reaches neither destroy_node() nor cb()); an absent sidecar
+        # means this node never started. The initial rows=0 masked=0 reads
+        # NO_ROWS. (notes: link-logger-sidecar-at-startup)
         self.write_sidecar()
         self.sub = self.create_subscription(
             Float64MultiArray, topic, self.cb, 50)
@@ -177,14 +168,10 @@ class LinkLogger(Node):
             if declared in (FIELDS, FIELDS_LEGACY) and n % declared == 0:
                 stride = declared
             else:
-                # A declaration that this script cannot use is NOT a reason to
-                # fall back to guessing. It means the publisher is a generation
-                # this script does not know (or its layout disagrees with its
-                # own payload), and the fallback would silently impose a width
-                # the publisher just said it was not using.
-                # `declared` is arbitrary publisher-supplied data and 0 is its
-                # default-constructed value, so the divisibility it fails can
-                # be a division by zero. Report the width, not the remainder.
+                # A declared width this script cannot use is not a reason to
+                # guess: log nothing. declared is publisher data and may be 0,
+                # so report the width rather than a remainder.
+                # (notes: link-logger-unusable-declared-width)
                 why = ("is not one of them"
                        if declared not in (FIELDS, FIELDS_LEGACY)
                        else f"leaves a remainder of {n % declared}")
@@ -196,13 +183,10 @@ class LinkLogger(Node):
                     "publisher did not declare.")
                 return None
         else:
-            # NO DECLARATION, SO DIVISIBILITY IS THE ONLY EVIDENCE -- and it is
-            # not always decisive. Both widths divide any multiple of 90, which
-            # is reachable: 10 pairs (N=5) of 9 columns and 9 pairs of 10 are
-            # the same 90 values. The old loop resolved that tie by preferring
-            # FIELDS, i.e. by assuming the workspace was NOT half-built, which
-            # is the one assumption the header comment above says this function
-            # exists to avoid making. A tie is missing information, not a vote.
+            # With no declared layout, divisibility is the only evidence. A
+            # payload both widths divide (any multiple of 90) is a tie, and a
+            # tie logs nothing rather than guessing a width.
+            # (notes: link-logger-undeclared-width-tie)
             fits = [c for c in (FIELDS, FIELDS_LEGACY) if n % c == 0]
             if len(fits) == 1:
                 stride = fits[0]
@@ -253,14 +237,10 @@ class LinkLogger(Node):
                 row = row + [VALID_NOT_REPORTED]
             self.w.writerow([f"{t:.3f}"] + [f"{v:g}" for v in row])
             self.rows += 1
-        # PUBLISHED, not self.rows. Keying the periodic write off the rows that
-        # survived the mask means a trace in which everything is masked -- the
-        # single case this sidecar exists to make visible -- increments nothing,
-        # writes no sidecar, and depends entirely on destroy_node() running.
-        #
-        # And a threshold on a running total, not a modulus: one callback adds
-        # a whole message's worth of pairs at once, so `total % 500 == 0` is a
-        # condition the counter can step straight over and never satisfy again.
+        # Key the periodic write off published rows (rows + masked), not
+        # self.rows, so a fully masked trace still writes the sidecar. Use a
+        # threshold on the running total, not a modulus: one callback adds many
+        # rows. (notes: link-logger-periodic-sidecar-trigger)
         published = self.rows + self.masked
         if published - self.last_sidecar_at >= 500:
             self.last_sidecar_at = published
@@ -272,13 +252,10 @@ class LinkLogger(Node):
         self.out.close()
         self.write_sidecar()
         frac, verdict = self.mask_verdict()
-        # Goes to stderr so the caller can separate it from the CSV path on
-        # stdout. No longer "the only place the mask count is reported" -- the
-        # sidecar is, and this line names it so a reader of the console log can
-        # find the machine-readable copy.
-        # Both mask counts, always, with the total: a rate needs a denominator,
-        # and "which discriminator fired" is how a reader learns whether the
-        # emulator was reporting validity at all.
+        # Summary goes to stderr and names the sidecar, the machine-readable
+        # copy. Always print both mask counts with the total: which
+        # discriminator fired shows whether the emulator reported validity.
+        # (notes: link-logger-shutdown-summary)
         print(f"[link_logger] rows={self.rows} masked={self.masked} "
               f"(by_valid={self.masked_by_valid} "
               f"by_path_loss={self.masked_by_path_loss}) "

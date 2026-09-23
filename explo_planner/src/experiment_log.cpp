@@ -1,3 +1,4 @@
+// Moved comments: doc/experiment_log_notes.md
 #include "explo_planner/experiment_log.hpp"
 
 #include <algorithm>
@@ -52,23 +53,10 @@ ExperimentLog::ExperimentLog(const std::string& path, std::string robot_id,
 }
 
 ExperimentLog::~ExperimentLog() {
-  // No run_end here: it needs run totals only the node can supply, and a
-  // destructor that logged a half-known ending would be worse than the missing
-  // line an analysis can already detect from `seq` (see the header).
-  //
-  // dup_run_ends_ IS reported here, and this is the only place it can be. The
-  // suppression that produces it necessarily happens after the run_end row is
-  // on disk, so unlike dup_mission_completes_ it cannot ride out on a JSON
-  // field; and appending a trailing event instead would break two invariants
-  // the readers depend on -- run_end is the last line, and the last line's seq
-  // is events_written - 1. So it goes to the ROS log, which the harness banks
-  // as planner_<robot>.log, where gate_g8 check 3n greps for it. The header's
-  // promise that this counter is "kept so a future ... destructor message can
-  // report it" is what this is.
-  //
-  // Only the total: the first duplicate already raised its own warning naming
-  // both instants. What this adds is MULTIPLICITY, which that one-shot warning
-  // deliberately does not carry.
+  // No run_end here: only the node has the totals. dup_run_ends_ can only be
+  // reported here, to the ROS log; a trailing event would break run_end-is-last
+  // and the seq invariant. gate_g8 check 3n greps for it.
+  // (notes: explog-dtor-dup-run-ends)
   if (dup_run_ends_ > 0) {
     RCLCPP_ERROR(logger_,
         "ExperimentLog closing '%s' with %lld SUPPRESSED duplicate run_end "
@@ -177,15 +165,9 @@ void ExperimentLog::begin(const char* event, const ExperimentContext& ctx) {
   text("robot", robot_id_);
   // THE stamp. Absolute simulation seconds on the node's own clock.
   num("t_sim_sec", ctx.sim_time_sec);
-  // Seconds since run_start, precomputed so no consumer has to find t0 first.
-  //
-  // SINGLE-ROBOT AXIS ONLY. t0 is this node's own first tick, and the two
-  // planners are launched back-to-back with no sleep, so their t0 values differ
-  // — measured at up to 4.93 sim s. Differencing one robot's t_rel_sec against
-  // the other's silently inherits that skew. Anything cross-robot (team
-  // completion, which robot reached a milestone first, event ordering) must use
-  // t_sim_sec, which is the same clock for both. run_start records this node's
-  // t0_sim_sec so the offset is recoverable rather than merely warned about.
+  // Seconds since this node's run_start. Single-robot axis only: each robot has
+  // its own t0, so anything cross-robot must use t_sim_sec. run_start records
+  // t0_sim_sec. (notes: explog-t-rel-single-robot)
   num("t_rel_sec", ctx.sim_time_sec - t0_sec_);
   // Secondary, and named so it cannot be mistaken for the primary axis.
   num("t_wall_sec", wallEpochSec());
@@ -207,11 +189,9 @@ void ExperimentLog::end() {
 
   file_.write(line_.data(), static_cast<std::streamsize>(line_.size()));
   file_.flush();
-  // Checked after EVERY write, which is the entire point (failure 4). A stream
-  // that failed once stays failed until cleared, so clear it: a transient
-  // condition (a full disk that is freed, an NFS hiccup) should not cost the
-  // rest of the run's events. `healthy_` never comes back, so the run is still
-  // marked suspect in run_end whatever happens afterwards.
+  // Checked after every write. The stream is cleared so a transient failure
+  // does not cost later events, but healthy_ never returns to true, so run_end
+  // still marks the run suspect. (notes: explog-write-check-clear)
   if (!file_.good()) {
     ++write_failures_;
     if (!write_error_reported_) {
@@ -352,17 +332,10 @@ void ExperimentLog::logClockAnchor(const ExperimentContext& ctx) {
   // derived rates, recorded so the drift is visible without differencing.
   num("sim_since_prev_sec", d_sim);
   num("wall_since_prev_sec", d_wall);
-  // Instantaneous real-time factor over the last anchor interval. Null (not 0)
-  // when the wall interval is degenerate, so a divide-by-zero never
-  // masquerades as a stopped simulation.
-  //
-  // `> 0.0` was not a strong enough guard. The first anchor fires in the same
-  // tick as run_start, which has just set prev_anchor_* to t0, so d_sim is
-  // exactly 0 and d_wall is a few microseconds: the division succeeds and
-  // writes 0.0 — the very "stopped simulation" reading the guard above claims
-  // to prevent, once per robot per run. Requiring a real wall interval keeps
-  // the genuine stopped-sim case (d_wall large, d_sim 0 -> rtf 0.0) reportable
-  // while rejecting the zero-length one.
+  // Real-time factor over the last anchor interval; null (not 0) unless the
+  // wall interval exceeds kMinAnchorWallSec, since the first anchor shares
+  // run_start's tick. A stopped sim still reads 0.0.
+  // (notes: explog-rtf-null-guard)
   constexpr double kMinAnchorWallSec = 1e-3;
   if (d_wall > kMinAnchorWallSec) {
     rtf_last_ = d_sim / d_wall;
@@ -371,9 +344,8 @@ void ExperimentLog::logClockAnchor(const ExperimentContext& ctx) {
     key("rtf");
     line_ += "null";
   }
-  // Mean since t0. The pair (rtf, rtf_mean) is what shows drift WITHIN a run —
-  // measured at 0.89 -> 0.81 in this campaign, which is what made a single
-  // linear wall->sim fit wrong by up to 54 s.
+  // Mean real-time factor since t0; with rtf it shows drift within a run.
+  // (notes: explog-rtf-mean-drift)
   if (span_wall > kMinAnchorWallSec) {
     num("rtf_mean", (ctx.sim_time_sec - t0_sec_) / span_wall);
   } else {
@@ -455,17 +427,14 @@ void ExperimentLog::logReconnectDispatch(const ExperimentContext& ctx,
   // with json.loads, so older readers ignore it and newer readers can tell a
   // link-gated fire from a record-age one without consulting the manifest.
   num("link_down_sec", e.link_down_sec);
-  // Additive for the same reason, and load-bearing: this is the left-hand side
-  // of the inequality the mid-run trigger evaluated. Without it the record holds
-  // the threshold (gate_sec) but not the quantity compared against it, so the
-  // decision cannot be re-derived from the log at all — peer_record_age_sec
-  // stands ~coord_claim_ttl_sec clear of it and tests a different inequality.
+  // Additive and load-bearing: the left-hand side of the mid-run trigger's
+  // inequality against gate_sec, so the decision can be re-derived from the
+  // log. peer_record_age_sec tests a different inequality.
+  // (notes: explog-team-incomplete-sec-2)
   num("team_incomplete_sec", e.team_incomplete_sec);
-  // P6 interception, additive for the same reason as the two above. `predictor`
-  // is written unconditionally — including "trail" on every control run — so
-  // the arm can be read off a single dispatch line instead of inferred from the
-  // absence of keys, which is what a reader would otherwise have to do and is
-  // indistinguishable from an older binary.
+  // Interception predictor fields, additive. predictor is written
+  // unconditionally so the arm reads off one dispatch line instead of being
+  // inferred from absent keys. (notes: explog-predictor-fields)
   text("predictor", e.predictor);
   text("predict_refused", e.predict_refused);
   num("predict_p", e.predict_p);
@@ -494,11 +463,10 @@ void ExperimentLog::logReconnectEnd(const ExperimentContext& ctx,
 void ExperimentLog::logExplorationComplete(
     const ExperimentContext& ctx, const ExplorationCompleteEvent& e) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
-  // THE completion time: the LAST declaration, so it moves forward when a robot
-  // resumes after a reconnect manoeuvre and exhausts again. On this line it is
-  // "the latest so far"; run_end carries the final value. The first declaration
-  // is latched alongside it — the two answer different questions and the run is
-  // not entitled to only one of them. See the member declarations.
+  // The completion time is the LAST declaration and moves forward if the robot
+  // resumes and exhausts again; run_end carries the final value. The first
+  // declaration is latched alongside it.
+  // (notes: explog-completion-last-declaration)
   if (explore_done_first_sec_ < 0.0) explore_done_first_sec_ = ctx.sim_time_sec;
   explore_done_last_sec_ = ctx.sim_time_sec;
   // A fresh declaration re-arms the post_latch window; the steps that led to
@@ -526,19 +494,10 @@ void ExperimentLog::logExplorationComplete(
 void ExperimentLog::logMissionComplete(const ExperimentContext& ctx,
                                        const MissionCompleteEvent& e) {
   if (!open_ || !started_) { ++dropped_before_start_; return; }
-  // Idempotence latch, the same construction as run_end_written_ below and for
-  // the same reason: a second mission_complete is a duplicate endpoint, and
-  // through generation 8 it made 16 ts1b robot-runs report a homing leg whose
-  // duration and distance restarted from zero. The node now refuses the
-  // re-entry that caused those (mission_return_done_), so this is the second
-  // line of defence, sitting at the layer that owns the FILE's contract.
-  //
-  // Suppressing it silently would be the trap. `occurrence` below was the only
-  // offline evidence a duplicate ever happened, and a latch that drops the row
-  // also drops the evidence — so the suppression is counted here and written
-  // into run_end as mission_completes_suppressed, and the first one warns. A
-  // reader cross-checking "one row, occurrence 1, zero suppressed" now gets
-  // three agreeing facts instead of one that the fix quietly emptied.
+  // A second mission_complete is suppressed, warned once, and counted in
+  // dup_mission_completes_ (written to run_end as
+  // mission_completes_suppressed). Second line of defence behind the node's
+  // re-entry guard. (notes: explog-mission-complete-latch-2)
   if (mission_complete_written_) {
     if (!dup_mission_complete_reported_) {
       dup_mission_complete_reported_ = true;
@@ -595,11 +554,9 @@ void ExperimentLog::logNavGoalFailed(const ExperimentContext& ctx, double x,
   text("reason", reason);
   num("elapsed_sec", elapsed_sec);
   num("budget_sec", budget_sec);
-  // The comparison that actually fired. Kept distinct from
-  // (elapsed_sec, budget_sec) rather than overwriting them: both pairs are
-  // wanted on a budget-rotate row — how long the whole attempt had been
-  // running AND how long the rotation had — and collapsing them is what made
-  // the old schema misreport 30 of 31 rows.
+  // The comparison that actually fired, kept separate from (elapsed_sec,
+  // budget_sec): a budget-rotate row needs both the whole attempt's and the
+  // rotation's timing. (notes: explog-nav-fail-test-fields)
   text("test_name", test_name);
   num("test_value", test_value);
   num("test_threshold", test_threshold);
@@ -634,11 +591,10 @@ void ExperimentLog::logGoalAmnesty(const ExperimentContext& ctx, double x,
   // hot goal, retired=true means nothing but confirmed traps were left, which
   // is a starvation signature and not a routine retry.
   boolean("retired", retired);
-  // Unconditional, and never empty: `retired` cannot stand in for the tier
-  // (the visited tier reads retired=false by construction), and the two tiers
-  // mean opposite things about the run's health — a "failed" row is the valve
-  // working, a "visited" row is a tick that would have stalled outright before
-  // v8. See the field doc.
+  // The amnesty tier, written unconditionally and never empty; retired cannot
+  // stand in for it (the visited tier reads retired=false). A failed row is the
+  // valve working; a visited row averts a stall.
+  // (notes: explog-amnesty-source-tier)
   text("source", source);
   end();
 }
@@ -656,21 +612,17 @@ void ExperimentLog::logHomeWatchdog(const ExperimentContext& ctx,
   text("mode", mode);
   text("response", response);
   num("dist_home_m", dist_home_m);
-  // INSTANTANEOUS, at the fire instant — the remaining-distance metric as
-  // sampled on this tick, in whichever mode was in force (straight-line for
-  // direct, along-trail for retrace, which is why it can exceed dist_home_m).
-  // It is NOT movement over `window_sec`; this comment said that it was
-  // through generation 7, which made it read as the tested quantity. The
-  // tested quantity is test_delta_m below.
+  // Remaining-distance metric sampled at the fire instant in the mode in force
+  // (straight-line for direct, along-trail for retrace, so it can exceed
+  // dist_home_m). Not movement over window_sec; test_delta_m is.
+  // (notes: explog-watchdog-metric-m)
   num("metric_m", metric_m);
   num("window_sec", window_sec);
   integer("escapes_used", escapes_used);
-  // The fired inequality, on detector-fire rows only: the detector fired
-  // because test_delta_m < test_threshold_m. Gated on `kind` rather than on a
-  // sentinel value because every numeric sentinel collides with a real
-  // reading — 0.0 is the canonical frozen fire and negatives are a receding
-  // approach fire — so ABSENCE is what has to mean "no inequality here".
-  // escape-end rows are leg terminations and evaluate no detector.
+  // The fired inequality test_delta_m < test_threshold_m, omitted on escape-end
+  // rows. Gated on kind, not a sentinel: 0.0 and negative deltas are real
+  // readings, so absence means no inequality.
+  // (notes: explog-watchdog-fired-inequality)
   if (std::strcmp(kind, "escape-end") != 0) {
     num("test_delta_m", test_delta_m);
     num("test_threshold_m", test_threshold_m);
@@ -681,22 +633,14 @@ void ExperimentLog::logHomeWatchdog(const ExperimentContext& ctx,
 
 void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
                               const RunEndEvent& e) {
-  // The three refusals are SEPARATED because they mean different things and two
-  // of them used to be silent. Collapsed into one `if`, a run_end that arrived
-  // before startRun went unrecorded — `events_dropped_before_start` counted
-  // every other event kind and this one alone escaped, so the logger's own
-  // accounting was inexact in the one place a reader would trust it.
+  // The refusals stay separate: a run_end before startRun must count in
+  // events_dropped_before_start like every other event kind.
+  // (notes: explog-run-end-refusals)
   if (!open_) return;
   if (!started_) { ++dropped_before_start_; return; }
-  // A SECOND run_end is a duplicate endpoint, the same class of defect as the
-  // 16 ts1b robot-runs that carried two mission_complete rows (see
-  // MissionCompleteEvent::occurrence). Suppressing it is right — a second
-  // run_end would give the file two last lines and every "read the tail"
-  // consumer a coin flip — but suppressing it SILENTLY makes the guard a check
-  // that stopped checking: it would absorb a DONE re-entry indefinitely with
-  // nothing anywhere saying so. The row is already written and cannot carry a
-  // count, so the evidence goes to the ROS log, which the harness captures per
-  // robot. Once, not per call, because the caller may be a tick loop.
+  // A second run_end is suppressed so the file keeps one last line, counted in
+  // dup_run_ends_, and warned once to the ROS log since the row cannot carry a
+  // count; the caller may be a tick loop. (notes: explog-run-end-duplicate)
   if (run_end_written_) {
     if (!dup_run_end_reported_) {
       dup_run_end_reported_ = true;
@@ -719,11 +663,10 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
   num("unknown_fraction", e.unknown_fraction);
   text("coverage_source", e.coverage_source);
   teamCounts(e.peers_live, e.expected_peers);
-  // THE completion time, restated so it can be read without scanning for the
-  // exploration_complete line. Null when this robot never declared exhaustion
-  // (killed by the duration cap, i.e. a censored run) — which is itself a
-  // result, and one that a "max sim time in the file" reading would silently
-  // convert into a completion.
+  // The completion time restated from exploration_complete. Null when the robot
+  // never declared exhaustion (a censored run), which a max-sim-time reading
+  // would wrongly turn into a completion.
+  // (notes: explog-run-end-completion-null)
   if (explore_done_last_sec_ >= 0.0) {
     num("explore_done_sim_sec", explore_done_last_sec_);
     num("explore_done_rel_sec", explore_done_last_sec_ - t0_sec_);
@@ -783,11 +726,10 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
     key("mission_home_result"); line_ += "null";
     key("mission_home_sim_sec"); line_ += "null";
   }
-  // Duplicate-endpoint accounting, both directions. mission_return_reentries
-  // is the NODE refusing to start a second homing leg; mission_completes_
-  // suppressed is the LOGGER refusing to write a second row. Both are 0 in a
-  // healthy run, and both are written unconditionally so that 0 is a measured
-  // fact rather than the absence of a field.
+  // mission_return_reentries counts the node refusing a second homing leg;
+  // mission_completes_suppressed counts the logger refusing a second row. Both
+  // 0 when healthy; always written so 0 is measured.
+  // (notes: explog-duplicate-endpoint-counts)
   integer("mission_return_reentries", e.mission_return_reentries);
   integer("mission_completes_suppressed", dup_mission_completes_);
   // Unconditional for the same reason as the two above: the mid-run attempt cap
@@ -844,39 +786,16 @@ void ExperimentLog::noteCoverage(const ExperimentContext& ctx,
     num("y", y);
     integer("rung", static_cast<long long>(i));
     integer("rungs_total", static_cast<long long>(milestones_.size()));
-    // C1: did this crossing happen after the robot declared exploration
-    // complete? A rung crossed post-declaration times post-stop map merging,
-    // not exploration, and whether a run reaches such a rung at all correlates
-    // with the arm -- so it is a selection artifact, not an endpoint. The
-    // ladder is now sized so this should always be false; recording it is how
-    // a future ladder/threshold mismatch announces itself instead of quietly
-    // contaminating a headline number.
-    // Keyed on the LAST declaration and on a flag that a resumed exploration
-    // clears -- not on explore_done_first_sec_, which is a one-way latch.
-    // Through generation 8 it was the latch, and that made the flag report
-    // `true` on genuine exploration: a robot that declares, is pulled into a
-    // reconnect manoeuvre, comes back with a merged map and explores on was
-    // still "post-latch" for the rest of the run. Resumption happens only
-    // where manoeuvres happen, so a flag added to detect an ARM-CORRELATED
-    // selection artifact was itself arm-correlated -- it would have attributed
-    // the reconnecting arms' late rungs to post-stop map merging and thrown
-    // away real coverage.
-    //
-    // explore_resumed_since_done_ is set by logStep, which is the right
-    // signal and needs nothing from the node: the step counter is frozen for
-    // the whole of a manoeuvre and for the whole homing leg, so a `step`
-    // event arriving after a declaration means this robot is exploring again.
-    // On the declaring tick doLogStep writes its step BEFORE routing into
-    // recordExplorationComplete, so the flag cannot be set spuriously by the
-    // very step that ended.
+    // True if the rung was crossed after the LAST declaration with no resumed
+    // exploration since (explore_resumed_since_done_, set by logStep). Relies
+    // on doLogStep writing its step before recordExplorationComplete.
+    // (notes: explog-post-latch)
     const bool post_latch =
         explore_done_last_sec_ >= 0.0 && !explore_resumed_since_done_;
     boolean("post_latch", post_latch);
-    // -1.0 is "not applicable", NOT a measured zero and not a negative
-    // interval: the robot had not declared, or it had declared and resumed.
-    // Same sentinel discipline as the field above it, and stated here because
-    // an undocumented -1 in a seconds column is unrecoverable once averaged.
-    // Measured from the LAST declaration for the same reason post_latch is.
+    // -1.0 means not applicable (not declared, or declared and resumed), not a
+    // measured zero. Measured from the LAST declaration, like post_latch.
+    // (notes: explog-sec-since-explore-done)
     num("sec_since_explore_done",
         post_latch ? ctx.sim_time_sec - explore_done_last_sec_ : -1.0);
     end();

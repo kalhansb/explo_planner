@@ -3,45 +3,16 @@
 #
 # The question: does a realistic radio differ measurably from perfect comms?
 #
-# Both conditions run the SHIPPED radio (tx_power_dbm = 30.0) on both robots.
-# Transmit power is fixed hardware, identical on every robot, and no field
-# experiment can turn it down; every earlier "severity level" in this plan was
-# produced by moving it, which is why section 3.19 withdrew that whole ladder.
-# The only difference between the two arms here is whether the message-level
-# radio emulator is in the path at all:
-#
-#   p5perfect  --comms 0   no emulator. One broadcast domain, every delta
-#                          reaches both robots. This is the honest way to say
-#                          "assume comms never fails" — not a magic 160 dBm
-#                          radio, which describes nothing a robot could carry.
-#   p5real     --comms 1   the emulator at 30 dBm: relay hop, delay, airtime
-#                          budget, fading, and disconnection whenever the link
-#                          budget actually fails.
-#
-# --expect-outage 0 on the realistic arm. Whether the honest radio ever drops
-# in THIS world is the question being asked, so the gate must not fail a run
-# for answering "no". Section 3.19's arithmetic predicts it will not: at 30 dBm
-# with 88 stems/ha over the +/-50 m ROI the link sits near 31 dB SNR, the top
-# tier, and reaching the 2 dB cutoff at 50 m would need roughly 3.8 trunks on
-# the path — about 240 stems/ha. If that prediction holds, the two arms will
-# be indistinguishable, and the finding is that THE WORLD cannot exercise the
-# radio: the next experiment is a denser forest, not another metric.
-#
-# arms=off throughout: the reconnection manoeuvres are disabled, so nothing
-# here is confounded by policy. Robots still re-merge opportunistically.
-#
-# --record 0: no bags. This comparison needs the planner CSVs and the link
-# trace only, and /tmp was at 97% when this was written. A Phase 5 oracle
-# re-merge needs bags and must be its own run.
+# Both conditions run the shipped 30 dBm radio, arms off, no bags. p5perfect has
+# no emulator; p5real runs through it with expect-outage 0, since whether the
+# link ever drops is the question. (notes: phase5-perfect-vs-real-arms)
 #
 # Read out with:
 #   sim/map_divergence.py                 (the metric that separated conditions)
 #   sim/analyze_runs.py --threshold 0.55
-# NOT set -e. run_campaign.sh returns non-zero when ANY cell failed, and on the
-# first attempt that aborted this script between the two arms — leaving the
-# perfect arm measured and the realistic arm, the half that carries the
-# comparison, never run at all. A failed cell is a cell to re-run, not a reason
-# to abandon the other condition.
+# NOT set -e: run_campaign.sh returns non-zero when any cell fails, and that
+# must not stop the other arm from running. (notes: phase5-not-set-e)
+# Moved comments: docs/sim_notes/run_phase5_notes.md
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-/tmp/hmr_campaign}"

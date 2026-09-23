@@ -1,3 +1,4 @@
+// Moved comments: doc/team_model_notes.md
 #include "explo_planner/team_model.hpp"
 
 #include <algorithm>
@@ -71,11 +72,10 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   if (!std::isfinite(now_sec) || now_sec < 0.0)
     return "receipt time must be a finite non-negative mission elapsed time";
 
-  // A gossip array longer than the fleet means the sender is running a
-  // different team_robot_names than we are, so its ids address different
-  // robots than ours do. The team_hash check upstream should have caught it;
-  // this is the backstop, and it refuses rather than truncating, because
-  // truncating would apply the sender's robot 0 to our robot 0.
+  // Gossip arrays longer than the fleet mean the sender runs a different
+  // team_robot_names; refuse rather than truncate, which would misapply its
+  // ids. Backstop to the upstream team_hash check.
+  // (notes: team-gossip-array-length-backstop)
   const size_t n = static_cast<size_t>(size_);
   if (obs.last_heard_sec.size() > n || obs.gx.size() > n ||
       obs.gy.size() > n || obs.gz.size() > n ||
@@ -91,39 +91,25 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   Peer& sp = peers_[static_cast<size_t>(s)];
   sp.known          = true;
   sp.in_range_mask  = obs.in_range_mask;
-  // FIRST-HAND IS AUTHORITATIVE and is a plain assignment, so it can also
-  // CLEAR. The relay below can only ever set the bit, so this is the one site
-  // that can undo it -- which matters for the single case where the bit is not
-  // monotonic in reality rather than on the wire: a node that restarts mid-run
-  // (its mission clock returns to zero, the case the gossip block below also
-  // calls out) genuinely un-finishes, and the robot itself is the only witness
-  // worth believing. Peers that learned the old bit by relay keep it until they
-  // hear the restarted robot first-hand; they are then receiving from it
-  // directly, which is what peerAccounted keys on anyway.
+  // First-hand is authoritative: this plain assignment is the only site that
+  // can clear finished (the relay below only sets it), which a restarted node
+  // that genuinely un-finishes needs. (notes: team-first-hand-finished-clears)
   sp.finished       = obs.finished;
   // Same channel, same rule, one extra level: first-hand is authoritative and
   // is therefore the one site that can lower the level, for the restart reason
   // spelled out directly above. The relay below can only raise it.
   sp.mode           = obs.mode;
-  // team_incomplete IS FIRST-HAND ONLY, and it does not follow `finished` above
-  // into the relay. The two are not the same kind of statement. This one is a
-  // NON-MONOTONIC claim a robot makes ABOUT THE TEAM, and relaying it is the
-  // deadlock TeamWorld.msg warns about arriving by a different route -- C would
-  // re-announce A's break as though it were C's own read and A would then see
-  // its own bit come back, with nothing able to clear it. `finished` is a
-  // MONOTONIC claim a robot makes ABOUT ITSELF: it cannot contradict a
-  // first-hand copy, cannot arrive early, and has no path back to its
-  // originator, which is exactly why it is safe to relay and this is not.
+  // First-hand only, never relayed: team_incomplete is a non-monotonic claim
+  // about the team, and a relayed copy could echo back to its originator with
+  // nothing able to clear it. (notes: team-incomplete-first-hand-only)
   sp.team_incomplete = obs.team_incomplete;
   // First-hand only for the same reason as team_incomplete directly above: it is
   // non-monotonic, so a relayed copy could hold an appointment barrier off an
   // echo of itself.
   sp.appointment_inbound = obs.appointment_inbound;
-  // Its one-hop report lands the same way: it is the sender's own statement
-  // about what the sender currently receives, stored under the sender so the
-  // reader believes it exactly while the sender itself is heard. The sender
-  // derives it from raw first-hand bits only (see TeamWorld.msg), so storing
-  // it here cannot start the echo the two comments above forbid.
+  // The sender's own report of what it currently receives, stored under the
+  // sender. The sender derives it from raw first-hand bits only, so storing it
+  // cannot start an echo. (notes: team-appointment-inbound-seen)
   sp.appointment_inbound_seen = obs.appointment_inbound_seen;
   sp.last_known_sec = now_sec;
   if (obs.have_position) {
@@ -138,15 +124,9 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   reported_at_sec_[static_cast<size_t>(s)] = now_sec;
 
   // --- third-party gossip ---------------------------------------------------
-  //
-  // The sender's entry for ITSELF is its publish time on its own mission
-  // clock. Everything else in the array is an earlier reading on that same
-  // clock, so (sender_now - entry) is an AGE — an interval, which transfers
-  // between clocks unchanged. Without the sender's own entry there is no
-  // reference point and the whole array is uninterpretable; it is dropped
-  // rather than guessed at, because guessing (say, assuming the sender
-  // published at its latest entry) would systematically under-age gossip and
-  // make stale positions look current.
+  // The sender's own entry is its publish time; sender_now minus an entry is an
+  // age, which transfers between clocks. Without the sender's own entry the
+  // array is dropped, not guessed at. (notes: team-gossip-clock-ages)
   const size_t nh = obs.last_heard_sec.size();
   if (nh > static_cast<size_t>(s)) {
     const double sender_now = obs.last_heard_sec[static_cast<size_t>(s)];
@@ -159,18 +139,10 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
         const double age = sender_now - t;
         if (!(age >= 0.0)) continue;             // sender's clock ran backwards
         if (age > cfg_.gossip_max_age_sec) continue;
-        // Local mission-elapsed time this information dates from.
-        //
-        // Stated bound: this treats transit as instantaneous, so gossip is
-        // under-aged by however long the message took to arrive. Sub-second in
-        // normal operation, and gossip_max_age_sec is set with slack for it.
-        // The pathological case is a message DELAYED or DUPLICATED by minutes,
-        // which would look that much fresher than it is. It is not guarded
-        // against, deliberately: the obvious guard — refuse a message whose
-        // sender entry is not strictly greater than the last we accepted from
-        // that sender — deadlocks that peer permanently the first time its
-        // node restarts and its mission clock returns to zero, which is a real
-        // event and a far worse failure than an over-fresh duplicate.
+        // Local mission-elapsed time this information dates from; transit
+        // counts as instantaneous. Do not reject a non-increasing sender entry:
+        // that deadlocks a peer whose node restarts.
+        // (notes: team-gossip-transit-bound)
         const double at = now_sec - age;
         Peer& p = peers_[static_cast<size_t>(r)];
         p.known = true;
@@ -183,12 +155,9 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
             k < obs.gx.size() && k < obs.gy.size() && k < obs.gz.size()) {
           p.have_position       = true;
           p.position_first_hand = false;
-          // `at`, not now_sec: this position was measured when the RELAY heard
-          // it, and the whole point of the interval arithmetic above is to
-          // recover that instant. Stamping it with the receipt time would make
-          // a two-minute-old relayed pose look one tick old — which is the
-          // failure this field exists to prevent, reintroduced at the one site
-          // where it actually happens.
+          // Stamp with at, not now_sec: a relayed position dates from when the
+          // relay heard it, and the receipt time would make an old pose look
+          // fresh. (notes: team-relayed-position-stamp)
           p.position_sec        = at;
           p.position_x = obs.gx[k];
           p.position_y = obs.gy[k];
@@ -199,28 +168,9 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   }
 
   // --- relayed `finished` ---------------------------------------------------
-  //
-  // A SEPARATE LOOP, AND DELIBERATELY NOT INSIDE THE ONE ABOVE. Every guard
-  // that block applies would suppress this bit exactly when it is needed. It
-  // skips a peer the sender never heard, skips one older than
-  // gossip_max_age_sec, and skips one whose reading is not strictly fresher
-  // than what we hold -- all of which are freshness rules, and a finished robot
-  // STOPS MOVING AND GOES QUIET, so its last-heard entry is the first thing to
-  // age out. Gating a monotonic fact on freshness would switch the relay off at
-  // the moment it starts to matter. There is no freshness to check: the bit
-  // only ever goes one way.
-  //
-  // PURE OR, NEVER CLEARS. A relayed false is "the sender has no evidence", not
-  // "that robot is still exploring" -- the sender may simply not have heard it
-  // either -- so false carries no information and must not overwrite a bit we
-  // already hold. Only the first-hand assignment above can clear.
-  //
-  // WHY IT EXISTS: without it, a robot that cannot hear a finished peer counts
-  // it missing forever (nothing ever clears the stale first-hand false), so it
-  // announces the team incomplete forever, and every robot that CAN hear the
-  // finished peer is held by that announcement at the unbounded appointment
-  // barrier. At N>=3 that hangs the run to the harness duration cap. See
-  // TeamWorld.msg/robot_finished for the full trace.
+  // A separate loop with no freshness gates: a finished robot goes quiet and
+  // would age out. Pure OR: a relayed false carries no information, and only
+  // the first-hand assignment clears. (notes: team-relayed-finished)
   for (size_t k = 0; k < obs.finished_gossip.size(); ++k) {
     const int r = static_cast<int>(k);
     if (r == self_id_ || r == s) continue;   // we know ourselves; s is above
@@ -231,17 +181,9 @@ std::string TeamModel::observe(const Observation& obs, double now_sec) {
   }
 
   // --- relayed `mode` -------------------------------------------------------
-  //
-  // Every argument in the block above transfers verbatim: not age-gated
-  // (a homing robot goes quiet in the same way a finished one does, and its
-  // level matters most once it has), and a merge that can only ever raise
-  // (a relayed EXPLORING is "the sender has no evidence", never "that robot is
-  // still exploring"). The one difference is the operator -- MAX rather than
-  // OR, because this fact has three ordered levels instead of two.
-  //
-  // WHY IT EXISTS separately from `finished`: it covers the window between
-  // leaving for home and arriving there, where `finished` is still false and a
-  // peer is nonetheless never coming back to the frontier or to a meeting.
+  // Same rules as relayed finished: not age-gated, and the merge only raises
+  // (max over the ordered levels). It covers a peer heading home that has not
+  // yet finished. (notes: team-relayed-mode)
   for (size_t k = 0; k < obs.mode_gossip.size(); ++k) {
     const int r = static_cast<int>(k);
     if (r == self_id_ || r == s) continue;   // we know ourselves; s is above
@@ -269,13 +211,9 @@ void TeamModel::tick(double now_sec) {
         receiving && maskHas(reported_mask_[static_cast<size_t>(i)], self_id_);
 
     // --- R1 instrumentation ---------------------------------------------
-    //
-    // Read the edges BEFORE the flags are overwritten: both measurements are
-    // differences across a transition, so they need the previous state, and
-    // the previous state is exactly what the three assignments below destroy.
-    // The two outputs are cleared unconditionally first — they describe THIS
-    // tick, and a stale value left standing would be counted as a second
-    // event by a reader that counts non-negative readings.
+    // Read the transition edges before the assignments below overwrite the
+    // previous state. acquire_sec and held_sec describe this tick only, so they
+    // reset to -1 first. (notes: team-r1-instrumentation-edges)
     p.acquire_sec = -1.0;
     p.held_sec    = -1.0;
     if (!receiving) {
@@ -294,11 +232,9 @@ void TeamModel::tick(double now_sec) {
         // the §10 one-way failure arriving on a link that was up.
         p.held_sec         = at - p.direct_since_sec;
         p.direct_since_sec = -1.0;
-        // AND THE NEXT ONE-WAY PERIOD STARTS HERE, not where the receiving run
-        // did. A link that breaks and re-forms without the packets ever
-        // stopping would otherwise have its second acquisition measured from
-        // the first packet of the whole run — reporting the length of the
-        // preceding HOLD as though it were acquisition latency.
+        // The next one-way period starts here, not at the start of the
+        // receiving run; otherwise a re-formed link reports the preceding hold
+        // as acquisition latency. (notes: team-one-way-period-restart)
         p.one_way_since_sec = at;
       }
     }
@@ -316,22 +252,10 @@ void TeamModel::tick(double now_sec) {
   if (!cfg_.closure_enabled) return;
 
   // --- 2. closure ----------------------------------------------------------
-  //
-  // Peer C is IN_COMMS if some robot we are already in comms with hears C
-  // directly. Expansion goes only through rows we have a FRESH first-hand copy
-  // of — which, since a peer's row arrives on its own message, means only
-  // through robots we can hear ourselves. Closure is therefore TWO HOPS, not
-  // unbounded: A—B—C is covered (the case §3.3 is written for), A—B—C—D is
-  // not, because nothing in TeamWorld carries C's mask to A. That is a
-  // limitation of the message, not an oversight here; extending it would mean
-  // relaying third-party masks the way positions are relayed, and the plan
-  // deliberately does not.
-  //
-  // The far edge B—C is taken on B's word alone. It cannot be handshaken from
-  // here — we cannot hear C — and requiring it would make closure impossible
-  // rather than careful. The exposure is bounded: a wrong closure suppresses a
-  // reconnection dispatch, and every consumer that would act on C's DATA keys
-  // on lastKnownAgeSec() instead, which no closure can inflate.
+  // Peer i is IN_COMMS via relay when a directly-connected peer's mask names
+  // it: two hops only, since only first-hand rows expand. The far edge is taken
+  // on the bridge's word; closure never touches last_known_sec.
+  // (notes: team-closure-two-hops)
   for (int i = 0; i < size_; ++i) {
     if (i == self_id_) continue;
     const Peer& p = peers_[static_cast<size_t>(i)];

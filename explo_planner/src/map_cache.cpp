@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/map_cache.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <scovox/uncertainty.hpp>
@@ -14,12 +15,9 @@ namespace explo_planner {
 
 namespace {
 
-// A non-positive (or non-finite) voxel size makes Bonxai's inv_resolution inf
-// or NaN, and every posToCoord then does a float->int32 cast on a non-finite
-// value — undefined behaviour that shows up as garbage coordinates rather than
-// as a crash. CostGrid::build() already refuses a degenerate grid; do the same
-// here instead of building an unusable cache. Config error, so fail at
-// construction with a message naming the value.
+// Rejects a non-positive or non-finite voxel size: Bonxai's posToCoord would
+// cast non-finite values to int32 (UB, garbage coordinates). A config error, so
+// it throws naming the value. (notes: mapcache-resolution-check)
 double checkedResolution(double resolution, const char* where) {
   if (!(resolution > 0.0) || !std::isfinite(resolution)) {
     throw std::invalid_argument(
@@ -46,12 +44,10 @@ bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
 bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                                    const Eigen::Vector3f& roi_min,
                                    const Eigen::Vector3f& roi_max) {
-  // msg.resolution comes off the wire, so validate it here rather than trusting
-  // it into the Grid constructor. `> 0.0f` is already false for NaN and for a
-  // non-positive value (both fall back to the last known-good resolution), but
-  // it is TRUE for +inf — which is the case that reaches Bonxai and makes every
-  // subsequent posToCoord undefined behaviour. See the header for why this
-  // rejects the message instead of throwing like the constructor does.
+  // msg.resolution is untrusted: NaN or non-positive falls back to the last
+  // good resolution; +inf passes the > 0.0f test, so the isfinite check drops
+  // the message (returns false) instead of throwing.
+  // (notes: mapcache-wire-resolution)
   const double res = msg.resolution > 0.0f ? static_cast<double>(msg.resolution)
                                            : resolution_;
   if (!(res > 0.0) || !std::isfinite(res)) return false;
@@ -72,12 +68,9 @@ bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
         y < roi_min.y() || y > roi_max.y() ||
         z < roi_min.z() || z > roi_max.z())
       continue;
-    // Drop non-finite Beta parameters too. p_occ is derived from them, and a
-    // NaN a_occ/a_free silently produced a NaN p_occ that propagated into the
-    // per-voxel scorers and the aggregate metrics (mean_eig / mean_entropy)
-    // for the rest of the run — the ratio test below cannot catch it, since
-    // every comparison against NaN is false and lands on the 0.5f branch only
-    // for the sum, not for the division.
+    // Drop voxels with non-finite Beta parameters: a NaN a_occ/a_free would
+    // poison the per-voxel scorers and the aggregate metrics (mean_eig /
+    // mean_entropy) for the rest of the run. (notes: mapcache-nonfinite-beta)
     if (!std::isfinite(vx.a_occ) || !std::isfinite(vx.a_free) ||
         vx.a_occ < 0.0f || vx.a_free < 0.0f)
       continue;
@@ -309,11 +302,9 @@ double MapCache::unknownColumnFraction(float min_x, float max_x,
   const int64_t total = nx * ny;
   if (total <= 0) return -1.0;
 
-  // One walk over active cells, projecting each to its (x, y) column. The
-  // shift-or pack (x zero-extended into the high 32 bits, y into the low 32)
-  // is bijective for 32-bit coords, so distinct columns never collide. The
-  // shift runs on uint64_t: left-shifting a negative signed value (any column
-  // west of the origin, c.x < 0) is undefined behaviour in C++17.
+  // One walk over active cells, each packed to its (x, y) column: x in the high
+  // 32 bits, y in the low (bijective). Shift on uint64_t: left-shifting a
+  // negative signed coord is UB in C++17. (notes: mapcache-column-pack)
   std::unordered_set<uint64_t> observed;
   grid_->forEachCell([&](const UnifiedVoxel&, const CoordT& c) {
     if (c.x < c_min.x || c.x > c_max.x || c.y < c_min.y || c.y > c_max.y)

@@ -10,6 +10,7 @@
 /// passes, and the damage is only visible months later in an archive.
 ///
 /// So these tests do not test behaviour; they pin the correspondence.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -83,13 +84,9 @@ TEST(MetricsLoggerSchema, ColumnNamesAreUnique) {
     EXPECT_EQ(n, 1) << "duplicate column name: " << name;
 }
 
-/// The ordering check a column-count test cannot do.
-///
-/// Every new field gets a DISTINCT value, so swapping any two of them in the
-/// writer — plan_rej_map for plan_rej_unreach, say — fails here. That specific
-/// swap is the one that matters: it mislabels the cause of a starvation, which
-/// is the entire quantity these columns were added to record, and both columns
-/// are ints so nothing else would ever flag it.
+/// The ordering check a column-count test cannot do: every plan column gets a
+/// distinct value, so swapping any two in the writer (e.g. plan_rej_map and
+/// plan_rej_unreach) fails here. (notes: mlog-test-plan-column-order)
 TEST(MetricsLoggerSchema, EachPlanColumnCarriesItsOwnValue) {
   StepMetrics m;
   m.plan_cand_total    = 178;
@@ -119,13 +116,9 @@ TEST(MetricsLoggerSchema, EachPlanColumnCarriesItsOwnValue) {
   EXPECT_EQ(v["plan_stall_ticks"],   "28");
 }
 
-/// -1 must survive to the file as -1.
-///
-/// These columns are read as "no planning attempt has happened yet". If the
-/// default were ever changed to 0, or clamped anywhere on the way out, a row
-/// from before the first plan would be indistinguishable from a row recording
-/// a genuine zero-rejection tick. That ambiguity is exactly what made
-/// rejected_by_minpos useless for a whole campaign.
+/// -1 must survive to the file as -1: it means no planning attempt yet. A 0
+/// default or an output clamp would make it indistinguishable from a measured
+/// zero-rejection tick. (notes: mlog-test-plan-minus-one)
 TEST(MetricsLoggerSchema, UnattemptedPlanColumnsWriteMinusOneNotZero) {
   StepMetrics m;  // untouched: no planning attempt
   auto [hdr, row] = writeOne(m, "unattempted");
@@ -162,22 +155,10 @@ TEST(MetricsLoggerSchema, LegacyRejectionColumnsAreUnchanged) {
   EXPECT_EQ(v2["rejected_by_unreachable"], "0");
 }
 
-/// The new block sits at the right-hand end, which is the schema rule the
-/// header comment states: readers outside this tree may resolve positionally,
-/// and an old file read against a new schema must stay aligned up to the point
-/// where it simply runs out of columns.
-///
-/// R5 added a block AFTER the plan_* block, so the assertion is now on the
-/// last ten names rather than the last seven, and the plan_* block is pinned
-/// in place by its own position rather than by being last. That is the point:
-/// this test is what makes "appended, never inserted" a checked property
-/// instead of a comment, and updating it is the cost of every append.
-///
-/// v8 appended `plan_rej_visited` — eleven now. That column belongs beside
-/// `plan_rej_blacklist` by meaning and is at the far end instead, which is
-/// exactly the pressure this test exists to resist: the tidy edit shifts eight
-/// columns under every positional reader of every banked run, and nothing else
-/// in the tree would notice.
+/// Columns are appended at the end, never inserted, because readers may
+/// resolve positionally; each append updates this tail list. Do not move a
+/// column (e.g. plan_rej_visited) beside its relatives.
+/// (notes: mlog-test-append-only-tail)
 TEST(MetricsLoggerSchema, NewColumnsAreAppendedAtTheEnd) {
   StepMetrics m;
   auto [hdr, row] = writeOne(m, "append");
@@ -199,12 +180,9 @@ TEST(MetricsLoggerSchema, PursuitColumnsDefaultToNotApplicable) {
   auto [hdr, row] = writeOne(m, "pursuit_default");
   auto v = byName(hdr, row);
 
-  // This line is also the ONLY reachable test of sanitizeField's empty input.
-  // The function is TU-local, so it can only be exercised through the writer,
-  // and F10 deleted an `if (s.empty()) return ""` fast path whose comment
-  // claimed it wrote "-". It never did — the loop returns "" for an empty
-  // string anyway — but the comment was what a reader would have believed.
-  // Asserting "" here is what keeps the deletion a refactor.
+  // Also the only reachable test of sanitizeField on empty input, since that
+  // function is TU-local: an empty pursue_peer must be written as an empty
+  // field. (notes: mlog-test-sanitize-empty)
   EXPECT_EQ(v["pursue_peer"], "")
       << "no chase must write an empty id, not a placeholder that could be "
          "mistaken for a robot name";

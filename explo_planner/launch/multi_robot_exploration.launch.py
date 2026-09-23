@@ -1,3 +1,4 @@
+# Moved comments: doc/explo_planner_code_notes.md
 """Launch one explo_planner_node per robot for an Exp 7 trial.
 
 Thin wrapper around exploration_experiment.launch.py: declares the robot
@@ -41,11 +42,10 @@ def launch_setup(context):
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() \
         in ("true", "1", "yes", "on")
     coordination_enabled = LaunchConfiguration("coordination_enabled").perform(context)
-    # Master switch for the reconnect subsystem. `rendezvous_enabled` is the
-    # deprecated alias and defaults to EMPTY, not "true", so that "the caller
-    # asked for it" is distinguishable from "the caller said nothing" — the
-    # node resolves the same way, and passing both unconditionally would make
-    # the alias win every launch and silently shadow the real argument.
+    # Master switch for the reconnect subsystem. The deprecated alias
+    # rendezvous_enabled defaults to empty so unset is distinguishable from set;
+    # passing both unconditionally would let the alias shadow reconnect_enabled.
+    # (notes: launch-reconnect-alias-empty)
     reconnect_enabled = LaunchConfiguration("reconnect_enabled").perform(context)
     rendezvous_enabled = LaunchConfiguration("rendezvous_enabled").perform(context)
     if rendezvous_enabled.strip():
@@ -53,11 +53,9 @@ def launch_setup(context):
               "'rendezvous_enabled' is deprecated (it is the master switch for "
               "the whole reconnect subsystem, not the rendezvous arm) — use "
               "'reconnect_enabled'.")
-        # The STRIPPED value, matching what was tested one line above. The
-        # truthiness test below is an exact membership check, so carrying the
-        # padding through would read `rendezvous_enabled:=" true "` as false and
-        # turn the subsystem OFF for a caller who asked to turn it on — the one
-        # outcome this alias exists to prevent.
+        # Use the stripped value: the truthiness test below is an exact
+        # membership check, so padding would turn the subsystem off.
+        # (notes: launch-alias-stripped)
         reconnect_enabled = rendezvous_enabled.strip()
     rendezvous_max_wait_sec = LaunchConfiguration("rendezvous_max_wait_sec").perform(context)
     reconnect_mode = LaunchConfiguration("reconnect_mode").perform(context)
@@ -89,12 +87,11 @@ def launch_setup(context):
                     "robot_name": robot,
                     "max_steps": int(max_steps),
                     "output_csv": output_csv,
-                    # dscovox_topic / planning_map_topic intentionally left
-                    # at their defaults so each planner reads its own
-                    # robot's per-robot fused view.
-                    # Multi-robot coordination on. The MinPos branch in the
-                    # planner's doPlan walks claim_matching against peer
-                    # intents on /exploration/intents.
+                    # dscovox_topic and planning_map_topic stay at their
+                    # defaults so each planner reads its own robot's fused view.
+                    # Coordination on: MinPos in doPlan tests peer intents from
+                    # /exploration/intents with claimMatching.
+                    # (notes: launch-own-map-and-minpos)
                     "coordination_enabled":
                         coordination_enabled.lower() in ("true", "1", "yes", "on"),
                     # Reconnect subsystem master switch. False = no mid-run
@@ -107,44 +104,29 @@ def launch_setup(context):
                     # 0 = wait forever (STAY until all connected).
                     "rendezvous_expected_peers": expected_peers,
                     "rendezvous_max_wait_sec": float(rendezvous_max_wait_sec),
-                    # THE ORDERED FLEET. Position in this list IS the robot id
-                    # that the in_range_mask, the knowledge bitmasks and the
-                    # rendezvous proposer rule (robot 0 proposes) all address
-                    # by. It is the same `robots` list this loop iterates, so
-                    # every node in one launch agrees on it by construction.
-                    #
-                    # Added 2026-09-16. Without it fleet identity is
-                    # unconfigured, and the rendezvous scheduler below calls
-                    # requireFleetIdentity and refuses to start — so this launch
-                    # could not actually run the `hybrid` arm it declares as its
-                    # default. Unconfigured remains legal in the node (it is
-                    # what a single-robot launch does); it is just not something
-                    # a multi-robot launch should ever leave to chance.
+                    # List position is the robot id that in_range_mask, the
+                    # knowledge bitmasks and the proposer rule (robot 0
+                    # proposes) address. Required here: without fleet identity
+                    # the rendezvous scheduler refuses to start.
+                    # (notes: launch-ordered-fleet)
                     "team_robot_names": robots,
-                    # Mesh reconnection manoeuvre on a robot-carried radio
-                    # team: rendezvous (drive to the cell and time the whole
-                    # team agreed while still connected), pursuit (chase the
-                    # missing peer's trail on a budget), or hybrid (chase while
-                    # the agreed meeting is not due yet, keep it when it is).
-                    # The pursuit_* budgets come from shared_params.yaml.
+                    # rendezvous: drive to the team-agreed cell and time;
+                    # pursuit: budgeted chase of the missing peer's trail;
+                    # hybrid: chase until the agreed meeting is due, then keep
+                    # it. pursuit_* budgets come from shared_params.yaml.
+                    # (notes: launch-reconnect-modes)
                     "reconnect_mode": reconnect_mode,
-                    # REQUIRED BY rendezvous AND hybrid, and interlocked in the
-                    # node: both arms ARE the agreed meeting, so with the
-                    # scheduler off there is no agreement to make and the cell
-                    # silently runs as a different arm (rendezvous degrades to
-                    # the off arm, hybrid to the pursuit arm). The node treats
-                    # that combination as fatal rather than let it produce a
-                    # healthy-looking run carrying no treatment, so this has to
-                    # be passed here — it defaults to false in the node, where
-                    # false is correct for the arms that do not schedule.
+                    # Required by rendezvous and hybrid, which are the agreed
+                    # meeting; the node treats either with the scheduler off as
+                    # fatal. It defaults to false in the node, so it must be
+                    # passed here. (notes: launch-schedule-interlock)
                     "rendezvous_schedule_enable":
                         reconnect_mode.strip().lower() in ("rendezvous",
                                                            "hybrid"),
-                    # Coordinated proximity stop: yield (cancel the nav goal,
-                    # hold) when a lex-smaller teammate is moving nearby. In
-                    # sim the guard runs off the 1 Hz intent heartbeats; on
-                    # hardware add the peers' localiser topics via
-                    # proximity_peer_pose_topics in the yaml.
+                    # Yield (cancel the nav goal, hold) when a lex-smaller
+                    # teammate is moving nearby. Sim runs off the 1 Hz intent
+                    # heartbeats; on hardware set proximity_peer_pose_topics in
+                    # the yaml. (notes: launch-proximity-stop)
                     "proximity_stop_enabled":
                         proximity_stop_enabled.lower() in ("true", "1", "yes", "on"),
                 },
@@ -171,8 +153,7 @@ def generate_launch_description():
                               description="Start configuration id (for CSV filename)"),
         DeclareLaunchArgument("world", default_value="flatforest",
                               description="World name (for CSV filename)"),
-        # C4: 500. This is the campaign launch path, and 100 was a fifth of
-        # the budget every reported run actually had.
+        # (notes: launch-max-steps-default)
         DeclareLaunchArgument("max_steps", default_value="500",
                               description="Per-robot step budget"),
         DeclareLaunchArgument("coordination_enabled", default_value="true",

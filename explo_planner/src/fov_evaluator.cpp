@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/fov_evaluator.hpp"
 #include "explo_planner/map_cache.hpp"
 #include <scovox/ray_iterator.hpp>
@@ -8,37 +9,10 @@ namespace explo_planner {
 
 namespace {
 
-// Clip the observable segment of one ray — the span from the sensor's minimum
-// range out to max_range — against the XYZ ROI box. Standard slab method:
-// intersect the per-axis entry/exit intervals with [min_range, max_range] and
-// keep what survives.
-//
-// BOTH ends need clipping, and the entry end for two distinct reasons:
-//
-//  1. A candidate within min_range of an ROI face, firing outward, has its ROI
-//     exit BEFORE min_range. Clamping only the far end left `ray_start` at
-//     origin + dir*min_range — outside the box and PAST the clamped far end —
-//     so RayIterator walked backwards through cells map_cache_ never ingests,
-//     scoring each as the Beta(1,1) max-uncertainty prior and inflating info
-//     gain exactly at the ROI boundary. Caught by the (t_exit > t_enter) test.
-//
-//  2. An origin already OUTSIDE the box on some axis, firing back toward it.
-//     In terrain mode this is reachable in the shipped config: a frontier
-//     candidate is snapped to ground + z_clearance searched around the
-//     CENTROID's z, so it can land up to (ground_search_above + z_clearance)
-//     above the ingested band. Every near-horizontal ray from there has
-//     d.z ~ 0, so an exit-only clip skipped the z axis entirely (see 3 below)
-//     and walked the full max_range through un-ingested space at the prior —
-//     the same boundary bias, one axis over. CandidateGenerator now clamps
-//     candidate z into the band as well, so this is belt-and-braces.
-//
-//  3. d[i] == 0 means the ray is parallel to that pair of faces and never
-//     crosses either: the axis contributes no bound, and the ray is entirely
-//     in or entirely out according to the origin alone. Skipping the axis (the
-//     old behaviour) silently treated "entirely out" as "unconstrained".
-//
-// Returns false when nothing observable survives, in which case the ray must be
-// skipped rather than walked.
+// Clip the ray's observable span [min_range, max_range] to the XYZ ROI box
+// (slab method) at both ends. An axis with d == 0 bounds nothing but rejects an
+// origin outside that slab. False means skip the ray.
+// (notes: fov-clip-ray-to-roi)
 bool clipRayToRoi(const Eigen::Vector3f& origin,
                   const Eigen::Vector3f& world_dir,
                   const FovConfig& cfg,
@@ -238,14 +212,9 @@ EvalResult FovEvaluator::evaluateSSMI(
           return true;
         });
 
-    // "No hit" event: the ray passes through every voxel on its span and each
-    // cell receives a free observation. Only valid when the walk actually ran
-    // to c_end. On the occlusion-stop path the iteration was TRUNCATED, so the
-    // residual `reach` is not "passed through cleanly" — it is the unmodelled
-    // mass beyond the occluder, and the cells that would carry it were never
-    // visited. Adding the term there credited a ray that demonstrably hit an
-    // occupied voxel with the full free-observation KL of everything in front
-    // of it, biasing the score toward staring at occluders.
+    // Add the no-hit term only when the walk reached c_end. After an occlusion
+    // stop the residual reach is mass beyond the occluder, and crediting it
+    // would bias scores toward occluders. (notes: fov-ssmi-no-hit-term)
     if (!occluded) result.total_score += reach * free_kl_acc;
   }
   return result;

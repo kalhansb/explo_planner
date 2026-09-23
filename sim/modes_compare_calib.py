@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# Moved comments: docs/sim_notes/modes_compare_calib_notes.md
 """Known-answer calibration for the permutation test in modes_compare.py.
 
 modes_compare's p-value used to be exact by enumeration, and an exact test needs
@@ -53,18 +54,9 @@ def fresh():
 # --------------------------------------------------------------------------
 # 1. the exact path, against arithmetic done by hand
 # --------------------------------------------------------------------------
-# xs=[1,2] ys=[3,4]. Pool [1,2,3,4], nx=2, C(4,2)=6 arrangements, and the
-# |median difference| of each is short enough to write out:
-#
-#   {1,2}|{3,4} -> |1.5-3.5| = 2      {1,3}|{2,4} -> |2.0-3.0| = 1
-#   {1,4}|{2,3} -> |2.5-2.5| = 0      {2,3}|{1,4} -> |2.5-2.5| = 0
-#   {2,4}|{1,3} -> |3.0-2.0| = 1      {3,4}|{1,2} -> |3.5-1.5| = 2
-#
-# diffs = [2,1,0,0,1,2], obs = 2, so p = #{d>=2}/6 = 2/6 = 1/3, and the floor is
-# the same 2/6 because the observed labelling IS the most extreme one. That the
-# two coincide here is not an accident to paper over -- it is the smallest
-# honest illustration of the point the floor column makes: at n=2 v 2 the most
-# significant result the test can produce is p = 0.333.
+# Pool [1,2,3,4], nx=2: the 6 arrangements give diffs [0,0,1,1,2,2] and obs 2,
+# so p = floor = 2/6, because the observed labelling is the most extreme one.
+# (notes: calib-exact-2v2-by-hand)
 print("=== the exact path, hand-computable ===")
 fresh()
 obs, diffs, exact = mc.perm_all([1, 2], [3, 4])
@@ -77,12 +69,9 @@ EXACT_2V2 = mc.perm_p([1, 2], [3, 4])
 check("2v2 exact p is 2/6", abs(EXACT_2V2 - 1 / 3) < 1e-12, f"got {EXACT_2V2}")
 check("2v2 floor is 2/6", abs(mc.perm_floor([1, 2], [3, 4]) - 1 / 3) < 1e-12)
 
-# Unequal groups, the case the floor formula 2/C(2n,n) got wrong and the reason
-# perm_floor enumerates. xs=[1] ys=[2,3,4]: C(4,1)=4 arrangements.
-#   {1}|{2,3,4} -> |1-3| = 2     {2}|{1,3,4} -> |2-3| = 1
-#   {3}|{1,2,4} -> |3-2| = 1     {4}|{1,2,3} -> |4-2| = 2
-# obs = 2, p = 2/4 = 0.5, floor = 2/4 = 0.5. The closed form would have said
-# 2/C(4,2) = 0.333, a floor BELOW the smallest p the test can return.
+# Unequal groups, where 2/C(2n,n) is wrong: xs=[1] ys=[2,3,4] has 4
+# arrangements, diffs [1,1,2,2], obs 2, so p = floor = 0.5, not the closed
+# form's 0.333. (notes: calib-unequal-groups-floor)
 fresh()
 _, d13, _ = mc.perm_all([1], [2, 3, 4])
 check("1v3 arrangement multiset is [1,1,2,2]", sorted(d13) == [1, 1, 2, 2],
@@ -94,16 +83,9 @@ check("1v3 floor is 2/4 (not the equal-groups 2/C(4,2)=0.333)",
 # --------------------------------------------------------------------------
 # 2. the sampled path must reproduce an exactly-known answer
 # --------------------------------------------------------------------------
-# This is the case the whole file is for. Same data as above, but the threshold
-# is dropped so the 6-arrangement problem takes the SAMPLING branch. The exact
-# answer is 1/3 and is known independently; a sampled estimate of it must land
-# on 1/3 within Monte-Carlo error and not, say, on 1/2 because the sampler
-# favours some arrangements.
-#
-# Tolerance: with M draws the estimate's standard error is
-# sqrt(p(1-p)/M) = sqrt((1/3)(2/3)/20000) = 0.0033, so 0.01 is 3 sigma. Tight
-# enough to catch the kind of bias that matters (the LCG case skewed p by far
-# more than that) and loose enough not to go red on a correct sampler.
+# Same data with the threshold dropped so it takes the sampling branch; the
+# sampled p must land on the exact 1/3. Tolerance 0.01 is 3 sigma at M = 20000.
+# (notes: calib-sampled-path-vs-exact)
 print("\n=== the sampled path, against the exact answer ===")
 _old_max, _old_n = mc.PERM_MAX_EXACT, mc.PERM_SAMPLES
 mc.PERM_MAX_EXACT, mc.PERM_SAMPLES = 1, 20_000
@@ -132,16 +114,9 @@ check("sampled distribution matches the exact one at every value",
 # arrangement as extreme as the observed one -- is hard to produce on purpose
 # and easy to inject.
 #
-# The first draft tried to produce it, with ten small values against ten large
-# ones, on the reasoning that the observed labelling is the uniquely most
-# extreme arrangement. It is not, and the case failed with 10 hits in 20000. The
-# statistic is a difference of MEDIANS, so an arrangement attains the maximum
-# whenever the two medians land where they started, and that survives swapping
-# any value that is not near a median: {0..8, 1000} against {9, 1001..1009}
-# has medians 4.5 and 1004.5, exactly like the observed split. Ties in a
-# median-based null are the rule, not the exception -- which is worth knowing on
-# its own, since it is the same fact that makes perm_floor's enumerated answer
-# larger than the naive 2/C(2n,n).
+# A median-difference null is full of ties: any swap that leaves both medians in
+# place still reaches the observed maximum. The same fact makes perm_floor
+# exceed 2/C(2n,n). (notes: calib-median-null-ties)
 print("\n=== the +1 correction ===")
 LO, HI = list(range(10)), list(range(1000, 1010))
 fresh()
@@ -156,12 +131,9 @@ check("p on the sampled path is (1+hits)/(1+M), not hits/M",
 check("the correction is not a rounding difference",
       abs(raw / len(diffs) - (1 + raw) / (1 + len(diffs))) > 1e-9)
 
-# And the raw==0 case itself, by injecting the distribution rather than hoping
-# for it. perm_p is handed a null in which nothing reaches the observed value;
-# the exact branch must answer 0/M = 0 (correct -- an exhaustive enumeration
-# that finds nothing that extreme has genuinely found nothing) and the sampled
-# branch must answer 1/(M+1) rather than 0, because a sample that missed it has
-# not established the same thing.
+# Zero-hit null, injected: the exact branch must return 0, since an exhaustive
+# search found nothing, and the sampled branch 1/(M+1), since a sample that
+# missed proves less. (notes: calib-zero-hit-injection)
 _real_perm_all = mc.perm_all
 mc.perm_all = lambda xs, ys: (1.0, [0.0] * 20_000, False)
 check("a sampled null with zero hits gives 1/(M+1), not 0",
@@ -188,14 +160,9 @@ fresh()
 # --------------------------------------------------------------------------
 # 4. the sampler itself, and mutations that must be caught
 # --------------------------------------------------------------------------
-# Checked at the level of WHICH SUBSET lands in the left group, because that is
-# what a relabelling is; the diff distribution in section 2 is a projection of
-# it and a coarse one (six subsets collapse onto three values), so it is the
-# weaker instrument. Every subset must appear with frequency 1/C(n,nx).
-#
-# This section tests mc.perm_split -- the function perm_all actually draws from
-# -- rather than a copy of its loop. A calibration that reimplements its subject
-# measures the difference between two pieces of code.
+# Uniformity is checked per subset dealt to the left group, each at 1/C(n,nx), a
+# finer test than the diff distribution. It calls mc.perm_split itself, not a
+# copy of its loop. (notes: calib-subset-uniformity)
 print("\n=== the sampler deals uniform subsets ===")
 N_UNIF = 200_000
 EXP = 1 / math.comb(4, 2)
@@ -218,16 +185,9 @@ check("every subset appears at frequency 1/6",
       all(abs(v - EXP) < TOL for v in good.values()),
       f"maxdev {max(abs(v - EXP) for v in good.values()):.4f}")
 
-# MUTATION 1 -- the textbook off-by-one Fisher-Yates. `randint(0, n-1)` where
-# `randint(0, i)` belongs: a bug people really write, not obviously wrong by
-# inspection, and biased by a factor small enough that the coarse diff-level
-# check of section 2 cannot see it (measured deviation 0.011 against a 0.01
-# tolerance -- a coin toss). At subset level it is unmissable.
-#
-# This mutation is also why perm_split copies the pool per draw. Against the
-# in-place version this same generator deviates by 0.0016, i.e. not at all: the
-# composition of many biased shuffles is a random walk and random walks
-# converge to uniform. The check below would have printed PASS forever.
+# Mutation 1, off-by-one Fisher-Yates (j drawn from 0..n-1, not 0..i). The
+# subset check must catch it; the diff-level check cannot. It shows only because
+# perm_split copies the pool per draw. (notes: calib-mutation-off-by-one)
 print("\n=== the check can fail: off-by-one Fisher-Yates ===")
 
 
@@ -244,12 +204,10 @@ check("the off-by-one shuffle is caught by the subset check",
       any(abs(v - EXP) >= TOL for v in bad.values()),
       f"maxdev {max(abs(v - EXP) for v in bad.values()):.4f}")
 
-# MUTATION 2 -- draw nx values independently instead of permuting. A repeated
-# draw puts one value in the left group twice, so the null is assembled from
-# arrangements that are not relabellings of the data at all. Different failure
-# mode from mutation 1 (wrong support, not merely wrong weights), included
-# because a check that only ever catches one shape of bug is only known to
-# catch that shape.
+# Mutation 2, drawing nx values independently: the null is built from
+# non-relabellings. A wrong-support bug, unlike mutation 1's wrong weights, so
+# the check is shown to catch both shapes.
+# (notes: calib-mutation-with-replacement)
 print("\n=== the check can fail: sampling with replacement ===")
 
 

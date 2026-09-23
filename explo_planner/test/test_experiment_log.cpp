@@ -1,28 +1,9 @@
 // Contract tests for the `home_watchdog` event row.
 //
-// These exist because of a generation-7 defect that no test could have caught,
-// since no test covered this writer at all: the fire rows recorded `metric_m`
-// (an INSTANTANEOUS remaining distance) while the quantity the detector
-// actually compared — the movement over the window — was recorded nowhere, and
-// the field comment described metric_m as movement "over window_sec".
-//
-// The banked evidence, re-measured rather than recalled: 7 non-escape-end
-// home_watchdog rows exist across the g6pilot cells (6 in hybrid_seed103's
-// bestla, 1 in off_seed102's atlas), all of kind `approach`; no frozen fire was
-// ever banked. In 4 of the 7 metric_m and dist_home_m disagree (8.06 vs 4.00,
-// and so on), which is the only reason the conflation was visible at all. The
-// tested delta itself appears in NEITHER the jsonl NOR the plaintext of any
-// banked cell — grep finds zero lines carrying it — so any statement about how
-// far it sat from metric_m is a RECONSTRUCTION from the CSV pose track, not a
-// reading. That unrecoverability is the finding: on the documented contract a
-// scorer would have called every fire spurious, and had no logged quantity to
-// check that against.
-//
-// That classification is load-bearing: these rows are the only basis for
-// deciding whether a `home-gave-up` park is a genuine stall or a detector
-// artefact, and that decision feeds censoring in the mission-completion
-// analysis. So the fired inequality is asserted here, at the byte level of the
-// emitted JSONL, rather than trusted.
+// These rows are the only basis for telling a genuine home-gave-up stall from a
+// detector artefact, which feeds censoring, so the fired inequality is asserted
+// on the emitted JSONL bytes. (notes: watchdog-tests-header-history)
+// Moved comments: doc/test_experiment_log_notes.md
 
 #include <gtest/gtest.h>
 
@@ -43,13 +24,9 @@ using namespace explo_planner;
 
 namespace {
 
-/// Writes to a per-test, per-process path under /tmp and removes it on
-/// destruction. Not a fixture member so each test names its own file — a
-/// shared path across tests would let one test's truncation race another's.
-/// The pid is in the name for the same reason one level up: `colcon test`
-/// runs test executables in parallel, and two concurrent runs of this binary
-/// sharing /tmp/explo_test_frozen.jsonl would interleave their writes and
-/// fail intermittently, which is the worst way for a contract test to fail.
+/// A per-test, per-process path under /tmp, removed on destruction: colcon test
+/// runs test binaries in parallel, and a shared path would let concurrent
+/// writes interleave. (notes: explog-temp-log-path)
 struct TempLogPath {
   explicit TempLogPath(const char* stem)
       : path(std::string("/tmp/explo_test_") + stem + "_" +
@@ -58,12 +35,9 @@ struct TempLogPath {
   std::string path;
 };
 
-/// Reads one `"name":<number>` field back out of a JSONL row.
-///
-/// Exists so the inequality assertions below are made against what the WRITER
-/// emitted, not against the literals the test passed in. Asserting
-/// `EXPECT_LT(-0.03, 1.0)` on two constants is a tautology that holds for
-/// every possible writer, including one that emits nothing at all.
+/// Reads one numeric field back out of a JSONL row, so assertions are made
+/// against what the writer emitted, not the test's own literals.
+/// (notes: explog-readnum)
 bool readNum(const std::string& row, const char* name, double* out) {
   const std::string key = std::string("\"") + name + "\":";
   const size_t at = row.find(key);
@@ -71,12 +45,9 @@ bool readNum(const std::string& row, const char* name, double* out) {
   return std::sscanf(row.c_str() + at + key.size(), "%lf", out) == 1;
 }
 
-/// Emits one home_watchdog row and returns it verbatim.
-///
-/// Deliberately returns the RAW LINE rather than a parsed structure: the defect
-/// being guarded against is a field that is present-but-wrong or absent, and
-/// both of those survive a lenient parser. Substring assertions on the emitted
-/// bytes are what the analysis scripts actually see.
+/// Emits one home_watchdog row and returns it as the raw line: an absent or
+/// present-but-wrong field survives a lenient parser, so assertions are on the
+/// bytes. (notes: explog-emit-watchdog-row)
 std::string emitWatchdogRow(const std::string& path, const char* kind,
                             double dist_home_m, double metric_m,
                             double window_sec, double test_delta_m,
@@ -125,12 +96,9 @@ TEST(ExperimentLogHomeWatchdog, FrozenFireCarriesTheTestedInequality) {
   EXPECT_NE(row.find("\"metric_m\":18.400000"), std::string::npos) << row;
 }
 
-// The sign case. metric_m 3.69 is a real banked row (g6pilot_hybrid_seed103,
-// bestla); the -0.03 beside it is reconstructed from that run's pose track, not
-// logged — the point being that a receding robot and an advancing one produced
-// indistinguishable rows. The field must therefore be able to disagree with
-// metric_m in DIRECTION, not just in magnitude. If a future change routes this
-// through a magnitude or clamps at zero, this fails.
+// The sign case: test_delta_m must keep its sign and can disagree with metric_m
+// in direction, not just magnitude. Routing it through a magnitude or clamping
+// at zero fails this. (notes: watchdog-negative-delta)
 TEST(ExperimentLogHomeWatchdog, ApproachFirePreservesNegativeDelta) {
   TempLogPath tmp("approach");
   const std::string row = emitWatchdogRow(tmp.path, "approach",
@@ -168,28 +136,10 @@ TEST(ExperimentLogHomeWatchdog, EscapeEndOmitsTheTestFieldsEntirely) {
   EXPECT_EQ(row.find("test_threshold_m"), std::string::npos) << row;
 }
 
-// The abort-an-escape fire. This kind exists because a frozen detector firing
-// DURING an escape leg used to be recorded only by the escape-end row that
-// followed it, and escape-end is the writer's omit-case — so the one fire on
-// that path was written down carrying no inequality at all.
-//
-// SCOPE, because two of the assertions below are weaker than they look.
-// emitWatchdogRow() calls logHomeWatchdog() with the test's own literals, so
-// this file can only pin the WRITER's round-trip: given this kind and this
-// window, does the row come out carrying them, and does the omit-case leave
-// the inequality alone. It cannot see what homeWatchdogFire actually passes.
-//
-// So the `window_sec` and the not-`escape-frozen` assertions would keep
-// passing if the production call site regressed to the leg duration or to the
-// aliased token. That is the whole failure they are named after, and it is
-// covered at scoring time — by gate_g8.py, over the emitted cells — not here.
-// Do not read a green run of this file as proof the call site is right.
-//
-// Why the name matters at all: `escape-frozen` is the `response` on the
-// escape-end row this abort emits immediately afterwards, so if the kind ever
-// becomes that same token, one abort puts the string in two columns of two
-// consecutive rows and a reader grepping the token rather than the column
-// counts one abort as two.
+// A frozen fire during an escape leg is its own kind and carries the
+// inequality. Pins the writer's round-trip only, not what homeWatchdogFire
+// passes. The kind must differ from escape-frozen, the escape-end response.
+// (notes: watchdog-frozen-in-escape)
 TEST(ExperimentLogHomeWatchdog, FrozenInEscapeIsAFireAndDoesNotAliasEscapeEnd) {
   TempLogPath tmp("frozen_in_escape");
   const std::string row = emitWatchdogRow(tmp.path, "frozen-in-escape",
@@ -213,10 +163,8 @@ TEST(ExperimentLogHomeWatchdog, FrozenInEscapeIsAFireAndDoesNotAliasEscapeEnd) {
       << "kind aliases the escape-end response token: " << row;
 }
 
-// Guards the writer against a silent regression to the generation-7 default
-// arguments, where a caller that passed nothing still produced a row that
-// LOOKED complete (0.0 / 0.0) and read as a frozen fire at a zero threshold —
-// an inequality that is false for every possible delta.
+// A call that omits the test arguments still writes both test fields, at their
+// 0.0 defaults. (notes: watchdog-defaulted-call)
 TEST(ExperimentLogHomeWatchdog, DefaultedCallStillEmitsBothFields) {
   TempLogPath tmp("defaulted");
   std::string row;
@@ -244,15 +192,9 @@ TEST(ExperimentLogHomeWatchdog, DefaultedCallStillEmitsBothFields) {
 }
 
 // --- cell_census (schema v4) ---
-//
-// P1's gate is read off this row and nothing else: it asks whether the coarse
-// census converges to COVERED as the ROI's continuous unknown fraction falls.
-// Both numbers therefore have to be ON THE SAME ROW — the sim is nondetermin-
-// istic enough run-to-run that joining `cell_census` to `coverage_milestone`
-// on a timestamp would be comparing two ticks and reporting the difference as
-// a disagreement between the measures. If a future edit moves either number
-// off this event, the gate silently degrades into that join, so the pairing is
-// asserted at the byte level rather than assumed.
+// P1's gate reads covered_fraction and roi_unknown_fraction off this one row.
+// Keep both on it: joining cell_census to coverage_milestone by timestamp
+// compares two different ticks. (notes: census-coverage-pairing)
 TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
   TempLogPath tmp("census");
   std::string row;
@@ -326,13 +268,10 @@ TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
   ASSERT_TRUE(readNum(row, "grid_hash", &v)) << row;
   EXPECT_DOUBLE_EQ(v, 3735928559.0);
 
-  // Reachability of the COVERED threshold. Without these, a census reporting
-  // zero COVERED cells is indistinguishable from a census that is broken, and
-  // P1's first run produced exactly that row: an entire run to the completion
-  // criterion with not one promotion and nothing to say why. They are checked
-  // by VALUE, not just presence — a distribution wired to the wrong cells (the
-  // whole grid rather than the measured ones) still writes all five fields,
-  // and reads as a world where nothing is mappable.
+  // Reachability of the COVERED threshold, checked by value: without these a
+  // census with zero COVERED cells looks broken, and a distribution over the
+  // wrong cells still writes all five fields.
+  // (notes: census-covered-reachability)
   ASSERT_TRUE(readNum(row, "cells_measured", &v)) << row;
   EXPECT_DOUBLE_EQ(v, 7.0);
   ASSERT_TRUE(readNum(row, "cells_frontier_ok", &v)) << row;
@@ -344,11 +283,10 @@ TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
   ASSERT_TRUE(readNum(row, "cell_unknown_median", &v)) << row;
   EXPECT_NEAR(v, 0.42, 1e-6);
 
-  // The frontier veto's own distribution. `_at_best_unknown` is the joint
-  // reading and the only one that can answer whether the two thresholds are
-  // simultaneously satisfiable, so it is pinned to a value DISTINCT from both
-  // marginals — wiring it to either of them would otherwise pass this test
-  // while silently answering a different question.
+  // The frontier veto's distribution. cell_frontier_frac_at_best_unknown is the
+  // joint reading, so it is pinned to a value distinct from both marginals;
+  // wired to either, it would still pass.
+  // (notes: census-frontier-joint-reading)
   ASSERT_TRUE(readNum(row, "cell_frontier_frac_min", &v)) << row;
   EXPECT_NEAR(v, 0.01, 1e-6);
   ASSERT_TRUE(readNum(row, "cell_frontier_frac_median", &v)) << row;
@@ -358,16 +296,9 @@ TEST(ExperimentLogCellCensus, CarriesBothCoverageMeasuresOnOneRow) {
 }
 
 // --- appointment_leg (schema v11) ---
-//
-// Two of this row's columns belong to one kind each — `leg_sec` to escape-end,
-// `rolled_to_sec` to unreached — and the writer carries both on every row at
-// -1.0 rather than omitting them off their own kind. That choice is what the
-// reader depends on, and it is invisible in the data if it breaks: an omitted
-// key and a sentinel one look identical to any `.get(k, -1)` reader, so the
-// give-up that HAD no appointment left to roll and the one whose roll was never
-// written would fold into the same count. Asserted at the byte level, on the
-// kind that owns NEITHER column, because that is the row where a writer that
-// omitted them would still look right on both of the others.
+// leg_sec (escape-end only) and rolled_to_sec (unreached only) are written on
+// every row, -1.0 when not applicable, never omitted. Asserted on a kind that
+// owns neither column. (notes: apptleg-conditional-columns)
 TEST(ExperimentLogAppointmentLeg, CarriesBothConditionalColumnsOnEveryKind) {
   TempLogPath tmp("appointment_leg");
   std::string row;
@@ -416,19 +347,9 @@ TEST(ExperimentLogAppointmentLeg, CarriesBothConditionalColumnsOnEveryKind) {
 }
 
 // --- The declared event vocabulary (schema v4) ---
-//
-// kEventKinds is what sim/equiv_gate.py scores "did a new event kind appear at
-// defaults?" against, and a declared universe that has drifted from the writer
-// answers that question wrongly in the silent direction: a kind missing from
-// the list reads as "new" on every run that emits it (noise, which gets the
-// gate loosened), and — worse — the gate's notion of which kinds are opt-in
-// comes from the list's tail, so an unlisted v4 kind is scored as legacy and
-// its appearance at defaults never fails anything.
-//
-// Nothing in C++ can enumerate the writer's calls, so the test reads the
-// writer's SOURCE, exactly as test_failed_goal_blacklist reads the shipped
-// YAML rather than a copy of its values. The path comes from CMake, so this
-// cannot silently pass by scanning a stale installed tree.
+// kEventKinds must match the kinds the writer emits: sim/equiv_gate.py scores
+// new kinds against it and reads opt-in kinds from its tail. The test scans the
+// writer's source, at a path CMake sets. (notes: schema-declared-event-kinds)
 TEST(ExperimentLogSchema, DeclaredKindsMatchTheWriter) {
   std::ifstream src(EXPERIMENT_LOG_CPP);
   ASSERT_TRUE(src.good()) << "cannot read " << EXPERIMENT_LOG_CPP;

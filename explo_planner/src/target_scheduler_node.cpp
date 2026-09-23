@@ -39,6 +39,7 @@
 ///   target_radius        (double[])      trunk radius (m); <=0 => default standoff
 ///   target_height        (double[])      optional trunk extent (m); 0 if omitted
 ///   target_release_sec   (double[])      release time relative to start (s)
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <algorithm>
 #include <chrono>
@@ -109,11 +110,9 @@ public:
     auto qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable().transient_local();
     pub_ = create_publisher<explo_planner_msgs::msg::TreeTarget>(topic_, qos);
 
-    // NB: start_time_ is latched on the first tick where the clock is valid,
-    // NOT here. Under use_sim_time the clock reads 0 in the constructor (no
-    // /clock yet); anchoring the schedule to 0 would make the first tick see a
-    // huge elapsed once /clock jumps to the bag's start stamp and release every
-    // target at once. See tick().
+    // start_time_ is latched in tick() on the first valid-clock tick, not here:
+    // under use_sim_time the clock reads 0 before /clock arrives, which would
+    // release every target at once. (notes: target-sched-start-latch)
     timer_ = rclcpp::create_timer(
         this, get_clock(), std::chrono::milliseconds(500),
         [this] { tick(); });

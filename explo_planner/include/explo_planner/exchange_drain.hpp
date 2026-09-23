@@ -19,6 +19,7 @@
 /// test-plan 7 and 8's behavioural halves could not be written as tests at all
 /// (§10). The extraction is verbatim: same order of tests, same arithmetic,
 /// same state transitions, and the node's log lines are unchanged.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 #include <vector>
@@ -27,20 +28,10 @@
 
 namespace explo_planner {
 
-/// A TUMBLING WINDOW, ON THE SETTLE'S CLOCK. `start_sec` is the start of the
-/// window currently being measured, as an offset into the settle (one hold,
-/// one epoch, nothing extra to keep in step); -1 while no window is open.
-/// `base` is the fusion-counter vector as it read when the window opened; the
-/// rate is the difference over the window divided by its length, which is why
-/// a window is closed and re-opened rather than slid — a ring buffer would buy
-/// sub-W granularity on a decision whose whole point is that it is taken at
-/// the end of a quiet interval.
-///
-/// IT IS ALSO THE HARD FLOOR. No window has elapsed before W seconds, so no
-/// drain release can happen before then, without a second mechanism saying so.
-///
-/// Reset to a default-constructed DrainWindow wherever the hold is cleared, so
-/// the next visit starts with no window open.
+/// Tumbling window on the settle's clock: start_sec is the open window's start,
+/// seconds into the settle, -1 if none; base is the counters at open. No
+/// release before W. Reset to default wherever the hold clears.
+/// (notes: drain-tumbling-window)
 struct DrainWindow {
   double                start_sec = -1.0;
   std::vector<uint64_t> base;

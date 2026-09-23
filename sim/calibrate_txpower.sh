@@ -2,14 +2,10 @@
 # Phase-2 severity calibration (plan §4): sweep tx_power_dbm over REPLAYED poses
 # and report the three acceptance numbers for each value.
 #
-# Offline and cheap by construction. The emulator's fading is a pure function of
-# (seed, tick) and its link model reads only poses + the world SDF, so the whole
-# sweep runs against a recorded bag with no Gazebo, no planners and no mapping —
-# minutes per point instead of the ~an hour a live run costs. What it CANNOT do
-# is anticipate behaviour: once comms actually degrade, trajectories change and
-# the replayed duty cycle stops being the realised one. That is why §4 calls this
-# "aiming" and why the analysis re-measures realised severity per run and reports
-# it without ever conditioning on it.
+# Offline: fading is a pure function of (seed, tick) and the link model reads
+# only poses and the world SDF, so a bag replaces Gazebo and planners. The
+# replayed duty only aims; behaviour changes the realised one.
+# (notes: calib-offline-replay)
 #
 # Acceptance, all three from one tx_power_dbm value (§4):
 #   * duty cycle 55-70 % disconnected
@@ -23,6 +19,7 @@
 #
 # Each DIR is a run OUTDIR containing rosbag2/ (RECORD=1 or 2) — i.e. the phase-1
 # control runs. Exhaustion time per bag is read from that run's planner CSVs.
+# Moved comments: docs/sim_notes/calibrate_txpower_notes.md
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS="$(cd "$HERE/../../.." && pwd)"
@@ -79,16 +76,9 @@ sweep_point() {
   local logger_pid=$!
   sleep 6
 
-  # Play ONLY the clock and the poses. This is not an optimisation, it is
-  # correctness: the bag also contains /hmr_comms_sim/link_states recorded
-  # during the control run, and replaying that publishes the ORIGINAL run's
-  # link rows onto the same topic the logger is subscribed to. The trace then
-  # interleaves rows computed at the control's tx_power_dbm with rows computed
-  # at the swept one, and since the control was deliberately run at a power
-  # where the link never drops, every sweep point reads far more connected than
-  # it is. Caught by the implied tx: a row's snr_db + path_loss_db - 101 gives
-  # the transmit power it was computed at, and the first row of every trace
-  # read 160.0 instead of the swept value.
+  # Play only /clock and the ground-truth poses: the bag also holds the control
+  # run's link_states, and replaying them would mix rows at the control's tx
+  # power into the swept trace. (notes: calib-play-only-clock-and-poses)
   #
   # --clock is deliberately NOT passed: the bag carries the live run's /clock
   # and letting `bag play` synthesise a second one would race it.

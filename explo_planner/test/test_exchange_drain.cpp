@@ -67,6 +67,7 @@
 ///        -> AllPeersLeaving.NoPeersIsNotEveryPeerLeaving
 ///   M58  leaving counted at DONE only, not HOMING
 ///        -> AllPeersLeaving.EveryPeerHomingOrDoneEndsTheHoldAtN3
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -199,11 +200,9 @@ const char* name(DrainStep s) {
   return "?";
 }
 
-/// The rate the predicate saw at `at`, per the test's own schedule: the
-/// difference over the window that closed there. Used to assert the
-/// precondition test-plan 8 states for both of its cases — a rate of zero at
-/// the moment of decision — so a schedule edit cannot quietly turn 8(a) into
-/// a test of something the rate alone already decides.
+/// The per-peer rate over the kWindowSec window closing at the given second,
+/// from the test's own schedule. Used to assert both blackout cases see a zero
+/// rate at the decision. (notes: drain-rate-at-decision)
 double rateAtDecision(const Counters& counters, int peer, int at) {
   const int from = at - static_cast<int>(kWindowSec);
   const auto k = static_cast<size_t>(peer);
@@ -216,26 +215,9 @@ double rateAtDecision(const Counters& counters, int peer, int at) {
 // TEST-PLAN 7 — EXCHANGE PRESENCE.
 // ===========================================================================
 
-/// A FINISHED PEER WITH NO FRESH CONTACT IS NOT WAITED FOR (the A3 regression).
-///
-/// `finished` is sticky and relayed — it says the peer's run is over, not that
-/// the peer is here. §4.1 of the design splits the two questions A3 conflated:
-/// the barrier asks "should I stop waiting?" and is right to count a finished
-/// peer; the exchange asks "is someone here to trade maps with?", which is a
-/// radio statement, and a robot that finished and drove off is not an answer
-/// to it.
-///
-/// cerd announces it is finished and done at t = 0 — it has been to its
-/// meeting and turned for home — and is never heard again; bestla is here,
-/// talks for five seconds, and goes flat. The exchange that is actually
-/// happening is over by the second window. If cerd is counted, it is mute
-/// against its own baseline for the whole hold, and the robot stands on the
-/// cell to the cap waiting for a map that is not coming.
-///
-/// DONE, since §10 item 5 was decided: a finished robot below HOMING is one
-/// still on its way here, and the barrier holds for it before this hold
-/// opens (test_meeting_attendance.cpp). The case this test is for is the one
-/// that left.
+/// finished is sticky and relayed: it says the peer's run is over, not that it
+/// is here. The exchange waits only for peers present by radio, so a finished
+/// peer that left is not waited for. (notes: drain-finished-absent-peer)
 TEST(ExchangePresence, AFinishedPeerThatIsNotHereIsNotWaitedFor) {
   TeamModel m = model(fleet3());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -272,15 +254,10 @@ TEST(ExchangePresence, AFinishedPeerThatIsNotHereIsNotWaitedFor) {
       << "cerd became reachable during the hold, so this was not the case";
 }
 
-/// THE PAIR TO THE TEST ABOVE: A FINISHED PEER THAT IS HERE IS WAITED FOR.
-///
-/// The filter is on presence, and presence only. The over-correction of A3 —
-/// skip finished peers — is wrong in the case generation 32 made the common
-/// one: keepAppointmentOnFinish sends a robot that has finished exploring to
-/// its standing appointment, so the partner on the cell is often finished and
-/// has its whole map still to hand over. Here cerd is finished, direct, and
-/// has delivered nothing since the hold began: the robot must hold for it to
-/// the cap and leave on the unfinished outcome, not release.
+/// The filter is on presence only: a finished peer that is direct is still
+/// waited for, as it may have its whole map to hand over. Here it delivers
+/// nothing, so the hold runs to the cap, unfinished.
+/// (notes: drain-finished-present-peer)
 TEST(ExchangePresence, AFinishedPeerThatIsHereIsWaitedFor) {
   TeamModel m = model(fleet3());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -306,18 +283,9 @@ TEST(ExchangePresence, AFinishedPeerThatIsHereIsWaitedFor) {
   EXPECT_EQ(h.reading.mute, 1) << "cerd, which never left its baseline";
 }
 
-/// A RELAYED PEER IS WAITED FOR.
-///
-/// cerd cannot hear atlas at all, but bestla can hear both and says so, so the
-/// model carries cerd as in comms by relay. The emulator forwards serialized
-/// bytes without deserializing them and dscovox credits the robot that SENSED
-/// the voxels, so cerd's counter moves on atlas's side even though nothing
-/// from cerd ever arrives first-hand — gen 32 measured relayed rows as the
-/// most productive exchange channel per row (§2.8). A direct-only filter lets
-/// that stream keep arriving while it calls the exchange finished.
-///
-/// bestla is quiet after its first two seconds; cerd keeps delivering at
-/// 2 vox/s — twice R — until s = 40. The release belongs to cerd going flat.
+/// A peer in comms only by relay is waited for: relayed data is credited to the
+/// robot that sensed it, so its counter moves here. cerd delivers until s = 40,
+/// so the release belongs to it going flat. (notes: drain-relayed-peer)
 TEST(ExchangePresence, ARelayedPeerIsWaitedFor) {
   TeamModel m = model(fleet3());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -344,21 +312,9 @@ TEST(ExchangePresence, ARelayedPeerIsWaitedFor) {
   EXPECT_EQ(h.reading.examined, 2) << "bestla direct and cerd by relay";
 }
 
-/// NOBODY READ IS NOT EVERYBODY DRAINED.
-///
-/// Every `continue` in the loop is a peer the robot could not read, and with
-/// all of them taken a loop seeded `true` would release having examined no
-/// one — at the first full window, on nothing. Here the only peer finished
-/// at t = 0, has not said it is leaving, and has not been heard since: the
-/// robot must not call that a drained exchange. It holds to the cap and
-/// leaves UNFINISHED.
-///
-/// HOW A ROBOT GETS HERE, since §10 item 5 was decided (DESIGN_gen33.md). A
-/// finished partner below HOMING is one still on its way to the meeting, and
-/// the barrier holds for it (holdingForFinishedPeer) — so this hold opens only
-/// once that wait has run out its cap with the partner neither arrived nor
-/// leaving. A no-show, and UNFINISHED is the honest outcome for it. Had the
-/// partner said it was leaving, the next test applies instead.
+/// A hold that examined no one must not release. The only peer finished, has
+/// not said it is leaving, and is not heard: the hold runs to the cap and ends
+/// UNFINISHED, the honest outcome for a no-show. (notes: drain-nobody-read)
 TEST(ExchangePresence, NobodyReadIsNotEverybodyDrained) {
   TeamModel m = model(fleet2());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -482,11 +438,10 @@ TEST(AllPeersLeaving, ALeavingPeerThatIsStillHereIsReadOnItsCounter) {
   EXPECT_EQ(h.reading.examined, 1);
 }
 
-/// AND WHEN ITS COUNTER CANNOT BE READ. The drain loop does not run on
-/// unmeasurable counters, so `examined` is 0 with bestla standing on the cell;
-/// "nobody here" must be the model's answer, not that zero. Unmeasured holds
-/// to the cap, as DrainUnmeasured says — being told "leaving" by a peer that
-/// is here does not change that.
+/// With unmeasurable counters examined is 0 even with the peer on the cell, so
+/// presence must come from the model, not that zero. A leaving peer that is
+/// here does not end an unmeasured hold before the cap.
+/// (notes: drain-leaving-peer-unmeasured)
 TEST(AllPeersLeaving, ALeavingPeerThatIsHereIsNotSkippedWhenUnmeasured) {
   TeamModel m = model(fleet2());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -557,15 +512,10 @@ TEST(BlackoutIsNotADrain, ACounterThatNeverMovedRunsToTheCapUnfinished) {
   EXPECT_EQ(rateAtDecision(counters, kBestla, h.at_sec), 0.0);
 }
 
-/// (b) THE COUNTER ROSE, THEN WENT FLAT FOR W. bestla delivers 40 vox/s until
-/// s = 15 and nothing after. The window 0-10 is busy, 10-20 still carries the
-/// tail of it, and 20-30 is the first quiet one: the predicate must release
-/// there, and as kDrained.
-///
-/// Also the rolling window. Each evaluation that does not drain must re-open
-/// the window where it closed, so the next rate is over the next W seconds
-/// and nothing older. A window left open from s = 0 dilutes the burst into an
-/// ever-longer denominator and never gets below R before the cap.
+/// bestla delivers 40 vox/s until s = 15; 20-30 is the first quiet window, so
+/// the release is there, as kDrained. Each non-draining evaluation re-opens the
+/// window where it closed, or the burst never drops below R.
+/// (notes: drain-rose-then-flat)
 TEST(BlackoutIsNotADrain, ACounterThatRoseThenWentFlatReleasesDrained) {
   TeamModel m = model(fleet2());
   const Deliver deliver = [](TeamModel& tm, double t) {
@@ -598,13 +548,10 @@ TEST(BlackoutIsNotADrain, ACounterThatRoseThenWentFlatReleasesDrained) {
 // UNMEASURED
 // ===========================================================================
 
-/// NO COUNTERS IS NEVER DRAINED.
-///
-/// dscovox publishes the counters only once it is up, and the node's vectors
-/// are empty until then, so a meeting that began earlier has nothing to
-/// difference. That reading is unmeasured, and it must hold to the cap and
-/// leave unfinished rather than release on the absence of evidence. The node
-/// warns on `evaluated && !measurable`, so the reading has to say so too.
+/// Empty counter vectors (dscovox not yet up) are unmeasured: the hold runs to
+/// the cap and ends unfinished, never drained. The reading must say so, since
+/// the node warns on an evaluated, unmeasurable reading.
+/// (notes: drain-unmeasured-never-drained)
 TEST(DrainUnmeasured, NoCountersIsNeverDrained) {
   TeamModel m = model(fleet2());
   const Deliver deliver = [](TeamModel& tm, double t) {

@@ -1,5 +1,6 @@
 /// @file plan_map_query.cpp
 /// @brief Definitions for the 2D planning_map cell queries (see header).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include "explo_planner/plan_map_query.hpp"
 
@@ -13,15 +14,10 @@ int8_t planMapCellAt(const nav_msgs::msg::OccupancyGrid& m,
                      const Eigen::Vector3f& pos) {
   if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
     return kCellNoData;
-  // info.width/info.height bound the INDEX computed below, but they are only a
-  // claim about the buffer -- nothing in nav_msgs makes data.size() agree with
-  // them. A publisher that fills in the metadata and then sends a short (or
-  // empty) data vector produces a grid that passes every bounds test here and
-  // still reads off the end: a 1140x1140 map carrying 1140 bytes segfaulted the
-  // planner under AddressSanitizer. Treat the disagreement as "this grid has no
-  // data" rather than trusting the header, which is exactly the test
-  // CostGrid::build() already applies to the same message (cost_grid.cpp), so
-  // the two agree on what a malformed planning_map is. (2026-09-18)
+  // nav_msgs does not make data.size() match width*height; a short buffer would
+  // read off the end. A mismatch returns kCellNoData, the same test
+  // CostGrid::build() applies, so both agree on a malformed map.
+  // (notes: planmap-data-size-check)
   if (m.data.size() !=
       static_cast<size_t>(m.info.width) * static_cast<size_t>(m.info.height))
     return kCellNoData;
@@ -52,14 +48,9 @@ double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
                             const Roi2D& roi) {
   if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
     return -1.0;
-  // Same buffer-vs-metadata mismatch planMapCellAt() screens above, and it
-  // matters more here: the loop below indexes every cell of the clipped ROI, so
-  // a short data vector walks off the end for the whole rectangle rather than at
-  // one cell. -1.0 is already this function's "cannot be measured" answer (the
-  // node's coverage-termination check treats it as "no reading this tick"), so
-  // a malformed grid degrades to no reading instead of to a crash -- the
-  // conservative direction, since a fabricated unknown-fraction would feed the
-  // DONE criterion. (2026-09-18)
+  // Same buffer-vs-metadata screen as planMapCellAt(). A mismatch returns -1.0
+  // (cannot be measured), which the node's coverage-termination check reads as
+  // no reading this tick. (notes: planmap-roi-data-size-check)
   if (m.data.size() !=
       static_cast<size_t>(m.info.width) * static_cast<size_t>(m.info.height))
     return -1.0;

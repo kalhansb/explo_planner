@@ -26,6 +26,7 @@
 /// vantage_planner. Spatial queries use an internal integer-coord hash; no
 /// Bonxai / MapCache dependency, because MapCache's UnifiedVoxel drops the
 /// semantic class this detector keys on.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 #include <vector>
@@ -34,11 +35,10 @@
 
 namespace explo_planner {
 
-/// One occupied voxel with the semantics the detector needs. The node builds
-/// these from a ScovoxMap voxel: best_class = argmax over semantic_evidence,
-/// class_conf = best_evidence / (sum_evidence + a_unk), evidence = a_occ+a_free,
-/// p_occ = a_occ / (a_occ + a_free). In geometric mode (LiDAR-only maps) the
-/// semantic records are empty: best_class / class_conf stay 0 and are ignored.
+/// One occupied voxel as the detector needs it, built by the node from a
+/// ScovoxMap voxel; class_conf = best_evidence / (sum_evidence + a_unk). In
+/// geometric mode best_class and class_conf stay 0 and are ignored.
+/// (notes: tree-semvoxel)
 struct SemVoxel {
   Eigen::Vector3f pos = Eigen::Vector3f::Zero();  ///< voxel centre, map frame.
   float    p_occ      = 0.5f;   ///< a_occ / (a_occ + a_free).
@@ -69,16 +69,10 @@ struct TreeDetection {
                          ///< robot-bearing history (use_bearing_coverage).
   float mean_entropy          = 0.0f;  ///< mean occupancy entropy, /ln2.
   float vertical_completeness = 0.0f;  ///< filled height bins / total. NOTE:
-                         ///< the bins span [base_z, top_z], and those bounds are
-                         ///< themselves the min/max of the cluster, so the first
-                         ///< and last bin are always filled and the span is
-                         ///< self-normalising. It therefore only ever detects an
-                         ///< INTERIOR gap (>= 1/n_height_bins of the height with
-                         ///< no voxels at all), which a continuous trunk never
-                         ///< has -- it read exactly 1.00 on all 17 trunks of the
-                         ///< map-test-2 bag. It is reported for diagnostics but
-                         ///< w_vertical defaults to 0: it is not a usable
-                         ///< occlusion signal in its current form.
+                         /// the bins span the cluster's own [base_z, top_z], so
+                         /// the end bins are always filled and only an interior
+                         /// gap registers. Diagnostic only; w_vertical defaults
+                         /// to 0. (notes: tree-vertical-completeness)
   float info_deficit          = 0.0f;  ///< combined "not enough info" score.
 
   bool  under_informed = false;        ///< info_deficit > cfg.deficit_thresh.
@@ -93,12 +87,10 @@ struct TreeDetectorConfig {
   double voxel_size = 0.15;   ///< grid resolution (m); neighbour-hash quantum.
 
   // --- Mode ---
-  // true  => semantic front-end (veg_class / min_class_conf gates, trunk band
-  //          relative to each cluster's base).
-  // false => geometric front-end for LiDAR-only maps: occupancy-only gate plus
-  //          the "Geometric mode" knobs below; veg_class / min_class_conf /
-  //          trunk_band_* are ignored. Scoring and the info-deficit predicate
-  //          are identical in both modes.
+  // true: semantic front-end (class gates, trunk band relative to each
+  // cluster's base). false: geometric front-end for LiDAR-only maps; veg_class,
+  // min_class_conf and trunk_band_* are ignored. Scoring is the same in both.
+  // (notes: tree-detector-mode)
   bool use_semantics = true;
 
   // --- Segmentation / gating ---
@@ -110,27 +102,17 @@ struct TreeDetectorConfig {
   float    trunk_band_lo  = 0.5f;   ///< trunk band start above cluster base (m).
   float    trunk_band_hi  = 2.5f;   ///< trunk band end above cluster base (m).
   int      min_trunk_voxels = 60;   ///< reject clusters thinner than this. The
-                                    ///< old default of 8 admitted noise: on the
-                                    ///< map-test-2 bag every real trunk carried
-                                    ///< 112-717 trunk voxels while every false
-                                    ///< positive carried 9-33, so this single
-                                    ///< gate separates them cleanly. Scale it
-                                    ///< down for coarser maps / smaller stems
-                                    ///< (it counts voxels, not metres).
+                                    /// gate counts voxels, not metres: scale it
+                                    /// down for coarser maps or smaller stems.
+                                    /// (notes: tree-min-trunk-voxels)
   float    min_height     = 1.5f;   ///< reject clusters shorter than this (m).
   float    max_radius     = 1.0f;   ///< reject fat blobs (walls / hedges) (m).
 
   // --- Geometric mode (use_semantics == false) only ---
-  // Terrain: min occupied z per XY cell, median-filtered over the 3x3 cell
-  // neighbourhood, bilinearly interpolated at query positions. Known
-  // limitations: (a) grades beyond ~2*ground_margin_m/terrain_cell_m (~38 deg
-  // at defaults) still leak ground voxels past the margin gate; (b) cells that
-  // only ever saw canopy (never the ground under it) over-estimate terrain and
-  // may cost the tree its lowest voxels; (c) two stems whose surfaces fall
-  // within cluster_tol_m merge into one slice cluster that can fail the
-  // linearity gate, dropping both (semantic mode returns one merged detection
-  // instead); (d) a tree fragment separated from its stem by a map gap wider
-  // than cluster_tol_m is not attached and goes uncounted.
+  // Terrain is the min occupied z per XY cell, 3x3 median-filtered, bilinearly
+  // interpolated. Known limits: steep grades leak ground, canopy-only cells
+  // overestimate terrain, and stems closer than cluster_tol_m merge.
+  // (notes: tree-geometric-terrain)
   float terrain_cell_m  = 1.0f;   ///< XY cell of the min-z terrain grid (m).
   float ground_margin_m = 0.4f;   ///< drop voxels closer than this to terrain (m).
   float stem_slice_lo   = 0.5f;   ///< stem clustering slice above terrain (m);
@@ -148,17 +130,10 @@ struct TreeDetectorConfig {
                                   ///< ribbons: their axis is horizontal).
 
   // --- Coverage / information ---
-  // 8 sectors (45 deg). Kept coarse on purpose: a thin trunk only presents
-  // ~2*pi*r/voxel distinct surface voxels around its circumference, so too many
-  // bins can never all fill and a fully-circled trunk would keep a high deficit,
-  // breaking the self-closing loop. 8 is fillable at typical trunk r / map res.
-  //
-  // Coverage measured from map geometry is only ever a PROXY, and a fragile one
-  // -- it depends entirely on the axis estimate being the true axis rather than
-  // the centroid of whatever happens to have been observed (see fitCrossSection).
-  // The node's use_bearing_coverage measures the same quantity directly, from
-  // the bearings the robot actually viewed the trunk from, and should be
-  // preferred whenever a pose is available.
+  // Keep n_azimuth_bins coarse (8 x 45 deg): a thin trunk cannot fill many
+  // bins, so a circled trunk would keep a high deficit. Map-geometry coverage
+  // is only a proxy; prefer the node's use_bearing_coverage when a pose exists.
+  // (notes: tree-azimuth-bins-coarse)
   int   n_azimuth_bins = 8;     ///< K sectors for angular coverage.
   int   n_height_bins  = 6;     ///< bins for vertical completeness.
   float w_coverage     = 0.75f; ///< info_deficit weights (auto-normalised).
@@ -170,33 +145,20 @@ struct TreeDetectorConfig {
   float deficit_thresh = 0.35f; ///< under_informed when info_deficit > this.
 };
 
-/// Combine the three information terms into the deficit using cfg's weights
-/// (auto-normalised, so the result stays in [0, 1] however they are set).
-/// Exposed because tree_detector_node re-scores a detection against a coverage
-/// value the map alone cannot supply: the set of robot bearings a trunk has
-/// actually been viewed from. Keeping one implementation means the node's
-/// verdict and the detector's stay on the same scale.
+/// Combine the three information terms with cfg's auto-normalised weights
+/// (result in [0, 1]). Shared with tree_detector_node, which re-scores with
+/// bearing coverage, so both verdicts stay on one scale.
+/// (notes: tree-info-deficit-shared)
 float infoDeficit(const TreeDetectorConfig& cfg, float coverage,
                   float mean_entropy, float vertical);
 
 // ===================================================================
 // Emission gate (bearing coverage)
 // ===================================================================
-// Per-tree state behind tree_detector_node's decision to publish a TreeTarget.
-// Lives here rather than in the node so the state machine is unit-testable
-// without a ROS graph -- the node owns one gate per tracked tree and feeds it
-// exactly one observation per scan.
-//
-// The gate answers a different question from the detector's `under_informed`.
-// The detector scores a SNAPSHOT ("is this trunk under-observed right now?"),
-// which under bearing coverage is trivially yes for every tree at first sight:
-// a track's bearing history starts empty, so coverage reads 1/n_azimuth_bins
-// and the deficit clears any sane threshold. Emitting there means "nominate
-// every tree the instant it is detected", which makes deficit_thresh
-// decorative. The gate instead waits until the bearing history has STOPPED
-// GROWING -- the robot has finished passing this tree -- and only then asks
-// whether it is still under-covered. A tree the robot happened to walk around
-// closes itself and is never nominated.
+// Per-tree state behind tree_detector_node's TreeTarget publishing: one gate
+// per tracked tree, fed exactly one observation per scan. Emits only once the
+// bearing history stops growing and the tree is still under-covered.
+// (notes: tree-emit-gate)
 
 /// Per-tree emission bookkeeping. Default-constructed state means "seen from
 /// nowhere, never confirmed, never published".
@@ -225,16 +187,10 @@ float bearingCoverage(uint32_t mask, int n_bins);
 /// per scan per tracked tree, BEFORE stepEmitGate (which reads the counter).
 float observeBearing(EmitGate& g, uint32_t bit, int n_bins);
 
-/// Advance confirmation and decide whether to publish this tree now. Returns
-/// true exactly once per tree, on the scan where all of these first hold:
-///   * `under_informed` (on the coverage the caller scored the tree with);
-///   * confirm_ticks consecutive under-informed scans -- a well-observed read
-///     resets the streak, so a half-built trunk cannot fire on a fluke;
-///   * the bearing history has been static for settle_ticks scans, i.e. the
-///     robot has finished passing the tree. Skipped when `has_bearing` is false
-///     (no pose, so the verdict came from map geometry and there is no bearing
-///     history to settle) or settle_ticks <= 0 (deferral disabled).
-/// Sets g.emitted on the true return, so emit-once needs no caller bookkeeping.
+/// Returns true once per tree, setting g.emitted, when under_informed has held
+/// for confirm_ticks consecutive scans and, if has_bearing and settle_ticks >
+/// 0, the bearing mask has not grown for settle_ticks scans.
+/// (notes: tree-step-emit-gate)
 bool stepEmitGate(EmitGate& g, bool under_informed, bool has_bearing,
                   int confirm_ticks, int settle_ticks);
 

@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -97,11 +98,10 @@ TEST(PlannerUtil, RendezvousWaitExpired) {
 
 // --- Mesh reconnection helpers ---
 
-// The wire strings are what the yaml/launch pass; anything else must fall back
-// to the legacy behaviour, never crash or invent a mode. Matching is
-// case-insensitive (a hand-typed "Hybrid" must not silently run legacy
-// rendezvous), and the `known` flag is what the node's startup warning keys
-// on, so it must be false exactly when the fallback was NOT asked for.
+// Unrecognised strings fall back to RENDEZVOUS (legacy); matching is
+// case-insensitive. known feeds the node's startup warning and must be false
+// exactly when the fallback was not asked for.
+// (notes: util-reconnect-mode-parse)
 TEST(PlannerUtil, ReconnectModeFromString) {
   EXPECT_EQ(reconnectModeFromString("rendezvous"), ReconnectMode::RENDEZVOUS);
   EXPECT_EQ(reconnectModeFromString("pursuit"), ReconnectMode::PURSUIT);
@@ -160,14 +160,10 @@ TEST(PlannerUtil, PursuitBudgetFloorAndDisable) {
               200.0, 1e-9);
 }
 
-// The ceiling wins over the floor. min_sec is the nav-family floor
-// (nav_min_timeout_sec, 30 s in the yaml) and max_sec the pursuit-family
-// ceiling — nothing orders them, and a short-chase A/B like
-// pursuit_budget_max_sec:=15 is legitimate config. The naive
-// clamp(raw, 30, 15) is UB (lo > hi) whose libstdc++ artifact returned the
-// FLOOR — a budget above the "hard ceiling" the waiting teammate relies on.
-// The ceiling must hold from both directions: raw below the floor and raw
-// above the ceiling.
+// The ceiling wins over the floor: min_sec (nav_min_timeout_sec) and max_sec
+// (pursuit family) are unordered, and std::clamp with lo > hi is UB. The
+// ceiling must hold for raw below the floor and above it.
+// (notes: util-pursuit-ceiling-beats-floor)
 TEST(PlannerUtil, PursuitBudgetCeilingBeatsFloor) {
   // raw = 0.5/0.15*3 = 10 s, floor 30 > ceiling 15 -> 15, never 30.
   EXPECT_NEAR(pursuitBudgetSec(0.5, 0.0, 0.15, 3.0, 180.0, 30.0, 15.0),
@@ -177,11 +173,9 @@ TEST(PlannerUtil, PursuitBudgetCeilingBeatsFloor) {
               15.0, 1e-9);
 }
 
-// Degenerate inputs must stay inside [0, max_sec]: a negative staleness
-// (clock skew between the record stamp and now on the same local clock is
-// impossible, but a caller bug must not inflate the budget past full
-// freshness) and a zero/negative speed estimate (guarded to 1e-3, so the raw
-// term explodes and the ceiling absorbs it — same guard navBudgetSec tests).
+// Degenerate inputs stay inside [0, max_sec]: a negative staleness clamps to
+// full freshness, and a zero or negative speed is guarded to 1e-3 so the
+// ceiling absorbs the raw term. (notes: util-pursuit-degenerate-inputs)
 TEST(PlannerUtil, PursuitBudgetDegenerateInputs) {
   // Negative staleness: freshness clamps to 1.0 — identical to fresh.
   EXPECT_NEAR(pursuitBudgetSec(10.0, -50.0, 0.15, 3.0, 180.0, 30.0, 240.0),
@@ -191,11 +185,9 @@ TEST(PlannerUtil, PursuitBudgetDegenerateInputs) {
               240.0, 1e-9);
 }
 
-// max_age <= 0 is UNBOUNDED. This is the case that matters most: it is the
-// default the parameter ships with, and it is what makes the TTL binary
-// reproduce the pre-TTL planner, so one build can run both arms of a campaign.
-// Nothing about the age may change the answer here — not a huge age, not the
-// "no position held" sentinel, not a negative bound.
+// max_age <= 0 is unbounded and is the shipped default, reproducing the planner
+// without a TTL: no age, not even the negative no-position sentinel, may change
+// the answer. (notes: util-alloc-ttl-unbounded)
 TEST(PlannerUtil, AllocPeerPositionUnboundedAdmitsEverything) {
   EXPECT_TRUE(allocPeerPositionFresh(0.0, 0.0));
   EXPECT_TRUE(allocPeerPositionFresh(3600.0, 0.0));
@@ -215,11 +207,9 @@ TEST(PlannerUtil, AllocPeerPositionBoundIsInclusive) {
   EXPECT_FALSE(allocPeerPositionFresh(3600.0, 120.0));
 }
 
-// TeamModel::positionAgeSec() returns a NEGATIVE age for "no position held".
-// Under a live TTL that must read as NOT fresh. The caller also tests
-// have_position, so this is belt-and-braces — but the failure it guards is
-// silent: "we have never located this peer" coming out identical to "we heard
-// from it a moment ago" would hand the whole map to a robot we cannot find.
+// TeamModel::positionAgeSec() returns a negative age for no position held;
+// under a live TTL that must read as not fresh. Belt-and-braces: the caller
+// also tests have_position. (notes: util-alloc-ttl-unknown-position)
 TEST(PlannerUtil, AllocPeerPositionUnknownIsNotFresh) {
   EXPECT_FALSE(allocPeerPositionFresh(-1.0, 120.0));
   EXPECT_FALSE(allocPeerPositionFresh(-0.001, 120.0));
@@ -233,11 +223,9 @@ TEST(PlannerUtil, AllocPeerPositionPreClockAgeIsFresh) {
   EXPECT_TRUE(allocPeerPositionFresh(0.0, 120.0));
 }
 
-// A non-finite input drops the peer instead of admitting it. The node refuses
-// a non-finite parameter at load, so this should be unreachable from the
-// harness; it is asserted because the NaN answer falls out of comparison
-// semantics rather than from any written branch, and the safe direction (drop)
-// and the dangerous one (admit) are one operator apart.
+// A NaN age or bound drops the peer rather than admitting it. The answer falls
+// out of comparison semantics, not a written branch, so drop and admit are one
+// operator apart. (notes: util-alloc-ttl-nan-drops)
 TEST(PlannerUtil, AllocPeerPositionNonFiniteIsNotFresh) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   EXPECT_FALSE(allocPeerPositionFresh(nan, 120.0));
@@ -258,20 +246,9 @@ TEST(PlannerUtil, MeetingPointMidpoint) {
   EXPECT_NEAR(m.z(), 0.5f, 1e-6f);
 }
 
-// A watchdog that cannot fire is worse than no watchdog.
-//
-// navBudgetSec is the NAVIGATE timeout. Both properties asserted here are
-// guarantees rather than incidental behaviour, and both used to fail:
-//
-//  - A non-finite input survived the clamp. std::clamp is written as
-//    `v < lo ? lo : hi < v ? hi : v`; both comparisons answer false against
-//    NaN, so the NaN came straight back out. Every later `elapsed > budget`
-//    test is then false too — the timeout never fires, the robot sits on a
-//    dead goal, and the cell runs to max_steps. In the campaign record that is
-//    indistinguishable from a genuinely slow cell, so a censored run is scored
-//    as a completed one.
-//  - Nothing orders min_sec against max_sec (they are separate parameters from
-//    unrelated families), and std::clamp with lo > hi is undefined behaviour.
+// navBudgetSec is the NAVIGATE timeout and must always return a finite deadline
+// that fires; a NaN budget never fires. min_sec and max_sec are unordered, and
+// std::clamp with lo > hi is UB. (notes: util-nav-budget-finite-deadline)
 TEST(PlannerUtil, NavBudgetIsAlwaysAFiniteFiringDeadline) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
@@ -364,12 +341,9 @@ TEST(NextAgreedOccurrence, RollsForwardOnWholeIntervalsAndNeverLandsShort) {
   // Every result is on the agreed lattice and at or after the floor, and once
   // the floor has passed the agreed instant it is also the SOONEST such point.
   //
-  // The overshoot bound is conditional on purpose. Before t_meet there is no
-  // earlier occurrence to choose — k = 0 is the first meeting the team agreed
-  // to — so the gap to the floor is whatever the agreement made it, and
-  // asserting "within one interval" there would be asserting that the function
-  // invents a meeting between now and the first agreed one. That is exactly
-  // what the countdown did.
+  // The within-one-interval bound applies only once the floor passes t_meet;
+  // before it, k = 0 (the first agreed meeting) is correct however far off the
+  // floor is. (notes: agreed-occurrence-overshoot-bound)
   for (int i = 0; i < 400; ++i) {
     const double floor_sec = 100.0 + 0.37 * i;
     const long long floor_ms =
@@ -390,14 +364,9 @@ TEST(NextAgreedOccurrence, RollsForwardOnWholeIntervalsAndNeverLandsShort) {
 }
 
 TEST(NextAgreedOccurrence, TwoRobotsOnOneAgreementDifferByWholeIntervals) {
-  // THE WHOLE POINT, as a test. The ts4 cells measure ~1.2 s of skew between
-  // robots' mission clocks, and the generation-18 measurement that killed the
-  // first attempt at an agreed time was an arming spread of 16.1 / 52.5 /
-  // 67.4 s. Feed that spread in against one committed triple: the three robots
-  // may choose different k, but every pair differs by a whole interval, so the
-  // early ones are standing at the agreed cell when the late one arrives. Under
-  // the countdown the differences were 36.4 s and 14.9 s — not multiples of
-  // anything, and never resolvable.
+  // Robots arming at different times against one committed (t_meet, interval)
+  // may pick different k, but every pair must differ by a whole number of
+  // intervals. (notes: agreed-occurrence-arming-spread)
   const long long t_meet = 130000, interval = 30000;
   const double notice[] = {16.1, 52.5, 67.4};
   long long got[3];
@@ -500,13 +469,9 @@ TEST(ArrivalShortfall, RefusesAnUnusableBudgetRatherThanPropagatingIt) {
 }
 
 TEST(ArrivalShortfall, ATeamThatCanAllAttendDoesNotFork) {
-  // The composed property, which is the only one that matters at the call site:
-  // feed one committed pair and a spread of drives, and every robot inside its
-  // budget must land on the SAME instant — not merely on the same lattice.
-  //
-  // Drives of 10-60 s against a 60 s budget and a 30 s lattice: all six robots
-  // keep t+130 s. Under the generation-19 rule the same six split across three
-  // occurrences.
+  // The composed property at the call site: with one committed pair, every
+  // robot inside its lateness budget must land on the SAME instant, not merely
+  // the same lattice. (notes: arrival-shortfall-no-fork)
   const long long t_meet = 130'000, interval = 30'000;
   const double t_now = 100.0;
   for (long long lead_ms = 0; lead_ms <= 60'000; lead_ms += 10'000) {
@@ -533,31 +498,10 @@ TEST(ArrivalShortfall, ATeamThatCanAllAttendDoesNotFork) {
 // THE FLICKER DWELL.
 // ===========================================================================
 //
-// Three sites in the node act on "the team came back": the manoeuvre barrier,
-// the appointment supersede, and the rendezvous_spent_ latch release. All three
-// read that fact from a claim table with a 5 s liveness TTL, where ONE packet
-// arriving is enough to make the team look whole for a reading — so all three
-// have to see it HOLD. Generation 23 moved the holding rule out of the node and
-// into these two functions, which is the only way it can be tested at all: the
-// node defines main(), every gtest target links gtest_main, so nothing there is
-// callable from here.
-//
-// dwellConfirmed owns a window; dwellHeld reads one. The split is not cosmetic.
-// The supersede site and the latch release share ONE window, written once per
-// heartbeat and read from doPlan, because they ask a single question and two
-// windows over one predicate is how "the outage is over" gets two answers. A
-// second caller into dwellConfirmed would advance or disarm the pair, which
-// would mean that asking the question changed it.
-//
-// THE TWO FAILURES THESE TESTS EXIST FOR, both of which ship silently:
-//
-//   * A dwell that fires on the arming tick. It reads as a guard, has a
-//     parameter, appears in the logs, and filters nothing.
-//   * A FROZEN window — dwellConfirmed called from behind a branch that is
-//     untaken for minutes. An un-ticked window does not decay; `armed` stays
-//     true with a stale `since_sec`, and the first sample after the gap sees
-//     `now - since` far past the confirm time and fires on ONE reading. Same
-//     visible symptom as no guard at all, but harder to see in the source.
+// A shared window has exactly one dwellConfirmed caller, run every heartbeat;
+// other sites read it with dwellHeld. Pins two silent failures: firing on the
+// arming tick, and a frozen window firing on one sample.
+// (notes: flicker-dwell-window-ownership)
 
 TEST(FlickerDwell, TheFirstEligibleTickArmsAndDoesNotFire) {
   bool armed = false;

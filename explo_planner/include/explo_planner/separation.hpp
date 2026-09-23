@@ -62,6 +62,7 @@
 ///
 /// This unit is pure: no ROS, no clock, no map. The caller decides which peers
 /// are eligible (see the freshness note on Anchor) and does the applying.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstddef>
 #include <string>
@@ -78,41 +79,21 @@ public:
     /// 1 means a candidate standing on a teammate scores exactly zero.
     double weight = 0.0;
 
-    /// Distance at which the discount has fully decayed, metres. Default 20,
-    /// the radius the correlation is stated at. Bounded to [1e-3, 1e6] by
-    /// configure(): the term computes d / radius in FLOAT, where a radius
-    /// below about 1e-38 rounds to zero and a candidate sitting exactly on a
-    /// teammate then evaluates 0/0 and logs a NaN discount, while a radius
-    /// above about 3e38 rounds to infinity and flattens the discount to a
-    /// constant across every candidate. Neither is a plausible request; both
-    /// are refused rather than clamped, for the reason configure() gives.
+    /// Distance at which the discount has fully decayed, metres. configure()
+    /// refuses, not clamps, values outside [1e-3, 1e6]: d / radius is computed
+    /// in float. (notes: separation-radius-bounds)
     double radius_m = 20.0;
 
-    /// How old a peer position may be and still repel, seconds. NOT a
-    /// convenience bound — a separation term driven by a stale position pushes
-    /// this robot away from where the teammate WAS, which after a long outage
-    /// is uncorrelated with where it is and may be the exact ground it has
-    /// since left uncovered.
-    ///
-    /// The default (10 s) is two TeamWorld heartbeats plus margin. It is
-    /// deliberately short, and under the 2026-09-03 radio that short bound is
-    /// self-consistent rather than restrictive: with a 30 m range horizon a
-    /// teammate is only HEARD while it is close, which is exactly when this
-    /// term should be acting. When the link is down the peer is beyond the
-    /// horizon, further away than `radius_m` anyway, and the term correctly
-    /// goes quiet instead of guessing.
+    /// Maximum POSITION age, seconds, at which a peer still repels; about two
+    /// TeamWorld heartbeats plus margin. A stale position would push this robot
+    /// away from where the teammate was. (notes: separation-max-age)
     double max_age_sec = 10.0;
   };
 
-  /// One teammate this robot is willing to be repelled by, in map-frame XY.
-  ///
-  /// ELIGIBILITY IS THE CALLER'S JOB and there are three parts to it, none of
-  /// which this unit can see: the position must exist, it must be fresher than
-  /// max_age_sec measured as a POSITION age (not as "when did we last hear
-  /// anything about this robot" — a relayed status update refreshes the second
-  /// while leaving the first untouched), and the peer must not have finished.
-  /// A finished teammate is parked and covering nothing, so being repelled by
-  /// it is pure loss.
+  /// One teammate this robot may be repelled by, map-frame XY. Eligibility is
+  /// the caller's job: a position exists, its POSITION age (not last-heard age)
+  /// is within max_age_sec, and the peer has not finished.
+  /// (notes: separation-anchor-eligibility)
   struct Anchor {
     float x = 0.0f;
     float y = 0.0f;
@@ -120,19 +101,10 @@ public:
 
   SeparationTerm() = default;
 
-  /// Install a configuration. Returns "" when the term is usable as given, or
-  /// a human-readable reason it was DISABLED. Out-of-range values disable
-  /// rather than clamp: `weight = 3` and `radius_m = -20` are not weak
-  /// requests for separation, they are typos, and a term that quietly ran at
-  /// some clamped value would put a number in the manifest that the binary did
-  /// not use. Silence is the failure mode this project keeps paying for, so
-  /// the refusal is returned for the caller to log.
-  ///
-  /// The one exception is `weight == 0`, which is OFF by request and returns
-  /// "" — it is the default and not an error. Note that `radius_m` and
-  /// `max_age_sec` are still validated in that case and still kept: they are
-  /// what the caller's separation DIAGNOSTICS are measured on, in every arm
-  /// including the untreated one.
+  /// Returns an empty string if usable, else why the term was DISABLED;
+  /// out-of-range values disable, never clamp. weight == 0 is OFF, not an
+  /// error; radius_m and max_age_sec are still validated and kept for
+  /// diagnostics. (notes: separation-configure-refuses)
   std::string configure(const Config& cfg);
 
   /// Whether the term will actually change any score. False when weight is 0,
@@ -144,20 +116,10 @@ public:
   /// the default (disabled) one, not the values that were rejected.
   const Config& config() const { return cfg_; }
 
-  /// Whether a teammate with this position age may be used as an anchor.
-  ///
-  /// This lives here rather than in the caller for one reason: `max_age_sec`
-  /// is otherwise a knob that is parsed, range-checked, written into the run
-  /// manifest and then consumed entirely outside anything a unit test can
-  /// reach. That is the precise shape of a failure this project has already
-  /// paid for more than once — a value that the manifest swears the run used
-  /// and the binary never read — and a review of this very file found that
-  /// replacing the age comparison with a constant would pass the whole suite.
-  /// Moving the comparison into the unit makes the knob testable.
-  ///
-  /// `position_age_sec` is a POSITION age (see Anchor), and a negative value
-  /// means no position is held at all. Independent of `enabled()`: the
-  /// eligible-peer count is logged in every arm, treated or not.
+  /// Whether a teammate with this position age may be an anchor.
+  /// position_age_sec is a POSITION age; negative means no position held.
+  /// Independent of enabled(): the eligible-peer count is logged in every arm.
+  /// (notes: separation-eligible-anchor)
   bool eligibleAnchor(double position_age_sec) const;
 
   /// Distance from (x, y) to the nearest anchor, or -1 when there are none.
@@ -173,21 +135,9 @@ public:
   /// never above 1.
   float discount(float x, float y, const std::vector<Anchor>& anchors) const;
 
-  /// Apply a multiplier to a utility, safely.
-  ///
-  /// Only a FINITE, STRICTLY POSITIVE utility is scaled, and both halves of
-  /// that guard are load-bearing:
-  ///
-  ///   - Unreachable candidates carry U = -inf so they sort to the bottom.
-  ///     -inf * 0 is NaN, and a NaN score is a candidate whose position in the
-  ///     sort depends on which comparisons the sort happens to make. The sort
-  ///     is NaN-safe, but "sorts somewhere defined" is not the same as "is not
-  ///     produced", and a NaN here would be produced by exactly the
-  ///     configuration an experiment is most likely to run (weight = 1).
-  ///
-  ///   - A negative utility scaled by a factor below 1 gets LARGER, so a
-  ///     discount would become a reward. Nothing currently produces one, which
-  ///     is precisely why it would go unnoticed if something started to.
+  /// Scales only a finite, strictly positive utility: unreachable candidates
+  /// carry -inf (-inf * 0 is NaN), and a negative utility scaled below 1 would
+  /// turn the discount into a reward. (notes: separation-apply-guard)
   static float apply(float utility, float discount);
 
 private:

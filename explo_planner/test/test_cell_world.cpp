@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 #include "explo_planner/cell_world.hpp"
 #include "explo_planner/fleet_identity.hpp"
@@ -76,14 +77,10 @@ float colCentre(float lo, int k) { return lo + 0.05f + 0.1f * k; }
 
 // --- exactly-representable fixture -----------------------------------------
 //
-// For the tests that compare against MapCache::unknownColumnFraction, the
-// resolution has to be a power of two. `msg.resolution` is a float, so 0.1f is
-// really 0.10000000149011612 and Bonxai's inv_resolution is 9.99999985, not
-// its exact inverse — posToCoord(1.0) is then 9, not 10, and a cell's
-// "equivalent box" picks up one column belonging to its neighbour. That is a
-// property of unknownColumnFraction's inclusive-bounds convention rather than a
-// disagreement about what an observed column is, and testing at 0.125 removes
-// it so the comparison is about the thing it claims to be about.
+// Tests compared against MapCache::unknownColumnFraction use a power-of-two
+// resolution: 0.1f is inexact, so a cell's equivalent box picks up a
+// neighbour's column under that function's inclusive bounds.
+// (notes: cellworld-test-exact-resolution)
 constexpr float kExactRes = 0.125f;   // 8 columns per 1 m cell
 constexpr int   kExactCols = 8;
 /// Voxel centre of the k-th column of a 1 m cell at 0.125 m resolution.
@@ -271,19 +268,10 @@ TEST(CellWorldConfigure, RefusesOutOfRangeThresholds) {
 }
 
 TEST(CellWorldConfigure, ShippedDefaultsAssumeASaturatingMap) {
-  // The thresholds are world-calibrated knobs, in the same family as
-  // done_unknown_fraction (shipped 0.05, overridden to 0.64 by the sim
-  // harness). Both measure "columns with nothing observed in them", and both
-  // have a floor above zero in any world where some columns can never be
-  // observed. There is therefore no universally correct value, and the thing
-  // worth pinning is not the numbers but the world model they encode.
-  //
-  // What this test asserts is that the defaults belong to the SAME world model
-  // as the shipped done_unknown_fraction: a map that saturates, where a swept
-  // cell really does approach zero unknown. Raising them to fit one particular
-  // world — which is what the flat-forest sim needs, and what an earlier
-  // version of this file did — silently redefines COVERED for every other
-  // deployment, so it belongs in that world's harness and not here.
+  // The defaults encode a saturating-map world model, like the shipped
+  // done_unknown_fraction. Values tuned to one world with a coverage floor
+  // belong in that world's launch config, not in the defaults.
+  // (notes: cellworld-test-defaults-world-model)
   const CellWorld::Config d;
   EXPECT_LT(d.covered_max_unknown, 0.2)
       << "a saturating-map default; a value tuned to a world with a coverage "
@@ -382,12 +370,9 @@ TEST(CellWorldClassify, PartialObservationIsExploring) {
 
 TEST(CellWorldClassify, SaturatedObservationIsCovered) {
   const CellWorld w = makeWorld();
-  // Deliberately NOT the exact threshold. 85 of 100 columns is an unknown
-  // fraction of 1.0 - 0.85, which is 0.15000000000000002 in doubles and so
-  // lands on the EXPLORING side of a 0.15 threshold. Behaviour exactly at a
-  // threshold on a continuous measure is not a contract this class offers, and
-  // pinning it in a test would only record which way the rounding happened to
-  // fall for one pair of numbers.
+  // Deliberately not the exact threshold: 85 of 100 gives 0.15000000000000002
+  // in doubles. Behaviour exactly at a threshold is not a contract of this
+  // class. (notes: cellworld-test-threshold-rounding)
   EXPECT_EQ(w.classify(CellStatus::EXPLORING, obs(100, 86)),
             CellStatus::COVERED);
   EXPECT_EQ(w.classify(CellStatus::EXPLORING, obs(100, 84)),
@@ -405,16 +390,10 @@ TEST(CellWorldClassify, RemainingFrontierVetoesPromotion) {
 }
 
 TEST(CellWorldClassify, FrontierVetoIsAFractionNotACount) {
-  // The regression this replaced. The veto used to be an absolute voxel count
-  // defaulting to 4, which is not a quantity that can be set correctly: it
-  // means something different at every cell size and map resolution, and at
-  // the shipped 10 m cells and 0.1 m voxels a thoroughly swept cell holds tens
-  // of thousands of voxels and hundreds of boundary ones. Every cell was
-  // vetoed for an entire 1800 s run.
-  //
-  // So the property under test is scale invariance: the same SHAPE of cell,
-  // measured at two very different sizes, must classify the same way. A count
-  // threshold fails this by construction, which is the point.
+  // The property under test is scale invariance: the same shape of cell
+  // measured at very different sizes must classify the same way. A
+  // frontier-voxel count threshold fails this by construction.
+  // (notes: cellworld-test-frontier-veto-fraction)
   const CellWorld w = makeWorld();
   EXPECT_EQ(w.classify(CellStatus::EXPLORING, obs(100, 100, 50)),
             CellStatus::COVERED)
@@ -429,11 +408,10 @@ TEST(CellWorldClassify, FrontierVetoIsAFractionNotACount) {
 }
 
 TEST(CellWorldClassify, UnmeasurableFrontierCannotPromote) {
-  // frontierFraction() reports "cannot measure" as -1.0, and -1.0 sails under
-  // any threshold. A cell with observed columns but no observed voxels cannot
-  // arise from censusFromMap, so this is guarding the seam rather than a
-  // reachable state — which is exactly the kind of check that gets dropped as
-  // impossible and then becomes reachable when a second producer appears.
+  // frontierFraction() returns -1.0 for cannot-measure, which passes under any
+  // threshold, so it must not promote. censusFromMap cannot produce this state;
+  // the test guards the seam for other producers.
+  // (notes: cellworld-test-frontier-sentinel)
   const CellWorld w = makeWorld();
   CellWorld::CellObservation o;
   o.total_columns    = 100;
@@ -459,11 +437,10 @@ TEST(CellObservationFrontierFraction, SentinelAndClamp) {
 
 TEST(CellWorldClassify, HysteresisHoldsCoveredInsideTheBand) {
   const CellWorld w = makeWorld();
-  // Unknown fraction 0.25: above covered_max_unknown (0.15) so it would not be
-  // promoted, but below exploring_min_unknown (0.35) so it is not demoted.
-  // Without this band a cell hovering at the threshold re-commits every tick,
-  // and since every commit resets known_by, the knowledge gate downstream
-  // would never suppress anything.
+  // Inside the band (covered_max_unknown 0.15, exploring_min_unknown 0.35)
+  // COVERED holds. Without it a cell at the threshold re-commits every tick,
+  // each commit resets known_by, and the knowledge gate never suppresses.
+  // (notes: cellworld-test-hysteresis-band)
   EXPECT_EQ(w.classify(CellStatus::COVERED, obs(100, 75)), CellStatus::COVERED);
   EXPECT_EQ(w.classify(CellStatus::COVERED, obs(100, 65)), CellStatus::COVERED);
   EXPECT_EQ(w.classify(CellStatus::COVERED, obs(100, 64)),
@@ -913,22 +890,10 @@ TEST(CensusFromMap, DrivesTheStatusMachineEndToEnd) {
 }
 
 TEST(CensusFromMap, DenominatorAndNumeratorShareTheColumnBinning) {
-  // The float-narrowing hazard, at a configuration where it actually bites.
-  //
-  // A voxel column's low corner is c * resolution in double, but CellGrid works
-  // in float. At resolution 0.05 and a ROI starting at -15, the column at a
-  // cell boundary is -15.000000223517418 in double and exactly -15.0f in
-  // float, so the two floor() to different cells. If the per-cell column count
-  // (the denominator) and the observed-column tally (the numerator) computed
-  // that independently, one cell would be short a column: unknown fractions on
-  // the affected cells would sit slightly below the truth, which reads as a
-  // threshold that needs tuning rather than as a bug.
-  //
-  // The configuration matters. At 0.05 m columns over 5 m cells the boundaries
-  // diverge unevenly and one cell in each axis loses a column; at 0.1 m over
-  // 1 m cells every boundary diverges the same way, the windows shift as a
-  // block, and the counts come out identical — which is why the other
-  // fixtures here cannot see this and this one can.
+  // Column corners are double but CellGrid is float, so a boundary column can
+  // floor() to different cells; the denominator and numerator must share one
+  // binning. 0.05 m columns over 5 m cells expose it; 0.1 m over 1 m do not.
+  // (notes: census-test-shared-column-binning)
   const CellGrid g = makeCellGrid(-15.0f, 5.0f, -15.0f, 5.0f, 5.0f);
   ASSERT_EQ(g.size(), 16);
   MapCache map = makeMap({}, {}, 0.05f);
@@ -944,11 +909,10 @@ TEST(CensusFromMap, DenominatorAndNumeratorShareTheColumnBinning) {
 }
 
 TEST(CensusFromMap, WorksOnANegativeOriginRoi) {
-  // The float-narrowing hazard the shared binning helper exists for: at
-  // min_x = -15 and res = 0.2 the boundary column is -15.000000000000002 in
-  // double but exactly -15.0f in float. If the denominator and the numerator
-  // disagreed about that column, the west and south edge cells would report an
-  // unknown fraction slightly below the truth.
+  // Float-narrowing hazard at a negative-origin ROI: the denominator and
+  // numerator must agree on the boundary column, or the west and south edge
+  // cells report an unknown fraction below the truth.
+  // (notes: census-test-negative-origin-roi)
   const CellGrid g = makeCellGrid(-15.0f, -13.0f, -15.0f, -13.0f, 1.0f);
   ASSERT_EQ(g.size(), 4);
   std::vector<Eigen::Vector3f> occ;
@@ -1085,13 +1049,10 @@ TEST(CellWorldSharedHash, DoesNotCollideAcrossGridSizes) {
 }
 
 TEST(CellWorldSharedHash, ConvergesAfterAnOutageHeals) {
-  // The unit-level form of the P2 smoke gate. Two robots explore apart with
-  // the link down, diverge, then exchange full state once it heals.
-  //
-  // Counts alone cannot score this and the fixture is built to show why: at
-  // the point of maximum divergence both robots have covered exactly two
-  // cells, so every aggregate in cell_census reads identical while the two
-  // worlds disagree about four cells out of nine.
+  // Two robots diverge with the link down, then exchange full state once it
+  // heals. Covered counts stay equal while the worlds disagree on four cells,
+  // so only sharedHash can see the divergence.
+  // (notes: sharedhash-test-outage-heal)
   CellWorld a = makeWorld();  // self 0
   CellWorld b;
   ASSERT_EQ(b.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
@@ -1295,12 +1256,10 @@ TEST(CellWorldMerge, ARetractionFromTheSourceIsHonoured) {
 }
 
 TEST(CellWorldMerge, AThirdPartyCannotUndoSomeoneElsesCovered) {
-  // The same shape as the test above, from a robot that is NOT in the mask.
-  // This is the case the plan's table would have applied unconditionally; here
-  // it is a disagreement between two second-hand sources, and the
-  // more-explored ordering settles it so that reordering cannot regress the
-  // census. At N=2 this branch is unreachable, which is why it needs its own
-  // test rather than a smoke run.
+  // A retraction from a robot not in known_by is a disagreement between
+  // second-hand sources; the more-explored ordering refuses it, so reordering
+  // cannot regress the census. Unreachable at N=2, hence this test.
+  // (notes: merge-test-third-party-retraction)
   CellWorld w = makeWorld();
   ASSERT_EQ(w.mergeWire(1, {wc(0, 2)}).applied, 1);
   ASSERT_EQ(w.status(0), CellStatus::COVERED_BY_OTHERS);

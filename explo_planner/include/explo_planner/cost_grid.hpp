@@ -14,6 +14,7 @@
 /// surrounded by inflated obstacles will return kInfCost from costTo(...) and
 /// false from reachable(...), so the planner can skip it before publishing a
 /// goal that the navigator would never reach.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <Eigen/Core>
 #include <limits>
@@ -31,46 +32,17 @@ public:
 
   CostGrid() = default;
 
-  /// Resample the cost grid from a fresh planning_map.
-  ///
-  /// `obstacle_threshold` matches the planner's existing isCellFree threshold.
-  /// A cell is impassable iff it is KNOWN and at or above the threshold, i.e.
-  /// `v >= 0 && v >= obstacle_threshold` (`cost_grid.cpp:61-66`).
-  ///
-  /// UNKNOWN (-1) IS TRAVERSABLE. This is deliberate and is the opposite of
-  /// what this comment used to claim. The flood's job is to find free pockets
-  /// sealed off by *known* obstacles; it is not a free-space test. Blocking
-  /// unknown would make every frontier a wall and the reachability filter
-  /// would reject exactly the candidates exploration exists to reach. The
-  /// per-candidate `isCellFree()` check in the node is what refuses to stand
-  /// a robot on an unknown cell — the two filters have different jobs and
-  /// must not be "made consistent".
-  /// Origin / resolution / dims are captured from the OccupancyGrid so the
-  /// caller can convert candidate world XY to grid coords without keeping a
-  /// pointer to the original message.
-  ///
-  /// Calling build(...) clears any prior flood result.
+  /// Blocks a cell iff known and >= obstacle_threshold (the isCellFree
+  /// threshold). Unknown (-1) is traversable on purpose; isCellFree() refuses
+  /// unknown goals. Do not make the two filters consistent. Clears any prior
+  /// flood. (notes: costgrid-build-unknown-traversable)
   void build(const nav_msgs::msg::OccupancyGrid& planning_map,
              int8_t obstacle_threshold = 50);
 
-  /// Run a single-source bounded flood from `source_xy`. Cells whose
-  /// shortest-path distance from the source exceeds `radius_cap_m` are not
-  /// touched and keep the sentinel kInfCost.
-  ///
-  /// Setting `radius_cap_m <= 0` (or NaN) runs a genuinely unbounded flood —
-  /// the cap becomes +inf. THE GRID DIAGONAL IS NOT AN EQUIVALENT BOUND: these
-  /// are *walked* Dijkstra distances, which routinely exceed the straight-line
-  /// diagonal around serpentine corridors and U-shaped obstacles, so a cap set
-  /// at the diagonal still leaves reachable cells at kInfCost and callers still
-  /// read them as unreachable. That was a real defect; see the note at the cap
-  /// computation in cost_grid.cpp. The bound is what makes this <1 ms per PLAN
-  /// tick on the live system.
-  ///
-  /// Diagonal moves cost sqrt(2) * resolution; orthogonal cost 1 * resolution.
-  /// Out-of-bounds source returns cleanly: every cell stays at kInfCost.
-  ///
-  /// Calling floodFrom(...) again replaces the previous flood result without
-  /// rebuilding the obstacle layer.
+  /// Bounded Dijkstra from source_xy; cells beyond radius_cap_m of walked
+  /// distance keep kInfCost. radius_cap_m <= 0 or NaN means unbounded; the grid
+  /// diagonal is not a safe bound. Diagonal steps cost sqrt(2) * resolution.
+  /// (notes: costgrid-flood-radius-cap)
   void floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m);
 
   /// O(1) lookup of the shortest-path distance from the source used in the
@@ -107,14 +79,9 @@ private:
   /// of the predecessor on the shortest path, or -1 for the source cell.
   std::vector<int> parent_;
 
-  /// Obstacle layer sampled from the OccupancyGrid at build() time.
-  /// blocked_[gy * dims_x_ + gx] == true for cells that the flood will not
-  /// enter: KNOWN cells at or above `obstacle_threshold` (occupied or
-  /// inflated). Unknown (-1) cells are NOT blocked — see build() above.
-  /// The one exception is a malformed message whose `data.size()` disagrees
-  /// with `dims_x_ * dims_y_`, where every cell is marked blocked so the
-  /// flood is empty and the caller degrades to "nothing reachable" instead
-  /// of indexing past the end of the array.
+  /// Obstacle layer from build(): set for known cells >= obstacle_threshold;
+  /// unknown (-1) is not blocked. If data.size() != dims_x_ * dims_y_, every
+  /// cell is blocked so nothing is reachable. (notes: costgrid-blocked-layer)
   std::vector<uint8_t> blocked_;
 
   int dims_x_ = 0;

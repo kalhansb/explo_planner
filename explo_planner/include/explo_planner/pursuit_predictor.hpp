@@ -55,6 +55,7 @@
 /// sums to one at every step. `step()` is exposed so that invariant can be
 /// tested where it holds — at the transition — rather than only at the end of a
 /// propagation, where a compensating pair of errors would hide.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <string>
 #include <vector>
@@ -113,49 +114,26 @@ public:
     double peer_speed_mps = 0.5;
     double my_speed_mps   = 0.5;
 
-    /// Time the peer spends WORKING a cell before moving on, seconds. This is
-    /// the I transition's whole content, and it dominates: at the 10 m cell
-    /// every campaign runs (CELL_SIZE_M:-10.0) and the 0.40 m/s the harness
-    /// passes for pursuit, the drive between two adjacent cells is ~25 s while
-    /// clearing one takes as long as the local planner needs — so a 45 s dwell
-    /// is already the larger term, and diagonally it is comparable rather than
-    /// smaller. (This read "at a 20 m cell and 0.5 m/s ... ~40 s" until
-    /// 2026-09-18: no campaign has ever run a 20 m cell, and the two errors
-    /// happened to cancel into a plausible number.) Setting it to zero turns
-    /// the model into pure translation and will predict the peer far ahead of
-    /// where it is.
+    /// Seconds the peer spends working a cell before moving on (the I
+    /// transition). Zero turns the model into pure translation, predicting the
+    /// peer far ahead. (notes: pursuit-dwell-sec)
     double dwell_sec = 45.0;
 
-    /// Chain step, seconds. Smaller is a finer distribution and more work;
-    /// the cost is linear in (horizon / step) x tour length. It also quantises
-    /// the horizon: a candidate is scored at floor(horizon / step) steps, so a
-    /// step comparable to the drive between two cells makes the intercept
-    /// insensitive to the very thing it is trying to resolve.
+    /// Chain step, seconds; cost is linear in (horizon / step) x tour length.
+    /// Candidates are scored at floor(horizon / step) steps, so a step
+    /// comparable to the inter-cell drive blurs the intercept.
+    /// (notes: pursuit-step-sec)
     double step_sec = 5.0;
 
-    /// Half-life of staying on the tour at all, seconds. After this long, half
-    /// the probability mass has drained into O. This is the parameter that
-    /// decides how much staleness is too much, and it is a half-life rather
-    /// than a cutoff so that the answer degrades continuously — a chase does
-    /// not become worthless one second after a threshold.
-    ///
-    /// <= 0 disables the hazard: the peer never leaves the tour. That is the
-    /// honest reading of "no half-life", and the opposite of the one a
-    /// clamp-to-epsilon would give (an infinitely SHORT half-life, i.e. total
-    /// drain in one step) — which is a setting nobody would ask for by typing
-    /// zero. It exists so the chain's arithmetic can be checked against an
-    /// exact binomial; in a run it is a way to say "trust the tour".
+    /// Seconds after which half the mass has drained off the tour into O; a
+    /// half-life, so staleness degrades the answer continuously. <= 0 disables
+    /// the hazard (the peer never leaves the tour).
+    /// (notes: pursuit-offroute-half-life)
     double offroute_half_life_sec = 180.0;
 
-    /// Bounds the PREDICTION HORIZON, seconds — `peer.age_sec + my drive`, not
-    /// my drive alone. The horizon is measured from the peer's last fix, so a
-    /// stale fix has already spent part of the budget before I move; scoring
-    /// against a report that old is the thing the bound exists to refuse.
-    /// Candidates over it are dropped rather than scored at a clamped horizon,
-    /// because scoring at the clamp would rank a cell I cannot reach inside the
-    /// prediction against cells I can, using a distribution that does not
-    /// describe the moment I would arrive. See pursuit_predictor.cpp's own note
-    /// at the rejection site: the age-inclusive form is the intended reading.
+    /// Bounds the prediction horizon, peer.age_sec + my drive (not the drive
+    /// alone), in seconds. Candidates over it are dropped, not scored at a
+    /// clamped horizon. (notes: pursuit-max-horizon)
     double max_horizon_sec = 600.0;
 
     /// Refuse below this probability. The floor is the legacy trail, and a
@@ -195,12 +173,9 @@ public:
                                int my_cell,
                                const Config& cfg);
 
-  /// Advance the chain one step, in place.
-  ///
-  /// `p` is index-aligned with `tour` and `p_off` is the absorbed mass; the sum
-  /// of the two is invariant. Exposed for the conservation test and for
-  /// callers that want the distribution itself — see the header on why that
-  /// invariant is tested at the step and not only at the end.
+  /// Advance the chain one step in place. p is index-aligned with tour and
+  /// p_off is the absorbed mass; their sum is invariant.
+  /// (notes: pursuit-step-conservation)
   static void step(const CellWorld& world, const std::vector<int>& tour,
                    std::vector<double>& p, double& p_off, const Config& cfg);
 

@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 #include "explo_planner/candidate_generator.hpp"
 #include "explo_planner/map_cache.hpp"
@@ -234,15 +235,9 @@ TEST(CandidateGenerator, FlatModeKeepsFixedZ) {
     EXPECT_NEAR(c.position.z(), 0.3f, 1e-4f);
 }
 
-// Terrain-snapped candidate z is clamped into the map's ingest band.
-//
-// The frontier path references the ground search to the CENTROID's own z (a
-// distant frontier can sit metres above the robot), so ground + z_clearance can
-// land above the band the map was ingested over — by up to
-// ground_search_above + z_clearance. A candidate there has its FOV origin
-// outside the observed volume, where every ray walks un-ingested cells and
-// scores them as the Beta(1,1) prior, which is maximal: the planner would rank
-// its own blind spot as the most informative place to go.
+// Terrain-snapped candidate z is clamped into the map's ingest band: above it,
+// un-ingested cells score at the maximal prior and the planner would rank its
+// own blind spot most informative. (notes: test-terrain-z-band-clamp)
 TEST(CandidateGenerator, TerrainCandidateZIsClampedIntoTheIngestBand) {
   // Ground at ~2.1 (top face of the voxel whose centre is 2.05).
   auto map = makeOccupiedMap({{5.0f, 5.0f, 2.05f}});

@@ -1,16 +1,12 @@
 # Write the CURRENT git revision of SRC into the header OUT.
 #
-# Run in script mode (`cmake -P`) from a custom target, so it re-evaluates on
-# every build. The obvious spelling — execute_process() at the top of
-# CMakeLists.txt — runs once, when the build tree is CONFIGURED, and never
-# again: editing a source file and rebuilding leaves the old revision compiled
-# into the binary. That is not a theoretical decay. Campaign cr5 ran a binary
-# stamped 6ce7ad0 while its manifest recorded 1a097dc, because the build tree
-# had been configured at P5 and every commit since had only rebuilt. The gate's
-# check 3b compares those two and could not pass on any cell.
+# Runs in script mode from a custom target so it re-evaluates on every build; an
+# execute_process() at configure time would leave a stale revision compiled into
+# the binary. (notes: stamp-why-script-mode)
 #
 # Written only when the contents CHANGE, so an unchanged revision does not
 # force a recompile of the translation unit that includes it on every build.
+# Moved comments: doc/explo_planner_code_notes.md
 if(NOT DEFINED OUT OR NOT DEFINED SRC)
   message(FATAL_ERROR "StampGitRev.cmake requires -DOUT= and -DSRC=")
 endif()
@@ -18,15 +14,9 @@ endif()
 set(_rev "unknown")
 find_package(Git QUIET)
 if(GIT_FOUND)
-  # A HASH, deliberately, and not `describe --tags`. Every consumer of this
-  # string matches it against a hash: the harness manifest records
-  # git_explo_planner from `git rev-parse --short`, gate check 3b asserts the
-  # manifest startswith the baked rev's first seven characters, and
-  # equiv_pair.sh requires exact equality with `rev-parse --short` to prove a
-  # rebuild happened. The old spelling carried --tags, which is harmless only
-  # while the repo has no tags: the first `git tag v1.0` would stamp binaries
-  # "v1.0-dirty", check 3b would hard-fail every cell of the campaign running
-  # at the time, and the cause would look nothing like the tag that caused it.
+  # A short hash, not describe --tags: the harness manifest, gate check 3b and
+  # equiv_pair.sh all compare this string against rev-parse --short.
+  # (notes: stamp-hash-not-describe)
   execute_process(
     COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
     WORKING_DIRECTORY "${SRC}"
@@ -36,12 +26,9 @@ if(GIT_FOUND)
     RESULT_VARIABLE _rc)
   if(_rc EQUAL 0 AND NOT _out STREQUAL "")
     set(_rev "${_out}")
-    # The "-dirty" marker, which rev-parse does not provide and gate check 3c
-    # exists to read: a campaign whose binary was built from uncommitted work
-    # is not reproducible from any commit. `status --porcelain` counts
-    # untracked files too, matching equiv_pair.sh's dirt test — an untracked
-    # source file survives `git checkout` and would compile into both sides of
-    # a supposedly-controlled comparison.
+    # Appends "-dirty", which gate check 3c reads. status --porcelain counts
+    # untracked files too, matching equiv_pair.sh's dirt test.
+    # (notes: stamp-dirty-marker)
     execute_process(
       COMMAND ${GIT_EXECUTABLE} status --porcelain
       WORKING_DIRECTORY "${SRC}"

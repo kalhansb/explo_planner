@@ -1,3 +1,4 @@
+# Moved comments: doc/explo_planner_msgs_code_notes.md
 cmake_minimum_required(VERSION 3.16)
 project(explo_planner_msgs)
 
@@ -9,11 +10,10 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TreeTarget.msg"
   "msg/RobotIntent.msg"
-  # The shared coarse world model. New TYPES rather than new fields on
-  # RobotIntent, deliberately: see the compatibility note at the top of
-  # TeamWorld.msg — on Humble a field added to RobotIntent makes a mixed-build
-  # producer permanently invisible to an updated consumer, silently, for
-  # deconfliction traffic as well. An unmatched type fails loudly instead.
+  # The shared coarse world model, as new types rather than new RobotIntent
+  # fields: on Humble an added RobotIntent field silently hides a mixed-build
+  # producer from an updated consumer. See TeamWorld.msg.
+  # (notes: msgs-new-types-not-fields)
   "msg/CellState.msg"
   "msg/TeamWorld.msg"
   DEPENDENCIES std_msgs geometry_msgs

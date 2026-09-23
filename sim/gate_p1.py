@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/gate_p1_notes.md
 """P1 smoke gate: does the coarse cell census agree with the planner's own
 coverage measure, and does it converge?
 
@@ -96,19 +97,10 @@ class GateError(Exception):
     pass
 
 
-# Column-binning slack, as a FRACTION of the ROI's columns.
-#
-# censusFromMap bins columns on doubles; MapCache::unknownColumnFraction bins
-# them through Bonxai's float inv_resolution, which is not the exact inverse of
-# the float resolution (at 0.1 m, posToCoord(1.0) == 9, not 10). The two can
-# therefore disagree about which side of the ROI EDGE a boundary column falls,
-# by at most one column-row per edge. Interior disagreements cancel: a column
-# moving between two cells changes neither sum.
-#
-# At the sim's 100 m ROI and 0.1 m voxels that is 4 * 1000 columns out of
-# 1000^2, i.e. 4e-3. The value here is deliberately a fixed number rather than
-# something derived per run, so that if a future change makes the two binnings
-# diverge in the INTERIOR the slack does not silently absorb it.
+# Slack as a fraction of ROI columns: censusFromMap and
+# MapCache::unknownColumnFraction differ by at most one column-row per ROI edge,
+# 4e-3 at the 100 m ROI and 0.1 m voxels. Fixed, so interior divergence is not
+# absorbed. (notes: gate-p1-edge-slack)
 EDGE_SLACK = 4.0e-3
 
 # Below this many census rows a robot has not been sampled enough for the
@@ -116,11 +108,9 @@ EDGE_SLACK = 4.0e-3
 # report a perfect rank correlation on noise.
 MIN_ROWS = 10
 
-# The run must have made this much progress in roi_unknown_fraction between its
-# first and last census for "coverage saturates" to describe what happened.
-# Not a coverage TARGET: this world's ROI is far larger than two robots clear in
-# a run (the shipped done_unknown_fraction is 0.64), so a threshold on the final
-# value would only encode how big the ROI happens to be.
+# Required drop in roi_unknown_fraction between the first and last census for
+# the run to count as saturated. Not a coverage target: a threshold on the final
+# value would only encode the ROI's size. (notes: gate-p1-min-progress)
 MIN_PROGRESS = 0.05
 
 # Rank correlation floor for "the census tracks the coverage measure".
@@ -276,10 +266,9 @@ def check_robot(name, path, fails, notes):
                              f"{ff[1]:.4f}) at t_sim={e['t_sim_sec']:.1f}")
                 return None
             # The joint reading is one of the cells in the marginal, so it
-            # cannot sit below the marginal's minimum. This is what catches the
-            # field being wired to something that is not a cell in the set —
-            # the failure mode that would leave the threshold advice below
-            # confidently describing a candidate that does not exist.
+            # cannot sit below the marginal's minimum; this catches the field
+            # being wired to a cell outside the set.
+            # (notes: gate-p1-joint-reading-in-marginal)
             if ff[2] < ff[0] - 1e-12:
                 fails.append(f"{name}: cell_frontier_frac_at_best_unknown "
                              f"{ff[2]:.4f} is below the frontier-fraction "

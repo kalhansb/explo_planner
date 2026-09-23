@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/proximity_guard.hpp"
 
 #include <cmath>
@@ -101,11 +102,10 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     const double age = (now - p.last_seen).seconds();
     const bool fresh = age >= 0.0 && age <= max_age;
 
-    // Parked peers are the navigator's obstacle grid's job (not a nav2
-    // costmap — there is none here), and holding against one deadlocks
-    // — but only beyond parked_keep_dist_m. Inside the floor "it parked" is
-    // no licence to drive even closer; the caller's max-hold escape hatch is
-    // the deadlock breaker there.
+    // A parked peer beyond parked_keep_dist_m is left to the navigator's
+    // obstacle grid, since holding against it deadlocks. Inside that distance
+    // it is not treated as parked; the caller's max-hold hatch breaks the
+    // deadlock. (notes: proxguard-parked-peers)
     const bool parked =
         (now - p.last_moved).seconds() > cfg_.peer_static_sec &&
         dist >= cfg_.parked_keep_dist_m;

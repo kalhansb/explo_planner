@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/equiv_gate_calib_notes.md
 """Known-answer calibration for equiv_gate.py.
 
 The plan (§6) requires the equivalence gate to be "calibrated in both
@@ -333,11 +334,9 @@ case("the new team_world_hz at its compiled default", 0,
 case("team_world_hz dumped with the exchange running", 1,
      r"new param 'team_world_hz' is NOT at its default",
      child_ev=set_param(child_side(), team_world_hz=1.0))
-# P6's knob, the same pair. This one is a STRING default read out of
-# dp("pursuit_predictor", std::string("trail")), so it also pins that
-# _literal() still understands that initialiser form: teach the parser to
-# mis-read std::string(...) and the first of these two fails on a message about
-# the parser refusing to guess, not on a message about the arm.
+# P6's knob, both ways round. Its std::string default also pins that _literal()
+# parses that initialiser: if it regresses, the first case fails on a
+# parser-refusal message. (notes: calib-pursuit-predictor-string)
 case("the new pursuit_predictor at its compiled default", 0,
      r"new param\(s\) at defaults:.*pursuit_predictor",
      child_ev=set_param(child_side(), pursuit_predictor="trail"))
@@ -428,11 +427,8 @@ case("an absent manifest is reported as NOT compared, not as agreement", 0,
 
 print("\n=== manifest keys a phase ADDS ===")
 
-# Copied from the P1 pair that first hit this: a run of the P1 harness with
-# CELL_WORLD unset writes all seven of these, and the P0 parent writes none of
-# them. Before GATED_MANIFEST_GROUPS the gate called that seven configuration
-# differences, which is a verdict of "not equivalent" against a subsystem that
-# was switched off.
+# The P1 harness with CELL_WORLD unset writes these seven keys; a P0 parent
+# writes none of them. (notes: calib-cell-block-off)
 CELL_BLOCK_OFF = ("cell_world=0\n"
                   "cell_size_m=10.0\n"
                   "cell_census_period_s=5.0\n"
@@ -474,15 +470,9 @@ case("both sides carry the block and a gated knob is re-valued", 1,
      child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF.replace(
          "cell_covered_max_unknown=0.55", "cell_covered_max_unknown=0.70")})
 
-# P2 adds a second block on top of P1's, so its equivalence pair has the cell
-# block on BOTH sides and the team block on the child only. Note the recorded
-# rate: TEAM_WORLD_HZ defaults to 1.0 in the launcher and the manifest records
-# the harness variable, so "off" here reads as team_world=0 with a non-zero
-# hz — the value that never reached the node, because the -p is passed only
-# inside the TEAM_WORLD=1 branch. If this case ever starts failing on the hz,
-# the fix is not to zero it in the manifest: block 2 of the gate is what proves
-# the node ran at its compiled 0.0, and this block is what proves the harness
-# knob was off. They are different facts and they are allowed to differ.
+# Cell block on both sides, team block on the child only. team_world_hz reads
+# 1.0 with team_world=0 (launcher default, never passed to the node); do not
+# zero it in the manifest to fix a failure here. (notes: calib-team-block-off)
 TEAM_BLOCK_OFF = ("team_world=0\n"
                   "team_world_hz=1.0\n")
 
@@ -502,20 +492,9 @@ case("the team rate present but its switch missing", 1,
      child_kw={"manifest": MANIFEST + CELL_BLOCK_OFF
                + TEAM_BLOCK_OFF.replace("team_world=0\n", "")})
 
-# P3 through P6. Four gate keys with no dependents, so there is no
-# switch-missing case to write for them — the switch IS the whole group. What
-# there is instead, and what the P1/P2 blocks above cannot test, is that two of
-# the four are off at a WORD rather than at "0". A registry entry of
-# ("0", set()) for either would fail an honest defaults child on a bookkeeping
-# line, and the fix somebody reaches for under time pressure is to delete the
-# check. Both directions are pinned below, per key.
-#
-# These blocks exist at all because the registry has now been forgotten twice:
-# global_alloc and reconnect_gate were written to the manifest one commit
-# before they were declared, and pursuit_predictor one commit before that
-# again. Neither lapse was caught by a calibration case, because until now the
-# calibration stopped at P2 — it tested the mechanism on the two oldest groups
-# and said nothing about the four that came after.
+# Four gate keys with no dependents, so no switch-missing case. Two are off at a
+# word, not 0 (reconnect_gate at silence, pursuit_predictor at trail); both
+# directions are pinned per key. (notes: calib-p3-p6-stack)
 STACK_BLOCK_OFF = ("global_alloc=0\n"
                    "reconnect_gate=silence\n"
                    "rendezvous_schedule=0\n"
@@ -571,13 +550,10 @@ case("a roster whose scenario changed under it", 1,
          "scenario=flatforest_3robot_lidar.yaml")
          + "robots=atlas,bestla,husky\nn_robots=3\n"})
 
-# The 2026-09-03 rename of the reconnect master switch. The harness echoes one
-# variable to both spellings, so the new key restates the legacy one — which
-# both sides still write, and which the direct comparison above already fails
-# on. The case that has to hold is the second: when the two sides ran DIFFERENT
-# arms, the new key must fail on its own line rather than being waved through
-# beside the legacy key's failure, or the relaxation becomes a way to smuggle an
-# arm change past a reader who saw one complaint and stopped reading.
+# reconnect_enabled restates rendezvous_enabled (the harness writes both from
+# one variable). When the sides ran different arms, the alias must fail on its
+# own line, not ride on the legacy key's failure.
+# (notes: calib-reconnect-rename)
 case("the renamed reconnect switch, restating a key both sides record", 0,
      r"1 new manifest key\(s\) restating a key both sides record: "
      r"reconnect_enabled",
@@ -590,11 +566,9 @@ case("the renamed switch where the two sides ran different arms", 1,
      child_kw={"manifest": STACKED.replace("rendezvous_enabled=true",
                                            "rendezvous_enabled=false")
                + "reconnect_enabled=false\n"})
-# The alias relaxation rests on the harness echoing both spellings from ONE
-# variable — an invariant enforced in run_explo_sim_rviz.sh, not here. This is
-# the case that notices if that ever stops being true. Without the intra-manifest
-# check the pair below reads EQUIVALENT: the source key agrees across the sides,
-# and nothing would look at what the child says under the new name.
+# Catches run_explo_sim_rviz.sh no longer writing both spellings from one
+# variable; without the gate's intra-manifest alias check this pair would read
+# EQUIVALENT. (notes: calib-alias-intra-manifest)
 case("a child whose two spellings of the switch disagree", 1,
      r"manifest reconnect_enabled: declared a rename of rendezvous_enabled, "
      r"but the child writes reconnect_enabled='true' and "
@@ -702,12 +676,9 @@ case("a flag contradicting the same run's FOV geometry is a difference",
      child_ev=set_param(child_side(),
                         **dict(OMNI, fov_is_omnidirectional=False)))
 
-# A directional child DOES fail -- D1 ships 360 deg, so a 60 deg comb is not a
-# defaults run -- but it must fail on the FOV it actually changed. If the
-# derived flag were pinned to True it would fail here a SECOND time, for a
-# reason that is not true, and the real finding would be one line of noise in
-# a pile. Asserted by reading the failure list, because what is being checked
-# is the ABSENCE of a line.
+# A directional FOV child fails, but on fov_hfov itself, never on the derived
+# flag. Asserted by reading the FAIL lines, since what is checked is the absence
+# of a line. (notes: calib-directional-fov-child)
 rc, out = run(parent_side(),
               set_param(child_side(), fov_hfov=1.047, fov_h_rays=16,
                         fov_is_omnidirectional=False))
@@ -735,12 +706,9 @@ case("an AUTO-sentinel param is UNRESOLVED, not a false difference",
      3, r"coord_claim_radius_m.*AUTO sentinel, not a default",
      child_ev=set_param(child_side(), coord_claim_radius_m=10.0))
 
-# ...and equally must not be quietly counted as one of the params that WERE
-# checked. A gate that says "1 new param at defaults" about a param it declined
-# to check is back to printing passes for things it never looked at.
-# NOT "the note is absent": this child also carries P0's three genuine new
-# params, so the note is printed and should be. What must not appear is the
-# declined param's NAME inside it.
+# The declined AUTO-sentinel param must not be counted as checked: the
+# at-defaults note still prints (P0's three new params) but must not name
+# coord_claim_radius_m. (notes: calib-auto-sentinel-not-counted)
 rc, out = run(parent_side(),
               set_param(child_side(), coord_claim_radius_m=10.0))
 _note = [l for l in out.splitlines() if "new param(s) at defaults" in l]
@@ -814,22 +782,9 @@ def audit_fixture_against_real_cell():
               f"that the other cases are built on a real schema")
         fails += 1
         return
-    # Scan for the NEWEST schema present rather than stopping at the first cell
-    # alphabetically. The fixture is written at the current schema, so auditing
-    # it against the oldest banked cell in the directory would silently compare
-    # it to a run_start that predates half the params it claims to copy.
-    #
-    # AND IT WAS DOING EXACTLY THAT. The scan was one level deep, so it could
-    # only reach cells sitting loose at the top of ~/hmr_campaign -- 3467 of
-    # them, none newer than schema 4. Every campaign since then writes its cells
-    # one level further down (ts4_smoke20_n2/<cell>/), so the schema-5, -6 and
-    # -7 runs were invisible and this audit had been certifying the fixture
-    # against a four-generation-old run_start while printing PASS. The comment
-    # above was true about the loop and false about the outcome, which is the
-    # failure mode this whole review pass is about.
-    #
-    # Depth 2 is the campaign/cell layout and is where the scan stops; a deeper
-    # walk would spend minutes crossing bag directories for nothing.
+    # Scans depth 1 and 2 under the root (the campaign/cell layout) and keeps
+    # the run_start with the newest schema; deeper walks only cross bag
+    # directories. (notes: calib-audit-scan-depth)
     real_start, real_params, real_schema, real_where = None, None, -1, None
     cand = [root] + [os.path.join(root, c) for c in sorted(os.listdir(root))
                      if os.path.isdir(os.path.join(root, c))]
@@ -872,23 +827,9 @@ def audit_fixture_against_real_cell():
     if invented:
         bad.append(f"run_start: fixture invents top-level key(s) "
                    f"{sorted(invented)}")
-    # BOTH DIRECTIONS, and only one of them used to be checked. `invented` says
-    # the fixture made something up; `missing` says the writer has moved on
-    # without it -- and a fixture that is merely BEHIND passes every subset test
-    # ever written while testing the wrong shape. The two are not symmetric in
-    # how they are treated, because the two halves of run_start are not:
-    #
-    #   top-level keys ARE a failure. There are twelve of them, the writer emits
-    #   the same twelve on every event kind plus t0_sim_sec/coverage_milestones,
-    #   and as of schema 7 the fixture has exactly that set. So equality is the
-    #   real invariant here, and a new one appearing is the writer changing
-    #   under the gate -- which is precisely what the gate exists to notice.
-    #
-    #   params are NOT. The fixture carries 16 of the 138 a real run dumps, on
-    #   purpose: the gate compares params generically, key by key, so a fixture
-    #   that copied all 138 would test the same code path 138 times and go stale
-    #   every time anyone declares a parameter. Missing params are reported as a
-    #   count for reach, never as a failure.
+    # Top-level run_start keys must equal the real cell's: invented or missing
+    # keys fail. Params are a deliberate subset: invented params fail, missing
+    # ones are only counted. (notes: calib-audit-both-directions)
     missing = real_start - fixture_start
     if missing:
         bad.append(f"run_start: a real schema-{real_schema} cell has top-level "
@@ -917,23 +858,10 @@ def audit_fixture_against_real_cell():
     if bad:
         fails += 1
 
-    # AND A TRIPWIRE ON THE REACH, separately from the shape. Everything above
-    # compares the fixture to whatever cell the scan found; none of it can tell
-    # a current reference from a stale one, because the top-level run_start keys
-    # have not changed since schema 3 and so an ancient cell agrees just as
-    # loudly. That is how the one-level scan survived four generations here: it
-    # kept finding a schema-4 cell, kept agreeing with it, and kept printing
-    # PASS. The staleness has to be its own verdict or nothing checks it.
-    #
-    # The header is the truth for the current schema — the binary stamps
-    # kSchemaVersion into every run_start and nothing else votes. Reading it
-    # here rather than pinning a number is deliberate: a second hand-kept pin is
-    # what gate_g8_calib.py had to grow an assertion to police, three drifts in.
-    #
-    # One behind is normal and stays green: the pin moves with the header, and
-    # no cell of the new generation exists until that binary has been built and
-    # run. Two behind means a whole generation was campaigned without this scan
-    # ever reaching one of its cells.
+    # The shape check cannot tell a stale cell from a current one, so the
+    # reference's schema is compared to kSchemaVersion read from
+    # experiment_log.hpp: one behind passes, two or more fails.
+    # (notes: calib-audit-reference-age)
     hdr = os.path.join(HERE, os.pardir, "explo_planner", "include",
                        "explo_planner", "experiment_log.hpp")
     m = (re.search(r"kSchemaVersion\s*=\s*(\d+)", open(hdr, errors="replace")

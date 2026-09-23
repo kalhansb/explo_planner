@@ -31,6 +31,7 @@
 /// asks `requireFleetIdentity()` and gets a fatal, named config error if identity is
 /// missing. Absent identity therefore cannot silently degrade a mechanism into
 /// doing nothing — it refuses to start.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 #include <string>
@@ -38,11 +39,9 @@
 
 namespace explo_planner {
 
-/// Policy cap on team size. A POLICY cap, not a representation one: the masks
-/// are uint32 and would hold 32. Eight is the largest fleet any of the
-/// data structures here have been reasoned about at, and a cap that is checked
-/// beats a cap that is assumed — an unnoticed 33rd robot would shift bits off
-/// the end of every mask and corrupt the knowledge gate silently.
+/// Policy cap on team size, not a representation limit: the uint32 masks could
+/// hold 32. Checked rather than assumed, since an unnoticed 33rd robot would
+/// shift bits off every mask. (notes: fleet-id-team-size-cap)
 inline constexpr int kMaxTeamSize = 8;
 
 /// Bit for robot `id`. Returns 0 for out-of-range ids, so a mask built from
@@ -52,13 +51,9 @@ inline uint32_t robotBit(int id) {
   return 1u << static_cast<unsigned>(id);
 }
 
-/// Mask naming every robot of a fleet of `size`, self included. Empty for a
-/// size outside the policy cap, so a mask built from an unvalidated size is
-/// empty — and therefore matches nothing — rather than naming robots that do
-/// not exist. `(mask & fleetMask(n)) == fleetMask(n)` is the test for "this
-/// robot reported direct contact with the WHOLE team", which is what makes a
-/// team-completeness question answerable from a peer's broadcast mask instead
-/// of only from our own links.
+/// Mask naming every robot of a fleet of size, self included; 0 outside the
+/// policy cap, so it matches nothing. A peer mask containing fleetMask(n)
+/// reports direct contact with the whole team. (notes: fleet-id-fleet-mask)
 inline uint32_t fleetMask(int size) {
   if (size <= 0 || size > kMaxTeamSize) return 0u;
   return (1u << static_cast<unsigned>(size)) - 1u;
@@ -73,19 +68,9 @@ inline bool maskHas(uint32_t mask, int id) {
 /// Number of robots named in `mask`, counting only bits inside the policy cap.
 int maskCount(uint32_t mask);
 
-/// FNV-1a 32-bit over the names joined by NUL, in order.
-///
-/// Hand-rolled rather than std::hash because this value goes ON THE WIRE and
-/// is compared between processes: std::hash is implementation-defined and is
-/// permitted to differ between two libstdc++ versions, let alone two
-/// standard libraries. A config check whose answer depends on which machine
-/// compiled the binary is worse than no check — it would report a config
-/// mismatch on a correctly configured fleet, and the fix people would reach
-/// for is deleting the check.
-///
-/// Order matters (it is what defines the ids), so this is deliberately NOT
-/// invariant to permutation: two robots that agree on the membership but not
-/// the order do not agree on identity.
+/// FNV-1a 32-bit over the names joined by NUL, in order. Hand-rolled, not
+/// std::hash: it goes on the wire and must match across builds. Order-sensitive
+/// on purpose, since order defines the ids. (notes: fleet-id-names-hash)
 uint32_t teamNamesHash(const std::vector<std::string>& names);
 
 /// The fleet definition this robot is running, resolved from the param.
@@ -99,11 +84,9 @@ struct FleetIdentity {
   uint32_t team_hash = 0;
   /// The validated, ordered fleet. Empty when not configured.
   std::vector<std::string> names;
-  /// Human-readable reason the param was rejected; empty when the param was
-  /// accepted OR when it was absent. Distinguishing those two is the caller's
-  /// job and is what `configured` plus emptiness of `names` is for: an absent
-  /// param is legacy operation, a malformed one is a config error the node
-  /// must refuse to run past.
+  /// Why the param was rejected; empty when accepted or absent. An absent param
+  /// is legacy operation, a malformed one a config error the node must refuse
+  /// to run past. (notes: fleet-id-error-field)
   std::string error;
 
   /// Mask naming every robot in the fleet. 0 when not configured.
@@ -117,18 +100,9 @@ struct FleetIdentity {
   const std::string& nameOf(int id) const;
 };
 
-/// Resolve `team_robot_names` for the robot called `self_name`.
-///
-/// Empty `names` -> unconfigured, no error (the default, legacy path).
-/// Otherwise the array must be a well-formed fleet definition or the result
-/// carries `error` and `configured == false`:
-///   - at most kMaxTeamSize entries;
-///   - no empty entry (an empty name cannot be matched against `robot_name`,
-///     and would give a bit nobody can claim);
-///   - no duplicates (two robots would share one bit, and the knowledge gate
-///     would credit one with the other's observations);
-///   - `self_name` must appear (a robot that is not in its own fleet cannot
-///     set its own bit, so every mask it publishes would be a lie).
+/// Resolve team_robot_names for self_name. Empty names: unconfigured, no error.
+/// Otherwise at most kMaxTeamSize entries, none empty or duplicated, and
+/// self_name present, or error is set. (notes: fleet-id-validation-rules)
 FleetIdentity makeFleetIdentity(const std::vector<std::string>& names,
                                 const std::string& self_name);
 

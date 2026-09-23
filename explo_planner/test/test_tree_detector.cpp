@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -93,11 +94,9 @@ void addGround(std::vector<SemVoxel>& out, float x0, float x1, float y0,
     }
 }
 
-// A trunk surface with THICKNESS and jitter, not the idealised single-radius
-// shell addTrunk() lays down. This is what a real fused voxel map holds: the
-// surface spans a couple of voxels radially and the returns are noisy. It is
-// also the case the thin-shell tests could not expose -- see
-// OneSidedThickTrunkIsUnderInformed below.
+// A trunk surface a couple of voxels thick with radial jitter, as in a real
+// fused map, unlike the single-radius shell addTrunk() lays down.
+// (notes: tree-thick-trunk-fixture)
 void addThickTrunk(std::vector<SemVoxel>& out, float cx, float cy, float base_z,
                    float radius, float height, float a_lo_deg, float a_hi_deg,
                    float voxel = 0.2f) {
@@ -159,14 +158,9 @@ TEST(TreeDetector, OneSidedTrunkIsUnderInformed) {
   EXPECT_TRUE(d[0].under_informed);
 }
 
-// A non-finite p_occ from an upstream producer must not poison the score.
-// The occupancy gates use `p_occ < occ_thresh`, which is FALSE for NaN, so a
-// poisoned voxel is kept rather than skipped and reaches the entropy sum. If
-// normEntropy let it through, mean_entropy -> info_deficit would go NaN, the
-// `deficit > deficit_thresh` test would compare false (the tree silently reads
-// well-observed and is never targeted), and the std::sort comparator on
-// info_deficit would stop being a strict weak ordering. Both must hold: the
-// outputs stay finite, AND the one-sided trunk stays flagged.
+// A NaN p_occ is not skipped by the occupancy gates and reaches the entropy
+// sum; normEntropy must absorb it, or info_deficit goes NaN, the tree reads
+// well-observed and the sort ordering breaks. (notes: tree-nan-pocc-entropy)
 TEST(TreeDetector, NonFinitePOccDoesNotPoisonTheScore) {
   std::vector<SemVoxel> vox;
   addTrunk(vox, 0.0f, 0.0f, 0.0f, 0.3f, 2.5f, {0.0f, 30.0f, 60.0f});
@@ -191,35 +185,19 @@ TEST(TreeDetector, NonFinitePOccDoesNotPoisonTheScore) {
   EXPECT_TRUE(d[0].under_informed);
 }
 
-// Two well-separated trunks segment into two distinct detections.
-// REGRESSION (map-test-2 bag): a trunk seen from one side only must read low
-// angular coverage even when its surface is thick and noisy rather than an
-// idealised single-radius arc.
-//
-// The thin-shell OneSidedTrunkIsUnderInformed above passed throughout the
-// period this was broken, because with a one-voxel-thick arc even a biased
-// centre leaves the azimuths clustered. Give the surface real thickness and the
-// old per-component-median centre lands ON the arc, the voxels fan out around
-// it through every sector, and coverage reads ~1.0 -- a half-observed tree
-// scoring as fully covered. On the real map that pinned 13 of 17 trunks at
-// coverage 1.00 and made the emission gate arithmetically unreachable.
+// A trunk seen from one side only must read low angular coverage even when its
+// surface is thick and noisy rather than an idealised single-radius arc.
+// (notes: tree-thick-one-sided-regression)
 TEST(TreeDetector, OneSidedThickTrunkIsUnderInformed) {
   std::vector<SemVoxel> vox;
   addThickTrunk(vox, 1.0f, 2.0f, 0.0f, 0.4f, 3.0f, -60.0f, 60.0f);
   const auto d = TreeDetector(defaultCfg()).detect(vox);
   ASSERT_EQ(d.size(), 1u);
   EXPECT_TRUE(d[0].axis_fitted);
-  // 120 deg of 360 was observed, so the ideal reading is 0.33. The measured
-  // value is 0.50: fitting a circle to a partial arc whose radial noise is a
-  // sizeable fraction of its radius (a 0.4 m trunk on a 0.2 m grid -- the real
-  // regime, not a pathological one) still biases the centre slightly toward the
-  // arc, which spreads the azimuths wider than the arc truly spans. That
-  // residual bias is why the node prefers bearing coverage, which measures
-  // viewing geometry directly instead of inferring it from surface shape.
-  //
-  // The value this test actually pins down is that it is no longer ~1.0. Before
-  // the fit it read 1.00 here, i.e. "fully circled" for a trunk seen from 120
-  // degrees, which is what made the emission gate unreachable on real maps.
+  // 120 of 360 degrees observed: ideal coverage is 0.33, but the circle fit on
+  // a noisy partial arc biases the centre toward the arc and reads higher,
+  // hence the 0.6 bound. The point is it is not ~1.0.
+  // (notes: tree-partial-arc-coverage-bias)
   EXPECT_LT(d[0].angular_coverage, 0.6f);
   EXPECT_TRUE(d[0].under_informed);
   // The fit must recover the true axis, not the centroid of the observed arc
@@ -311,11 +289,9 @@ TEST(TreeDetectorGeometric, DetectsUnlabeledTrunkOnGround) {
   EXPECT_FALSE(d[0].under_informed);
 }
 
-// The shared ground plane must NOT merge two trunks. stem_slice_lo is zeroed
-// so the clustering slice would include any ground the margin gate failed to
-// strip: this passes only if terrain removal actually removes the plane (with
-// the default slice, ground below stem_slice_lo never reached the clusterer
-// and the test could not fail even with terrain removal ablated).
+// The shared ground plane must not merge two trunks. stem_slice_lo is zeroed so
+// only terrain removal, not the clustering slice, can keep the ground out.
+// (notes: tree-ground-no-merge-slice)
 TEST(TreeDetectorGeometric, GroundDoesNotMergeTrunks) {
   std::vector<SemVoxel> vox;
   addGround(vox, -2.0f, 6.0f, -2.0f, 2.0f);
@@ -328,10 +304,8 @@ TEST(TreeDetectorGeometric, GroundDoesNotMergeTrunks) {
   EXPECT_EQ(det.detect(vox).size(), 2u);
 }
 
-// Terrain interpolation keeps ground out on a 27 deg slope (grade 0.5). With
-// a piecewise-constant terrain lookup, ground leaked past the margin gate at
-// grades above ~ground_margin/terrain_cell (~22 deg): bases dropped below the
-// true ground and steeper slopes fused trunks with ground ribbons.
+// Terrain interpolation keeps ground out on a 27 deg slope (grade 0.5).
+// (notes: tree-sloped-terrain-interp)
 TEST(TreeDetectorGeometric, HandlesSlopedTerrain) {
   std::vector<SemVoxel> vox;
   const float grade = 0.5f;
@@ -349,11 +323,9 @@ TEST(TreeDetectorGeometric, HandlesSlopedTerrain) {
   TreeDetector det(geomCfg());
   auto d = det.detect(vox);
   ASSERT_EQ(d.size(), 2u);
-  // Bases stay within [local ground, ground + margin]. The min-z terrain
-  // estimate sits ~grade*cell/2 below true ground, so downslope-side trunk
-  // voxels right at the base can survive the margin gate (base = ground
-  // exactly) — what must never happen is a base BELOW local ground (the old
-  // piecewise-constant lookup reported -0.5 here) or ground voxels attaching.
+  // Bases must lie within [local ground, ground + margin]. The min-z terrain
+  // estimate sits below true ground, so a base may equal ground, but never lie
+  // below it, and no ground voxel may attach. (notes: tree-sloped-base-bounds)
   std::vector<float> zs = {d[0].center.z(), d[1].center.z()};
   std::sort(zs.begin(), zs.end());
   EXPECT_GE(zs[0], -0.05f);
@@ -362,11 +334,10 @@ TEST(TreeDetectorGeometric, HandlesSlopedTerrain) {
   EXPECT_LE(zs[1], 2.45f);
 }
 
-// A wall slab: linearity does NOT reject it (a wall longer than its in-slice
-// height reads linear along its length) and its median radius sits exactly AT
-// max_radius (1.0, not >), so the verticality gate is the sole rejector.
-// The second config ablates that gate (and moves the radius knife-edge out of
-// the way) to pin the rejection on verticality specifically.
+// Linearity does not reject this wall and its median radius sits exactly at
+// max_radius (not above), so verticality is the sole rejector; the second
+// config ablates that gate to pin the rejection on it.
+// (notes: tree-wall-verticality-sole-rejector)
 TEST(TreeDetectorGeometric, RejectsWallByShape) {
   std::vector<SemVoxel> vox;
   addGround(vox, -3.0f, 3.0f, -2.0f, 2.0f);

@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <Eigen/Core>
@@ -134,20 +135,10 @@ TEST(PlanMapQuery, UnknownFractionRoiClippingAndMiss) {
   EXPECT_EQ(unknownFractionInRoi(empty, {0.0f, 1.0f, 0.0f, 1.0f}), -1.0);
 }
 
-// A grid whose METADATA claims more cells than data[] actually holds.
-//
-// nav_msgs ties nothing together: info.width/info.height are a separate claim
-// from data.size(), and every bounds test in this file is written against the
-// former. A publisher that fills in the header and then sends a short (or
-// empty) vector therefore produces a grid that passes every index check and
-// still reads off the end — a 1140x1140 map carrying 1140 bytes segfaulted the
-// planner under AddressSanitizer.
-//
-// Both functions must degrade to their existing "cannot be measured" answer
-// rather than to a fabricated one. That direction matters for
-// unknownFractionInRoi in particular: its output feeds the DONE criterion, so
-// inventing a fraction would end a run, while -1.0 is already read as "no
-// reading this tick".
+// A grid whose metadata claims more cells than data[] holds must read as no
+// data (kCellNoData, -1.0), never overread or invent a fraction:
+// unknownFractionInRoi feeds the DONE criterion.
+// (notes: planmap-short-data-buffer)
 TEST(PlanMapQuery, ShortDataBufferIsNoDataNotAnOverread) {
   auto g = makeGrid(10, 10, 1.0f, -5.0f, -5.0f);
   setCell(g, 3, 4, 42);

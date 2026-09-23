@@ -5,31 +5,15 @@
 # map hmr_localisation/gt_map/gt_map.ply, and each release time is set so the
 # target lands while the bag walk is passing that trunk.
 #
-# How these were chosen (the run is bag replay: NOTHING drives to the
-# vantages). At the time, exploitation was NOT terrain-adapted, so the trunks
-# were picked to suit the *absolute* z knobs. That constraint is gone —
-# exploitZAt() now snaps vantage z and the LoS sightline to the local ground —
-# but the pair still demonstrates the ring cleanly, so it stays as solved:
-#   * ground_z <= -1.4  — scovox projected the planning_map over the ABSOLUTE
-#     band [-1, 2]; on higher ground the ground plane itself landed in the band,
-#     marked every cell occupied and every vantage was rejected as not-free.
-#     (The runbook now also keeps the planning_map off entirely.)
-#   * sightline clearance — the LoS ray marched at the absolute
-#     candidate_robot_z (0.3), which had to sit ~2 m above the local ground and
-#     well under the canopy to actually strike the trunk.
-#   * open ring — with vantage_start_angle_deg: 30 the three vantages
-#     (30/150/270 deg, standoff = radius + 2.0 m) land in free, LoS-clear cells.
-#     Both the angle and these centres were solved together; changing one
-#     without re-checking the other will start rejecting vantages.
-#
-#   id  centre (x, y)   ground_z  radius  closest approach   ring @ start=30
-#   1   ( 5.43, -8.10)   -1.70     0.25   4.9 m at t=151 s   2/3 free, 2/3 LoS
-#   2   (15.93, 16.57)   -2.65     0.27   5.4 m at t=219 s   3/3 free, 2/3 LoS
+# The trunks were picked for the absolute z knobs of the time. These centres and
+# vantage_start_angle_deg 30 were solved together; re-check the vantages when
+# changing either. (notes: targets-map-test2-trunks)
 #
 # Release times are in SIM seconds from the scheduler's origin, which it latches
 # on its first tick with a live /clock (~bag start). The bag's first localized
 # pose lands ~2.6 s after that, so these are (trajectory time + ~2.6 s), set a
 # few seconds BEFORE closest approach so the planner engages on the way in.
+# Moved comments: doc/explo_planner_code_notes.md
 target_scheduler:
   ros__parameters:
     use_sim_time: true

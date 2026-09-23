@@ -1,6 +1,7 @@
 #pragma once
 /// @file fov_evaluator.hpp
 /// @brief Simulated FOV ray-casting for viewpoint evaluation.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include "explo_planner/scoring.hpp"
 #include "explo_planner/candidate_generator.hpp"
@@ -11,15 +12,10 @@ namespace explo_planner {
 
 class MapCache;
 
-/// NOT a sensor model. Every field below is overwritten from parameters by
-/// explo_planner_node before the evaluator is constructed, so these values
-/// never reach a run; the deployed sensor lives in `shared_params.yaml`
-/// (`fov_*`) and is traceable to the SDF. They are deliberately left at the
-/// old narrow-camera numbers so that the unit tests, which construct a
-/// FovConfig and set only the fields they are exercising, keep testing the
-/// directional geometry they were written for. Do not "correct" them to the
-/// deployed values: that would create a second place for the sensor model to
-/// drift, and would silently change what ten tests assert.
+/// Not a sensor model: the node overwrites every field from parameters before
+/// construction, the sensor from the fov_* params. Defaults are unit-test
+/// placeholders; do not correct them to the deployed values.
+/// (notes: fov-config-test-placeholders)
 struct FovConfig {
   float hfov      = 1.047f;   ///< Horizontal FOV (radians). Test placeholder.
   float vfov      = 0.785f;   ///< Vertical FOV (radians). Test placeholder.
@@ -29,12 +25,9 @@ struct FovConfig {
   int   v_rays     = 12;      ///< Vertical ray samples. Test placeholder.
   float occ_stop   = 0.7f;    ///< Stop ray at voxels above this p_occ
 
-  /// XYZ ROI bounds.  Rays are clipped at the ROI boundary so the
-  /// evaluator never scores voxels outside the region of interest. The z
-  /// band must match the volume the local map_cache_ actually holds (in
-  /// dscovox mode that is the GetRegion fetch band): otherwise rays leaving
-  /// the band traverse absent voxels and score them as the Beta(1,1) prior,
-  /// inflating info gain for upward-pointing rays into unfetched space.
+  /// XYZ ROI bounds; rays are clipped at them. The z band must match the
+  /// volume map_cache_ actually holds, or rays leaving it score absent voxels
+  /// as the Beta(1,1) prior and inflate info gain. (notes: fov-roi-z-band)
   float roi_min_x  = -1e9f;
   float roi_max_x  =  1e9f;
   float roi_min_y  = -1e9f;
@@ -54,11 +47,9 @@ class FovEvaluator {
 public:
   explicit FovEvaluator(const FovConfig& cfg);
 
-  /// Re-band the vertical ray clip. Terrain-relative mode moves the map z-slab
-  /// with the robot each PLAN tick; the ray clip must track it so out-of-band
-  /// space stays "empty" (no score, no occlusion) rather than reading absent
-  /// voxels as the max-uncertainty prior. Ray directions only depend on the
-  /// FOV so no recompute is needed.
+  /// Re-band the vertical ray clip to follow the terrain-relative map z-slab
+  /// each PLAN tick, so out-of-band space stays empty. Ray directions depend
+  /// only on the FOV; no recompute. (notes: fov-set-roi-z)
   void setRoiZ(float roi_min_z, float roi_max_z) {
     cfg_.roi_min_z = roi_min_z;
     cfg_.roi_max_z = roi_max_z;

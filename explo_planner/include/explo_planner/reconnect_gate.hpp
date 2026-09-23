@@ -49,6 +49,7 @@
 ///   Neither is corrected, because a travel model accurate enough to matter
 ///   would need the manoeuvre chosen before the decision that chooses it.
 ///   Both directions are recoverable from the logged `leg_mm`.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 #include <string>
@@ -90,17 +91,10 @@ struct GateVerdict {
   long long c_re_mm = -1;
   long long leg_mm  = -1;
 
-  /// Cells no vehicle could legally take under the no-comms mask.
-  ///
-  /// STRUCTURALLY ZERO, AND THEREFORE A DEAD COLUMN. It was meant to report
-  /// comms-mask starvation, and it cannot: the deciding robot is always built
-  /// in_comms, the mask exempts an in_comms vehicle from the known-by test
-  /// entirely, and an exempt vehicle can absorb any cell. So it is not merely
-  /// "expected to be 0" (which this said until 2026-09-18, alongside a reading
-  /// of what a nonzero value would mean) — nonzero is unreachable while self is
-  /// in the vehicle set, which it always is. Kept only so the column does not
-  /// change meaning mid-campaign; listed with the other dead columns in
-  /// CODE_TODO.
+  /// Cells no vehicle could take under the no-comms mask. Structurally zero
+  /// while self, always in_comms and so exempt from the mask, is in the vehicle
+  /// set; kept so the column keeps its meaning.
+  /// (notes: reconnect-gate-unassigned-dead)
   int unassigned = 0;
 
   /// Non-empty when the arithmetic could not be evaluated. `dispatch` is then
@@ -108,34 +102,18 @@ struct GateVerdict {
   std::string refused;
 };
 
-/// Evaluate the gate.
-///
-/// `robots` is the full vehicle set as doPlan would build it for the allocator,
-/// including the missing peers themselves — the value gate needs them present
-/// in both solves, differing only in whether they are reachable. `missing` is
-/// the set of peers the trigger is considering, i.e. the CANDIDATES; the gate
-/// picks exactly one of them — the nearest it can locate — and prices and
-/// values a manoeuvre that fetches that one. It is not a set of peers that all
-/// get fetched, and at N >= 3 the distinction is the difference between a
-/// correct verdict and a one-directional bias towards dispatch.
-///
-/// `cfg` supplies the allocator's polish/candidate limits; its `comms_mask`
-/// field is IGNORED. Both solves run with the mask ON (2026-09-18) and differ
-/// only in the vehicle set: in the "stay apart" solve every missing candidate
-/// is out of comms, and in the "reconnect" solve the one chosen peer is back.
-/// Switching the flag off for the second solve — which is what this used to do
-/// — unmasks the whole fleet at once and cannot express a single reconnection.
+/// robots is the full vehicle set, missing peers included; the gate prices
+/// fetching only the nearest locatable peer in missing. cfg.comms_mask is
+/// ignored: both solves run masked, differing only in that peer.
+/// (notes: reconnect-gate-evaluate)
 GateVerdict evaluateReconnectGate(const CellWorld& world,
                                   const std::vector<AllocRobot>& robots,
                                   const std::vector<MissingPeer>& missing,
                                   const GlobalAllocator::Config& cfg);
 
-/// The knowledge gate on its own: how many non-UNSEEN cells are missing from at
-/// least one unfinished peer's `known_by`. Exposed separately because it is the
-/// half with a documented failure mode in both directions — vacuous-true if the
-/// reset semantics regress, vacuous-false if the mask is ever widened by a
-/// merge that did not actually transfer the status — and a count is testable
-/// where a bool is only ever anecdote.
+/// Number of non-UNSEEN cells missing from at least one unfinished missing
+/// peer's known_by. Exposed as a count so the knowledge gate is testable in
+/// both failure directions. (notes: reconnect-gate-unshared-count)
 int unsharedCellCount(const CellWorld& world,
                       const std::vector<MissingPeer>& missing);
 

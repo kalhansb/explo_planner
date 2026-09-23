@@ -9,6 +9,7 @@
 ///     be IN_COMMS while everything we know about it is minutes old;
 ///   - a peer's clock is never read as a time, only ever differenced into an
 ///     age on the peer's own clock and re-based onto ours.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -394,13 +395,10 @@ TEST(TeamModelGossip, OnlyEverMovesFreshnessForward) {
   EXPECT_NEAR(m.lastKnownAgeSec(2, 1001.0), 1.0, 1e-9)
       << "a 50 s-old relay must not age our 1 s-old first-hand contact";
 
-  // And a relay that keeps re-sending the same reading must not keep
-  // refreshing it. Note what "the same reading re-sent" looks like on the
-  // wire: the entry for cerd is unchanged at 190, but the SENDER'S OWN entry
-  // advances every publish, because it is the sender's publish time. So the
-  // age grows message by message and `at` stays put — which is the point.
-  // (Constructing this with a frozen sender entry instead would be a
-  // duplicated message, not a re-send; see the note in observe().)
+  // A relay re-sending the same reading must not refresh it. A re-send keeps
+  // the subject's entry but advances the sender's own entry (its publish time),
+  // so the age grows; see the note in observe().
+  // (notes: gossip-resend-does-not-refresh)
   TeamModel r = makeModel();
   ASSERT_EQ(r.observe(gossipMsg(1, robotBit(0), {-1.0, 200.0, 190.0}), 500.0),
             "");
@@ -468,12 +466,10 @@ TEST(TeamModelObserve, TickIsIdempotentAndSafeBeforeAnyMessage) {
 // ===========================================================================
 // Position freshness
 //
-// Rule 3 of the file header, made testable. lastKnownAgeSec() answers "when
-// did we last learn ANYTHING about this robot"; positionAgeSec() answers "how
-// old is the pose we hold for it". Both refresh paths in observe() advance
-// last_known_sec BEFORE testing whether the message carried a position at all,
-// so the two genuinely come apart, and the consumer that steers on a peer pose
-// — a chase, the separation term — is the one that would be wrong about it.
+// lastKnownAgeSec() ages anything heard from a robot, positionAgeSec() the pose
+// held for it. observe() advances last_known_sec before checking for a
+// position, so they differ; pose consumers need the latter.
+// (notes: team-position-vs-known-age)
 // ===========================================================================
 
 TEST(TeamModelPositionAge, NegativeUntilAPositionArrives) {
@@ -651,12 +647,9 @@ TEST(TeamModelMode, OversizedModeGossipIsRefusedWholesale) {
 // ---------------------------------------------------------------------------
 // R1 instrumentation (generation 33) — acquire_sec / held_sec
 //
-// Timing the detector, never changing it: every assertion below is about WHEN
-// a transition was reported, and none of them is about whether `direct` was
-// right. The one design property they exist to pin is that both readings are
-// differences of PACKET stamps rather than tick stamps, so the tests drive the
-// tick at times deliberately offset from the arrivals. A measurement that
-// picked up the tick clock would read those offsets and fail.
+// Timing only: acquire_sec and held_sec are differences of packet stamps, not
+// tick stamps, so these tests tick at times offset from the arrivals and a
+// tick-clock measurement fails. (notes: r1-packet-stamp-timing)
 // ---------------------------------------------------------------------------
 
 TEST(TeamModelR1, AcquisitionIsMeasuredFromTheFirstOneWayPacket) {

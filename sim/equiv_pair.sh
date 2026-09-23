@@ -1,34 +1,10 @@
 #!/usr/bin/env bash
 # Builds and runs the two sides equiv_gate.py compares.
 #
-# docs/mtare_evolution_plan.md §6 requires every phase to land default-off: at
-# shipped defaults the new binary must be the same planner as its parent
-# commit. equiv_gate.py scores that claim, but it can only score runs somebody
-# produced, and producing them by hand is where the claim quietly rots — one
-# side built from a tree that was not the rev it is labelled with, or a run
-# launched with a treatment env var still exported from the last shell, and the
-# gate compares two things that are not what the report says they are.
-#
-# So this script owns the whole pair: checkout, build, run, restore, compare.
-# Both sides come out of ONE workspace built sequentially, because that is the
-# workspace the harness sources and a second install space would be a different
-# dependency set pretending to be a control.
-#
-# What it refuses to do, and why each refusal matters:
-#
-#   * run on a dirty explo_planner tree. The child side is labelled with a
-#     commit; if uncommitted work is in the tree, the binary is not that commit,
-#     and the resulting PASS certifies a rev that was never tested. Untracked
-#     files are equally disqualifying — they survive `git checkout` and would
-#     sit in the parent's tree too.
-#   * accept a parent that is not an ancestor of HEAD. "Equivalent to its
-#     parent" is a claim about a specific lineage; two unrelated revs can be
-#     equivalent and still say nothing about what this phase changed.
-#   * believe a build happened. After each run it reads the `git_rev` the
-#     binary BAKED IN at compile time back out of the run's own event log and
-#     requires it to match the rev that was checked out. A skipped or failed
-#     rebuild leaves the previous binary in place, and two runs of the same
-#     binary are the most convincing false PASS this gate can produce.
+# Owns checkout, build, run, restore and compare, both sides from one workspace
+# built in turn. Refuses a dirty tree (untracked files too), a parent not an
+# ancestor of HEAD, and a binary whose baked git_rev mismatches.
+# (notes: pair-owns-whole-pair)
 #
 # Usage:
 #   ./equiv_pair.sh PARENT_REV
@@ -40,6 +16,7 @@
 #   KEEP=1             keep OUT on success
 #
 # Exit: 0 equivalent, 1 not equivalent, 2 usage/precondition/provenance.
+# Moved comments: docs/sim_notes/equiv_pair_notes.md
 
 set -euo pipefail
 
@@ -108,11 +85,10 @@ run_side() {
 
   git -C "$SRC" checkout --quiet --detach "$rev"
 
-  # A stale binary is the failure mode this whole exercise is blind to, so the
-  # build is not allowed to be a no-op that succeeded quietly: --packages-up-to,
-  # because explo_planner_msgs must build first, and the same Release type the
-  # workspace already carries, because a build-type flip would change the
-  # binary for a reason that has nothing to do with the phase.
+  # --packages-up-to because explo_planner_msgs must build first; Release to
+  # match the build type the workspace already carries, since a flip would
+  # change the binary for reasons unrelated to the phase.
+  # (notes: pair-build-flags)
   ( set +u
     source /opt/ros/humble/setup.bash
     cd "$WS"
@@ -122,34 +98,10 @@ run_side() {
     || { echo "build failed, tail of $OUT/build_$side.log:" >&2
          tail -30 "$OUT/build_$side.log" >&2; exit 2; }
 
-  # None of the treatment knobs: the whole point is the SHIPPED defaults.
-  # Unset rather than trust the caller's shell.
-  #
-  # A LEAK HERE DOES NOT PRODUCE A SPURIOUS FAIL, IT PRODUCES A FALSE
-  # EQUIVALENT, which is why this list has to be kept in step with every phase
-  # rather than only mostly so. equiv_gate.py short-circuits on `if a == b:
-  # continue` and its gated-key branch fires only for keys NEW in the child, so
-  # a knob exported in the calling shell reaches BOTH sides identically and is
-  # never examined at all. An operator with `export RECONNECT_MODE=mtare_hybrid`
-  # live from scoring a campaign would run both sides with all four features on,
-  # every manifest key would compare equal, and the pair would print EQUIVALENT
-  # — certifying "no behaviour change at defaults" from a run in which no
-  # default was in effect on either side. The gate cannot catch it; only this
-  # line can.
-  #
-  # The second row was added later, after a review found three of these knobs
-  # (RENDEZVOUS_SCHEDULE, PURSUIT_PREDICTOR from P5/P6, COORD_CLAIM_R from cr2)
-  # missing while the paragraph above described the hazard exactly.
-  #
-  # What this list covers, stated so the next reader does not over-trust it: the
-  # cell/comms geometry and the per-phase FEATURE switches. It is not every
-  # environment knob run_explo_sim_rviz.sh reads. SCENARIO, SEED, MAX_STEPS,
-  # DONE_CRITERION, DONE_SEEK and MISSION_RETURN are all still inherited from the
-  # calling shell, and each one leaks by the identical mechanism — exported
-  # equally to both sides, compared equal, never examined. They are left alone
-  # here only because widening the list is a change to what "defaults" MEANS for
-  # this gate, which deserves its own commit and its own re-run of a known-good
-  # pair, not a drive-by. Until then: run equiv_pair.sh from a clean shell.
+  # Unsets the treatment knobs so both sides run shipped defaults. Keep it in
+  # step with every phase: a leaked knob reaches both sides equally and yields a
+  # false EQUIVALENT. Other run knobs still inherit; use a clean shell.
+  # (notes: pair-unset-treatment-knobs)
   ( unset CELL_WORLD CELL_SIZE_M CELL_CENSUS_S COMMS LINK_GATE EXPLOIT \
           RECONNECT_MODE TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
           RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R

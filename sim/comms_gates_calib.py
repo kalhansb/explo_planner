@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/comms_gates_calib_notes.md
 """Calibrates the link gates in comms_gates.py against known answers.
 
 THE DEFECT CLASS THIS FILE EXISTS FOR IS THE EMPTY DENOMINATOR. Every gate here
@@ -71,12 +72,9 @@ DROPPED = stats(link("r1", "r2", drop_disconnected=31), link("r2", "r1"))
 
 
 # --- the cases -------------------------------------------------------------
-#
-# (name, thunk, expected verdict, substring the message must carry)
-#
-# The substring is not decoration. A case that only asserts "this refused"
-# passes when the gate refuses for an unrelated reason, which is how a guard
-# ends up calibrated against a defect it does not actually detect.
+# Each case carries an expected verdict and a substring its message must
+# contain, so a gate that refuses for an unrelated reason does not pass.
+# (notes: gates-calib-case-substring)
 
 def run_overflow(s):
     rep = cg.Report("")
@@ -193,14 +191,9 @@ case("a negative poll count cannot reach the FAIL text", "UNRUN",
 
 
 # --- watch_summary ---------------------------------------------------------
-#
-# THE `watch` TOKEN IS WHAT THE TEARDOWN LOOKS FOR. run_explo_sim_rviz.sh reads
-# comms_gates.txt for a line whose second field is `watch`, and a file without
-# one is SUSPECT — the guard that stops a silently-dead watcher from banking a
-# clean cell. That makes the exact token on the `watch` line load-bearing in a
-# way no other gate's is: PASS clears the run, UNRUN carries the token (so the
-# teardown still finds its line) but counts an unrunnable and lands SUSPECT.
-# Both halves are asserted below.
+# run_explo_sim_rviz.sh treats a comms_gates.txt with no line whose second
+# field is watch as SUSPECT. PASS clears the run; UNRUN keeps the token but
+# lands SUSPECT. Both are asserted below. (notes: gates-calib-watch-token)
 
 def run_watch(expect, ever, polls, usable, tripped_in=False):
     rep = cg.Report("")

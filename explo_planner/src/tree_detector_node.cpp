@@ -86,6 +86,7 @@
 ///   plus the TreeDetectorConfig knobs (veg_class, occ_thresh, deficit_thresh…
 ///   and, in geometric mode, terrain_cell_m, ground_margin_m, stem_slice_lo/hi,
 ///   attach_radius_m, min_linearity, max_tilt_deg).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <algorithm>
 #include <chrono>
@@ -142,12 +143,9 @@ public:
         map_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
         [this](scovox_msgs::msg::ScovoxMap::SharedPtr msg) { latest_map_ = msg; });
 
-    // Latched + deep history so a planner that subscribes after the first
-    // targets were emitted still receives them all. The depth must exceed the
-    // number of targets a run can emit: geometric mode nominates every
-    // vertical structure in the map, not just a preselected handful, so the
-    // old fixed KeepLast(50) could silently drop early targets for
-    // late-joining planners.
+    // Latched with deep history so a late-joining planner still gets every
+    // target; the depth must exceed the targets a run can emit (geometric mode
+    // nominates every vertical structure). (notes: node-targets-qos-depth)
     const int qos_depth = static_cast<int>(
         declare_parameter<int>("targets_qos_depth", 500));
     auto qos = rclcpp::QoS(rclcpp::KeepLast(std::max(1, qos_depth)))
@@ -182,13 +180,9 @@ private:
     EmitGate gate;
   };
 
-  /// A tree this node has already published a target for. Outlives the Track it
-  /// came from: a track that times out and re-arms must NOT re-emit the same
-  /// tree under a fresh id (observed on the map-test-2 bag -- one trunk emitted
-  /// twice, ~190 s apart, as 813062754 and 823040963, because a 0.10 m drift in
-  /// the centre estimate straddled an id_cell_m boundary). Matching a new track
-  /// against this list restores emit-once AND pins the id to the one already in
-  /// the planner's queue.
+  /// A tree this node already published a target for; outlives its Track. A new
+  /// track near one re-adopts its id and starts emitted, so a re-armed track
+  /// never re-emits the tree. (notes: node-emitted-trees)
   struct Emitted {
     uint32_t id;
     Eigen::Vector3f center;
@@ -232,12 +226,9 @@ private:
     return c;
   }
 
-  /// Convert the latest ScovoxMap into the detector's SemVoxel input. Semantic
-  /// mode forwards only vegetation-class voxels (the dominant reduction) and
-  /// the detector applies the occupancy / confidence gates. Geometric mode
-  /// (LiDAR-only maps: semantic records empty, so the veg pre-filter would
-  /// silently drop everything) forwards every likely-occupied voxel instead —
-  /// the detector's terrain removal + shape gates do the reduction there.
+  /// Converts the ScovoxMap to detector input. Semantic mode forwards
+  /// vegetation-class voxels only; geometric mode (LiDAR-only, empty semantic
+  /// records) forwards every likely-occupied voxel. (notes: node-build-input)
   std::vector<SemVoxel> buildInput(const scovox_msgs::msg::ScovoxMap& m) const {
     std::vector<SemVoxel> in;
     in.reserve(m.voxels.size() / 4 + 1);
@@ -321,14 +312,10 @@ private:
         ++it;
     }
 
-    // At most one detection may claim a given track per scan. Without this,
-    // two trunks closer together than match_radius_ both resolved to the SAME
-    // nearest track: `confirm` incremented twice inside a single scan (so
-    // confirm_ticks=2 was satisfied after one scan rather than two in a row,
-    // defeating the consecutive-confirmation requirement) and the second trunk
-    // was silently absorbed into the first track's centre/radius estimate
-    // instead of getting its own track and its own emitted target. Index-
-    // aligned with tracks_; push_back below keeps both in step.
+    // At most one detection claims a track per scan, so confirm counts scans,
+    // not detections, and nearby trunks get their own tracks. Index-aligned
+    // with tracks_; the push_back below keeps them in step.
+    // (notes: node-one-claim-per-track)
     std::vector<char> claimed(tracks_.size(), 0);
     size_t needy_eff = 0;
     size_t deferred = 0;
@@ -355,15 +342,9 @@ private:
       if (best) {
         claimed[best_i] = 1;
       } else {
-        // New track, created up front so the gate below has one home for both
-        // paths. If this tree was already emitted under an earlier track that
-        // has since timed out, adopt that id and start already `emitted` --
-        // emit-once is a property of the TREE, not of the track that happened
-        // to see it. Note this now also tracks trees that read well-observed
-        // on first sight (the old code only created a track on the needy
-        // branch): under bearing coverage that case cannot arise, and under
-        // map-geometry coverage tracking it is what makes the consecutive-
-        // under-informed streak mean what it says.
+        // New track for every unmatched detection. A tree already emitted under
+        // a timed-out track re-adopts that id and starts emitted: emit-once
+        // belongs to the tree, not the track. (notes: node-new-track-adopts-id)
         const int prev = emittedNear(d.center);
         const uint32_t id = (prev >= 0) ? emitted_[prev].id : cellId(d.center);
         tracks_.push_back(Track{id, d.center, d.radius, d.height, now, {}});
@@ -373,13 +354,10 @@ private:
       }
 
       // --- Information verdict ------------------------------------------
-      // Default to the detector's own map-geometry score. When a pose is
-      // available, replace the coverage term with the bearings this trunk has
-      // ACTUALLY been viewed from and re-score. The map-geometry proxy cannot
-      // tell "seen from one side" from "circled" once the axis estimate starts
-      // following the observed surface; the bearing history is a direct
-      // measurement of the very thing exploitation improves, so the loop
-      // genuinely closes: circle the tree, the sectors fill, the deficit drops.
+      // Start from the detector's map-geometry score; with a pose, replace the
+      // coverage term with the bearings this trunk was actually viewed from and
+      // re-score. The proxy cannot tell one-sided from circled.
+      // (notes: node-bearing-verdict)
       float cov = d.angular_coverage;
       float deficit = d.info_deficit;
       bool needy = d.under_informed;
@@ -411,11 +389,9 @@ private:
       }
     }
 
-    // Heartbeat so a mode/topic misconfiguration (e.g. semantic mode on a
-    // LiDAR-only map, where every voxel is dropped) is visible instead of the
-    // node just never emitting anything. Logged after the loop because the
-    // under-informed count is the OPERATIONAL verdict (bearing-based when a
-    // pose is available), not the detector's map-geometry one.
+    // Throttled heartbeat so a mode or topic misconfiguration is visible.
+    // Logged after the loop because needy_eff is the operational verdict
+    // (bearing-based when a pose is available). (notes: node-scan-heartbeat)
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
         "scan (%s mode, %s coverage): %zu map voxels -> %zu candidate voxels "
         "-> %zu trees (%zu under-informed, %zu held pending settle), "
@@ -426,15 +402,9 @@ private:
         deferred, tracks_.size(), emitted_.size());
   }
 
-  // Deterministic target id from the trunk's map-frame XY, quantised to an
-  // id_cell_m grid. Every robot's detector runs on the SAME fused dscovox map,
-  // so a trunk at a given position hashes to the SAME id fleet-wide — which is
-  // what the planner's id-keyed dedup and team dwell-credit need (a per-node
-  // counter collides: two robots both start at 1 for different trees). Coarse
-  // quantisation (≈ the planner's target_dedup_radius_m) absorbs small per-robot
-  // centre-estimate differences; if two estimates still straddle a cell edge the
-  // ids differ and credit just isn't shared for that trunk (safe degradation to
-  // independent coverage — never a cross-tree mis-merge).
+  // cellId() below derives the target id from the trunk's map-frame XY
+  // quantised to id_cell_m, so the same tree gets the same id on every robot; a
+  // cell-edge straddle only loses shared credit. (notes: node-cell-id)
   /// Robot position in frame_id_, or nullopt if TF cannot supply one yet.
   /// TimePointZero (latest available) rather than `now`: the detector runs off
   /// a map that is already seconds old, so the freshest pose is both what we

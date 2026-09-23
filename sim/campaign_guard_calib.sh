@@ -1,29 +1,16 @@
 #!/usr/bin/env bash
 # Known-answer cases for run_campaign.sh's guards.
 #
-# The link veto below is the one this file was written for and still the
-# longest section. Two others have joined it: the launcher's own validation
-# blocks, and the RESUME guard, which decides whether a directory already
-# holding a finished cell is "already complete" or a different experiment
-# wearing the same name (last section).
+# Main sections: the link veto, which refuses a campaign arming the mid-run
+# reconnect trigger at the 90 s clock (below the ~180 s heartbeat-suppression
+# tail) with no link veto; launcher validation; the resume guard.
+# (notes: guardcal-link-veto-scope)
 #
-# The guard refuses a campaign that would arm the mid-run reconnect trigger at
-# the generation-9 clock (90 s, below the ~180 s heartbeat-suppression tail)
-# with no link veto to tell a quiet teammate from an absent one. Its first draft
-# was wrong in four ways at once, none of which a reading would have caught:
-# it disarmed on the mere PRESENCE of the string "MIDRUN_SILENCE=" (so
-# GATE_MIDRUN_SILENCE=240 turned it off, and MIDRUN_SILENCE=5 passed), it armed
-# on "LINK_GATE=0" as a substring (so MY_LINK_GATE=0 tripped it), it matched
-# only the literal value 0 while the launcher treats every non-1 value as off,
-# it never saw COMMS= arriving through --env where it beats the flag, and it
-# blocked control-only campaigns that have no treatment to protect.
-#
-# Every case runs --dry-run, so nothing launches. Asserting the ALLOW cases by
-# letting them start and killing the driver orphaned six gazebo/scovox/
-# robot_state_publisher processes the first time it was tried; the last section
-# checks the process census to make sure that cannot come back.
+# No case may launch a simulation; the process-census section checks for started
+# processes. (notes: guardcal-nothing-launches)
 #
 # Run: ./campaign_guard_calib.sh   -- exits non-zero on any FAIL.
+# Moved comments: docs/sim_notes/campaign_guard_calib_notes.md
 set -u
 CS="$(cd "$(dirname "$0")" && pwd)/run_campaign.sh"
 TMP=$(mktemp -d)
@@ -42,12 +29,9 @@ CENSUS_BEFORE=$(ps -e -o pid=,comm= \
 # want=ALLOW  -> the guard must not fire AND the campaign must actually be
 #                accepted, i.e. exit 0
 #
-# ALLOW checks the EXIT CODE and not merely the absence of the guard's FATAL
-# text. An earlier version asserted absence alone and discarded the status, so
-# any unrelated refusal scored as ALLOW -- `--bogus` exits 2 on an unknown
-# argument, never reaches the guard, and was counted a pass. That is a check
-# that agrees with itself: the campaign it certifies as permitted is one that
-# cannot run at all. The planted case at the end of the arm section pins it.
+# ALLOW requires exit 0, not merely the absence of the guard's FATAL text, so an
+# unrelated refusal is not a pass; the planted --bogus case pins it.
+# (notes: guardcal-allow-needs-exit-zero)
 t() {
   want="$1"; label="$2"; shift 2
   cases=$((cases+1))
@@ -123,15 +107,10 @@ chk "is not a number"         "a non-numeric clock refused"  --arms hybrid,off -
 
 echo
 echo "=== the ambient environment must not reach the cells ==="
-# The hole every case above was blind to, because every case passes its setting
-# through --env, which is the one channel the guard reads. `env` without -i
-# inherits the caller's environment and the launch line did not assign LINK_GATE
-# or MIDRUN_SILENCE, so `export LINK_GATE=0` before a normal launch ran the whole
-# treated matrix on the 90 s clock with no veto and no complaint.
-#
-# Asserted on the LAUNCH LINE rather than on the guard's verdict, because the
-# guard would (correctly) stay silent either way -- the bug was never in what it
-# concluded, it was in what reached the cells afterwards.
+# env without -i inherits the caller's environment, so the per-cell launch must
+# strip LINK_GATE and MIDRUN_SILENCE. Asserted on the launch line, since the
+# guard's verdict is the same either way.
+# (notes: guardcal-ambient-link-gate-strip)
 cases=$((cases+1))
 if grep -q -- '-u LINK_GATE -u MIDRUN_SILENCE' "$CS"; then
   echo "  PASS  the per-cell launch strips both from the inherited environment"
@@ -166,12 +145,9 @@ fi
 
 echo
 echo "=== the guard's copy of the launcher default must still be true ==="
-# run_campaign.sh decides whether the veto will be live BEFORE anything is
-# launched, so it has to know what LINK_GATE defaults to inside
-# run_explo_sim_rviz.sh, and it hard-codes 1. Nothing else links the two files:
-# flip the launcher default to 0 and the guard would happily pass a campaign
-# that runs the 90 s clock bare, which is the entire hazard it exists to stop.
-# Read the literal back out and compare.
+# run_campaign.sh hard-codes the launcher's LINK_GATE default to decide before
+# launch whether the veto is live; nothing else links the two files, so read the
+# literal back and compare. (notes: guardcal-link-gate-default-readback)
 LAUNCHER="$(dirname "$CS")/run_explo_sim_rviz.sh"
 lg_default=$(sed -n 's/^LINK_GATE="\${LINK_GATE:-\([^}]*\)}"$/\1/p' "$LAUNCHER" | head -1)
 guard_assumes=$(sed -n 's/^env_has LINK_GATE || _link_gate_req=\([0-9]*\).*$/\1/p' "$CS" | head -1)
@@ -209,21 +185,9 @@ t ALLOW "MY_SEED=7 must not be read as SEED" --arms hybrid,off --seeds 1 --env "
 
 echo
 echo "=== the harness itself must launch nothing ==="
-# The first version of this file had no --dry-run and asserted the ALLOW cases
-# by letting them start and killing the driver after 20 s. That orphaned six
-# gazebo/scovox/robot_state_publisher processes, which is a worse bug than any
-# it was testing for. Assert the absence directly rather than assuming it.
-# A DELTA, not an absolute. The first version took one census after the cases and
-# demanded zero, which is wrong in both directions: a stray sim already on the box
-# is reported as "this harness started a simulation", and on a busy box the check
-# fails for someone else's work. What this harness is responsible for is the
-# CHANGE it caused.
-#
-# It also had no known-answer case -- every case runs --dry-run, so nothing could
-# ever start a process and the check could not fail however broken it was. That is
-# the shape §32.14 is about, in the harness whose whole purpose is to prevent it.
-# The planted case below starts a process the census pattern matches and requires
-# the census to see it, so a census that has stopped counting says so.
+# Asserts the harness launched nothing: the census must equal CENSUS_BEFORE (a
+# delta, so a sim already on the box is not blamed). The planted case below
+# proves the census can read non-zero. (notes: guardcal-process-census-delta)
 census() {
   ps -e -o pid=,comm= \
     | grep -c -E 'ruby|ign|gz|parameter_br|explo_planner|scovox|dscovox|robot_state|rviz'
@@ -269,26 +233,10 @@ fi
 
 echo
 echo "=== the launcher's own validation blocks (the M-TARE knobs) ==="
-# run_explo_sim_rviz.sh has no --dry-run: invoking it launches gazebo for real.
-# Probing it that way once burned two minutes and left processes on the box --
-# the same failure the census section above exists to stop. Every guard tested
-# here lives in the launcher's PRELUDE: the defaults, the validation and the
-# refusals, ending at the arm-stamp check. That region runs no ROS, spawns
-# nothing and writes nothing, so it is cut out of the SHIPPED file by line range
-# and run on its own. It is the real text, not a transcription of it: edit a
-# guard and these cases move with it.
-#
-# THE CUT MUST BE WRITTEN INTO sim/, not a tmpdir. The launcher computes HERE
-# from BASH_SOURCE[0] and the workspace root three levels above it, so a copy
-# anywhere else dies at the scenario-installed check for a reason that has
-# nothing to do with the guard under test. Every BLOCK case would still see a
-# non-zero exit, and this whole section would pass while testing nothing.
-# Moved past the arm-stamp guard 2026-09-16, to the end of the _rzv_needed
-# block that now follows it. Cutting at the arm-stamp unset would have left the
-# `a mode that is nothing without the schedule` refusal outside the probe
-# entirely -- so the bare-default ALLOW case below would have certified a
-# default that the real launcher refuses one line later, which is the exact
-# shape of a check that has stopped checking.
+# The launcher has no --dry-run, so its inert prelude, through unset
+# _rzv_needed, is cut from the shipped file and run alone. Write the cut into
+# sim/, not a tmpdir: the launcher derives paths from BASH_SOURCE[0].
+# (notes: guardcal-prelude-cut)
 PRELUDE_ANCHOR='^unset _rzv_needed$'
 PRELUDE_END=$(grep -n "$PRELUDE_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
 PROBE="$(dirname "$LAUNCHER")/.prelude_probe.$$.sh"
@@ -329,11 +277,9 @@ if [ -n "$PRELUDE_END" ]; then
     fi
   done
 
-  # env -i: the point of several of these guards is that an AMBIENT export must
-  # not reach a cell, so the probe must not inherit one either.
-  # $SCEN, not a literal: every case here used to pin the 2-robot scenario, so
-  # the whole section only ever saw N == 2 and nothing that varies with the
-  # roster was under test in either direction. Callers that care set SCEN.
+  # env -i: an ambient export must not reach a cell, so it must not reach the
+  # probe either. SCEN picks the scenario, so the roster can vary; callers that
+  # care set it. (notes: guardcal-lg-env-i-and-scen)
   SCEN=flatforest_dense_2robot_lidar.yaml
   lg() {
     local want="$1" expect="$2" label="$3"; shift 3
@@ -344,13 +290,9 @@ if [ -n "$PRELUDE_END" ]; then
               timeout 30 bash -c \
               "source /opt/ros/humble/setup.bash >/dev/null 2>&1; bash '$PROBE'" 2>&1)
     rc=$?
-    # A sentinel is matched as a WHOLE LINE, a FATAL as a substring. The
-    # distinction is not cosmetic: the sentinel's last field is the arm name, so
-    # a substring match for `rm=mtare_hybrid` is also satisfied by an output
-    # reading `rm=mtare_hybrid_mdp`. The palette case in the derivations section
-    # below was written with a substring match and could not fail for exactly
-    # this reason -- COSTAR_..._REDUCED is a prefix of COSTAR_..._REDUCED_YELLOW
-    # -- and survived the mutation that was meant to kill it.
+    # A __ sentinel is matched as a whole line (-qxF), a FATAL as a substring:
+    # arm names are prefixes of each other, e.g. rm=mtare_hybrid and
+    # rm=mtare_hybrid_mdp. (notes: guardcal-sentinel-whole-line)
     local ok=0 _mx=-qF
     case "$expect" in __*) _mx=-qxF ;; esac
     if [ "$want" = BLOCK ]; then
@@ -372,13 +314,9 @@ if [ -n "$PRELUDE_END" ]; then
   # ever fails, the launcher is refusing a bare invocation; if the second fails,
   # the mtare_hybrid arm does not exist and the campaign has no treatment.
   #
-  # The first used to assert `every M-TARE knob off`, because RECONNECT_MODE
-  # defaulted to plain `hybrid`. That default was UNRUNNABLE from the day the
-  # schedule-needed refusal landed -- plain hybrid with rs=0 is refused there,
-  # and with rs=1 it is refused by the arm-stamp guard -- so the default moved
-  # to mtare_hybrid and this case moved with it. The two now assert the same
-  # vector by two routes, which is the point: the default and the token that
-  # names it must not drift apart.
+  # Both cases assert the same vector by two routes: the shipped default and the
+  # mtare_hybrid token must not drift apart.
+  # (notes: guardcal-default-is-mtare-hybrid)
   lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
      "shipped defaults resolve to the mtare_hybrid stack"
   lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
@@ -404,13 +342,9 @@ if [ -n "$PRELUDE_END" ]; then
      "and turning the schedule ON under a plain token is the other refusal" \
      CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=rendezvous
 
-  # The other three cells of the doc §3.6.1 factorial. Each expands to a
-  # DIFFERENT vector, and the two that differ from mtare_hybrid are the point
-  # of the design: mtare_pursuit is chase without an appointment,
-  # mtare_rendezvous is an appointment without a chase, mtare_off is neither.
-  # Asserted one knob at a time because a token that expanded to the hybrid
-  # stack under a different name would run the campaign as one arm four times
-  # and every gate downstream would agree with it.
+  # The other three factorial cells: mtare_pursuit is the chase without an
+  # appointment, mtare_rendezvous the appointment without a chase, mtare_off
+  # neither. Each full vector is asserted. (notes: guardcal-factorial-tokens)
   lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 pp=trail rm=mtare_off' \
      "RECONNECT_MODE=mtare_off expands to P1-P3 and NEITHER mechanism" \
      RECONNECT_MODE=mtare_off
@@ -421,15 +355,10 @@ if [ -n "$PRELUDE_END" ]; then
      "RECONNECT_MODE=mtare_rendezvous expands to the appointment WITHOUT a chase" \
      RECONNECT_MODE=mtare_rendezvous
 
-  # A typo in a 0/1 knob reads as OFF, and an off treatment knob is invisible:
-  # the run completes, the manifest records the value it was handed, and the
-  # cell is analysed as treated. Only the launcher can catch this.
-  #
-  # RECONNECT_MODE=pursuit on both, so the arm stack is EMPTY and the 0/1
-  # validity check is what the case actually reaches. Under an mtare_* token
-  # (which the default now is) the stack's own contradiction check fires first
-  # and reports the same input as a different mistake -- still a refusal, but
-  # not the one this case is calibrating.
+  # A typo in a 0/1 knob would read as OFF and go unnoticed; only the launcher
+  # can catch it. RECONNECT_MODE is pursuit so the arm stack is empty and the
+  # 0/1 check, not the mtare_* contradiction check, fires.
+  # (notes: guardcal-01-knob-typos)
   lg BLOCK "FATAL: CELL_WORLD='true'" \
      "CELL_WORLD=true is refused, not silently read as off" \
      CELL_WORLD=true RECONNECT_MODE=pursuit
@@ -456,15 +385,10 @@ if [ -n "$PRELUDE_END" ]; then
      "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
      CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2 RECONNECT_MODE=pursuit
 
-  # The node reconstitutes the arm itself, prefixing `mtare_` when
-  # global_alloc_enable_ || reconnect_gate_info_ || rendezvous_schedule_enable_.
-  # Every directory, index row and analysis keys off the NAME; only run_start
-  # carries the stamp. Setting a knob by hand under the plain name puts a
-  # treated cell in the control column.
-  #
-  # One case per disjunct, and that is the whole reason this block is a list
-  # rather than one case: a guard that tracked only two of the three would keep
-  # printing two PASSes while the third knob walked straight through it.
+  # The node stamps an mtare_ prefix from its knobs, but directories and
+  # analysis key off the name, so a knob set by hand under a plain name files a
+  # treated cell as control. Each knob gets its own case.
+  # (notes: guardcal-arm-stamp-per-knob)
   lg BLOCK "FATAL: the arm name and the arm" \
      "GLOBAL_ALLOC=1 under the plain hybrid name is refused" \
      CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
@@ -494,12 +418,10 @@ if [ -n "$PRELUDE_END" ]; then
      "contradicting the mtare_rendezvous token's own stack is refused" \
      RECONNECT_GATE=silence RECONNECT_MODE=mtare_rendezvous
 
-  # The P6 knob. It is the SIXTH thing that flips the node's `mtare_` prefix, so
-  # it needs the same three-way coverage the fifth got: the typo, the arm-stamp
-  # direction, and the preconditions.
-  # RECONNECT_MODE=pursuit for the same reason as the two 0/1 typo cases above:
-  # every mtare_* token pins PURSUIT_PREDICTOR, so under the default the arm
-  # stack refuses 'MDP' as a contradiction before the spelling check sees it.
+  # PURSUIT_PREDICTOR also flips the node's mtare_ prefix: typo, arm-stamp and
+  # precondition cases. RECONNECT_MODE is pursuit because every mtare_* token
+  # pins the predictor and would refuse MDP first.
+  # (notes: guardcal-pursuit-predictor-cases)
   lg BLOCK "FATAL: PURSUIT_PREDICTOR='MDP'" \
      "a mis-cased PURSUIT_PREDICTOR is refused, not read as trail" \
      PURSUIT_PREDICTOR=MDP RECONNECT_MODE=pursuit
@@ -529,12 +451,10 @@ if [ -n "$PRELUDE_END" ]; then
      "contradicting the mtare_pursuit token's predictor pin is refused" \
      PURSUIT_PREDICTOR=mdp RECONNECT_MODE=mtare_pursuit
 
-  # The two _mdp tokens are the only way to REQUEST the predictor, and they are
-  # ordinary arm tokens: the whole stack comes from the name, and the name is
-  # what the node will stamp back (its arm rule gained the matching `_mdp`
-  # suffix in the same commit). These four assert both halves -- the stack the
-  # token expands to, and the refusal of an override that would make the
-  # directory name and the run_start stamp disagree.
+  # The two _mdp tokens are the only way to request the predictor; the stack
+  # comes from the name, which the node stamps back. Asserted: the expansion,
+  # and refusal of an override that splits name from stamp.
+  # (notes: guardcal-mdp-tokens)
   lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 pp=mdp rm=mtare_pursuit_mdp' \
      "mtare_pursuit_mdp expands to the mtare_pursuit stack with the predictor on" \
      RECONNECT_MODE=mtare_pursuit_mdp
@@ -552,16 +472,9 @@ if [ -n "$PRELUDE_END" ]; then
      RECONNECT_MODE=mtare_rendezvous_mdp
 
   # --- the roster axis (P7) -------------------------------------------------
-  # Everything above this line ran at N == 2 and could not have told a harness
-  # that generalised from one that merely still works for a pair. That is not a
-  # hypothetical gap: the launch-time planner-count guard kept comparing against
-  # a literal 2 through a whole "78/78 ALL PASS" run, because no case ever asked
-  # for a third robot.
-  #
-  # The roster is read from the SCENARIO and is deliberately not overridable, so
-  # the only way to vary it is to point at a different scenario file. The N == 2
-  # case below is the control: without it, an assertion that matched a constant
-  # string would pass at both sizes and prove nothing.
+  # The roster is read from the scenario and cannot be overridden, so SCEN
+  # selects it. The N == 2 case is the control: an assertion matching a constant
+  # string would pass at both sizes. (notes: guardcal-roster-axis)
   lg ALLOW '__ROSTER_OK__ n=2 robots=[atlas bestla]' \
      "the roster resolves to the 2-robot scenario's own names"
   SCEN=flatforest_3robot_lidar.yaml
@@ -581,17 +494,10 @@ fi
 
 echo
 echo "=== the launcher's per-robot derivations (the region BELOW the prelude) ==="
-# The prelude section above stops at the arm-stamp guard, which is where the
-# launcher stops being inert. Everything the P7 change actually rewired --
-# peers_of / peers_csv / peers_ros_array, and the roster-position viz palette --
-# lives below that line and had no coverage at all, in either direction.
-#
-# They are still inert: pure shell over $ROBOTS, no ROS, no processes. So they
-# get their own cut, assembled from the prelude (which is what resolves $ROBOTS
-# from the scenario) plus this block. The two are not adjacent, and the region
-# skipped between them sets exactly one variable this block reads -- $OUTDIR --
-# which the shim supplies. If that ever stops being true the probe fails loudly
-# under `set -u` rather than testing a stub.
+# The per-robot derivations (peers_of, peers_csv, peers_ros_array, the viz
+# palette) are inert shell over ROBOTS, so they are cut and run after the
+# prelude. The one skipped variable they read, OUTDIR, the shim supplies.
+# (notes: guardcal-derivation-cut)
 DERIV_START_ANCHOR='^VIZ_PALETTE=(COSTAR_'
 DERIV_END_ANCHOR='^# --- environment: humble'
 DERIV_START=$(grep -n "$DERIV_START_ANCHOR" "$LAUNCHER" | head -1 | cut -d: -f1)
@@ -682,17 +588,10 @@ fi
 
 echo
 echo "=== the launch-time planner count is roster-derived, not a literal ==="
-# This one guard cannot be executed without launching gazebo -- it counts real
-# processes 8 s after a real bring-up -- so it is asserted textually. That is a
-# weaker check than running it, and it is here because the ALTERNATIVE was no
-# check: it compared against a literal 2 while everything around it was
-# generalised, so a 3-robot scenario started the entire stack and then died on
-# "expected exactly 2 explo_planner_node, found 3".
-#
-# A textual assertion is worth nothing unless it can fail, so it is run three
-# times: on the shipped launcher, on a copy mutated back to the literal, and on
-# a copy with the guard deleted. The last one matters most -- a check that
-# reports PASS when its subject is absent has stopped checking.
+# The planner-count guard needs a real bring-up, so it is checked textually on
+# three inputs: the shipped launcher, a copy mutated to a literal 2, and a copy
+# with the guard deleted, which must not PASS.
+# (notes: guardcal-planner-count-textual)
 nplan_guard() {
   local f=$1 ln
   ln=$(grep -n 'NPLAN=$(count_own' "$f" | head -1 | cut -d: -f1)
@@ -719,14 +618,9 @@ done
 unset _spec _f _rest _want _lbl _rc _MUT _GONE
 
 echo
-# A clean launch must be SILENT on stderr. `env_val` took its default from a
-# bare "$2" while two callers legitimately omit it, so under `set -u` every
-# campaign launch opened with two `line 190: $2: unbound variable` lines. They
-# were harmless -- the value returned was the empty string the callers wanted
-# -- and that is the problem: an operator who learns the launcher always prints
-# two errors has learned to skim past the third one that means something. This
-# asserts the absence, not a message, because the next such regression will
-# have a different line number and a different variable.
+# A clean --dry-run must write nothing to stderr, so a real error is not skimmed
+# past. Asserts the absence of output, not a specific message.
+# (notes: guardcal-silent-stderr)
 cases=$((cases+1))
 _stderr=$(timeout 20 "$CS" --root "$TMP" --duration 3000 \
             --scenario flatforest_dense_2robot_lidar.yaml --dry-run \
@@ -740,30 +634,10 @@ else
 fi
 unset _stderr
 
-# The ambient-export strip on the launch line. This is the one leak the
-# arm-stamp guard above CANNOT see: CELL_WORLD and TEAM_WORLD rename nothing, so
-# `export CELL_WORLD=1 TEAM_WORLD=1` in the launching shell would run the census
-# and the exchange in every cell of a plain hybrid-vs-off campaign, stamp the
-# same arm on both sides, and score CLEAN. Read the -u list back out rather than
-# trusting that it was kept in step with the knobs the launcher grew.
-#
-# DERIVED, not re-listed. This loop used to enumerate nine names by hand, and a
-# hand-maintained copy of a list is a check that goes stale silently: by the
-# time anything looked, six knobs the guard reasons about (TREE_ATTEN,
-# MAX_RANGE, CELL_SIZE_M and the three SEPARATION_*) had been added to
-# run_campaign.sh and to none of them, and this section printed nine PASSes
-# without noticing. So take the knob list from the script's own env_val() calls
-# -- that IS the set of things the guard models -- and assert the invariant
-# stated at the -u list: each one is either stripped there, or assigned
-# explicitly on the same launch line. A knob that is neither is one the guard
-# scores at its default while the cell runs on the ambient shell's value.
-# Anchored on `env ` and not on `env -u LINK_GATE`, because the launch line
-# grew a derived sweep in front of the literal strips on 2026-09-18 and the
-# tighter anchor then matched nothing: sed returned an empty range, every knob
-# below was "neither stripped nor assigned", and fifteen guards that were in
-# fact intact reported FAIL. An extraction that can silently select nothing is
-# the same defect as a gate that can silently examine nothing, so the emptiness
-# of BOTH halves is now an explicit case rather than a fifteen-way symptom.
+# Each knob run_campaign.sh reads through env_val must be stripped (-u) or
+# assigned on the per-cell launch line, or the cell runs the ambient value. The
+# knob list is derived; an empty extraction is a FAIL.
+# (notes: guardcal-launch-line-strips-knobs)
 _launch_line=$(sed -n '/^  env /,/run_explo_sim_rviz.sh"/p' "$CS")
 _knobs=$(grep -oE 'env_val [A-Z_][A-Z0-9_]*' "$CS" | awk '{print $2}' | sort -u)
 if [ -z "$_knobs" ]; then
@@ -793,33 +667,14 @@ unset _u _knobs _launch_line
 
 echo
 echo "=== the ambient-knob sweep derived from the runner ==="
-# The section above asserts an invariant over the knobs run_campaign.sh MODELS.
-# That is roughly twenty names. run_explo_sim_rviz.sh reads about a hundred and
-# ten, all as `${NAME:-default}`, and until 2026-09-18 the other ninety reached
-# every cell straight from the launching shell: `env` without -i inherits, the
-# strip list had never heard of them, the resume guard does not compare them,
-# and for most of them run_manifest.txt does not record them either. So an
-# `export RDV_DEPART_DELAY=30` left in a terminal retuned every cell of a
-# multi-day matrix with nothing anywhere able to say it had.
-#
-# RDV_DEPART_DELAY is not a hypothetical: through generation 24 it was the
-# 100 s in "after 100s after one robot disconnect, all robots go to the
-# rendezvous point" — the treatment itself in two of ts4's four arms. Since
-# generation 25 it is inert in the binary but still logged, so a leak now
-# forges the param rows rather than the behaviour.
-#
-# The sweep is derived from the runner rather than listed, so these cases check
-# the DERIVATION -- reproduced here from the same source, which is the only way
-# to notice the scan silently matching nothing.
+# The runner reads about 110 defaulted knobs, not just the ~20 run_campaign.sh
+# models; unstripped, an ambient export of any would retune every cell. The
+# sweep is derived from the runner; these cases check the derivation.
+# (notes: guardcal-runner-knob-sweep)
 _keep=$(sed -n 's/^RUNNER_ENV_KEEP="\(.*\)"$/\1/p' "$CS" | head -1)
-# THE SCANNER IS EXTRACTED, NOT REPRODUCED, and that distinction was found the
-# hard way. The first draft of this section pasted a copy of the awk program
-# here; two mutations of the launcher's real scanner -- dropping the bare
-# `${X-default}` form, and letting commented-out knobs through -- then passed
-# every case below, because the thing under test was a second copy that had not
-# been mutated. A calibrator holding its own copy of the code it certifies is
-# the same defect as the hand-maintained knob list this whole section replaced,
-# and it fails the same way: silently, while printing PASS.
+# The scanner is extracted from run_campaign.sh, never pasted here: a pasted
+# copy would keep passing while the real scanner is broken.
+# (notes: guardcal-scanner-extracted)
 _awkprog=$(sed -n '/^RUNNER_STRIP=\$(awk -v keep=/,/^'"'"' "\$HERE\/run_explo_sim_rviz.sh")$/p' "$CS" \
            | sed '1d;$d')
 _scan() {  # $1 = file to scan; prints one name per line
@@ -923,11 +778,9 @@ else
   fails=$((fails+1))
 fi
 
-# And the tripwire's own threshold, read back rather than assumed. The case
-# above establishes that a broken scan reaches zero; this one establishes that
-# zero is refused. `-lt 0` can never fire and `-lt 200` would refuse every real
-# campaign, and both edits look equally innocuous in a diff -- which is how a
-# threshold is the quietest place for a guard to die.
+# Reads the launcher's derived-knob tripwire threshold back and requires it
+# between 0 and the derived count: at 0 it never fires, at or above the count it
+# refuses every real campaign. (notes: guardcal-tripwire-threshold)
 cases=$((cases+1))
 _thr=$(sed -n 's/^if \[ "${_nstrip:-0}" -lt \([0-9]*\) \]; then$/\1/p' "$CS" | head -1)
 if [ -z "$_thr" ]; then
@@ -941,16 +794,9 @@ else
   fails=$((fails+1))
 fi
 
-# The sweep must be WIRED, not merely computed. A derivation that is never
-# referenced on the launch line is the same nothing as no derivation, and it
-# reads as a fix in every diff.
-# The OUTPUT FORM, which every other case here is deliberately blind to: _scan
-# splits the `-u` flags off before comparing names, so a scanner that emitted
-# bare names would satisfy all of them. It would also turn the launch line into
-# `env RDV_APPT_WAIT OUTDIR=... runner`, where env runs the first name as the
-# command. That fails loudly at the first cell rather than silently -- but it is
-# the launcher's own `<10` tripwire that makes it loud, by counting exactly the
-# `-u` tokens asserted here, so this is the case that keeps that tripwire honest.
+# The derivation must emit -u flags, the form env and the launcher's tripwire
+# count (bare names would make env run the first as the command), and the launch
+# line must expand RUNNER_STRIP. (notes: guardcal-sweep-output-and-wiring)
 cases=$((cases+1))
 _nflag=$(awk -v keep=" $_keep " "$_awkprog" "$_runner" | tr ' ' '\n' | grep -c '^-u$' || true)
 if [ "${_nflag:-0}" -ge 10 ]; then
@@ -990,45 +836,17 @@ unset -f _scan
 
 echo
 echo "=== the resume guard: a banked cell must have run THIS experiment ==="
-# The resume guard decides whether a directory that already holds a finished
-# cell counts as "already complete" or as a different experiment wearing the
-# same name. It had no known-answer case of any kind until this section, while
-# growing from one compared key to seventeen -- and the failure it exists to
-# stop is silent by construction: the campaign prints SKIP, the matrix fills
-# up, and two configurations end up pooled under one tag with nothing in the
-# analysis able to tell.
-#
-# Both directions are asserted, because each has its own way of going wrong. A
-# guard that never aborts is a rubber stamp; a guard that always aborts is
-# worse than none, since the operator learns to reach for a fresh --tag every
-# time and the guard stops being read. The float keys make the second failure
-# easy to write by accident: the two sides of the comparison reach it by
-# different routes -- the manifest carries the value as the run recorded it,
-# the guard the value the operator typed -- so a cell banked at "20.0" can be
-# checked against a request for "20" and a string compare would abort a correct
-# resume on a formatting difference alone. Cases feeding both spellings pin
-# that, and the garbage-value cases below pin the other end of it: awk reads an
-# unparseable string as 0, so the numeric branch has to check that what it was
-# handed is a number before believing they agree.
-#
-# Nothing launches. The cases run without --dry-run -- the guard sits below the
-# point where --dry-run exits -- so MIN_FREE_MB is set absurdly high, which
-# trips the disk guard immediately AFTER the resume guard and before the cell
-# is started. That also gives the "guard wrongly let it through" outcome its
-# own distinguishable name (LAUNCHED) instead of a 3000 s gazebo run.
+# Asserts the resume guard both ways, already complete versus a different
+# experiment; floats compare numerically. No --dry-run (the guard sits below
+# it): a huge MIN_FREE_MB stops a let-through, which reads LAUNCHED.
+# (notes: guardcal-resume-guard-cases)
 RG_ARM=mtare_hybrid
 # Agrees with the reference campaign below on every key the guard reads. Each
 # case overwrites, or deletes, exactly one line.
 #
-# run_gates_verdict IS `CLEAN`, WHICH IS A TOKEN THE HARNESS CAN ACTUALLY WRITE.
-# It said `VALID` until 2026-09-18, and nothing in run_explo_sim_rviz.sh has ever
-# emitted that word: the teardown writes exactly one of CLEAN, SUSPECT or
-# INVALID. The reference manifest was therefore a manifest no cell could have,
-# which cost nothing while the resume guard asked only "is this literally
-# =INVALID", and became thirteen simultaneous failures the moment it started
-# distinguishing CLEAN from everything else. A fixture that cannot be produced
-# by the thing it stands in for is a fixture that will one day disagree with it
-# for a reason that has nothing to do with the case being tested.
+# run_gates_verdict is CLEAN, a token the harness can write: the teardown writes
+# exactly one of CLEAN, SUSPECT or INVALID.
+# (notes: guardcal-fixture-verdict-clean)
 rg_manifest() {
   cat <<'EOF'
 run_end_reason=all_done
@@ -1060,26 +878,9 @@ reconnect_midrun_silence_sec=90
 team_world_hz=1.0
 EOF
 }
-# The five keys above the EOF joined the guard in the C2/C3 pass and were not
-# added here at the time, which put SIXTEEN of the cases below into permanent
-# ABORT: every SKIP case failed on `link_gate=<absent>` long before reaching the
-# key it was written to exercise. The suite exited non-zero either way, so the
-# 16 reds read as one known breakage rather than as sixteen assertions that had
-# stopped asserting anything -- the cases pinning the FLOAT-formatting branch
-# (20 vs 20.0, padded values, the nan/awk trap) were the expensive ones to lose,
-# because that branch is the one that aborts a CORRECT resume.
-#
-# Values are the reference campaign's, i.e. what a no---env `--arms mtare_hybrid
-# --seeds 1` invocation predicts: LINK_GATE defaults to 1 in the launcher and
-# run_campaign mirrors that when --env carries no LINK_GATE, --comms defaults to
-# 1 so the effective veto is live too, MIDRUN_SILENCE and TEAM_WORLD_HZ mirror
-# the launcher's 90 and 1.0, and done_seek is off (the campaign spells it 0, the
-# runner writes the ROS bool).
-#
-# n_robots is deliberately NOT here. Its check is a consistency test across the
-# banked cells of a tag, and it skips a manifest that does not carry the key --
-# so an absent one is a case in its own right rather than a hole, and every rg()
-# case banks exactly one cell anyway.
+# Every key the guard reads must be here at the reference campaign's value
+# (launcher defaults, no --env), or every SKIP case aborts on the missing key.
+# n_robots is deliberately absent. (notes: guardcal-fixture-keys)
 # rg WANT "label" ARM KEY VALUE
 #   KEY=""          -> the manifest is left agreeing
 #   VALUE="<none>"  -> the key is DELETED, i.e. a manifest predating it
@@ -1106,11 +907,9 @@ rg() {
   elif echo "$_out" | grep -q "SKIP rg_${_arm}_seed1 (already complete)"; then
     _got=SKIP
   elif echo "$_out" | grep -q "SKIP rg_${_arm}_seed1 (complete, but run_gates_verdict="; then
-    # BANKED BUT NOT CERTIFIED. Its own outcome name, because it is neither of
-    # the two the guard used to have: the cell IS skipped (so it is not ABORT
-    # and not LAUNCHED) but it is skipped with a verdict gate_g8 will hard-fail,
-    # and folding it into SKIP would make the loud path and the silent path
-    # indistinguishable here — which is the exact defect being calibrated.
+    # SKIP-DIRTY: the cell is skipped but carries a verdict gate_g8 will
+    # hard-fail; kept apart from SKIP so the loud and silent paths stay
+    # distinguishable. (notes: guardcal-skip-dirty)
     _got=SKIP-DIRTY
   elif echo "$_out" | grep -q "MB free under"; then
     _got=LAUNCHED          # the guard passed the cell through to be re-run
@@ -1133,9 +932,8 @@ rg SKIP  "an agreeing manifest is skipped, not re-run"        "$RG_ARM"
 rg SKIP  "cell_size_m=10 agrees with 10.0"                    "$RG_ARM" cell_size_m 10
 rg SKIP  "tree_attenuation_db=70 agrees with 70.0"            "$RG_ARM" tree_attenuation_db 70
 rg SKIP  "done_unknown_fraction=.64 agrees with 0.64"         "$RG_ARM" done_unknown_fraction .64
-# The radio regime. The first of these is the change of 2026-09-03 itself: a
-# cell banked under the 11.98 dB trunks, resumed by a campaign running the
-# 70 dB ones. Before this key was compared it scored SKIP.
+# The radio regime: a cell banked under a different tree attenuation, max range
+# or tx power must abort. (notes: guardcal-radio-regime-keys)
 rg ABORT "tree_attenuation_db=11.98 is the old radio"         "$RG_ARM" tree_attenuation_db 11.98
 rg ABORT "max_range_m absent predates the horizon"            "$RG_ARM" max_range_m "<none>"
 rg ABORT "max_range_m=60.0 is a different horizon"            "$RG_ARM" max_range_m 60.0
@@ -1161,17 +959,9 @@ rg ABORT "an unsuffixed arm banked at a pinned 10.0"          "$RG_ARM" coord_cl
 # spellings; the four above pass either way.
 rg ABORT "a non-numeric value is not the 'none' sentinel"     "$RG_ARM" coord_claim_radius_override unset
 rg ABORT "an empty value cannot be shown to agree"            "$RG_ARM" coord_claim_radius_override ""
-# The allocator peer-position TTL, set from the "_ttl<N>" suffix. Same sentinel
-# shape as the radius above, with one difference that matters: 0 is a REAL level
-# here (unbounded, the control arm) rather than a spelling of "unset", so "0.0"
-# and "none" are the same behaviour and must still be different cells.
-#
-# The two SKIP cases below are also the only test of the SUFFIX PARSER itself,
-# and they test both halves of it at once. A parser that failed to strip "_ttl120"
-# would leave cell_pos_ttl empty (want "none" against a manifest saying 120.0 ->
-# ABORT, not SKIP) AND leave cell_mode as "mtare_hybrid_ttl120", which matches no
-# branch of the arm-stack case, so cell_world would fall back to 0 against a
-# manifest saying 1 and abort there instead. Either way the SKIP does not happen.
+# alloc_peer_pos_max_age_sec comes from the _ttl<N> suffix; 0 is a real level
+# (unbounded, the control), so 0.0 and none are different cells. The two SKIP
+# cases are the only test of the suffix parser. (notes: guardcal-ttl-suffix)
 rg SKIP  "_ttl120 with a matching 120.0 is skipped"           mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec 120.0
 rg SKIP  "_ttl0 (the control level) matches an explicit 0.0"  mtare_hybrid_ttl0 alloc_peer_pos_max_age_sec 0.0
 # The case this key exists for: a cell named for the treatment, banked with the
@@ -1196,12 +986,10 @@ rg SKIP  "_ttl120 banked as ' 120.0 ' (padded) still resumes" mtare_hybrid_ttl12
 rg SKIP  "separation_weight=0 matches the campaign default"   "$RG_ARM" separation_weight 0
 rg ABORT "a cell banked at separation_weight=0.4 differs"     "$RG_ARM" separation_weight 0.4
 rg ABORT "separation_weight absent cannot be shown to agree"  "$RG_ARM" separation_weight "<none>"
-# Numeric, not string: a cell can bank "20.0" against a campaign requesting
-# "20" -- the two spellings travel by different routes, the manifest taking the
-# value the node resolved and the guard the value the operator typed -- so a
-# string compare would abort a correct resume. This is the case that would catch
-# that regression, and the 25.0 one below is what stops the fix from
-# degenerating into "any radius agrees".
+# Compared numerically: the manifest carries the node's resolved value and the
+# guard the operator's spelling, so 20.0 must match 20. The differing-value
+# cases stop that from becoming any value agrees.
+# (notes: guardcal-numeric-compare)
 rg SKIP  "separation_radius_m=20.0 matches a requested 20"    "$RG_ARM" separation_radius_m 20.0
 rg ABORT "a cell banked at separation_radius_m=25.0 differs"  "$RG_ARM" separation_radius_m 25.0
 rg ABORT "separation_radius_m absent cannot be shown to agree" "$RG_ARM" separation_radius_m "<none>"
@@ -1209,25 +997,18 @@ rg SKIP  "separation_max_age_sec=10.0 matches a requested 10" "$RG_ARM" separati
 rg ABORT "a cell banked at separation_max_age_sec=3.0 differs" "$RG_ARM" separation_max_age_sec 3.0
 rg ABORT "separation_max_age_sec absent cannot be shown to agree" \
                                                               "$RG_ARM" separation_max_age_sec "<none>"
-# A manifest value that is not a NUMBER must abort, and separation_weight is the
-# key where getting this wrong is invisible: awk reads any unparseable string as
-# 0, the requested weight is 0 in every campaign run so far, so before the
-# numeric branch was taught to check its inputs each of these compared EQUAL and
-# banked a cell whose weight could no longer be determined. "0.0" is the control
-# alongside them -- a real number that really does agree -- so a fix that
-# degenerated into "abort on everything" would not pass this block either.
+# A manifest value that is not a number must abort: awk reads it as 0, which
+# agrees with the requested weight of 0. The 0.0 case is the control, so
+# abort-on-everything fails too. (notes: guardcal-non-number-aborts)
 rg ABORT "separation_weight=off is not a number"              "$RG_ARM" separation_weight off
 rg ABORT "separation_weight=unset is not a number"            "$RG_ARM" separation_weight unset
 rg ABORT "separation_weight=0x0 is not a number"              "$RG_ARM" separation_weight 0x0
 rg ABORT "separation_weight= (truncated line) is not a number" "$RG_ARM" separation_weight ""
 rg SKIP  "separation_weight=0.0 IS a number and agrees with 0" "$RG_ARM" separation_weight 0.0
 rg ABORT "separation_radius_m=default is not a number"        "$RG_ARM" separation_radius_m default
-# "nan" gets its own case at a key whose requested value is NOT 0, because it
-# fails differently from the strings above. This awk parses it as a real NaN
-# and then reports nan == <anything> as TRUE, so under a bare `a + 0 == b + 0`
-# a single corrupted value agrees with every key at every level -- 25.0 as
-# readily as 0. The "off"/"unset" cases cannot catch that: they only compare
-# equal where the request happens to be 0.
+# nan is tested at keys whose requested value is not 0: this awk compares nan
+# equal to anything under a bare +0 compare, which the off and unset cases
+# cannot catch. (notes: guardcal-nan-compare)
 rg ABORT "separation_max_age_sec=nan is not a number"         "$RG_ARM" separation_max_age_sec nan
 rg ABORT "separation_radius_m=nan agrees with 20 under a bare +0" \
                                                               "$RG_ARM" separation_radius_m nan
@@ -1238,35 +1019,20 @@ rg ABORT "separation_radius_m=nan agrees with 20 under a bare +0" \
 rg SKIP  "separation_radius_m= 20.0 (padded) still resumes"   "$RG_ARM" separation_radius_m " 20.0 "
 
 # --- the verdict itself, which the resume guard used to read one bit of ------
-# The guard's test was `grep -q '^run_gates_verdict=INVALID'`, so of the four
-# states a banked cell can be in it distinguished exactly one. SUSPECT and a
-# missing key both landed in the `else` and printed `SKIP (already complete)` --
-# the same line a certified cell gets -- and gate_g8, which is the only thing
-# that reads the verdict, is run by hand after the campaign. A bank full of
-# uncertifiable cells therefore announced itself for the first time at analysis
-# time, with every hour of sim already spent.
-#
-# These cases pin the three directions separately, because "it still skips" and
-# "it says why" are different properties and only one of them was broken.
+# A banked SUSPECT, verdict-less or unknown-verdict cell still skips but says so
+# (SKIP-DIRTY), not with the certified SKIP line. Still skipping and saying why
+# are pinned separately. (notes: guardcal-verdict-directions)
 rg SKIP-DIRTY "a banked SUSPECT cell still skips, but says so"  "$RG_ARM" run_gates_verdict SUSPECT
 rg SKIP-DIRTY "a banked cell with no verdict at all says so"    "$RG_ARM" run_gates_verdict "<none>"
 rg SKIP-DIRTY "a verdict token nothing emits is not read as CLEAN" "$RG_ARM" run_gates_verdict VALID
-# LAUNCHED, not SKIP-DIRTY: INVALID keeps its old behaviour of falling through
-# to a re-run (the disk guard then stops it, which is what LAUNCHED names here).
-# The new branch must not have swallowed the one verdict that was already acted
-# on — an INVALID cell that started merely being reported instead of redone
-# would be a silent loss of the only automatic remedy this driver has.
+# INVALID still falls through to a re-run (stopped here by the disk guard, hence
+# LAUNCHED), not SKIP-DIRTY: it is the only verdict this driver remedies
+# automatically. (notes: guardcal-invalid-still-redoes)
 rg LAUNCHED   "INVALID still redoes the cell, not just reports it" "$RG_ARM" run_gates_verdict INVALID
 
-# REDO_SUSPECT=1 IS THE OPT-IN, AND IT HAS TO BE TESTED IN BOTH DIRECTIONS.
-# The env var is the operator's way of saying "re-roll the uncertified cells",
-# and a knob that silently does nothing is worse than no knob: it converts a
-# deliberate decision into a no-op that looks like it was honoured. Run inline
-# rather than through rg(), which has no env hook.
-#
-# LAUNCHED is the wanted outcome — the cell is passed through to be re-run and
-# stopped immediately afterwards by the absurd MIN_FREE_MB, which is the same
-# trick every case above uses to avoid starting a 3000 s gazebo run.
+# REDO_SUSPECT=1 re-rolls SUSPECT cells: tested at 1 (LAUNCHED, stopped by the
+# huge MIN_FREE_MB) and 0 (SKIP-DIRTY). Run inline because rg() has no env hook.
+# (notes: guardcal-redo-suspect)
 for _rs in 1 0; do
   cases=$((cases+1))
   _root="$TMP/resume_redo_$_rs"; _cell="$_root/rg_${RG_ARM}_seed1"
@@ -1309,12 +1075,10 @@ unset _want _lbl _arm _key _val _root _cell _out _rc _got _rs RG_ARM
 
 echo
 echo "=== the resume guard's copies of the launcher defaults must still be true ==="
-# Same hazard as the LINK_GATE readback above, and the reason that one exists is
-# on display here: TREE_ATTEN's shipped default MOVED, from 11.98 to 70.0. The
-# resume guard predicts what a cell's manifest will say, so a stale copy of a
-# default does not fail loudly -- it aborts every resume of a campaign that is
-# running exactly as intended, or, in the other direction, skips a cell from
-# the wrong regime. Read all three literals back out of the launcher.
+# The resume guard keeps copies of launcher defaults to predict each manifest; a
+# stale copy aborts correct resumes or skips cells from the wrong regime. Read
+# TREE_ATTEN, MAX_RANGE and CELL_SIZE_M back.
+# (notes: guardcal-resume-default-readback)
 for _spec in TREE_ATTEN:TREE_ATTEN_REQ MAX_RANGE:MAX_RANGE_REQ \
              CELL_SIZE_M:CELL_SIZE_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}

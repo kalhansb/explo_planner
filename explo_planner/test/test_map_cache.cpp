@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 #include "explo_planner/map_cache.hpp"
 #include <scovox_msgs/msg/scovox_map.hpp>
@@ -159,15 +160,9 @@ TEST(MapCacheIngest, DropsVoxelsWithNonFiniteBetaParameters) {
 // ==================================================================
 // groundZAt — local ground elevation under one column
 // ==================================================================
-// This is the load-bearing function of terrain_relative_z mode: exploration
-// candidates, exploitation vantages and (through the vantage z) every
-// line-of-sight occlusion ray are placed at ground + clearance. It had no test
-// coverage at all before these.
-//
-// Contract, from the implementation: coords are voxel corners, so the returned
-// elevation is the TOP FACE of the top voxel of the ground stack, i.e.
-// (coord_z + 1) * resolution. At 0.1 m a single ground voxel whose centre is
-// 0.05 sits in coord 0 and reports 0.1.
+// Load-bearing in terrain_relative_z mode: candidates, vantages and LoS rays
+// sit at ground + clearance. Returns the TOP FACE of the ground stack's top
+// voxel, (coord_z + 1) * resolution. (notes: mapcache-groundz-contract)
 
 namespace {
 
@@ -196,21 +191,10 @@ TEST(MapCacheGroundZ, ScanIsBottomUpSoAnOverhangAboveIsIgnored) {
   EXPECT_FLOAT_EQ(map.groundZAt(0.05f, 0.05f, -1.0f, 4.0f, kOcc, 0.6f), 0.1f);
 }
 
-// CHARACTERISATION, not an endorsement. With no ground voxel in the column but
-// an overhang inside the window (a fallen log, a ledge, a low branch, or simply
-// ground that the sensor has not seen yet under something it has), groundZAt
-// returns the overhang's top face — a plausible, FINITE, wrong answer. Every
-// caller's only defence is std::isfinite, which this passes.
-//
-// The consequence in terrain mode: the vantage is placed z_clearance above a
-// branch, and lineOfSightClear marches its occlusion ray at that height. With
-// use_planning_map false, that LoS test is the only real vantage filter, so a
-// wrong-but-finite ground silently produces a confidently-wrong capture pose.
-// The dwell re-confirms LoS from the settled pose, which limits the damage to a
-// wasted vantage rather than a false success, but nothing detects the cause.
-// If this behaviour is ever changed (e.g. require a supporting stack, or return
-// NaN when the column below the hit is unobserved rather than free), this test
-// is the one that should fail and be updated deliberately.
+// Characterisation, not endorsement: with no ground voxel but an overhang in
+// the window, groundZAt returns the overhang's top face, finite and wrong.
+// Change this test deliberately if that changes.
+// (notes: mapcache-groundz-overhang)
 TEST(MapCacheGroundZ, AnOverhangWithNoGroundBelowIsReportedAsGround) {
   auto map = makeMap({{0.05f, 0.05f, 2.05f}});
   const float gz = map.groundZAt(0.05f, 0.05f, -1.0f, 4.0f, kOcc, 0.6f);
@@ -299,12 +283,9 @@ TEST(MapCacheGroundZ, DegenerateAndNonFiniteQueriesReturnNotFinite) {
 // Ingest rejects an unusable wire resolution instead of trusting it
 // ==================================================================
 TEST(MapCacheIngest, NonFiniteWireResolutionIsRejectedAndKeepsThePreviousGrid) {
-  // A positive-but-infinite msg.resolution passed the old `> 0.0f` guard
-  // straight into the Grid, making inv_resolution zero and every posToCoord a
-  // float->int32 cast of a non-finite value: UB that shows up as garbage
-  // coordinates, not a crash. Reject the MESSAGE (this arrives over the wire
-  // mid-run) rather than throwing, so one malformed publish cannot take the
-  // planner down in the field.
+  // A positive-but-infinite msg.resolution would make every posToCoord UB.
+  // Ingest rejects the message rather than throwing, so one malformed publish
+  // cannot take the planner down. (notes: mapcache-wire-resolution-reject)
   scovox_msgs::msg::ScovoxMap good;
   good.resolution = 0.1f;
   scovox_msgs::msg::ScovoxVoxel v;

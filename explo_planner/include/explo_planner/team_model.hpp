@@ -44,6 +44,7 @@
 /// about a third robot arrives as an elapsed interval on the PEER's clock, and
 /// is converted on receipt by adding the local age of the message that carried
 /// it — an interval plus an interval, with no absolute stamp anywhere.
+/// Moved comments: doc/team_model_notes.md
 
 #include <cstdint>
 #include <string>
@@ -79,11 +80,9 @@ public:
     /// whose radios are not actually relaying.
     bool closure_enabled = true;
 
-    /// A peer's gossip about a third robot is only usable while the gossip
-    /// itself is fresh. Past this, the third-party entry is treated as never
-    /// heard — NOT as "heard a long time ago", because a very stale interval
-    /// added to a very stale message is a number with no meaning that would
-    /// still compare against thresholds.
+    /// Gossip about a third robot is usable only while the gossip itself is
+    /// younger than this, seconds; past it the entry is treated as never heard,
+    /// not as heard long ago. (notes: team-gossip-max-age)
     double gossip_max_age_sec = 120.0;
   };
 
@@ -112,22 +111,15 @@ public:
 
     // --- R1 instrumentation (generation 33) ---------------------------------
     //
-    // The detector is not changed by any of the four fields below; they only
-    // TIME it. Both measurements exist today by offline reconstruction against
-    // an oracle the robot does not have, which is the gap R1 names.
-    //
-    // ALL FOUR ARE STAMPED FROM THE PACKET CLOCK (`reported_at_sec_`), never
-    // from the tick clock. A tick is a coarse, jittering sample of a link that
-    // changes on arrivals, so differencing tick times would report the planner's
-    // scheduling noise as link behaviour. Differencing the two packets that
-    // bracket the transition reports the link.
+    // The four fields below only time the detector; they do not change it. All
+    // are stamped from the packet clock (reported_at_sec_), never the tick
+    // clock, so scheduling jitter is not reported as link behaviour.
+    // (notes: team-link-timing-packet-clock)
 
-    /// Packet stamp that opens the CURRENT period without a completed
-    /// handshake — the first packet of a receiving run, or the packet that
-    /// broke the last handshake while the peer stayed audible. Negative while
-    /// not receiving. This is the "first one-way packet" acquisition latency is
-    /// measured from. It is stamped whether or not that packet already
-    /// completes the handshake, so an instant handshake correctly reads 0.
+    /// Packet stamp opening the current period without a completed handshake:
+    /// first packet of a receiving run, or the packet that broke the last
+    /// handshake. Negative while not receiving. An instant handshake reads 0.
+    /// (notes: team-one-way-since)
     double   one_way_since_sec = -1.0;
     /// Packet stamp of the message that completed the CURRENT handshake.
     /// Negative while not direct. Distinct from `last_direct_sec`, which is the
@@ -135,28 +127,15 @@ public:
     /// difference between them plus whatever ends it.
     double   direct_since_sec = -1.0;
 
-    /// ONE-SHOT, and the only two fields in this struct that are: set on the
-    /// tick that carries the transition and cleared on every other tick, so a
-    /// reader counts events by counting non-negative readings instead of
-    /// diffing a level. Negative means "no transition this tick".
-    ///
-    /// THE ONE-SHOT IS SOUND BECAUSE NEITHER TRANSITION CAN HAPPEN ON A TICK
-    /// WITH NO PACKET FROM THIS PEER. Both `receiving` and the peer's mask move
-    /// only on an arrival, so a tick with an empty batch can lower `direct` by
-    /// TTL expiry (which is not this measurement) but can never raise it and can
-    /// never break a handshake while still receiving. The value is therefore
-    /// always readable on a row that exists for this peer in the same drain.
-    ///
-    /// `acquire_sec`: seconds from the first packet of the contact run to the
-    /// packet that completed the handshake — acquisition LATENCY.
+    /// One-shot, like held_sec: set only on the tick carrying the transition,
+    /// else -1, so count non-negative readings. Both transitions need a packet
+    /// from this peer. Seconds from first contact packet to the handshake
+    /// packet. (notes: team-acquire-one-shot)
     double   acquire_sec = -1.0;
-    /// `held_sec`: seconds a completed handshake survived, from the packet that
-    /// made it to the packet that broke it, and set ONLY on a break that
-    /// happens WHILE STILL RECEIVING — the peer is still audible and stopped
-    /// naming us back. A link that ends because the packets stopped is a
-    /// different event with a different cause (§2.7's fleet-wide blackout), it
-    /// has no closing packet to stamp, and conflating the two would average a
-    /// delivery failure into a handshake statistic.
+    /// Seconds a completed handshake survived, packet to packet; set only on a
+    /// break while still receiving (the peer is audible but stopped naming us).
+    /// A link that ends because packets stopped is not recorded here.
+    /// (notes: team-held-sec)
     double   held_sec = -1.0;
     /// Mission-elapsed seconds of the freshest information we hold about the
     /// peer, first-hand or gossiped. Negative for never. This is the field
@@ -166,81 +145,40 @@ public:
     bool     position_first_hand = false;
     double   position_x = 0.0, position_y = 0.0, position_z = 0.0;
     bool     have_position = false;
-    /// Mission-elapsed seconds the POSITION dates from. Negative for never.
-    ///
-    /// Tracked separately from last_known_sec, and the difference is rule 3 of
-    /// the file header made concrete rather than a redundancy. Both first-hand
-    /// and gossiped updates refresh last_known_sec BEFORE testing whether the
-    /// message carried a position at all, so a status-only relay about a robot
-    /// nobody has seen in minutes leaves last_known_sec reading "fresh" over a
-    /// position that is minutes old. A consumer that steers on the position —
-    /// a chase, a separation term — must key on this field.
+    /// Mission-elapsed seconds the POSITION dates from; negative for never.
+    /// Status-only updates refresh last_known_sec but not this, so a consumer
+    /// that steers on the position (chase, separation term) must key on this
+    /// field. (notes: team-position-sec)
     double   position_sec = -1.0;
 
-    /// The peer's run is over (TeamWorld/finished). MONOTONIC and STICKY: set
-    /// first-hand from the peer's own message, or by relay from a third robot
-    /// that heard it, and never cleared by either. The publisher latches the
-    /// bit, so false here means "no evidence", not "still exploring".
-    ///
-    /// It is relayed — unlike `team_incomplete` below — because it is a
-    /// monotonic statement a robot makes about ITSELF, so a relayed copy can
-    /// neither contradict a first-hand one nor echo back to its originator.
-    /// Without the relay, a robot that cannot hear the finished peer keeps
-    /// counting it missing forever and holds the whole team at the unbounded
-    /// appointment barrier; see TeamWorld.msg/robot_finished.
+    /// The peer's run is over (TeamWorld/finished). Set first-hand or by relay;
+    /// relay never clears it. False means no evidence, not still exploring.
+    /// Relayed so an unheard finished peer cannot hold the appointment barrier
+    /// forever. (notes: team-peer-finished)
     bool     finished = false;
 
-    /// What the peer is doing with the rest of its run (TeamWorld/mode), on the
-    /// ordered scale EXPLORING(0) < HOMING(1) < DONE(2). MONOTONIC and STICKY
-    /// for `finished`'s reasons exactly, merged by MAX instead of OR because
-    /// the fact has three levels rather than two. 0 means "no evidence", not
-    /// "confirmed exploring". It follows `finished`'s two-channel rule to the
-    /// letter: the FIRST-HAND assignment is authoritative and may therefore
-    /// LOWER the level (the restarted-node case `finished` documents applies
-    /// here identically), while RELAY can only ever raise it.
-    ///
-    /// WHAT IT BUYS OVER `finished`, which is the whole point of having both:
-    /// it fills the window between "left for home" and "arrived and announced
-    /// finished". A peer in that window is not coming to the meeting and will
-    /// explore no more cells, but `finished` still reads false — so a partner
-    /// waits at an unbounded barrier, and the allocator reserves frontier for
-    /// a robot that is driving the other way. Read this where the question is
-    /// "will this peer participate?"; read `finished` where it is "is its run
-    /// over?". See TeamWorld.msg/mode for the levels and their preconditions.
+    /// The peer's TeamWorld/mode: EXPLORING(0) < HOMING(1) < DONE(2); 0 means
+    /// no evidence. First-hand is authoritative and may lower it; relay merges
+    /// by MAX. Read it for will this peer participate, finished for is its run
+    /// over. (notes: team-peer-mode)
     uint8_t  mode = 0;
 
-    /// The peer's own FIRST-HAND answer to "is the team whole?", as it sent it
-    /// (TeamWorld/team_incomplete). NOT its derived armed state — see the
-    /// field's own documentation in TeamWorld.msg for why announcing the armed
-    /// state instead deadlocks.
-    ///
-    /// Stale-safe in one direction only, which is the useful one: this is
-    /// whatever the peer last said, with no TTL of its own, so a consumer must
-    /// pair it with `direct || heard_one_way` to mean "a peer we are receiving
-    /// from RIGHT NOW says the team is broken". Both flags are required, not
-    /// `direct` alone: one-way contact (we receive from the peer, it cannot
-    /// hear us) is exactly the case this exists to catch — the peer's own read
-    /// is broken, it is announcing so, and it has no other way to tell us.
+    /// The peer's own first-hand team_incomplete bit, not its armed state. No
+    /// TTL of its own: pair it with direct or heard_one_way (not direct alone),
+    /// since one-way contact is the case it exists to catch.
+    /// (notes: team-peer-team-incomplete)
     bool     team_incomplete = false;
 
-    /// The peer is in a rendezvous appointment manoeuvre and has not stopped
-    /// driving yet (TeamWorld/appointment_inbound). First-hand only, like
-    /// team_incomplete, and its reader pairs it with `direct || heard_one_way`
-    /// for the same reason: it carries no TTL of its own.
-    ///
-    /// It clears when the DRIVE ends — arrival, nav budget, or no-progress —
-    /// and not when the cell is reached, so a peer whose destination turned out
-    /// unreachable stops holding the barrier instead of hanging it. That bound
-    /// is also why it needs no finished exemption; see TeamWorld.msg.
+    /// The peer is in an appointment manoeuvre and still driving
+    /// (TeamWorld/appointment_inbound). First-hand only, no TTL: pair with
+    /// direct or heard_one_way. Clears when the drive ends, not when the cell
+    /// is reached. (notes: team-peer-appointment-inbound)
     bool     appointment_inbound = false;
 
-    /// The peer reports that some robot IT receives first-hand is still
-    /// driving to the agreed cell (TeamWorld/appointment_inbound_seen): the
-    /// one-hop companion to the bit above, added with the generation-27
-    /// closure door. The sender derives it from raw first-hand
-    /// appointment_inbound bits only, never from other robots' copies of this
-    /// field, so it cannot echo (see TeamWorld.msg). Same reader contract as
-    /// the bit above: pair with `direct || heard_one_way`, no TTL of its own.
+    /// The peer reports a robot it hears first-hand is still driving to the
+    /// agreed cell. Derived from raw first-hand bits only, so it cannot echo.
+    /// Pair with direct or heard_one_way; no TTL of its own.
+    /// (notes: team-peer-inbound-seen)
     bool     appointment_inbound_seen = false;
 
     /// The peer's last reported direct-contact mask, as it sent it.
@@ -287,11 +225,9 @@ public:
     std::vector<double> gx, gy, gz;       ///< last known position per robot
     std::vector<uint8_t> have_gossip_pos;
 
-    /// Relayed `finished`, indexed by fleet id. Merged as a pure OR that never
-    /// clears, and — unlike everything else in this block — NOT age-gated: a
-    /// finished robot goes quiet, so its last-heard entry ages out of
-    /// gossip_max_age_sec exactly when the bit matters. A monotonic fact has no
-    /// freshness to check. See Peer::finished and TeamWorld.msg/robot_finished.
+    /// Relayed finished, by fleet id: OR-merged, never cleared, and NOT
+    /// age-gated, since a finished robot goes quiet and its gossip ages out
+    /// exactly when the bit matters. (notes: team-finished-gossip)
     std::vector<uint8_t> finished_gossip;
 
     /// Relayed `mode`, indexed by fleet id. Merged by MAX that never lowers,
@@ -305,11 +241,9 @@ public:
   /// of receipt. Returns "" or a reason the message was dropped.
   std::string observe(const Observation& obs, double now_sec);
 
-  /// Recompute every peer's status: TTL expiry, handshake, then closure.
-  /// Separated from observe() because closure is a property of the whole graph
-  /// and must not be recomputed once per arriving message — with three robots
-  /// publishing at 1 Hz that would be three different answers per second, and
-  /// whichever one a consumer happened to read would be the one that counted.
+  /// Recompute every peer's status: TTL expiry, handshake, then closure. Kept
+  /// out of observe(): closure is a whole-graph property and must not be
+  /// recomputed per arriving message. (notes: team-tick-whole-graph)
   void tick(double now_sec);
 
   const Peer& peer(int id) const { return peers_[static_cast<size_t>(id)]; }
@@ -322,11 +256,10 @@ public:
   /// that needs the peer's data must key on.
   double lastKnownAgeSec(int id, double now_sec) const;
 
-  /// Seconds since the POSITION we hold for `id` was measured, or negative
-  /// for "we hold no position". This is the accessor the file header has
-  /// always named and the one every consumer that STEERS on a peer position
-  /// must use; lastKnownAgeSec() answers a different question and can read
-  /// fresh over a stale position (see Peer::position_sec).
+  /// Seconds since the POSITION held for id was measured, or negative if none.
+  /// Every consumer that steers on a peer position must use this;
+  /// lastKnownAgeSec() can read fresh over a stale position.
+  /// (notes: team-position-age-accessor)
   double positionAgeSec(int id, double now_sec) const;
 
   /// Seconds since DIRECT contact with `id`, or negative for never. The
@@ -334,22 +267,16 @@ public:
   /// last actually talked, not on whether someone else can currently hear it.
   double lastDirectAgeSec(int id, double now_sec) const;
 
-  /// Mask of peers currently IN_COMMS, self included — the closure result.
-  /// This is a local conclusion and must NOT be published: TeamWorld's
-  /// in_range_mask is defined as direct contacts, and putting the closure mask
-  /// there would make the handshake circular — A claims to hear C because B
-  /// said C was reachable, C concludes the same about A from its own copy of
-  /// the same relay, and the mutual test that rule 1 exists for passes without
-  /// anybody having heard anybody.
+  /// Mask of peers currently IN_COMMS, self included (the closure result).
+  /// Local only: publishing it as TeamWorld in_range_mask, which is direct
+  /// contacts, would make the rule-1 handshake circular.
+  /// (notes: team-in-comms-mask-local)
   uint32_t inCommsMask() const;
 
-  /// Mask of peers heard DIRECTLY inside the TTL, self included. This is the
-  /// mask to publish in TeamWorld.in_range_mask.
-  ///
-  /// Deliberately NOT the handshake result: this is "I receive from them",
-  /// which is the half of the handshake only we can observe. Publishing the
-  /// mutual result instead would deadlock a healthy link — neither robot could
-  /// name the other until the other had already named it.
+  /// Mask of peers heard directly inside the TTL, self included; this is what
+  /// TeamWorld in_range_mask carries. Not the handshake result: publishing the
+  /// mutual result would deadlock a healthy link.
+  /// (notes: team-direct-mask-published)
   uint32_t directMask() const;
 
   /// Number of peers (excluding self) currently LOST_COMMS.

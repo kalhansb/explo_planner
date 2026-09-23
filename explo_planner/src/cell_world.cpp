@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/cell_world.hpp"
 
 #include "explo_planner/fleet_identity.hpp"
@@ -14,11 +15,10 @@ namespace explo_planner {
 
 namespace {
 
-/// FNV-1a 32-bit, the same construction fleet_identity uses and for the same
-/// reason: this value is compared between processes, so it may not be
-/// std::hash. Kept local rather than shared because the two hash different
-/// things and a shared helper would invite hashing them into one value, which
-/// would stop an operator being told WHICH half of the config disagrees.
+/// FNV-1a 32-bit, as in fleet_identity: the value is compared between
+/// processes, so not std::hash. Kept separate from fleet_identity's so a
+/// mismatch still tells which half of the config disagrees.
+/// (notes: cellworld-fnv1a-local)
 struct Fnv1a {
   uint32_t h = 2166136261u;
   void byte(uint8_t b) { h ^= b; h *= 16777619u; }
@@ -192,11 +192,9 @@ std::string CellWorld::configure(const CellGrid& grid, const Config& cfg,
                   grid.size(), kMaxCells);
     return buf;
   }
-  // self_id is required, not optional. known_by is a bitmask addressed by id;
-  // with no id every bit this robot would set is bit-nothing, and the
-  // knowledge gate downstream would compute a correct-looking answer from an
-  // always-empty mask. Refusing here is what keeps that from being silent —
-  // callers gate on fleet identity being configured before enabling this.
+  // self_id is required: known_by is an id-addressed bitmask, and without an id
+  // the knowledge gate would compute from an always-empty mask. Callers gate on
+  // fleet identity before enabling this. (notes: cellworld-self-id-required)
   if (self_id < 0 || self_id >= kMaxTeamSize) {
     std::snprintf(buf, sizeof(buf),
                   "self robot id %d is outside [0, %d): cell world needs "
@@ -245,15 +243,10 @@ CellStatus CellWorld::classify(CellStatus current,
   CellStatus fresh = CellStatus::UNSEEN;
   if (o.observed_columns >= cfg_.min_observed_columns) {
     const double u = o.unknownFraction();
-    // The frontier count vetoes PROMOTION only. It is the volumetric check the
-    // 2.5D column measure cannot do (unknown pockets behind a trunk), but it
-    // is also the noisier of the two — it counts absent 6-neighbours, so the
-    // ROI boundary contributes to it. Using it to demote as well would put the
-    // flap back in through a channel the hysteresis band does not cover.
-    // A cell with observed columns but no observed voxels cannot exist, but
-    // frontierFraction()'s "cannot measure" sentinel is negative and would
-    // sail under any threshold, so the veto is written to require a real
-    // measurement rather than to trust that it got one.
+    // The frontier fraction vetoes promotion to COVERED only; using it to
+    // demote would bring flapping back outside the hysteresis band. Its
+    // negative cannot-measure sentinel must not pass, so the veto needs a real
+    // measurement. (notes: cellworld-frontier-veto)
     const double ff = o.frontierFraction();
     fresh = (u >= 0.0 && u <= cfg_.covered_max_unknown &&
              ff >= 0.0 && ff <= cfg_.covered_max_frontier_frac)
@@ -262,11 +255,10 @@ CellStatus CellWorld::classify(CellStatus current,
   }
 
   if (!isFirstHand(current)) {
-    // The current belief came from a peer that was there. My own map saying
-    // "unknown" is not evidence against that — it is evidence I have not been.
-    // So a relayed belief may only ever be RAISED by what I see, never lowered.
-    // Equal rank still adopts, because upgrading provenance from relayed to
-    // first-hand is real information for the merge guard table.
+    // The current belief is relayed, so my own evidence may only raise it,
+    // never lower it. Equal rank still adopts: upgrading provenance to
+    // first-hand matters to the merge guard table.
+    // (notes: cellworld-relayed-raise-only)
     return exploredRank(fresh) >= exploredRank(current) ? fresh : current;
   }
 
@@ -333,13 +325,9 @@ std::vector<CellWorld::WireCell> CellWorld::toWire() const {
 
 uint32_t CellWorld::sharedHash() const {
   Fnv1a f;
-  // The cell COUNT is folded in first, and it is not redundant with the
-  // per-cell bytes: an empty world and a world of one UNSEEN cell would
-  // otherwise differ only by one zero byte, and — more to the point — two
-  // grids of different size are not comparable at all, so their digests must
-  // not be able to collide by accident. configHash() covers the geometry
-  // properly; this is the cheap guard for a caller that compares digests
-  // without having compared grids.
+  // The cell count is folded in first so grids of different size cannot collide
+  // by accident. configHash() covers geometry; this guards callers that compare
+  // digests without comparing grids. (notes: cellworld-shared-hash-count)
   f.i64(static_cast<int64_t>(cells_.size()));
   for (const auto& c : cells_) f.byte(normaliseForWire(c.status));
   return f.h;
@@ -414,12 +402,10 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
     const CellStatus peer  = fromWire(w.status);
     const CellStatus local = c.status;
 
-    // mTARE's local-priority rule. Refused ENTIRELY — not even the known_by
-    // OR — because while this robot is standing in a cell and actively
-    // exploring it, a peer's claim about that ground is the one claim we have
-    // positive reason to distrust, and crediting the peer with knowledge of a
-    // status we are about to change would suppress exactly the reconnection
-    // that would tell it otherwise.
+    // mTARE's local-priority rule: a peer update to a cell in the
+    // local-priority neighbourhood that we are EXPLORING is refused entirely,
+    // known_by included, so the peer is not credited with a status we are about
+    // to change. (notes: cellworld-local-priority)
     if (n_priority > 0 && local == CellStatus::EXPLORING) {
       bool mine = false;
       for (int k = 0; k < n_priority; ++k)
@@ -427,20 +413,10 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
       if (mine) { ++st.refused_local; continue; }
     }
 
-    // Statuses AGREE on the wire: nothing to adopt, but the peer's knowledge
-    // composes with ours. The peer's own mask is ORed in as well, and that is
-    // what makes the knowledge gate work at N>=3 without hearing from
-    // everybody: if A and B agree a cell is COVERED and B's mask says C has it
-    // too, A can conclude the whole team has it.
-    //
-    // Note the ASYMMETRY with adoption below, which is deliberate. Here the
-    // peer's mask is a claim about the SAME status we already hold first-hand
-    // or otherwise, so composing it adds one level of hearsay. When we ADOPT a
-    // status we are already taking the peer's word for the status itself, and
-    // crediting third parties on top of that compounds two levels — so
-    // adoption resets to {self, sender} instead. Over-crediting is the
-    // expensive direction: it makes the knowledge gate suppress a reconnection
-    // that was needed, and nothing later can recover the lost information.
+    // Statuses agree: OR in the sender and its known_by (this makes the
+    // knowledge gate work at N>=3). Deliberate asymmetry: adoption below resets
+    // the mask to self and sender, since over-crediting suppresses needed
+    // reconnections. (notes: cellworld-agree-mask-asymmetry)
     if (normaliseForWire(local) == w.status) {
       const uint32_t before = c.known_by;
       c.known_by |= w.known_by | sender_bit;
@@ -461,25 +437,10 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
       if (local == CellStatus::UNSEEN) {
         adopt = CellStatus::EXPLORING_BY_OTHERS;
       } else if (local == CellStatus::COVERED_BY_OTHERS) {
-        // THE ONE PLACE THIS DELIBERATELY STRENGTHENS THE PLAN'S TABLE (§3.2).
-        //
-        // The plan makes peer-EXPLORING apply to a local COVERED_BY_OTHERS
-        // unconditionally. That is right for the case it was written for — the
-        // SAME peer retracting, because its own hysteresis released the cell —
-        // and full-state broadcast means the peer's latest census is what
-        // arrives, so retractions must be trackable or our view of that peer
-        // can never come back down.
-        //
-        // But applied unconditionally it also lets a THIRD robot's staler
-        // EXPLORING undo a COVERED we adopted from someone else, which is a
-        // regression of the census under mere reordering — the thing rule 1
-        // and the more-explored ordering exist to prevent. known_by already
-        // records who we took the COVERED from, so the two cases are
-        // distinguishable and there is no reason to conflate them: honour a
-        // retraction from a robot that is in the mask, refuse a contradiction
-        // from one that is not. At N=2 there is only ever one peer, so this is
-        // identical to the plan's rule; it only bites at N>=3, where the plan's
-        // version is wrong.
+        // Peer EXPLORING replaces a local COVERED_BY_OTHERS only from a robot
+        // in known_by (a retraction by a source of that COVERED); a third
+        // robot's staler EXPLORING is refused. Identical to the plain rule at
+        // N=2. (notes: cellworld-exploring-retraction)
         if (maskHas(c.known_by, sender_id)) adopt = CellStatus::EXPLORING_BY_OTHERS;
       }
       // local first-hand COVERED: never downgraded by a peer. local
@@ -503,12 +464,9 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
 std::vector<int> CellWorld::interceptCandidates(int robot_id) const {
   std::vector<int> out;
   if (robotBit(robot_id) == 0u) return out;   // no bit, so no claim to check
-  // Asking where to look for OURSELVES has no answer, and the honest one is
-  // "nowhere". It is not "nowhere" by accident: self is in the known_by of
-  // every cell we have observed or adopted, so without this the query would
-  // return most of the map, and a caller that looped over the fleet without
-  // excluding itself would get a large, plausible, entirely spurious search
-  // list for the one robot that is definitely not missing.
+  // Asking for this robot returns nothing: self is in known_by of every cell
+  // observed or adopted, so the query would otherwise return a large spurious
+  // search list. (notes: cellworld-intercept-self)
   if (robot_id == self_id_) return out;
   for (size_t i = 0; i < cells_.size(); ++i) {
     const Cell& c = cells_[i];
@@ -638,20 +596,10 @@ std::vector<CellWorld::CellObservation> censusFromMap(const MapCache& map,
 
   // --- column-to-cell binning --------------------------------------------
   //
-  // A voxel column has integer coord (cx, cy) and covers
-  // [cx*res, (cx+1)*res) — Bonxai's coordToPos returns the LOW corner. Bin it
-  // by that corner, the same floor() convention as ingest.
-  //
-  // ONE helper does the binning for both the denominator (total_columns) and
-  // the numerator (observed_columns), rather than the counts being computed
-  // analytically and the observations through CellGrid::idAt. Those two would
-  // drift: at min_x = -15 and res = 0.2 the boundary column is
-  // -75 * 0.2 == -15.000000000000002 in double, which floors to cell index -1,
-  // but narrowed to float it is exactly -15.0f and floors to 0. One path would
-  // then count a column the other did not, and every cell on the ROI's west
-  // and south edges would report an unknown fraction slightly below the truth
-  // — small enough to look like a threshold that needed tuning. Sharing the
-  // arithmetic makes the two agree by construction.
+  // A column covers [cx*res, (cx+1)*res) (coordToPos returns the low corner);
+  // bin it with floor() as ingest does. total_columns and observed_columns
+  // share this helper so float rounding cannot make them disagree.
+  // (notes: cellworld-column-binning)
   auto axis_index = [&](int64_t c, float lo, int ncells) -> int {
     const float p = static_cast<float>(static_cast<double>(c) * res);
     const double k =
@@ -693,11 +641,10 @@ std::vector<CellWorld::CellObservation> censusFromMap(const MapCache& map,
   auto acc = vg.createConstAccessor();
   static const Bonxai::CoordT kOff[6] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                          {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
-  // Packed (x, y) column keys, deduplicated: x zero-extended into the high 32
-  // bits, y into the low. Bijective for 32-bit coords, and the shift runs on
-  // uint64_t because left-shifting a negative signed value (any column west of
-  // the origin) is undefined behaviour. Same construction as
-  // unknownColumnFraction, deliberately, so the two measures agree.
+  // Deduplicated column keys: x zero-extended into the high 32 bits, y into the
+  // low; shift as uint64_t, since shifting a negative signed value is UB. Same
+  // construction as unknownColumnFraction, so the measures agree.
+  // (notes: cellworld-packed-column-keys)
   std::unordered_set<uint64_t> observed;
   vg.forEachCell([&](const UnifiedVoxel& uv, const Bonxai::CoordT& c) {
     const int col = axis_index(c.x, grid.min_x, grid.nx);

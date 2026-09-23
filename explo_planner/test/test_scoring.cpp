@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 #include "explo_planner/scoring.hpp"
 #include <cmath>
@@ -122,11 +123,9 @@ TEST(Scoring, FactoryReturnsCorrectFunction) {
   EXPECT_THROW(scoring::create("invalid"), std::invalid_argument);
 }
 
-// entropy() must return 0 for a non-finite p_occ. The saturation guard was
-// written as `p < eps || p > 1-eps`, and every comparison against NaN is
-// false, so a NaN slipped through and returned NaN — which then poisoned the
-// accumulated ray score and mean_entropy in the metrics CSV for the rest of
-// the run.
+// entropy() must return 0 for a non-finite p_occ; a NaN would otherwise
+// poison the accumulated ray score and mean_entropy in the metrics CSV.
+// (notes: scoring-entropy-non-finite)
 TEST(Scoring, EntropyIsZeroForNonFiniteProbability) {
   UnifiedVoxel nan_v;
   nan_v.p_occ = std::numeric_limits<float>::quiet_NaN();

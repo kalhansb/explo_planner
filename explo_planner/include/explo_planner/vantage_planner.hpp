@@ -12,6 +12,7 @@
 /// node's existing filters; the occlusion-specific check lives here as
 /// lineOfSightClear(). Pure geometry + a read-only MapCache ray-march, so it is
 /// unit-tested in isolation (test_vantage_planner.cpp).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <vector>
 
@@ -46,22 +47,17 @@ public:
   /// and the trunk axis is within the max range.
   float standoffFor(float radius) const;
 
-  /// Generate cfg_.n_vantages viewpoints evenly spaced on the standoff circle
-  /// around `center`. Each viewpoint's yaw faces the trunk centre and
-  /// is_vantage is set. Z is cfg_.robot_z. Angular order is deterministic
-  /// (i = 0..n-1 at start_angle + i * 2π/n), so the same trunk yields the same
-  /// vantage positions every tick (the queue's visited-by-proximity tracking
-  /// relies on this stability).
+  /// cfg_.n_vantages viewpoints evenly spaced on the standoff circle, facing
+  /// the trunk, is_vantage set, z = cfg_.robot_z. The angular order is
+  /// deterministic, which the queue's visited-by-proximity tracking relies on.
+  /// (notes: vantage-deterministic-order)
   std::vector<CandidateViewpoint> generateVantages(
       const Eigen::Vector3f& center, float radius) const;
 
-  /// Line-of-sight test from `from` to the trunk at `center` (radius). Marches
-  /// a ray at the sightline height (from.z) toward the trunk axis and returns
-  /// false if any known-occupied voxel (p_occ >= occ_stop) is hit *before*
-  /// reaching within (radius + one voxel) of the axis — voxels at or inside the
-  /// trunk surface are the trunk itself (an expected hit, not an occluder).
-  /// Unknown space (Beta(1,1) prior, p_occ = 0.5) never blocks. An empty map is
-  /// trivially clear.
+  /// Marches a ray at from.z toward the trunk axis; false if a voxel with p_occ
+  /// >= occ_stop is hit before radius + one voxel of the axis (the trunk
+  /// itself). Unknown space never blocks; an empty map is clear.
+  /// (notes: vantage-line-of-sight)
   bool lineOfSightClear(const Eigen::Vector3f& from,
                         const Eigen::Vector3f& center, float radius,
                         const MapCache& map) const;

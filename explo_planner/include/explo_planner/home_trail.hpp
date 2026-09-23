@@ -17,6 +17,7 @@
 /// selection functions therefore start at index 1 — see their comments for what
 /// selecting crumb 0 actually does, which is worse than a rounding error in
 /// both cases.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cmath>
 #include <cstddef>
@@ -28,17 +29,9 @@
 namespace explo_planner {
 namespace home_trail {
 
-/// Index of the crumb nearest `pos`, searching from 1 (never home itself).
-/// Returns 1 for a trail with a single usable crumb; the caller must not call
-/// this with `trail.size() <= 1`, where there is no retrace to engage at all.
-///
-/// Selecting crumb 0 would put the planner in RETRACE while making the
-/// republished goal, and the approach metric, identical to DIRECT: the robot is
-/// re-sent the very goal that just failed twice, under a label saying
-/// otherwise. It is also a one-way door — the escape branch keys off
-/// `home_mode_ == RETRACE`, so a nominal retrace that never retraces sends
-/// every later fire straight to an escape and deletes three rungs of the
-/// ladder.
+/// Nearest crumb to pos, searching from 1 (never home); returns 1 for a single
+/// usable crumb. Do not call with trail.size() <= 1. Crumb 0 would make RETRACE
+/// resend the failed DIRECT goal. (notes: home-trail-nearest-crumb)
 inline int nearestCrumbFromOne(const std::vector<Eigen::Vector3f>& trail,
                                const Eigen::Vector3f& pos) {
   int best_i = 1;
@@ -50,13 +43,9 @@ inline int nearestCrumbFromOne(const std::vector<Eigen::Vector3f>& trail,
   return best_i;
 }
 
-/// Distance from `pos` to crumb `idx`, plus the trail from `idx` down to home.
-/// This is what the robot still has to drive while retracing, and it is the one
-/// definition of "remaining" that both the watchdog and the nav budget use.
-///
-/// No trail[0]-to-home term: they are the same point (see the file comment), so
-/// writing it out would only suggest a correction that is not happening.
-/// `idx` outside [1, size) is a spent or unset trail and yields 0.
+/// XY distance from pos to crumb idx plus the trail from idx down to home: the
+/// one definition of remaining used by both the watchdog and the nav budget.
+/// idx outside [1, size) yields 0. (notes: home-trail-remaining-distance)
 inline float remainingTrailDistance(const std::vector<Eigen::Vector3f>& trail,
                                     int idx, const Eigen::Vector3f& pos) {
   if (idx <= 0 || idx >= static_cast<int>(trail.size())) return 0.0f;
@@ -67,17 +56,10 @@ inline float remainingTrailDistance(const std::vector<Eigen::Vector3f>& trail,
   return m;
 }
 
-/// Nearest crumb whose distance from `pos` falls inside [band_min, band_max],
-/// skipping `exclude_idx` (the crumb a previous escape already used) and
-/// searching from 1. Ties break toward the HIGHER index — the most recently
-/// visited crumb, which is the one behind the robot. -1 when nothing qualifies,
-/// which is the caller's signal to use the rotate-behind fallback.
-///
-/// From index 1 for a sharper reason than the retrace case: for a robot stalled
-/// 1.5-6 m out, home sits squarely in the escape band, so crumb 0 would aim the
-/// escape at the one goal already known to have trapped it — and AHEAD of it,
-/// not behind, so the ~180 deg rotate-in-place the mechanism depends on never
-/// happens. An escape onto home is a resend wearing an escape's label.
+/// Nearest crumb whose distance from pos is in [band_min_m, band_max_m],
+/// skipping exclude_idx and crumb 0; ties go to the higher (more recent) index.
+/// -1 if none: use the rotate-behind fallback.
+/// (notes: home-trail-escape-band-crumb)
 inline int pickBandCrumb(const std::vector<Eigen::Vector3f>& trail,
                          const Eigen::Vector3f& pos, float band_min_m,
                          float band_max_m, int exclude_idx) {

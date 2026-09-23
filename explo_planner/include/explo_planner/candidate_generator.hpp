@@ -1,6 +1,7 @@
 #pragma once
 /// @file candidate_generator.hpp
 /// @brief Polar-grid viewpoint candidate generation.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <Eigen/Core>
 #include <vector>
@@ -27,37 +28,26 @@ struct CandidateConfig {
   float occ_thresh  = 0.7f;   ///< Reject candidates with p_occ above this
   float ground_z    = 0.15f;  ///< Voxels at or below this height are ground (ignored for occupancy check)
   bool  enable_polar = true;  ///< When false, generate() returns empty (frontier-only mode)
-  /// Terrain-relative (3D) mode. When true AND a map is provided, each
-  /// candidate's z is set to the local ground elevation (MapCache::groundZAt,
-  /// searched in a window around the reference z: the robot z for polar
-  /// candidates, the centroid z for frontier candidates) plus z_clearance.
-  /// Columns with no detected ground fall back to the reference z unchanged.
-  /// When false (default) the legacy flat-world behaviour is preserved
-  /// bit-for-bit: every candidate sits at the fixed absolute robot_z.
+  /// Terrain mode (with a map): candidate z = local ground + z_clearance,
+  /// searched around the robot z (polar) or centroid z (frontier); no ground
+  /// keeps that reference z. False (default): fixed absolute robot_z.
+  /// (notes: cand-terrain-relative)
   bool  terrain_relative     = false;
   float z_clearance          = 0.5f;  ///< Candidate height above detected ground (m)
   float ground_search_below  = 4.0f;  ///< Ground search window below the reference z (m)
   float ground_search_above  = 1.0f;  ///< Ground search window above the reference z (m)
   float ground_stack_max_m   = 0.6f;  ///< Contiguous occupied-stack walk cap (vertical smear)
-  /// Hard XY bounding box on candidate positions (map frame, metres). The
-  /// generator drops any candidate (radial or frontier) whose centre falls
-  /// outside [roi_min_x, roi_max_x] x [roi_min_y, roi_max_y]. Set the dscovox
-  /// planning_map size + origin to match this box so the global planner is
-  /// constrained to the same area.
+  /// Hard XY box (map frame, m): candidates whose centre falls outside are
+  /// dropped. Match the dscovox planning_map size and origin to it.
+  /// (notes: cand-roi-xy-box)
   float roi_min_x   = -1e9f;
   float roi_max_x   =  1e9f;
   float roi_min_y   = -1e9f;
   float roi_max_y   =  1e9f;
-  /// Vertical band a terrain-snapped candidate z is clamped into (map frame,
-  /// metres, ABSOLUTE — the node pushes the effective robot-relative band each
-  /// PLAN tick via setRoiZ). This is the band MapCache actually ingested, so a
-  /// candidate outside it is a viewpoint whose FOV origin sits in space the map
-  /// holds nothing for: every ray from there walks un-ingested cells and scores
-  /// them as the Beta(1,1) prior, which is maximal — the planner would chase
-  /// its own blind spot. Reachable in terrain mode because ground search is
-  /// referenced to the CENTROID's z for frontier candidates, so ground +
-  /// z_clearance can land above the band. Defaults are wide enough to be inert
-  /// in flat mode, where candidates sit at the fixed absolute robot_z.
+  /// Absolute band (m) a terrain-snapped z is clamped into: the band MapCache
+  /// ingested, pushed each PLAN tick via setRoiZ. Outside it a viewpoint scores
+  /// un-ingested cells at the maximal prior. Inert in flat mode.
+  /// (notes: cand-roi-z-clamp)
   float roi_min_z   = -1e9f;
   float roi_max_z   =  1e9f;
 };
@@ -75,11 +65,10 @@ public:
       float robot_yaw,
       const MapCache* map = nullptr) const;
 
-  /// Inject frontier centroids as additional candidates. In flat mode the
-  /// centroid z is flattened to robot_z; in terrain-relative mode (with a
-  /// map) the candidate is snapped to ground + z_clearance, searched around
-  /// the centroid's own z, falling back to the centroid z when no ground is
-  /// found (frontiers naturally border unobserved columns).
+  /// Adds frontier centroids as candidates: flat mode sets z to robot_z;
+  /// terrain mode snaps to ground + z_clearance searched around the centroid z,
+  /// or keeps the centroid z when no ground is found.
+  /// (notes: cand-frontier-candidates)
   void addFrontierCandidates(
       std::vector<CandidateViewpoint>& candidates,
       const std::vector<Eigen::Vector3f>& frontier_centroids,

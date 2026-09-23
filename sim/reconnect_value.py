@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/reconnect_value_notes.md
 """Is reconnecting worth what it costs?
 
   COST     chase_sec   time in PURSUE -- driving at the peer instead of exploring
@@ -104,12 +105,9 @@ def roster(d):
     if not raw:
         return from_logs
     r = tuple(raw)
-    # The manifest is the authority on WHO RAN, so a name it lists with no log
-    # is reported, not quietly swapped out: an event log missing for one robot
-    # of three is a truncated cell, and falling back to the two that do have
-    # logs would analyse it as a two-robot run. Only a roster with NO usable
-    # names at all falls back, because at that point the manifest has told us
-    # nothing we can use.
+    # The manifest is authoritative on who ran: a listed robot with no event
+    # log is reported, not dropped. Only when no listed name has a log does the
+    # roster fall back to the log filenames. (notes: roster-manifest-authority)
     missing = [x for x in r
                if not os.path.exists(os.path.join(d, f"{x}.events.jsonl"))]
     if missing and len(missing) == len(r):
@@ -256,19 +254,10 @@ def analyse(d):
     cell = os.path.basename(d)
     robs = roster(d)
     if len(robs) != 2:
-        # Refuse, do not score. Everything below is pairwise: link_states.csv
-        # carries one row PER PAIR per tick, and outages() folds the whole file
-        # into a single connected series. On three robots that is three
-        # interleaved link traces, so a genuine A-B outage is cancelled by the
-        # healthy A-C rows at the same t_sim and sep_at() returns whichever
-        # pair's row happened to be last. The result is not a degraded answer,
-        # it is an arbitrary one -- a 3-robot cell with A-B down for 300 s
-        # reports zero outages and an empty table, which reads as "no reconnect
-        # opportunities arose".
-        #
-        # An N-robot version needs a per-link outage series and a per-link
-        # separation, i.e. the whole table re-keyed on the pair. Until that
-        # exists this says so instead of guessing.
+        # Refuse any cell without exactly two robots: link_states.csv has one
+        # row per pair per tick, and outages() and sep_at() fold it into one
+        # series, so more robots give arbitrary results.
+        # (notes: value-pairwise-only-refusal)
         print(f"SKIP\t{cell}\tthis script is pairwise and the cell has "
               f"{len(robs)} robot(s) {list(robs)}: link_states.csv carries one "
               f"row per PAIR, and folding several links into one connected "
@@ -385,11 +374,9 @@ def timing_table(cells):
     # "meeting_point" is retained for banked pre-generation-19 logs only; the
     # midpoint construction it named no longer exists.
     ACTED = ("chase", "appointment", "anchor_return", "meeting_point")
-    # A NEW ACTION STRING MUST NOT BE ABSORBED SILENTLY. Membership in ACTED
-    # fails open into `declined`, which is the direction that flatters the
-    # untreated arm, so an unrecognised action is announced once per run rather
-    # than binned. This is the check that would have caught `appointment`
-    # arriving as an unclassified string in the first place.
+    # Membership in ACTED fails open into declined, so a new action string must
+    # be classified deliberately; any action outside KNOWN is announced (it is
+    # still counted as declined). (notes: value-unclassified-action-warning)
     KNOWN = set(ACTED) | {"hold", "resume_exploring"}
     unknown = sorted({e.get("action") for c in cells for rob in c["roster"]
                       for e in c["robots"][rob]["_disp"]} - KNOWN - {None})

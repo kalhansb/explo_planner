@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/pursuit_predictor.hpp"
 
 #include <algorithm>
@@ -12,31 +13,16 @@ namespace {
 
 constexpr double kMmPerM = 1000.0;
 
-/// Metres between two cells, through the allocator's own cost model.
-///
-/// Reused rather than reimplemented for the same reason the rendezvous
-/// scheduler reuses routeCostMm: a second distance function is free to drift
-/// from the first, and the symptom of that drift is a chase aimed at a cell the
-/// allocator would never have put on the tour — invisible in every log, because
-/// both numbers look reasonable in isolation. costMm also carries the
-/// unreachable-cell fallback, so an over-aggressive edge probe degrades the
-/// ranking instead of deleting nodes from the chain.
+/// Metres between two cells through GlobalAllocator::costMm, reused so the
+/// chase cannot drift from the allocator's tours; costMm also carries the
+/// unreachable-cell fallback. (notes: pursuit-cell-dist-reuses-costmm)
 double cellDistM(const CellWorld& w, int a, int b) {
   return static_cast<double>(GlobalAllocator::costMm(w, a, b)) / kMmPerM;
 }
 
-/// P(the G transition fires this step) for tour node `i`.
-///
-/// A leg takes `dwell + drive` seconds, and a step is `step_sec` of it, so the
-/// per-step advance probability is the ratio. That makes the sojourn time
-/// geometric with the right MEAN — it is not a claim that the peer's dwell is
-/// memoryless, it is the coarsest model with the correct first moment, which is
-/// all a 5-second-resolution intercept can use.
-///
-/// Returns 0 at the tail: a peer at the end of its tour has nowhere on the
-/// record to advance to. Its mass then sits on the last cell and drains only
-/// through O, so a long-finished tour predicts nothing rather than predicting,
-/// with confidence, that the peer is parked on its last cell forever.
+/// P(the G transition fires this step) for tour node i: step_sec / (dwell +
+/// drive), a geometric sojourn with the right mean. Returns 0 at the tour tail,
+/// whose mass then drains only through O. (notes: pursuit-pgo-transition)
 double pGo(const CellWorld& w, const std::vector<int>& tour, size_t i,
            const PursuitPredictor::Config& cfg) {
   if (i + 1 >= tour.size()) return 0.0;
@@ -75,15 +61,9 @@ void PursuitPredictor::step(const CellWorld& world,
                             const Config& cfg) {
   if (tour.empty() || p.size() != tour.size()) return;
 
-  // O first, as a hazard on ALL surviving mass, then G/I split the remainder.
-  // Order matters and this one is deliberate: applying the hazard only to the
-  // mass that stayed put would make a fast tour immune to abandonment, which
-  // is exactly backwards — the peer most likely to have re-planned is the one
-  // that has had time to finish what it was doing.
-  // A non-positive half-life is the hazard switched OFF, not one clamped to an
-  // epsilon — see the Config comment. Written as an exact 1.0 rather than an
-  // exp() of something tiny, because the chain's test case is an exact
-  // binomial and a survive of 1 - 3e-9 is not 1.
+  // O first, as a hazard on ALL surviving mass, then G/I split the rest; do not
+  // reorder. A non-positive offroute_half_life_sec switches the hazard off:
+  // survive is exactly 1.0. (notes: pursuit-hazard-order)
   const double survive = cfg.offroute_half_life_sec > 0.0
       ? std::exp(-std::log(2.0) * cfg.step_sec / cfg.offroute_half_life_sec)
       : 1.0;
@@ -142,12 +122,10 @@ PursuitTarget PursuitPredictor::predict(const CellWorld& world,
   out.anchor_index = anchor;
 
   // --- candidate horizons ------------------------------------------------
-  //
-  // Scored at (record age + MY drive to it), not at the record age alone:
-  // §3.7's objective is to intercept where the peer will be WHEN I GET THERE,
-  // and the two differ by minutes at these speeds. Nodes BEFORE the anchor are
-  // still candidates — the peer may have been driving toward the anchor rather
-  // than away from it, and dropping them would bias every intercept forward.
+  // Each candidate is scored at record age plus my drive to it, i.e. where the
+  // peer will be when I arrive. Nodes before the anchor stay candidates;
+  // dropping them biases every intercept forward.
+  // (notes: pursuit-candidate-horizons)
   struct Cand { size_t i; int cell; long long travel_ms; long long horizon_ms;
                 size_t stepk; };
   std::vector<Cand> cands;
@@ -177,11 +155,9 @@ PursuitTarget PursuitPredictor::predict(const CellWorld& world,
   }
 
   // --- one forward pass, snapshotting each candidate at its own step ------
-  //
-  // A fresh chain per candidate would be O(cands x steps x tour) for exactly
-  // the same numbers; the distribution does not depend on which candidate is
-  // being scored, only on how far it is propagated. So propagate once and read
-  // each candidate off as the pass goes by it.
+  // Propagate the chain once and read each candidate off at its own step: the
+  // distribution depends only on how far it is propagated, not on the
+  // candidate. (notes: pursuit-single-forward-pass)
   std::vector<double> p(peer.tour.size(), 0.0);
   p[static_cast<size_t>(anchor)] = 1.0;
   double p_off = 0.0;
@@ -197,11 +173,9 @@ PursuitTarget PursuitPredictor::predict(const CellWorld& world,
     }
   }
 
-  // Argmax, with a total tie-break: probability, then the SOONER arrival, then
-  // the earlier tour position, then the lower cell id. Sooner-first is not
-  // cosmetic — two cells the peer is equally likely to be in are not equally
-  // good chases, because the near one re-forms the link earlier and leaves
-  // budget for a second attempt.
+  // Argmax with a total tie-break: probability, then sooner arrival, then
+  // earlier tour position, then lower cell id. Sooner-first is deliberate: the
+  // nearer chase re-forms the link earlier. (notes: pursuit-argmax-tiebreak)
   size_t best = 0;
   bool   have = false;
   for (size_t j = 0; j < cands.size(); ++j) {

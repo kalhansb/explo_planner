@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/team_convergence_calib_notes.md
 """Known-answer calibration for team_convergence.py.
 
 Same discipline as equiv_gate_calib.py and for the same reason: this repo has
@@ -83,11 +84,10 @@ def build(root, series_a, series_b, exch_a=None, exch_b=None, outages=None,
         with open(os.path.join(root, "link_states.csv"), "w") as f:
             f.write("t_sim,i,j,distance_m,trees_on_link,path_loss_db,snr_db,"
                     "ber,bandwidth_mbps,connected\n")
-            # One sample every `link_period` from 0 to 300, connected unless
-            # inside an outage interval. The emulator writes at link_rate_hz;
-            # the period does not matter to the reader, only the up/down
-            # transitions do — but it bounds the NARROWEST outage a case can
-            # express, and a sub-census-period outage is a distinct case.
+            # One link sample every link_period over [0, 300], down inside an
+            # outage. Only up/down transitions matter to the reader, but
+            # link_period bounds the narrowest outage a case can express.
+            # (notes: calib-link-trace-grid)
             for k in range(0, int(300.0 / link_period) + 1):
                 t = k * link_period
                 up = 0 if any(a <= t < b for a, b in outages) else 1
@@ -162,11 +162,9 @@ case("diverged and never agreed again", 1,
      r"never agreed again for the rest of the run",
      series_a=a, series_b=b, outages=[(100.0, 180.0)])
 
-# Healed, but long after the link came back — the merge is not the thing that
-# fixed it, and a generous window would call this a pass. The outage is short
-# so the 160 s gap is unambiguously outside the 120 s window: with the default
-# [100, 180) outage the last sample lands exactly ON the boundary, and a case
-# that straddles the comparison tests nothing but which way `>` rounds.
+# Agreeing again only long after recovery must fail. The outage is short so the
+# 160 s gap is clearly outside the 120 s window; a case on the boundary would
+# test only which way the comparison rounds. (notes: calib-late-heal-window)
 a, b = healthy(heal_at=300.0)
 case("agreed again only long after the link recovered", 1,
      r"s after the link recovered \(window 120",
@@ -209,50 +207,28 @@ case("the two robots' census samples do not line up", 2,
      outages=[(100.0, 180.0)])
 
 print("\n=== the outage must be real, and it must be scoreable ===")
-# THE CASE THIS SUITE WAS MISSING. The first real smoke run scored by this
-# gate had the link connected on all 6493 samples — the robots never separated
-# enough to lose it — and the gate printed PASS: the per-outage loop never
-# executed, and the guard meant to catch "nothing was scored" was itself
-# written `if outages and scored == 0`, so an empty outage list skipped it.
-#
-# Note what makes it nasty: the run does diverge. Two robots sampling a shared
-# fused map at slightly different sim times disagree on shared_hash from timing
-# skew alone, so the "must have diverged somewhere" requirement — the guard
-# specifically there to reject vacuous passes — was satisfied by something that
-# is not a dropout. Every ingredient of the pass was real except the dropout.
-# Hence `healthy()` here, unmodified: this fixture is a PASSING run in every
-# respect but the one that matters.
+# A run whose link never drops must be refused, not passed. healthy() is used
+# unmodified on purpose: the fixture passes in every respect but the dropout.
+# (notes: calib-link-never-dropped)
 a, b = healthy()
 case("the link never dropped, so there is no heal to score", 2,
      r"link never dropped: connected on every sample",
      series_a=a, series_b=b, outages=[])
 case("no link trace at all", 2, r"no link_states\.csv",
      series_a=a, series_b=b, outages=None)
-# An outage still down when the trace ends has no heal to score. This case
-# found a real defect: the reader used to close such an outage at the last
-# link sample and the scorer relied on there being no later census sample to
-# notice, so a census tick landing on that same second scored the run for
-# failing to converge across a recovery that never happened. The verdict is
-# now driven by whether the link was OBSERVED to come back, not by sample
-# alignment — hence the deliberately coincident stamps here (the trace and the
-# census both end at 300).
-#
-# rc is 1 rather than 0 because this run also has nothing else to score: the
-# only outage is unscoreable, which the gate reports separately below.
+# An outage still down when the trace ends has no heal to score. Trace and
+# census both end at 300 on purpose, so only an observed recovery counts, not
+# sample alignment. rc is 1: nothing else is scoreable.
+# (notes: calib-outage-down-at-teardown)
 a, b = healthy(diverge=(240.0, 1e9), heal_at=1e9)
 case("an outage still down at teardown is not scored as a failure to heal", 1,
      r"still down when the trace ended — there is no heal to score",
      series_a=a, series_b=b, outages=[(240.0, 400.0)])
 
-# A heal the run gave no room to observe. The second outage recovers on the
-# very last census sample, so there is no undisturbed link after it at all —
-# the pair cannot be shown to converge and cannot be shown to fail. The first
-# smoke run to reach this code failed two such outages at t=1517 and t=1522 in
-# a run that stopped at 1559, which says nothing about the exchange.
-#
-# Both cases below share a fixture and differ ONLY in the outage list, because
-# the pair is the point: censoring must rescue a truncated heal WITHOUT
-# rescuing a run that has nothing else to show.
+# The second outage recovers on the last census sample, so its heal is
+# censored, not failed. Both cases share a fixture and differ only in outages:
+# censoring must not rescue a run with nothing else to show.
+# (notes: calib-censored-heal-pair)
 a, b = healthy()
 b[-1] = census(300.0, shared=77777)      # still apart at the final sample
 case("a heal with no room left to observe is censored, not failed", 0,
@@ -262,13 +238,10 @@ case("a run whose every outage is censored does not pass", 1,
      r"none could be scored",
      series_a=a, series_b=b, outages=[(290.0, 295.0)])
 
-# An outage shorter than one census period observes NOTHING: no paired sample
-# falls inside it. The scoring loop used to fall through such an outage to
-# `healed`, which picks the first agreeing sample after the end — for a pair
-# that had not diverged in that window, the very next tick — and recorded a
-# "converged 1 s after the link recovered" that no merge produced. Census
-# samples here are 20 s apart, so the flicker at [245, 247) contains none.
-# link_period=1.0 because the default 10 s link grid cannot express it.
+# An outage shorter than one census period holds no paired sample and must not
+# be scored as a heal. Census samples are 20 s apart, so [245, 247) holds none;
+# link_period is 1.0 as the default 10 s grid cannot express it.
+# (notes: calib-flicker-outage)
 print("\n=== an outage too short to observe anything ===")
 a, b = healthy()
 case("a flicker with no census sample inside it is not scored as a heal", 0,

@@ -42,6 +42,7 @@
 /// Coordination: field robot clocks are not synchronised, so peer header
 /// stamps are never compared against the local clock. Distances are XY —
 /// the whole planner is ground-restricted.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <Eigen/Core>
 #include <string>
@@ -68,20 +69,15 @@ public:
     /// An active hold with no data for this long RELEASES (peer presumed
     /// gone / out of comms).
     float hold_release_stale_sec = 10.0f;
-    /// After the caller's max-hold escape hatch fires, the escaped-from peer
-    /// cannot START a new hold for this long — long enough to drive out of
-    /// the trigger disc. 0 disables (restores the pre-hatch wedge). The
-    /// immunity ends early if the peer moves (a moving peer is alive, and
-    /// alive peers get full yields).
+    /// Seconds after the max-hold escape hatch fires during which the
+    /// escaped-from peer cannot start a new hold; 0 disables. Ends early if
+    /// the peer moves. (notes: prox-escape-grace)
     float escape_grace_sec = 30.0f;
   };
 
-  /// One evaluation result. When hold is true, peer_id/dist_m name the
-  /// nearest offending peer (for logging; the hold itself is boolean). When
-  /// hold is false they name the nearest outranking peer considered — if any
-  /// — and note says why it did not hold: "clear" (beyond the trigger),
-  /// "parked", "stale", or "no-peer" (nothing outranking is tracked), so a
-  /// release log can tell cleared-off from parked from comms-lost.
+  /// When hold, peer_id/dist_m name the nearest offending peer; otherwise the
+  /// nearest outranking peer considered, and note says why it did not hold
+  /// (e.g. clear, parked, stale, no-peer). (notes: prox-decision-note)
   struct Decision {
     bool hold = false;
     std::string peer_id;
@@ -94,11 +90,9 @@ public:
   /// is below it, so the hysteresis band can never be inverted.
   ProximityGuard(Config cfg, std::string self_id);
 
-  /// Record a peer pose observation, stamped with the LOCAL receipt time
-  /// (the caller's node clock). Sources: RobotIntent.robot_pos (1 Hz
-  /// heartbeat) and any configured peer localiser topics (~10 Hz); both feed
-  /// the same per-peer track, latest-wins. Self-echoes and non-finite
-  /// positions (a diverged localiser) are dropped.
+  /// Record a peer pose stamped with the local receipt time; all sources feed
+  /// one per-peer track, latest wins. Self-echoes and non-finite positions are
+  /// dropped. (notes: prox-peer-pose-ingest)
   void onPeerPose(const std::string& peer_id, const Eigen::Vector3f& pos,
                   const rclcpp::Time& now_local);
 

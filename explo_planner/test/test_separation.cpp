@@ -9,6 +9,7 @@
 /// or never ran. So the cases below are weighted toward the boundary between
 /// "off" and "on", toward configurations a typo would produce, and toward the
 /// exact inputs a treated campaign is most likely to run (weight = 1).
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -60,13 +61,9 @@ TEST(SeparationConfigure, ZeroWeightAcceptedAndOff) {
 }
 
 TEST(SeparationConfigure, ZeroWeightStillKeepsRadiusAndMaxAge) {
-  // The control arm's DIAGNOSTICS are measured on these two numbers, in every
-  // arm, and they are the counterfactual a treated arm is read against. If a
-  // weight-0 configure quietly reverted them to the defaults, an off arm asked
-  // for a 25 m radius would have reported its peer distances against 20 m and
-  // the two arms' columns would not have been comparable — a mismatch nothing
-  // downstream could see, because both arms would print the requested 25 in
-  // their manifests.
+  // A weight-0 configure keeps the requested radius_m and max_age_sec, not the
+  // defaults: every arm's diagnostics are measured on them, so an off arm must
+  // use what its manifest reports. (notes: sep-weight0-keeps-radius-maxage)
   SeparationTerm s;
   ASSERT_EQ(s.configure(cfg(0.0, 25.0, 3.0)), "");
   EXPECT_FALSE(s.enabled());
@@ -113,12 +110,10 @@ TEST(SeparationConfigure, RefusesNonPositiveRadius) {
 }
 
 TEST(SeparationConfigure, RefusesRadiiThatBreakTheFloatRamp) {
-  // Positivity is not enough. The ramp divides by the radius in float: a radius
-  // that underflows the cast to 0 makes a candidate sitting exactly on a
-  // teammate evaluate 0/0 and log a NaN discount, and one that overflows it to
-  // infinity gives every candidate the same discount, so the term takes the
-  // information away and steers nothing. Both pass a bare `> 0` check and both
-  // look like a working term in the manifest.
+  // Positivity is not enough: the ramp divides by the radius in float, so a
+  // radius that casts to 0 gives a NaN discount and one that casts to infinity
+  // makes the term inert. configure() must refuse both.
+  // (notes: sep-radius-float-bounds)
   for (double r : {1e-40, 1e-30, 1e-4, 1e7, 1e39, 1e300}) {
     SeparationTerm s;
     EXPECT_FALSE(s.configure(cfg(0.5, r)).empty()) << "radius " << r;
@@ -257,12 +252,8 @@ TEST(SeparationDiscount, ExactlyOneAtTheRadiusAndBeyond) {
 }
 
 TEST(SeparationDiscount, RadiusIsHonouredAndNotHardCoded) {
-  // Added after a mutant that replaced cfg_.radius_m with a literal 20.0f
-  // survived the whole suite: every other case here happens to use the default
-  // radius, so a knob that was parsed, validated, logged into the manifest and
-  // then ignored would have looked exactly like a working one. That specific
-  // failure — a configured value the binary does not actually use — is the one
-  // this project keeps paying for, so it gets its own case.
+  // Uses radii other than the 20 m default so a hard-coded constant in place of
+  // cfg_.radius_m fails. (notes: sep-radius-not-hardcoded)
   const auto peer = anchorsAt({{0.0f, 0.0f}});
   {
     SeparationTerm tight;
@@ -429,13 +420,9 @@ TEST(SeparationOrdering, ADistantTeammateChangesNothing) {
 // ---------------------------------------------------------------------------
 // eligibleAnchor(): the freshness bound, and why it lives in this unit
 // ---------------------------------------------------------------------------
-//
-// max_age_sec used to be consumed entirely in the planner node, in a private
-// method no test could reach. A review of this file found that replacing the
-// comparison there with a constant passed the whole suite — the knob would have
-// been parsed, range-checked, written into every run manifest, and then not
-// read, which is a failure this project has already paid for more than once.
-// The comparison moved in here so these tests can hold it.
+// The max_age_sec freshness comparison lives in eligibleAnchor(), not in the
+// planner node, so these tests can check the configured bound is actually read.
+// (notes: sep-max-age-in-eligible-anchor)
 
 TEST(SeparationEligible, HonoursTheConfiguredBoundAndIsNotHardCoded) {
   // Two different bounds, checked either side of each. A constant in place of

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/map_agreement_notes.md
 """Measure how far apart the robots' copies of the merged map ended.
 
 Prints one TAB-separated line (PASS/INFO <name> <detail>) into comms_gates.txt.
@@ -191,13 +192,9 @@ def main():
                     help="sampling step for the peak/trace, sim seconds")
     ap.add_argument("--start", type=float, default=200.0,
                     help="ignore before this sim time (both maps still filling)")
-    # NO --max-pct. It was accepted-and-ignored for one generation, which is
-    # the worst of the three options: the caller passed 0.5, the manifest
-    # banked `map_agree_max_pct=0.5`, and anyone reading either would conclude
-    # a 50% spread threshold had decided something. Nothing was ever failed on
-    # it. Removing it rather than keeping a SUPPRESSed no-op means a resurrected
-    # banked command line dies with "unrecognized arguments: --max-pct" instead
-    # of quietly agreeing that the threshold is live.
+    # No --max-pct option, on purpose: this check is report-only, so a banked
+    # command line carrying it must fail as an unrecognized argument rather than
+    # look like a live threshold. (notes: map-agree-no-max-pct)
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.outdir, "planner_*.csv")))
@@ -216,12 +213,10 @@ def main():
                        f"numbers here cover a SUBSET of the team)")
     else:
         roster_note = f" (all {len(team)} robots of the team present)"
-    # Two is the FLOOR, not the shape. A spread needs at least two series; above
-    # that the arithmetic is the same. Returning 0 on the INFO paths as well as
-    # the PASS path is deliberate: this file is report-only, so a non-zero exit
-    # would be one more way for it to influence a verdict it has no business
-    # influencing (run_explo_sim_rviz.sh currently swallows it with `|| true`,
-    # and that `|| true` should not be what keeps the contract).
+    # Two series is the minimum for a spread, not a shape limit. Return 0 on
+    # every path, INFO included: this is report-only, and the || true in
+    # run_explo_sim_rviz.sh must not be what keeps that.
+    # (notes: map-agree-two-series-exit-zero)
     if len(paths) < 2:
         print(f"INFO\t{args.name}\tfound {len(paths)} planner_*.csv; a map "
               f"spread needs at least two robots to compare — nothing to "
@@ -235,12 +230,10 @@ def main():
               f"{','.join(empty)} — fewer than two comparable "
               f"series{roster_note}")
         return 0
-    # A robot with no rows at all is dropped and NAMED. Silently comparing the
-    # remaining two would print a clean spread for a team of four in which two
-    # robots logged nothing.
-    # Two different absences, kept apart because they mean different things: a
-    # robot that logged a header and no rows produced a planner that ran, and a
-    # robot with no file at all produced one that did not.
+    # A robot whose CSV has no rows is dropped and named, never silently. Kept
+    # apart from a robot with no CSV at all (roster_note): header-only means the
+    # planner ran, no file means it did not.
+    # (notes: map-agree-empty-vs-absent-csv)
     dropped = f" (dropped, no voxel counts: {','.join(empty)})" if empty else ""
     dropped += roster_note
     keep = [(n, x) for n, x in zip(names, ser) if x]

@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -20,16 +21,9 @@ CellWorld::Config cfg0() {
   return c;
 }
 
-/// A 5x5 world of 10 m cells over [-25, 25]^2. Row-major ids, so the bottom
-/// row is 0..4 with centres (-20,-20), (-10,-20), (0,-20), (10,-20), (20,-20)
-/// — a straight line of 10 m hops, which is what makes every number below
-/// hand-computable.
-///
-/// No cell edges are set, so CellWorld::distance reports unreachable and
-/// GlobalAllocator::costMm falls back to centroid distance. That fallback is
-/// the documented behaviour (global_allocator.hpp) and it is what the predictor
-/// inherits; a test that quietly depended on a roadmap would be testing a
-/// configuration the node does not always have.
+/// A 5x5 world of 10 m cells over [-25, 25]^2 with row-major ids. Row 0 is
+/// cells 0..4, a straight line of 10 m hops, so every number below is
+/// hand-computable. (notes: pursuit-fixture-world5)
 CellWorld world5(int self = 0) {
   CellWorld w;
   const std::string err =
@@ -39,13 +33,10 @@ CellWorld world5(int self = 0) {
   return w;
 }
 
-/// A chain whose arithmetic is exact: 1 m/s over 10 m legs with no dwell is a
-/// 10 s leg, and a 5 s step makes P(go) exactly 1/2. Off-route drain is
-/// switched off outright (half-life 0, which the Config defines as "the hazard
-/// is off") so the distribution is a clean binomial and any deviation is the
-/// model, not the hazard. A merely LARGE half-life would not do: at 1e9 s each
-/// step still loses 3e-9 of the mass, which is a thousand times the tolerance
-/// these tests need in order to be checking the binomial at all.
+/// 1 m/s over 10 m legs with no dwell is a 10 s leg, so a 5 s step gives P(go)
+/// = 1/2. offroute_half_life_sec 0 turns the hazard off; a merely large
+/// half-life would still drain more than the test tolerance.
+/// (notes: pursuit-fixture-exact-chain)
 PursuitPredictor::Config exact() {
   PursuitPredictor::Config c;
   c.peer_speed_mps = 1.0;
@@ -224,22 +215,9 @@ TEST(PursuitPredictorAnchor, EmptyOrAllInvalidHasNoAnchor) {
 // The intercept
 // ---------------------------------------------------------------------------
 
-/// THE GATE TEST (plan §4, P6): argmax intercept against a hand-computed case.
-///
-/// The peer is at cell 0 driving 0->4; I am at cell 4. My drive to each cell is
-/// 40/30/20/10/0 m, so at 1 m/s I would arrive after 8/6/4/2/0 steps of 5 s.
-/// Reading the binomial rows at those steps:
-///
-///     cell 0 @ 8 steps: 2^-8            = 0.0039
-///     cell 1 @ 6 steps: 0.09375
-///     cell 2 @ 4 steps: 6/16            = 0.375   <-- the argmax
-///     cell 3 @ 2 steps: 0
-///     cell 4 @ 0 steps: 0
-///
-/// The answer is cell 2: not where the peer WAS (cell 0, which is what the
-/// legacy trail would chase) and not where I already am. That gap is the whole
-/// point of §3.7, and this test is what would fail if the horizon reverted to
-/// the record age alone.
+/// Peer at cell 0 driving 0->4, me at cell 4: my arrivals after 8/6/4/2/0 steps
+/// read the binomial rows, and cell 2 wins at p = 6/16 = 0.375, neither where
+/// the peer was nor where I am. (notes: pursuit-intercept-gate-test)
 TEST(PursuitPredictorIntercept, MeetsInTheMiddleAgainstAHandComputedChain) {
   const CellWorld w = world5();
   const auto c = exact();
@@ -282,18 +260,10 @@ TEST(PursuitPredictorIntercept, AFreshRecordNextDoorInterceptsInPlace) {
   EXPECT_EQ(t.horizon_ms, 0);
 }
 
-/// Staleness is inside the horizon, so a record that has aged moves the
-/// intercept forward on its own, with no change to where either robot is. Both
-/// robots stand on cell 0 here; the only difference between the two calls is
-/// how long ago the tour was heard.
-///
-/// With the hazard off the tour's last node absorbs, so the aged intercept runs
-/// all the way to the tail (30 s of staleness is six steps of a chain whose
-/// P(go) is 1/2, and the mass has nowhere else to end up). That is the model
-/// being honest rather than a defect: a tour heard long enough ago and never
-/// contradicted really does say "it finished". In a run the half-life drains
-/// that same mass into O and `min_probability` returns the chase to the trail —
-/// which is what AStaleRecordRefusesButStillReports covers.
+/// Staleness is inside the horizon: both robots stand on cell 0 and only the
+/// record's age differs, which moves the intercept forward. With the hazard off
+/// the tail absorbs, so the aged intercept runs to the tour's end.
+/// (notes: pursuit-age-moves-intercept)
 TEST(PursuitPredictorIntercept, AgeAloneMovesTheInterceptForward) {
   const CellWorld w = world5();
   const auto c = exact();
@@ -316,11 +286,10 @@ TEST(PursuitPredictorIntercept, AgeAloneMovesTheInterceptForward) {
   EXPECT_EQ(aged.horizon_ms, aged.my_travel_ms + 30000);
 }
 
-/// The tie-break is total and its FIRST rule is "sooner arrival". Both
-/// surviving candidates here score exactly zero — the mass cannot reach either
-/// in the steps available — so the only thing separating them is the rule.
-/// The duplicated tail cell then exercises the second rule (lower tour index)
-/// at an identical horizon.
+/// The tie-break is total: sooner arrival first, then lower tour index. The
+/// surviving candidates here all score zero, and the duplicated tail cell
+/// exercises the second rule at an identical horizon.
+/// (notes: pursuit-tie-break-order)
 TEST(PursuitPredictorIntercept, TiesBreakOnSoonerThenEarlierIndex) {
   const CellWorld w = world5();
   auto c = exact();
@@ -344,11 +313,9 @@ TEST(PursuitPredictorIntercept, TiesBreakOnSoonerThenEarlierIndex) {
 // Degradation: the floor is the legacy trail, and every refusal names itself
 // ---------------------------------------------------------------------------
 
-/// §3.7's hard requirement: with no tour on record, pursuit is exactly what it
-/// was before this file existed. The refusal must be a NAMED one — "the model
-/// had nothing to say" and "the model was never asked" are different runs, and
-/// one empty answer for both would make an arm that never predicted look like
-/// one that predicted badly.
+/// With no tour on record pursuit stays the legacy trail, and the refusal must
+/// be named: an empty answer would make an arm that never predicted look like
+/// one that predicted badly. (notes: pursuit-no-tour-named-refusal)
 TEST(PursuitPredictorDegradation, NoTourRefusesAndSaysWhy) {
   const CellWorld w = world5();
   PursuitPredictor::PeerTrack peer;   // no tour, no position
@@ -507,11 +474,9 @@ TEST(PursuitPredictorDegradation, NoPositionAnchorsAtTheTourHead) {
 // The dwell parameter is load-bearing
 // ---------------------------------------------------------------------------
 
-/// A peer that works its cells advances more slowly than one that drives
-/// through them, and the intercept has to move back to meet it. Zero dwell is
-/// the setting that predicts the peer far ahead of where it is (see the
-/// Config comment), so the two must give different answers or the parameter is
-/// decorative.
+/// A peer that works its cells advances more slowly, so the intercept must move
+/// back to meet it; zero dwell and a 60 s dwell must give different answers.
+/// (notes: pursuit-dwell-pulls-intercept-back)
 TEST(PursuitPredictorDwell, WorkingTheCellsPullsTheInterceptBack) {
   const CellWorld w = world5();
   const auto peer = atCell(w, 0, {0, 1, 2, 3, 4});

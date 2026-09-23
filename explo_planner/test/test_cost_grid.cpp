@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -221,11 +222,8 @@ TEST(CostGrid, PerformanceSmokeCheck) {
   EXPECT_LT(cg.reachedCellCount(), 6000u);
 }
 
-// 11. An unbounded flood (radius_cap_m <= 0) must reach cells whose PATH cost
-//     exceeds the grid's straight-line diagonal. The old implementation
-//     silently clamped the "no bound" case to diag + 1, so a serpentine
-//     corridor — a walked distance far longer than the diagonal — read as
-//     unreachable and the exploitation planner rejected drivable vantages.
+// 11. An unbounded flood (radius_cap_m <= 0) must reach cells whose path cost
+// exceeds the grid's straight-line diagonal. (notes: costgrid-unbounded-flood)
 TEST(CostGrid, UnboundedFloodExceedsGridDiagonal) {
   // 20 x 20 at 1 m: diagonal is hypot(20,20) = 28.3 m, so the old cap was
   // ~29.3 m. Block every odd row except a single gap that alternates between
@@ -260,14 +258,9 @@ TEST(CostGrid, PositiveCapStillBoundsTheFlood) {
   EXPECT_FALSE(cg.reachable(cellCenter(grid, 15, 15))); // way past the cap
 }
 
-// A reachability structure may answer "no"; it must never answer "yes" off a
-// map it has already rejected.
-//
-// build() marks every cell blocked when data.size() disagrees with the claimed
-// dims, so the flood has nowhere to go — but the source used to be seeded at
-// cost 0 unconditionally, which left it the ONLY finite cell in the grid.
-// reachable(robot_pose) then answered true and reachedCellCount() answered 1
-// on a map where nothing whatsoever is reachable.
+// A map build() rejected (data.size() disagreeing with the dims marks every
+// cell blocked) must report nothing reachable, the source included.
+// (notes: costgrid-rejected-map-seed)
 TEST(CostGrid, MalformedMapLeavesNothingReachableIncludingTheSource) {
   auto grid = makeGrid(10, 10, 1.0f);
   grid.data.resize(10);  // metadata still claims 100 cells
@@ -282,14 +275,10 @@ TEST(CostGrid, MalformedMapLeavesNothingReachableIncludingTheSource) {
   EXPECT_FALSE(cg.reachable(cellCenter(grid, 0, 0)));
 }
 
-// The case that must NOT regress: a robot standing on an inflated cell.
-//
-// The planning map is inflated by the body radius, so a robot in a dense stand
-// genuinely stands on a blocked cell. That is routine, not malformed, and the
-// flood must still start from there — the relaxation refuses to pass through
-// any OTHER blocked cell, so seeding on inflation cannot route a path through
-// it. The seed test is therefore "does the flood have anywhere to go", not "is
-// the source traversable".
+// A robot standing on an inflated (blocked) cell must still flood. The seed
+// test is whether the flood has anywhere to go, not whether the source is
+// traversable; relaxation never passes another blocked cell.
+// (notes: costgrid-seed-on-inflation)
 TEST(CostGrid, BlockedSourceWithAFreeNeighbourStillFloods) {
   auto grid = makeGrid(10, 10, 1.0f);
   block(grid, 5, 5);  // robot sits on inflation; everything else is free

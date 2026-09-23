@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/vantage_planner.hpp"
 
 #include <algorithm>
@@ -63,90 +64,10 @@ bool VantagePlanner::lineOfSightClear(const Eigen::Vector3f& from,
   const float stop = dist - surface;
   if (stop <= 0.0f) return true;  // standoff is at/inside the trunk surface
 
-  // Exact voxel traversal (Amanatides-Woo), NOT a fixed sample spacing.
-  //
-  // The reason it has to be exact: NO fixed spacing can guarantee one sample
-  // per crossed voxel. A ray clips the corner of a voxel for an arbitrarily
-  // short length of travel, so the minimum traversal length is 0 no matter the
-  // bearing, while any fixed spacing is positive. Spacing by `res` skips
-  // roughly 25% of the crossed voxels on a diagonal bearing; spacing by
-  // `res / L1(dir)` — the MEAN traversal length, which is what the previous
-  // revision here marched by — narrows the gap but does not close it, and its
-  // comment claimed a guarantee it did not deliver. Worked example at res 0.1
-  // on the (2,1)/sqrt(5) bearing: the ray occupies the voxel at (1,1) for
-  // 0.0559 of travel while that spacing is 0.0745, and the occluder inside it
-  // is still reported CLEAR. A miss here sends the exploitation planner to a
-  // viewpoint that cannot see the trunk it was chosen for: in a 270-pair trial
-  // 8 of 40 genuinely occluded vantage/trunk pairs came back clear.
-  //
-  // So step boundary-to-boundary instead. `t_exit` is the smallest of the three
-  // per-axis crossing parameters, i.e. exactly where the ray leaves the voxel
-  // it is currently in, and the sample is taken at the MIDPOINT of the interval
-  // — strictly interior, so it cannot land on a boundary and read a neighbour.
-  // Every crossed voxel gets exactly one sample and none gets two, which is the
-  // guarantee the old comment asserted. Iterations are the number of voxels the
-  // ray actually crosses, so this is also the cheapest sampling that is
-  // correct.
-  //
-  // Voxel boundaries are taken as floor(p / res) * res, in float.
-  //
-  // THIS IS NOT EXACTLY THE KEYING MapCache USES, and the comment here asserted
-  // that it was until 2026-09-18. What getVoxel actually does is widen the
-  // float sample position to double and hand it to Bonxai, which keys on
-  // floor(x * inv_resolution) with inv_resolution = 1.0 / resolution held as a
-  // double. Measured, not reasoned: over a scan of seven bearings the float
-  // divide here disagrees with that by a WHOLE VOXEL on ~13 of every 800 nice
-  // round coordinates at res 0.1 — x = 0.7f keys to 6 in the grid and 7 here —
-  // and the float `t_delta` accumulation drifts the later boundaries up by
-  // ~1.5e-7 per step on top of that. So this is a real disagreement, not a
-  // rounding curiosity, and the line above overstated the agreement.
-  //
-  // IT IS LEFT AS IT IS, DELIBERATELY, and the naive repair is worse. Widening
-  // the entry point to double (`double(from[a]) + d * double(t_begin)`) is the
-  // obvious fix and it is WRONG: the position this loop actually samples is
-  // built in float by Eigen (`from + dir * t`), so a double entry point is a
-  // different point from the one the grid will be asked about. At
-  // from.x = 0.1f that variant puts the ray in voxel 1 while the float sample
-  // lands in voxel 2. Any correct version has to form the entry point in float
-  // — the same arithmetic as the sample — and only then widen for the keying,
-  // and it needs to be checked against a dense ground-truth sweep of the float
-  // ray rather than against these twelve tests, all of which pass under every
-  // variant tried.
-  //
-  // DEFERRED ON PURPOSE. The whole lineOfSightClear path is unreachable in a
-  // campaign: run_campaign.sh launches every cell with EXPLOIT=0, so
-  // exploitation_enabled_ is false and all four call sites
-  // (onPeerExploitIntent, doExploitPlan x2, doExploitDwell) are gated off. No
-  // banked or planned result can move on this, which is why it is not worth
-  // taking an unmeasured change into a build. Do not "tidy" it without the
-  // ground-truth sweep.
-  //
-  // COVERAGE. Four LoS tests march along +x (LineOfSightClearOnEmptyMap,
-  // LineOfSightBlockedByOccluder, TrunkSurfaceIsCarvedOut,
-  // OccluderJustBeyondTrunkSurfaceBlocks) — the one family of bearings where
-  // every sampling scheme agrees, so they could never have caught the
-  // skipped-voxel defect this traversal replaced. FOUR MORE now do the off-axis
-  // work, and this comment named only the first of them until 2026-09-18:
-  // LineOfSightOffAxisOccluderIsNotSkipped (a crossed voxel must be read),
-  // LineOfSightDoesNotReadVoxelsTheRayMisses (an uncrossed neighbour must not
-  // be), LineOfSightAtFortyFiveDegreesCrossesOnlyTheDiagonal (the exact-corner
-  // case, the only bearing reaching the multi-axis advance below) and
-  // LineOfSightOnANegativeBearingReadsItsFinalVoxel (which is what makes the
-  // midpoint sample load-bearing rather than a style choice). New coverage
-  // still has to be off-axis; it is just no longer true that there is one test.
-  //
-  // MUTATION STATUS (2026-09-18, 17 mutants): killed are the tied-axis advance
-  // `<=`->`<` (it stops advancing and the loop never terminates), sampling at
-  // t_enter or t_exit instead of the midpoint, and dropping the one-voxel pad
-  // from `surface`. THIRTEEN SURVIVED. One is a documented equivalent (the
-  // textbook single-axis `break`, see the comment on
-  // LineOfSightAtFortyFiveDegreesCrossesOnlyTheDiagonal). The rest are real
-  // gaps with no test behind them: the own-cell carve-out (`t_begin = 0`
-  // survives), floor vs trunc on negative coordinates, the `occ_stop`
-  // comparison being `>=` rather than `>`, dropping the `stop` clamp on t_exit,
-  // both loop-guard strictnesses, the d == 0 early-out (which every call takes,
-  // since the ray is horizontal by construction), and standoffFor's `lo`
-  // dropping the radius term. Deferred with the keying, same reason.
+  // Amanatides-Woo traversal: one midpoint sample per crossed voxel, which no
+  // fixed spacing guarantees. Float boundaries can sit a whole voxel off
+  // MapCache keying; do not widen to double or edit without a ground-truth
+  // sweep. (notes: vantage-los-voxel-traversal)
   constexpr float kInf = std::numeric_limits<float>::infinity();
   float t_max[3], t_delta[3];
   // Begin one step out from the vantage: the vantage cell itself is the free

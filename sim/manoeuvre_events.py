@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/manoeuvre_events_notes.md
 """One row per reconnection manoeuvre — the mechanism evidence, per event.
 
 The campaign scores runs. A run is a poor unit for judging the manoeuvres: it
@@ -100,11 +101,9 @@ import statistics as st
 # entry, so its rows carry reconnect_elapsed_sec = -1 and belong to no episode.
 MANOEUVRE_STATES = {"PURSUE", "RETURN_NAV", "RETURN_SYNC"}
 
-# Decision lines. Each marks one firing; the kind is fixed by which line hit.
-# The 2026-08-17 planner renamed the dispatch prefix ("exploration ended" ->
-# "dispatched": with the mid-run trigger the manoeuvre no longer implies the
-# end of exploration); both spellings are accepted so old campaigns keep
-# parsing.
+# Decision lines: each marks one firing, and the kind is fixed by which line
+# hit. Both dispatch prefixes are accepted so older logs keep parsing.
+# (notes: manoeuvre-decision-lines)
 RE_CHASE = re.compile(
     r"Pursuit: (?:exploration ended|dispatched) \[([^\]]*)\], '([^']+)' "
     r"out of comms \(record (\d+)s old[^)]*\) -> chasing")
@@ -113,54 +112,26 @@ RE_CHASE = re.compile(
 RE_DECLINE = re.compile(
     r"Pursuit: record of '([^']+)' is (\d+)s old "
     r"\((?:max (\d+)s|goal stale)\)")
-# THREE DESTINATION SPELLINGS, TWO OF THEM HISTORICAL (2026-09-19).
-#
-# The node names the destination with `return_dest_label_`, which is the `what`
-# argument of startReturnTo. Generation 19 renamed the agreed-cell destination
-# from "meeting point" (the midpoint construction, now deleted) to "appointment"
-# — and this alternation was not updated, so on a gen-19 or gen-20 log the line
-# "-> returning to appointment" matched NOTHING. Every appointment dispatch in
-# the two arms this tool exists to compare was invisible: not miscounted, absent.
-# That is the `checks-that-stopped-checking` failure again, one file over.
-#
-# All three spellings stay so that banked runs remain re-analysable, and the
-# mapping to a `kind` is below at the one place that reads group 4.
+# The destination is the node's return_dest_label_ (the what argument of
+# startReturnTo). All three spellings stay so banked runs remain re-analysable;
+# the mapping to a kind is done once, where group 4 is read.
+# (notes: manoeuvre-destination-spellings)
 DEST = r"appointment|meeting point|last-connected anchor"
 RE_RETURN = re.compile(
     r"Rendezvous: (?:exploration ended|dispatched) \[([^\]]*)\], "
     r"team incomplete "
     r"\((\d+)/(\d+) peers\) -> returning to (" + DEST + r")")
 RE_HOLD = re.compile(r"Reconnect: holding for the team at the current pose")
-# Mid-run trigger context (2026-08-17). The dispatch marker precedes the
-# firing line and tags it; the resume/exhaustion lines are their own events.
-#
-# ANCHORED ON THE STABLE PREFIX ONLY, and the attempt index is pulled by a
-# separate search. The 2026-08-17 pattern spelled the whole line —
-# `peer silent (\d+)s >= \d+s \(attempt (\d+)/(\d+)\)` — and when the info gate
-# added `gate `, `radio down` and `est unshared` to the middle of that line the
-# regex stopped matching anything. It failed silently: `pending_midrun` never
-# went True, so the `midrun` column of the readout read 0 for every firing.
-# Measured on the banked logs: 6 dispatch lines present, 0 matched, i.e. every
-# mid-run fire was reported as terminal. See MIDRUN_LINE_MARKER below for the
-# guard that now makes that failure loud instead of silent.
-#
-# Both spellings are accepted. "peer silent" is the pre-generation-8 wording for
-# the same quantity (seconds since the team last read complete); it was renamed
-# because it invited reading the number as the peer's record age, which stands
-# ~coord_claim_ttl_sec clear of it. Keeping the alternation means logs from
-# either generation parse; it does not weaken the guard, which fires on any
-# wording this pattern has not been taught.
+# Tags the firing line that follows as mid-run. Anchored on the stable prefix
+# only, with the attempt index a separate search, so words added mid-line cannot
+# break it. Both wordings are accepted. (notes: manoeuvre-midrun-dispatch-regex)
 RE_MIDRUN_DISPATCH = re.compile(
     r"Reconnect \(mid-run\): (?:team incomplete|peer silent) (\d+)s >= "
     r"(?:gate )?\d+s")
 RE_MIDRUN_ATTEMPT = re.compile(r"attempt (\d+)/(\d+)\)")
-# The guard is a WHITELIST of the mid-run lines that are legitimately not
-# dispatches, not a pattern for what a dispatch looks like. Keying it on dispatch
-# syntax (an earlier attempt matched on " >= ") reproduces the original bug one
-# level up: the comparison operator is part of the wording, so a reworded line
-# escapes the detector exactly as it escapes the parser. Whitelisting inverts the
-# failure direction — a NEW kind of mid-run line raises a false alarm, which is
-# loud and cheap, instead of a silent undercount.
+# The guard is a whitelist of mid-run lines that are not dispatches, not a
+# pattern for dispatches: a new kind of mid-run line raises a loud false alarm
+# instead of a silent undercount. (notes: manoeuvre-midrun-whitelist-guard)
 MIDRUN_LINE_MARKER = "Reconnect (mid-run):"
 MIDRUN_NON_DISPATCH = (
     "attempt budget exhausted",   # RE_MIDRUN_EXHAUSTED
@@ -169,18 +140,10 @@ MIDRUN_NON_DISPATCH = (
     "gate says stay",             # the info gate refusing: no attempt spent
     "spent but no manoeuvre",     # RE_MIDRUN_ABORTED (attempt spent, no fire)
 )
-# The whitelist working as designed is still noise if nobody adds to it. These
-# two were raising the `!! NOT PARSED` banner on EVERY banked run — 603 and 24
-# lines across ts3/ts4 — and a banner that fires on every run is one the reader
-# learns to scroll past, which is how the thing it was built to catch gets
-# through. Both are node lines that explicitly say no manoeuvre started.
-#
-# The second one also has to CLEAR pending_midrun. The node logs the dispatch
-# line first and only then discovers dispatchReconnect() returned false, so the
-# mid-run flag is already set with no firing to consume it; left standing it
-# rides forward and stamps `midrun=1` on the next firing, which may be the
-# terminal one at mission end. That is a mid-run count that is too high in
-# exactly the arm that retries.
+# The last two whitelist entries above are node lines saying no manoeuvre
+# started. RE_MIDRUN_ABORTED must also clear pending_midrun: the dispatch line
+# already set it, and left standing it stamps midrun=1 on the next firing.
+# (notes: manoeuvre-midrun-non-dispatch-lines)
 RE_MIDRUN_ABORTED = re.compile(
     r"Reconnect \(mid-run\): attempt \d+ spent but no manoeuvre started")
 RE_MIDRUN_RESUME = re.compile(
@@ -203,24 +166,9 @@ RE_REJOIN = re.compile(
 RE_ARRIVED = re.compile(r"Rendezvous: reached (" + DEST + r")")
 RE_UNREACH = re.compile(r"Rendezvous: (" + DEST + r") unreachable")
 RE_GIVEUP = re.compile(r"max_wait=[\d.]+s reached -> giving up and finishing")
-# The AUTHORITATIVE outcome, when the line carries one. Generation 8 puts the
-# planner's own classification into the ending line; the group is optional so
-# pre-gen-8 logs, which end `... s sim (-> STATE).`, still parse for duration.
-#
-# This exists because the outcome regexes above resolved almost nothing in the
-# banked logs. Under mission return every manoeuvre ends "-> RETURN_HOME"
-# whether it reconnected or gave up, so no RESOLVING marker — rejoin, gave-up,
-# unreachable — was ever emitted across the 5 banked g6pilot firings: grep finds
-# 0 of each. 4 of the 5 therefore fell through to the `open_at_horizon` default,
-# "the manoeuvre never ended", printed beside a duration parsed from this very
-# line. The 5th (hybrid_seed106, bestla) did emit one ARRIVED line — "reached
-# meeting point (dist=3.98, tol=4.0)" — and so became `arrived_waiting` at
-# line 710 instead. That is not a rescue: the jsonl records that manoeuvre as
-# gave_up, so the score against ground truth is 0/5 either way, and the arrived
-# case is strictly worse because it also carried the ARRIVAL instant as the
-# outcome time (see the t_ended note below). The destination state cannot
-# substitute; it is the same for both outcomes. Prefer this group over the walk
-# below whenever it is present.
+# The planner's own outcome, when the ending line carries one; the group is
+# optional so older logs still parse for duration. Prefer it over the outcome
+# walk whenever present. (notes: manoeuvre-ended-line-outcome)
 RE_ENDED = re.compile(
     r"Reconnect manoeuvre ended after ([\d.]+) s sim"
     r"(?::\s+(reconnected|gave_up|abandoned))?")
@@ -350,20 +298,11 @@ def parse_log(path, steps=None):
                 # this tags it as a mid-run (vs terminal) dispatch.
                 pending_midrun = True
                 ma = RE_MIDRUN_ATTEMPT.search(line)
-                # attempt=0 is a SENTINEL, not a count: the node numbers
-                # attempts from 1, so 0 can only mean the attempt clause was
-                # missing from the line. Kept distinguishable rather than
-                # defaulted to 1, because a silent 1 would read as "first
-                # attempt" and understate a retry ladder in exactly the arm
-                # that retries.
-                #
-                # A 0 is therefore AMBIGUOUS on its own and must be read
-                # alongside the `!! ... NOT PARSED` banner in main(). This
-                # script only prints that banner; it still exits 0. The
-                # campaign-level enforcement is check 20 of gate_g8.py, which
-                # is deliberately not in-tree (it is scoring, not runtime), so
-                # nothing in THIS repo will fail a run over a drifted parser.
-                # Do not read a lone 0 as proof the clause was optional.
+                # attempt=0 is a sentinel, not a count: attempts are numbered
+                # from 1, so 0 means the attempt clause was missing; never
+                # default it to 1. Read a 0 with the NOT PARSED banner from
+                # main(), not as proof the clause was optional.
+                # (notes: manoeuvre-midrun-attempt-sentinel)
                 events.append({"w": w, "type": "midrun_dispatch",
                                "silent": float(m2.group(1)),
                                "attempt": int(ma.group(1)) if ma else 0})
@@ -420,14 +359,10 @@ def parse_log(path, steps=None):
                 if m2.group(1) == "hold-escalate":
                     events.append({"w": w, "type": "escalate_leg"})
                     continue
-                # THE THREE SPELLINGS, MAPPED ONCE. "appointment" is the
-                # generation-19 name for the agreed cell and it is a DIFFERENT
-                # kind from "anchor_return": the anchor is the robot's own
-                # last-connected pose, which no teammate is committed to, while
-                # the appointment is a place the whole fleet agreed on. Folding
-                # them together (which is what the old `else` did, since the
-                # gen-19 wording matched neither branch) reports the rendezvous
-                # treatment as a solo retreat.
+                # Map the three spellings to a kind once. appointment (a place
+                # the fleet agreed on) and anchor_return (the robot's own
+                # last-connected pose) are different kinds and must not be
+                # folded together. (notes: manoeuvre-destination-to-kind)
                 kind = {"appointment":   "appointment",
                         "meeting point": "meeting_point"}.get(
                             m2.group(4), "anchor_return")
@@ -834,13 +769,10 @@ def analyse_run(run_dir):
             if e["type"] != "fire":
                 continue
             t_arm = to_sim(e["w"])
-            # Walk forward to the resolution of THIS firing. The LAST decisive
-            # event before the next firing wins, not the first: an escalated
-            # hold can arrive at the anchor and STILL give up later, and a
-            # mid-run barrier can arrive and still resume — "arrived_waiting"
-            # is only the outcome when nothing further resolved it. escalate /
-            # escalate_leg / midrun context rows are continuations, never
-            # resolutions.
+            # Walk to this firing's resolution, up to the next firing. An
+            # arrival does not end the walk: a later rejoin, resume, give-up or
+            # unreachable overrides it. Escalation and mid-run rows are
+            # continuations. (notes: manoeuvre-outcome-walk)
             outcome, t_out, dur = "open_at_horizon", None, None
             arrived_at = None
             for j in range(i + 1, len(ev)):
@@ -876,42 +808,22 @@ def analyse_run(run_dir):
                     break
                 if ev[j]["type"] == "fire":
                     break
-            # The planner's own classification wins over the walk above. The
-            # walk infers an outcome from which marker line appeared; this is
-            # the node stating it from the two facts that decided it
-            # (team-complete at the instant, and the state it landed in). Where
-            # they disagree the walk is wrong by construction — it cannot see a
-            # release that emitted no marker, which under mission return is
-            # every release.
+            # The planner's stated outcome overrides the walk above, which
+            # cannot see a release that emitted no marker.
+            # (notes: manoeuvre-stated-outcome-wins)
             if stated:
                 outcome = stated
-                # The timestamp has to move with the label. t_out was
-                # backfilled only `if t_out is None`, so a manoeuvre that
-                # reached the anchor and THEN ended kept the ARRIVAL instant
-                # while taking the ending's outcome word — reporting
-                # "gave_up at t=100" next to a duration measured to t=180, and
-                # sampling dist/link at an instant the stated outcome is not
-                # about. The stated outcome is a property of the ending, so it
-                # carries the ending's time; the walk's arrival time survives
-                # only where no ending line was parsed at all.
-                #
-                # Scope, deliberately wider than the arrival case that
-                # motivated it: this overrides t_out for EVERY stated outcome,
-                # including reconnected/resumed_exploring where the walk had a
-                # marker instant. Under mission return no resolving marker is
-                # ever emitted, so today that branch is unreachable and the two
-                # instants would coincide anyway. If a rejoin line is ever
-                # added, revisit — dt_to_outcome_s would then measure the whole
-                # manoeuvre rather than time-to-reconnect.
+                # The stated outcome carries the ending's time: t_out becomes
+                # t_ended for every stated outcome. If a rejoin marker line is
+                # ever added, revisit, as dt_to_outcome_s would then span the
+                # whole manoeuvre. (notes: manoeuvre-stated-outcome-time)
                 if t_ended is not None:
                     t_out = t_ended
             elif dur is not None and outcome == "open_at_horizon":
-                # A manoeuvre that demonstrably ENDED (a duration was parsed
-                # from its ending line) cannot also be "open at the horizon".
-                # Pre-gen-8 logs carry no outcome word, so this is the honest
-                # label for them; it is a distinct string from the default so
-                # the two are never confused in a table, and so this exact
-                # contradiction can never again be printed as "never ended".
+                # A manoeuvre with a parsed duration ended, so it cannot be
+                # open_at_horizon; with no outcome word it is labelled
+                # ended_unclassified, a string distinct from the default.
+                # (notes: manoeuvre-ended-unclassified)
                 outcome = "ended_unclassified"
 
             lk = link_at(link, t_arm) if (link and t_arm is not None) else None
@@ -934,11 +846,10 @@ def analyse_run(run_dir):
                 "after_decline": int(bool(e.get("declined"))),
                 "staleness_s": e.get("stale"),
                 "t_arm_sim": t_arm,
-                # Renamed with the meaning, deliberately: these were
-                # link_up_*/separation_m_at_arm when they were one pair's
-                # numbers. They are now the team's (read_link), and a column
-                # that quietly changes what it measures under an unchanged name
-                # is how a banked table gets re-read as something it never said.
+                # These columns are the team's (read_link), not one pair's, and
+                # are named for that. A column that changes what it measures
+                # must also change its name, or banked tables get misread.
+                # (notes: manoeuvre-team-column-names)
                 "team_connected_at_arm": ("" if lk is None else int(lk[1])),
                 "team_connected_frac_10s": ("" if upf is None else round(upf, 2)),
                 "delivered_per_s": ("" if dlv is None else round(dlv, 2)),

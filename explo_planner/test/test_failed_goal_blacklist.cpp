@@ -1,3 +1,4 @@
+// Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -19,18 +20,9 @@ Eigen::Vector3f p(float x, float y, float z = 0.0f) {
   return Eigen::Vector3f(x, y, z);
 }
 
-/// Read a scalar out of the SHIPPED config instead of restating it as a
-/// literal.
-///
-/// A test that hardcodes 240.0 checks arithmetic the blacklist was never going
-/// to get wrong. What can actually regress is somebody tuning
-/// failed_goal_ttl_sec back down toward the gen-4 value, and against that a
-/// literal is inert: it keeps passing while the claim it stands for stops being
-/// true of anything that runs. Reading the file makes the guard live.
-///
-/// Returns NaN when the key is absent, so the caller can ASSERT on it — a
-/// silent 0.0 default would make every check downstream vacuous in the other
-/// direction, which is the failure mode this helper exists to avoid.
+/// Reads a scalar from the shipped config (SHARED_PARAMS_YAML) so the tests
+/// guard the value that actually runs. Returns NaN when the key is absent;
+/// callers must ASSERT on it. (notes: blacklist-test-shipped-param)
 double shipped_param(const std::string& key) {
   std::ifstream in(SHARED_PARAMS_YAML);
   if (!in) return std::numeric_limits<double>::quiet_NaN();
@@ -111,11 +103,9 @@ TEST(FailedGoalBlacklist, MultipleEntries) {
   EXPECT_FALSE(bl.isNear(p(10.0f, 10.0f), 1.0));
 }
 
-// prune() must not assume insertion order implies age order. Under sim time a
-// bag restart or a /clock step backwards stamps a fresh entry with an OLDER
-// timestamp than the one already queued behind it; the old pop-front-until-
-// fresh loop hit the newer entry first, broke, and left the expired one
-// blacklisting its goal forever.
+// prune() must not assume insertion order is age order: under sim time a bag
+// restart or a backwards /clock step can stamp a fresh entry older than one
+// already queued. (notes: blacklist-prune-out-of-order-stamps)
 TEST(FailedGoalBlacklist, PrunesExpiredEntriesOutOfTimestampOrder) {
   FailedGoalBlacklist bl;
   bl.add(p(0, 0), /*now_sec=*/1000.0);  // recent, must survive
@@ -165,12 +155,9 @@ TEST(FailedGoalBlacklist, ClusteredAddsCountUpAndKeepFirstCentre) {
   EXPECT_EQ(bl.add(p(11, 0), 10.0, 2.0), 2);   // 1 m away: same site
   EXPECT_EQ(bl.add(p(11.5f, 0), 20.0, 2.0), 3);  // 1.5 m from the CENTRE
   EXPECT_EQ(bl.size(), 1u);
-  // Centre never moved. Probed as a two-sided fence, because the obvious probe
-  // is not a probe at all: a point at (11.9, 0) is inside the disc whether the
-  // centre stayed at (10,0), moved to the mean (10.83,0) or jumped to the last
-  // add (11.5,0), so asserting it passes on every build and rules out nothing.
-  // These two bracket the drift instead. Both adds pushed +x, so a centre that
-  // followed them loses the trailing edge and gains the leading one.
+  // Centre never moved, probed as a two-sided fence: a centre that followed the
+  // +x adds would lose the trailing edge (8.1, 0) and gain the leading edge
+  // (12.1, 0). (notes: blacklist-test-centre-fence)
   EXPECT_TRUE(bl.isNear(p(8.1f, 0), 2.0));    // trailing edge: lost if drifted
   EXPECT_FALSE(bl.isNear(p(12.1f, 0), 2.0));  // leading edge: gained if drifted
   // A genuinely different site is its own record.
@@ -221,14 +208,10 @@ TEST(FailedGoalBlacklist, LastFailTimeNearReportsMostRecentOrNegInf) {
   EXPECT_FALSE(std::isfinite(bl.lastFailTimeNear(p(99, 99), 2.0)));
 }
 
-// KNOWN-ANSWER REPLAY, both sides. mr1_hybrid_seed18 atlas re-picked the same
-// unreachable site with measured gaps of 210, 203, 224 and 225 s between
-// failures; each attempt then burned a full 180 s nav budget, 1441 s in total,
-// and the cell was censored 0.021 above the coverage threshold.
-//
-// The test asserts BOTH directions on purpose: a one-sided "the new TTL
-// suppresses it" would also pass on a build where the blacklist suppressed
-// everything forever, and a guard that cannot fail is not a guard.
+// Known-answer replay of measured re-pick gaps, asserted both ways: suppressed
+// at the shipped TTL, expired at 60 s. A one-sided check would also pass on a
+// blacklist that suppresses forever.
+// (notes: blacklist-test-known-answer-replay)
 TEST(FailedGoalBlacklist, Seed18GapIsSuppressedAtShippedTtlAndNotAtGen4) {
   // Calibrate the reader first, on a key whose value is not the one under test.
   // A parser that returns the first number in the file, or NaN for everything,
@@ -264,9 +247,8 @@ TEST(FailedGoalBlacklist, Seed18GapIsSuppressedAtShippedTtlAndNotAtGen4) {
     neu.prune(t_fail + gap, ttl);
     EXPECT_TRUE(neu.isNear(trap, 2.0)) << "ttl=" << ttl << " must still "
                                        << "suppress after " << gap << " s";
-    // Generation 4 (60 s): expired — this is the defect, reproduced. A literal
-    // on purpose: 60 is a historical fact about a campaign that has already
-    // run, not a value anything still reads.
+    // At a 60 s TTL the entry has expired. The literal is deliberate: nothing
+    // still reads this value. (notes: blacklist-test-old-ttl-literal)
     FailedGoalBlacklist old;
     old.add(trap, t_fail, 2.0);
     old.prune(t_fail + gap, 60.0);
@@ -308,17 +290,9 @@ TEST(FailedGoalBlacklist, LongSeed18GapsNeedRetirementNotTtl) {
 // ---------------------------------------------------------------------------
 // Failure history has to outlive the suppression window.
 //
-// The test above builds its retirement history from gaps of 210 s and 203 s —
-// both UNDER the 240 s TTL, so no prune ever lands between two failures at the
-// same site. That is what let it pass while the mechanism it names was dead in
-// the field: prune() runs every PLAN tick, and it used to ERASE the record, so
-// a robot returning to a trap after longer than the TTL found nothing there and
-// started counting at 1 again. Retirement was therefore reachable only when
-// every failure fell inside one TTL — the opposite of the "entry ages out while
-// the robot is busy failing somewhere else" case it was written for.
-//
-// The field evidence: across at1 + sr3, 64 robot-runs and 177 nav failures, the
-// logged failure count was 1 on every single one. retire_after=3 never fired.
+// prune() runs every PLAN tick. With retirement on it must keep an expired
+// record rather than erase it, so the count can reach the retire threshold
+// across gaps longer than the TTL. (notes: blacklist-history-outlives-ttl)
 // ---------------------------------------------------------------------------
 
 // The core of the fix. Each failure is separated by more than the TTL, with a
@@ -364,11 +338,9 @@ TEST(FailedGoalBlacklist, ExpiredSiteKeepsHistoryButStopsSuppressing) {
   EXPECT_EQ(bl.historySize(), 1u) << "revival must reuse the record, not append";
 }
 
-// Regression built from the run that exposed this: at1 seed2, atlas. Two sites
-// in the SW corner each caught the robot twice, and the gaps are the real ones
-// (818 s and 804 s) — both far past the 240 s TTL, which is why both were
-// logged k=1 and neither ever retired. Under the fix the second visit counts as
-// the second, and a third would close the trap for the run.
+// Two sites each failed twice with gaps far past the TTL: the second failure
+// must count as the second, and a third retires the site.
+// (notes: blacklist-test-sw-corner-trap)
 TEST(FailedGoalBlacklist, Seed2SwCornerTrapAccumulatesAcrossItsRealGaps) {
   const double ttl = 240.0;
   const Eigen::Vector3f a = p(-42.03f, -23.66f);
@@ -442,11 +414,9 @@ TEST(FailedGoalBlacklist, ClusteredAddTakesTheFirstSiteNotTheNearest) {
   EXPECT_DOUBLE_EQ(bl.lastFailTimeNear(p(12.5f, 0), 0.5), 1.0);  // B did not
 }
 
-// isRetiredNear answers "is any of this suppressed for good?", so a nearer
-// non-retired record does not overturn it. Under the old nearest-wins form this
-// query returned false and the planner treated a confirmed trap as an ordinary
-// suppressed site — in the amnesty ordering, in the WARN, and in the event
-// field the analysis reads.
+// isRetiredNear asks whether any record in the radius is retired, so a nearer
+// non-retired record does not overturn it. The planner's amnesty ordering, WARN
+// and event field read it. (notes: blacklist-retired-veto-any-record)
 TEST(FailedGoalBlacklist, RetiredVetoSurvivesANearerFreshSite) {
   FailedGoalBlacklist bl;
   bl.setRetireAfter(2);
@@ -519,11 +489,9 @@ TEST(FailedGoalBlacklist, AmnestyOrderIsIrreflexive) {
   EXPECT_FALSE(amnestyOrderBefore(bl, p(60, 0), p(50, 0), 2.0));
 }
 
-// End to end through the same std::stable_sort the planner runs, on indices
-// into a candidate list, because that is where the two properties interact: the
-// partition has to hold across the whole list, and equal-key candidates have to
-// keep the utility order they arrived in (the sort is the last thing standing
-// between the amnesty pick and an arbitrary one).
+// Runs the same std::stable_sort the planner runs: the retired partition must
+// hold across the whole list, and equal-key candidates must keep their incoming
+// utility order. (notes: blacklist-amnesty-sort-end-to-end)
 TEST(FailedGoalBlacklist, AmnestySortIsPartitionedAndStable) {
   FailedGoalBlacklist bl;
   bl.setRetireAfter(2);

@@ -97,6 +97,7 @@
 // would pass on a node with every guard deleted and the comments left behind —
 // which is the most likely way this regresses, since comments are what a
 // "cleanup" edit keeps.
+// Moved comments: doc/test_gen21_latched_hold_notes.md
 
 #include <gtest/gtest.h>
 
@@ -110,11 +111,10 @@
 
 namespace {
 
-/// The source with `//` and `/* */` comments removed, string literals preserved.
-/// Duplicated from test_gen20_rendezvous.cpp rather than shared: these are
-/// standalone source-scan binaries that link nothing of their own, and a shared
-/// header between two test executables whose whole job is to be independently
-/// re-runnable against a mutated node would make one mutation break both.
+/// The source with line and block comments removed, string literals preserved.
+/// Copied into each source-scan binary rather than shared, so one mutated node
+/// cannot break more than one test binary.
+/// (notes: latched-hold-strip-comments-copy)
 std::string stripComments(const std::string& text) {
   std::string out;
   out.reserve(text.size());
@@ -187,19 +187,10 @@ std::string nodeSource() { return stripComments(readFile(EXPLO_PLANNER_NODE_CPP)
 // GROUP A. THE HOLD ITSELF.
 // ===========================================================================
 
-/// THE HOLD SITS BETWEEN THE ENDPOINT STAMP AND EVERY ENDING.
-///
-/// Both halves of that sentence are the assertion, and they fail differently:
-///
-///   * ABOVE THE ENDINGS. There are three of them (startReturnHome, the park,
-///     the done_seek coast) and the first is `mission_return_enabled_ &&
-///     have_home_`, which is TRUE in every campaign config. A hold placed after
-///     it is dead code that reads as live — the robot drives home and the test
-///     suite is green.
-///   * BELOW recordExplorationComplete. The exploration ENDPOINT must not move
-///     because of the hold. The robot finished when the map saturated, not when
-///     the meeting resolved, and stamping it later would make the rendezvous
-///     and hybrid arms pay their own hold on the primary metric.
+/// The hold must sit below recordExplorationComplete, so the endpoint is not
+/// stamped later because of it, and above every ending; the first ending,
+/// mission_return_enabled_ && have_home_, is on in campaign configs.
+/// (notes: latched-hold-between-stamp-and-endings)
 TEST(Gen21LatchedHold, TheHoldIsBelowTheEndpointStampAndAboveEveryEnding) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -236,11 +227,9 @@ TEST(Gen21LatchedHold, TheHoldIsBelowTheEndpointStampAndAboveEveryEnding) {
          "campaign config, so the hold is unreachable and the robot drives "
          "home from the meeting exactly as it did before generation 21";
 
-  // The hold must EXIT the function, not fall through into the endings it was
-  // placed above. `return false` specifically: coverage_latched_ is already
-  // true, so the guard at the top of the function makes every re-entry a no-op
-  // and the manifest still reports finished. `return true` would tell the
-  // caller the run ended, which is the thing the hold is refusing to do.
+  // The hold must return false, not fall through into the endings below it.
+  // coverage_latched_ is already set, so every re-entry is a no-op and the run
+  // still reports finished. (notes: latched-hold-returns-false)
   const size_t hold_stmt_end = body.find('}', hold);
   ASSERT_NE(hold_stmt_end, std::string::npos);
   const std::string hold_block = body.substr(hold, hold_stmt_end - hold);
@@ -256,13 +245,10 @@ TEST(Gen21LatchedHold, TheHoldIsBelowTheEndpointStampAndAboveEveryEnding) {
       << hold_block;
 }
 
-/// THE HOLD IS GATED ON HAVING ARRIVED, NOT ON MERELY BEING ON AN APPOINTMENT.
-///
-/// `appointment_manoeuvre_` is true for the whole drive, and the return-budget
-/// and no-progress paths also enter RETURN_SYNC on an appointment manoeuvre with
-/// arrived=false. Those robots are not standing on any agreed place, so holding
-/// them is a hold in an arbitrary spot — the pre-gen-21 ending is the right one
-/// for them and this gate is what keeps it.
+/// The hold is gated on State::RETURN_SYNC, appointment_manoeuvre_ and arrival:
+/// the return-budget and no-progress paths also enter RETURN_SYNC on an
+/// appointment manoeuvre without arriving, and keep the normal ending.
+/// (notes: latched-hold-gated-on-arrival)
 TEST(Gen21LatchedHold, TheHoldRequiresArrivalAndTheSyncState) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -291,13 +277,10 @@ TEST(Gen21LatchedHold, TheHoldRequiresArrivalAndTheSyncState) {
       << cond;
 }
 
-/// EVERY ENDING BELOW THE HOLD IS FLAGGED AS A TEARDOWN.
-///
-/// `coverage_latch_teardown_` is what stops the appointment outcome classifier
-/// calling a coverage-latch ending a no-show. It must be set BELOW the hold and
-/// ABOVE the endings: above the hold it would fire on the held robot too, which
-/// is the one case that is NOT a teardown — that robot is still keeping its
-/// appointment and its outcome is still open.
+/// coverage_latch_teardown_ stops the outcome classifier calling a
+/// coverage-latch ending a no-show. Set it below the hold (a held robot's
+/// appointment is still open) and above every ending.
+/// (notes: latched-hold-teardown-flag-placement)
 TEST(Gen21LatchedHold, TheTeardownFlagIsSetBelowTheHoldAndAboveTheEndings) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -339,18 +322,10 @@ TEST(Gen21LatchedHold, TheTeardownFlagIsSetBelowTheHoldAndAboveTheEndings) {
 // GROUP B. THE THREE GUARDED EXITS.
 // ===========================================================================
 
-/// 1b. THE BARRIER RELEASE MUST NOT HAND A LATCHED ROBOT BACK TO PLAN.
-///
-/// This release is unconditional in every generation before 21, and it was safe
-/// only because a robot in RETURN_SYNC could never be finished. The hold breaks
-/// that premise. A latched robot sent to PLAN explores a finished map to
-/// max_steps_ and calls finishOrRendezvous("step-budget") ->
-/// recordExplorationComplete a second time; that stamp is keyed on `step_`, not
-/// once per run, so the cell carries TWO exploration_complete rows at very
-/// different t_sim, in the rendezvous and hybrid arms only, and the readers
-/// disagree about which to keep (ts1b_cells.py takes the last, n23.py the
-/// first). An asymmetric corruption of the primary endpoint is strictly worse
-/// than the no-show miscount the hold was added to fix.
+/// The barrier release must not send a coverage_latched_ robot to PLAN: it
+/// would explore a finished map to max_steps_ and stamp a second
+/// exploration_complete (the stamp is keyed on step_, not once per run).
+/// (notes: latched-hold-barrier-release)
 TEST(Gen21GuardedExits, TheBarrierReleaseEndsTheRunForALatchedRobot) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -394,14 +369,10 @@ TEST(Gen21GuardedExits, TheBarrierReleaseEndsTheRunForALatchedRobot) {
       << guarded;
 }
 
-/// 1c. THE HOLD HAS ITS OWN CAP, CHECKED BEFORE THE ORDINARY PATIENCE.
-///
-/// The ordinary appointment patience is `rendezvous_appointment_wait_sec`, which
-/// is 0 = unbounded by default and is MEANT to be — that patience belongs to a
-/// robot with exploring left to trade against it. A finished robot has none, so
-/// an unbounded hold is a cell that runs to the harness wall clock with one
-/// robot standing still. Because the ordinary cap is unbounded, rendezvousWaitExpired
-/// never fires on an appointment manoeuvre, so a cap placed after it is dead.
+/// The latched hold has its own cap, checked before rendezvousWaitExpired:
+/// rendezvous_appointment_wait_sec defaults to 0 = unbounded, so that check
+/// never fires on an appointment manoeuvre and a cap after it is dead.
+/// (notes: latched-hold-cap-before-wait-cap)
 TEST(Gen21GuardedExits, TheLatchedHoldIsCappedIndependentlyOfTheWaitCap) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -409,18 +380,10 @@ TEST(Gen21GuardedExits, TheLatchedHoldIsCappedIndependentlyOfTheWaitCap) {
       functionBody(text, "void ExploPlannerNode::doReturnSync(");
   ASSERT_FALSE(body.empty()) << "the scan found no doReturnSync definition";
 
-  // ANCHORED FROM THE ENDING REASON BACKWARDS, and this direction is the whole
-  // point. Anchoring on the member name alone would pass with the cap deleted —
-  // the release path's log line names it thirty lines earlier, also above
-  // rendezvousWaitExpired. Anchoring FORWARDS on the conditional was the fix for
-  // that and it decayed in generation 32, which added a second
-  // `if (coverage_latched_ && ...)` — the lazy hold stamp — ABOVE the cap: the
-  // forward find then resolved to the stamp, every assertion here passed against
-  // the wrong block, and moving the cap below rendezvousWaitExpired stopped
-  // being caught while the suite still reported green. Search back from
-  // "latched-hold-expired" instead. That string is the cap's own ending and
-  // nothing else emits it, so the conditional immediately above it is the cap by
-  // construction no matter how many siblings are added later.
+  // Anchored back from latched-hold-expired, which only the cap emits, so the
+  // conditional just above it is the cap however many look-alikes are added. A
+  // forward or member-name anchor can test the wrong block.
+  // (notes: latched-hold-cap-scan-anchor)
   const size_t cap_end = body.find("latched-hold-expired");
   ASSERT_NE(cap_end, std::string::npos)
       << "the latched-hold cap does not reach its own ending reason string; it "
@@ -462,13 +425,10 @@ TEST(Gen21GuardedExits, TheLatchedHoldIsCappedIndependentlyOfTheWaitCap) {
       << cap_block;
 }
 
-/// 1d. THE MID-RUN GIVE-UP MUST NOT HAND A LATCHED ROBOT BACK TO PLAN EITHER.
-///
-/// This is the same defect as 1b through a different door, and it is the easier
-/// one to miss: `reconnect_terminal_` reads as an exceptional state but its
-/// value on a mid-run manoeuvre is FALSE by construction — all 16 gen-20
-/// dispatch+end row pairs carry terminal=False — so this branch is the DEFAULT
-/// path out of an expired barrier, not a corner of it.
+/// The mid-run give-up must exclude a coverage_latched_ robot, as the barrier
+/// release does. reconnect_terminal_ is false on every mid-run manoeuvre, so
+/// this branch is the default exit from an expired barrier.
+/// (notes: latched-hold-midrun-giveup)
 TEST(Gen21GuardedExits, TheMidRunGiveUpIsDisqualifiedByTheLatch) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -505,21 +465,10 @@ TEST(Gen21GuardedExits, TheMidRunGiveUpIsDisqualifiedByTheLatch) {
 // GROUP C. THE OUTCOME CLASSIFIER.
 // ===========================================================================
 
-/// `run-ended` ANSWERS A PRIOR QUESTION TO arrived/unreachable, AND A LATER ONE
-/// THAN team_back.
-///
-/// The ordering IS the semantics, and both neighbours matter:
-///
-///   * BELOW team_back. If the team is back, the meeting succeeded — regardless
-///     of what ended this robot's run. Putting run-ended above it would relabel
-///     successful reunions.
-///   * ABOVE the arrived/unreachable split. Whether this robot reached the cell
-///     says how the appointment was GOING; it says nothing once the run ended
-///     underneath it. A teardown mid-drive is no more "unreachable" than a
-///     teardown on the cell is a "no-show".
-///
-/// The defect this fixes is a sign reversal, not a miscount: in the smoke20 N=3
-/// rendezvous cell the arm's headline failure count was made of its successes.
+/// run-ended is tested after reconnected (a team back is a success whatever
+/// ended the run) and before the no-show/unreachable split (once the run ended,
+/// arrival no longer says how the appointment went).
+/// (notes: latched-hold-run-ended-ordering)
 TEST(Gen21OutcomeClassifier, RunEndedSitsBelowTeamBackAndAboveTheArrivalSplit) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -578,13 +527,9 @@ TEST(Gen21OutcomeClassifier, RunEndedSitsBelowTeamBackAndAboveTheArrivalSplit) {
 // GROUP D. THE KNOB.
 // ===========================================================================
 
-/// THE CAP IS A DECLARED PARAMETER WITH A VALIDATED DEFAULT.
-///
-/// A hard-coded hold would be untunable from the harness, and the harness is
-/// the only place the value is ever chosen (`RDV_LATCHED_HOLD`). The validation
-/// matters for the same reason every other duration in this node validates: a
-/// NaN or a negative from a typo'd override would make `held >= cap` false
-/// forever, which is silently the unbounded hold this cap exists to prevent.
+/// rendezvous_latched_hold_sec is a declared parameter because the harness sets
+/// it (RDV_LATCHED_HOLD), and it is validated because a NaN makes held >= cap
+/// false forever: an unbounded hold. (notes: latched-hold-cap-parameter)
 TEST(Gen21LatchedHold, TheCapIsADeclaredAndValidatedParameter) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -599,13 +544,9 @@ TEST(Gen21LatchedHold, TheCapIsADeclaredAndValidatedParameter) {
          "makes `held >= cap` false forever, which is exactly the unbounded "
          "hold the cap exists to prevent — and it fails silently";
 
-  // NON-POSITIVE, not merely negative. Every guard on this value reads
-  // `> 0.0`, so zero DISABLES the cap rather than setting it to nothing, and
-  // since generation 32 the cap is the only bound a latched keeper has: it is
-  // non-terminal by construction, so rendezvous_max_wait_sec cannot end it and
-  // rendezvous_appointment_wait_sec is itself 0 = forever. A `< 0.0` validator
-  // admits the one value that reproduces the censored cell, through a
-  // parameter that reads like a disable switch.
+  // The validator must reject <= 0.0, not only < 0.0: the cap's guards read >
+  // 0.0, so zero disables the cap, and the cap is the only bound a latched
+  // keeper has. (notes: latched-hold-cap-rejects-zero)
   const size_t read = text.find("dp(\"rendezvous_latched_hold_sec\"");
   ASSERT_NE(read, std::string::npos);
   const size_t reset = text.find("rendezvous_latched_hold_sec_ = 300.0", read);
@@ -639,20 +580,10 @@ TEST(Gen21LatchedHold, TheCapIsADeclaredAndValidatedParameter) {
 //    M22  the cap validator relaxed from `<= 0.0` back to `< 0.0`
 // ===========================================================================
 
-/// THE KEEP IS CALLED FROM BOTH ENDINGS, AND ABOVE MISSION RETURN IN EACH.
-///
-/// Both halves fail differently and both are silent:
-///
-///   * ONE CALLER ONLY. The two endings catch different robots — the coverage
-///     latch catches one that saturates mid-tick, finishOrRendezvous catches
-///     the step budget and the peer-announced paths — and a robot that reaches
-///     the ending this call is missing from abandons its meeting exactly as it
-///     did in generation 31.
-///   * BELOW `mission_return_enabled_`. That branch is true in every campaign
-///     config, so a keep placed under it never runs. This is not hypothetical:
-///     it is precisely why dispatchReconnect's own "exploration is over, go to
-///     the appointment now" branch was unreachable for eleven generations
-///     while reading as live.
+/// Both maybeLatchCoverageDone and finishOrRendezvous must call
+/// keepAppointmentOnFinish, each above mission_return_enabled_: the two endings
+/// catch different robots, and a keep below the mission-return branch never
+/// runs. (notes: keep-appointment-both-endings)
 TEST(Gen32KeepAppointment, BothEndingsKeepItAheadOfMissionReturn) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -683,17 +614,10 @@ TEST(Gen32KeepAppointment, BothEndingsKeepItAheadOfMissionReturn) {
   }
 }
 
-/// THE LATCH'S KEEP RETURNS TRUE, AND THE DISTINCTION IS THE SAFETY ARGUMENT.
-///
-/// maybeLatchCoverageDone's return value means "the caller must stop this
-/// tick", and doPlan is the only caller that acts on it. The gen-21 hold above
-/// can afford `false` because it is gated on State::RETURN_SYNC, which doPlan
-/// is never in; this call is not, because a robot saturates from PLAN. `false`
-/// here lets doPlan run on past a dispatch that has already published the
-/// meeting goal, select a frontier, publish it over that goal and enter
-/// NAVIGATE — at which point the classifier closes the appointment
-/// `unreachable` on a fabricated navigation failure, and with the coverage
-/// ending spent there is nothing left to end the run but max_steps_.
+/// The latch's return means the caller must stop this tick; only doPlan acts on
+/// it. The keep must return true, or doPlan publishes a frontier over the
+/// dispatched meeting goal. The RETURN_SYNC hold may return false.
+/// (notes: keep-appointment-latch-returns-true)
 TEST(Gen32KeepAppointment, TheLatchStopsThePlanTickWhenItKeeps) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -720,15 +644,10 @@ TEST(Gen32KeepAppointment, TheLatchStopsThePlanTickWhenItKeeps) {
       << stmt;
 }
 
-/// AN UNPLACEABLE CELL IS DECLINED BEFORE ANY STATE MOVES.
-///
-/// appointmentPoint() has a branch that cannot solve the agreed cell on either
-/// grid: it latches `appointment_unplaceable_` and answers the robot's OWN
-/// position. Departing for that "arrives" on the next tick, so the keeper would
-/// hold a barrier at its own feet for the full latched cap over a meeting no
-/// travel of its could reach. The check must be above `appointment_departed_`,
-/// because declining after that flag is set closes the record as a departure
-/// that never happened.
+/// keepAppointmentOnFinish must decline on appointment_unplaceable_ (the point
+/// is then the robot's own position) before appointment_departed_ is set or the
+/// drive dispatched, or it records a departure that never happened.
+/// (notes: keep-appointment-unplaceable)
 TEST(Gen32KeepAppointment, AnUnplaceableCellIsDeclinedBeforeDeparture) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -776,15 +695,10 @@ TEST(Gen32KeepAppointment, AnUnplaceableCellIsDeclinedBeforeDeparture) {
          "classifier sees a keeper that never left";
 }
 
-/// THE APPOINTMENT LEG'S LAST RUNG MUST NOT HAND A LATCHED ROBOT BACK TO PLAN.
-///
-/// The same defect as 1b and 1d through a third door, and this one opened only
-/// in generation 32: before the keep, no drive to an agreed cell could be
-/// carrying a finished robot, so every robot this rung returned to PLAN still
-/// had its ending in front of it. One that has spent the coverage ending does
-/// not — first-touch latching will not give it another — so the exit leaves
-/// nothing but max_steps_ and a SECOND exploration_complete, in the treated
-/// arms only.
+/// The appointment leg's terminal rung must end a coverage_latched_ robot's run
+/// (finishNow, startReturnHome, teardown flag) rather than return it to PLAN,
+/// which would run to max_steps_ and stamp a second exploration_complete.
+/// (notes: keep-appointment-leg-terminal-rung)
 TEST(Gen32KeepAppointment, TheUnreachedLegDoesNotResumeALatchedRobot) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -1115,14 +1029,10 @@ std::string flatten(const std::string& s) {
 
 }  // namespace
 
-/// THE PUBLISHER SAYS DONE THROUGH THE ATTENDANCE RULE, AND ONLY THROUGH IT.
-///
-/// The defect was a keeper publishing DONE at the start of its drive to the
-/// meeting. announcedMode holds the level below HOMING while the robot keeps
-/// its appointment — but only if it is TOLD the robot is keeping it, and only
-/// if nothing else in the publisher writes the level afterwards. And the
-/// homing latch must be current when the call reads it, or the tick the robot
-/// turns for home publishes one level too low.
+/// publishTeamWorld sets the announced level once, from announcedMode told
+/// whether the robot is keeping its appointment, after the homing and finished
+/// latches are updated, so a keeper never says DONE on its way to the meeting.
+/// (notes: attendance-publisher-says-done)
 TEST(Gen33MeetingAttendance, ThePublisherSaysDoneThroughTheAttendanceRule) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -1151,16 +1061,10 @@ TEST(Gen33MeetingAttendance, ThePublisherSaysDoneThroughTheAttendanceRule) {
   EXPECT_LT(at_finished, at_call);
 }
 
-/// THE APPOINTMENT BARRIER WAITS FOR A FINISHED PEER STILL COMING — BOUNDED,
-/// AND ONLY THERE.
-///
-/// Three things, one per assertion: the veto is in the APPOINTMENT branch of
-/// the release predicate (the other branch serves mid-run and terminal
-/// reconnects, which are this robot's own business); it answers false outside
-/// an appointment manoeuvre (the classifier and doReturnNav also call the
-/// predicate); and it runs out at rendezvous_latched_hold_sec measured from
-/// its stamp, or a partner whose "leaving" the radio never delivered holds
-/// this robot to the run's end.
+/// The finished-peer veto sits in the appointment branch of
+/// manoeuvreReleaseEligible, returns false outside an appointment manoeuvre
+/// (other callers share it), and runs out at rendezvous_latched_hold_sec from
+/// its stamp. (notes: attendance-finished-peer-veto)
 TEST(Gen33MeetingAttendance, TheAppointmentBarrierWaitsForAFinishedPeerStillComing) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
@@ -1199,16 +1103,10 @@ TEST(Gen33MeetingAttendance, TheAppointmentBarrierWaitsForAFinishedPeerStillComi
       << hold;
 }
 
-/// THE WAIT'S CLOCK: STAMPED AT THE BARRIER, FLOORED AT t_meet, KEPT FOR THE
-/// MANOEUVRE, AND ITS END LOGGED WHERE IT CAN BE REACHED.
-///
-/// The floor is GROUP F's argument again: the cap is sized from t_meet, so an
-/// early arrival must not spend it before the team is due. Kept across legs,
-/// because the settle-lapsed resume re-dispatches from the barrier and a
-/// restart per leg is an unbounded wait by instalments. Cleared when the
-/// manoeuvre ends, or the next appointment inherits a spent bound. And the
-/// expiry line sits ABOVE the release gate: the expiry is what opens the gate,
-/// and the settle behind it returns before anything further down runs.
+/// finished_peer_wait_start_sec_ is stamped at the barrier floored at t_meet,
+/// kept across appointment legs and cleared when the manoeuvre ends; its expiry
+/// is logged above the release gate, whose settle returns early.
+/// (notes: attendance-finished-peer-wait-clock)
 TEST(Gen33MeetingAttendance, TheWaitIsStampedFlooredKeptAndCleared) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;

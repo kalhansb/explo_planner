@@ -14,6 +14,7 @@
 /// no further vantage is reachable (partial). DONE targets are kept in the
 /// queue (not erased) so re-reports of an already-finished tree dedup against
 /// them; the small queue size makes this cheap.
+/// Moved comments: doc/explo_planner_code_notes.md
 
 #include <cstdint>
 #include <deque>
@@ -32,11 +33,10 @@ struct Target {
   enum class Status : uint8_t { PENDING, ACTIVE, DONE };
   Status status = Status::PENDING;
 
-  /// XY positions of vantages already dwelled at for this target — local
-  /// dwells plus canonical ring positions merged from peers. Vantages are
-  /// re-generated every plan tick, so "already visited" is tracked by proximity
-  /// to these recorded positions (see isVantageVisited) rather than by a
-  /// transient per-tick index. Z is ignored in the comparison.
+  /// XY positions dwelled at for this target, local plus canonical ring
+  /// positions merged from peers. Vantages regenerate every tick, so visited is
+  /// judged by proximity (isVantageVisited); Z is ignored.
+  /// (notes: target-visited-vantages)
   std::vector<Eigen::Vector3f> visited_vantages;
 
   /// Count of clear-LoS dwells credited to this target — the TEAM union, not
@@ -44,12 +44,10 @@ struct Target {
   /// criterion is reached once this hits min_vantages_required.
   int clear_los_dwells = 0;
 
-  /// Bitmask of vantage indices dwelled with clear LoS (bit i = ring index i).
-  /// The ring is deterministic from (center, radius), so indices are globally
-  /// meaningful across robots; this is what gets broadcast in RobotIntent and
-  /// what makes local + peer credit idempotent to merge (an index counts once
-  /// no matter how many robots dwell it or how often the mask is re-received).
-  /// Indices >= 32 fall back to the plain counter (no team sharing).
+  /// Ring indices dwelled with clear LoS (bit i = ring index i). The ring is
+  /// deterministic, so indices are global: broadcast in RobotIntent and
+  /// idempotent to merge. Indices >= 32 use the plain counter only.
+  /// (notes: target-clear-mask)
   uint32_t clear_mask = 0;
 };
 
@@ -81,28 +79,23 @@ public:
   /// Mark the ACTIVE target DONE and clear the active slot. No-op if none.
   void markActiveDone();
 
-  /// Demote the ACTIVE target back to PENDING and clear the active slot.
-  /// Unlike markActiveDone() this does NOT close the target — it stands
-  /// exploitation down so a higher-priority behaviour (the rendezvous barrier)
-  /// can run without the target being lost or its exploit claim left live.
-  /// The next activate() picks the same target up again. No-op if none.
+  /// Demote the ACTIVE target to PENDING without closing it, so a
+  /// higher-priority behaviour (the rendezvous barrier) can run; the next
+  /// activate() picks it up again. No-op if none.
+  /// (notes: target-queue-deactivate)
   void deactivate();
 
-  /// Record that the robot dwelled at a vantage of the ACTIVE target.
-  /// `vantage_index` is the deterministic ring index of the vantage (< 32 for
-  /// team credit sharing; -1 / out-of-range falls back to counter-only).
-  /// A clear-LoS dwell on an index already credited (e.g. merged from a peer
-  /// that dwelled it first) does not double-count.
+  /// Record a dwell at a vantage of the ACTIVE target. vantage_index is the
+  /// ring index (< 32 for team sharing; -1 or out of range counts locally
+  /// only). A clear-LoS dwell on a credited index does not double-count.
+  /// (notes: target-record-vantage-dwell)
   void recordVantageDwell(const Eigen::Vector3f& vantage_xy, bool los_clear,
                           int vantage_index = -1);
 
-  /// Merge a peer's clear-LoS dwelled vantage-index mask into the target with
-  /// `target_id` (team quota: the union of everyone's dwells counts toward
-  /// success). `ring` is the locally generated vantage ring for that target —
-  /// canonical positions for newly credited indices are appended to
-  /// visited_vantages so isVantageVisited() skips angles a peer already
-  /// captured. Idempotent; returns true iff any new index was credited.
-  /// No-op on DONE or unknown targets.
+  /// Merge a peer's clear-LoS index mask into target_id (the team union counts
+  /// toward success); ring positions of new indices join visited_vantages.
+  /// Idempotent; true iff a new index was credited; no-op on DONE or unknown
+  /// targets. (notes: target-merge-peer-dwells)
   bool mergePeerDwells(uint32_t target_id, uint32_t peer_mask,
                        const std::vector<Eigen::Vector3f>& ring);
 

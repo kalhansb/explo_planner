@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/analyze_runs_notes.md
 """Per-run metrics for the comms/reconnection campaign (plan §5).
 
 Reads a campaign root of run OUTDIRs and emits one row per run plus the
@@ -125,15 +126,10 @@ def read_link_mask(run_dir):
     except (OSError, ValueError):
         return None
     if "mask_verdict" not in kv:
-        # A sidecar with no verdict in it grades nothing, so it is the same
-        # answer as no sidecar at all: unknown. This is not a hypothetical
-        # input -- write_sidecar() rewrites the file in place as the run goes,
-        # so a cell killed at teardown can leave a truncated or zero-byte one,
-        # and an empty file parses to an empty dict without raising anything.
-        # Returning the partial dict instead would make it a GRADED run whose
-        # verdict is None, which is not flagged and therefore gets counted in
-        # the "all N graded run(s) OK" line: the unreadable case reported as
-        # the clean one.
+        # A sidecar with no mask_verdict grades nothing, so it is treated like
+        # no sidecar: unknown. write_sidecar() rewrites the file in place, so a
+        # killed run can leave it truncated or empty.
+        # (notes: linkmask-no-verdict-is-unknown)
         return None
     try:
         kv["masked_frac"] = (float(kv["masked_frac"])
@@ -264,11 +260,10 @@ def time_to_criterion(rows, thresh):
 
 def duty_and_outages(trace):
     if len(trace) < 2:
-        # FOUR values, like the normal return below. This branch returned three,
-        # so any run with a missing or short link trace (read_link_trace returns
-        # [] on OSError, and the path_loss_db <= 0 startup mask can empty a
-        # short one) raised ValueError at the call site and took the whole batch
-        # down with it rather than skipping the one bad run.
+        # Returns four values, like the normal return below; the caller unpacks
+        # four. A missing or short trace takes this branch (read_link_trace
+        # returns [] on OSError; the startup mask can empty one).
+        # (notes: duty-outages-short-trace-return)
         return float("nan"), [], float("nan"), None
     down = total = 0.0
     for (t0, up0, _), (t1, _, _) in zip(trace, trace[1:]):
@@ -285,12 +280,10 @@ def duty_and_outages(trace):
         elif up and start is not None:
             eps.append(t - start)
             start = None
-    # An outage still open when the trace stops is RIGHT-CENSORED, not absent.
-    # Dropping it silently discarded the largest outage in the pursuit run
-    # (1225 s, from t=2495 to the end) from a set whose median was 6 s, and
-    # rendered a permanently-down link as "0 outages, median nan". Its duration
-    # is a lower bound, so it is reported and counted but kept out of the
-    # median — same discipline as calib_summary.episodes.
+    # An outage still open when the trace stops is right-censored: its duration
+    # is a lower bound, so it is returned as open_ep and kept out of eps and the
+    # median. Same discipline as calib_summary.episodes.
+    # (notes: duty-outages-open-outage-censored)
     open_ep = (trace[-1][0] - start) if start is not None else None
     med = statistics.median(eps) if eps else float("nan")
     return (down / total if total else float("nan")), eps, med, open_ep
@@ -409,23 +402,10 @@ def analyse_run(run_dir, thresh):
     censored = any(h is None for h in hits)
     makespan = None if censored else max(hits)
 
-    # Manoeuvre accounting straight off the state column.
-    #
-    # NOTE (section 3.22): this UNDERCOUNTS. The CSV is sampled on a ~5-10 s
-    # timer and manoeuvre episodes are routinely shorter, so 6 of the 22
-    # firings on disk leave no row here at all — and they are the FAST ones,
-    # which is the worst possible bias for a mode comparison. The count below
-    # is retained because reconnect_secs is derived from it and needs the
-    # in-episode rows, but the authoritative firing census is the log-derived
-    # one in manoeuvre_events.py; `n_firings_log` is reported beside it.
-    # reconnect_elapsed_sec must be read from INSIDE the episode, not from the
-    # row that leaves it: the planner's transitionTo clears reconnect_active_
-    # before that row is emitted, so the exit row always reads -1 and the old
-    # ">= 0" filter discarded every value. Verified: the exit rows carry -1
-    # while the last in-manoeuvre rows carry 183.08 / 124.45 / 12.85. Take the
-    # largest value seen within the episode — the field counts up, so that is
-    # its duration, and it also survives an episode still running at the
-    # horizon (which otherwise contributes nothing at all).
+    # Counts manoeuvres off the sampled state column, which misses short
+    # episodes; n_firings_log (manoeuvre_events.py) is authoritative. Take the
+    # max reconnect_elapsed_sec inside the episode: the exit row reads -1.
+    # (notes: analyze-manoeuvre-count-sampled)
     manoeuvres, reconnect_secs, open_manoeuvres = 0, [], 0
     for rows in planners.values():
         in_man, best = False, -1.0
@@ -548,12 +528,9 @@ def main():
     report_link_mask(runs)
 
     print()
-    # Group by the CELL, not the arm alone. Keying on reconnect_mode_requested
-    # by itself pooled three tx=160 controls, a tx=-60 blackout and a tx=-14
-    # treatment run into one "arm off n=5" line with a realised-severity range
-    # of 0.000-1.000 — three different experiments averaged into a number that
-    # describes none of them. The criterion is in the key for the same reason:
-    # it DEFINES the endpoint, so two thresholds are two endpoints.
+    # Group by cell (arm, tx_power, threshold), not by arm alone: different tx
+    # powers are different experiments, and the threshold defines the endpoint.
+    # (notes: analyze-group-by-cell)
     by_arm = {}
     for r in runs:
         by_arm.setdefault((r["arm"], r["tx_power"], r["threshold"]), []).append(r)

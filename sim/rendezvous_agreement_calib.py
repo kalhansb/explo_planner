@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: docs/sim_notes/rendezvous_agreement_calib_notes.md
 """Known-answer calibration for rendezvous_agreement.py.
 
 WHY A CALIB AND NOT JUST THE GATE
@@ -138,17 +139,10 @@ def cell(tmp, name, *, scheduled=True, robots=("atlas", "bestla"),
                 # case that does not mention echoes writes a healthy line and
                 # the planted defect in every other case is unambiguous.
                 e_n, e_d = (n - 1, n - 1) if echo in (None, "omit") else echo
-                # WHICH OF THE THREE PRINTING FORMATS THIS FIXTURE IS ON, chosen
-                # by what the caller left out rather than by a flag, so a case
-                # cannot claim one generation and write another:
-                #
-                #   prov  is None -> gen <= 19  "every Xs from t+Ys."
-                #   tmeet is None -> gen 20-22  "interval Xs (provisional=P, echoes a/b)."
-                #   otherwise     -> gen >= 23  "interval Xs from t+Ys (provisional=P, echoes a/b)."
-                #
-                # The default is the CURRENT format on purpose. A calibrator
-                # whose fixtures are all on a retired wording proves the gate can
-                # read the bank and says nothing about the binary about to run.
+                # The wording follows what the case leaves out, so a case cannot
+                # claim one format and write another: prov None gives the
+                # oldest, tmeet None the middle, otherwise the current one, the
+                # default on purpose. (notes: calib-fixture-wording-choice)
                 if prov is None:
                     tail = "every %ds from t+%ds." % (interval, tmeet)
                 elif tmeet is None:
@@ -181,14 +175,10 @@ try:
     except OSError as exc:
         src = ""
         bad("cannot read %s: %s" % (NODE, exc))
-    # Recover the concatenated string literal the node passes to RCLCPP_INFO,
-    # starting at the phrase the gate greps for. Adjacent C string literals are
-    # joined the way the compiler joins them.
-    #
-    # COMMENT OCCURRENCES ARE SKIPPED. The node quotes this phrase in a comment
-    # right above the call, to say that the text is load-bearing — and a comment
-    # is a one-chunk "literal" that renders to the bare phrase and would fail
-    # this case for the wrong reason.
+    # Recover the concatenated literal the node passes to RCLCPP_INFO from the
+    # phrase the gate greps, joining adjacent literals as the compiler does.
+    # Occurrences on // comment lines are skipped.
+    # (notes: calib-literal-recovery)
     i = -1
     _at = src.find('"Rendezvous AGREED by all')
     while _at >= 0:
@@ -231,23 +221,19 @@ try:
         sys.path.insert(0, HERE)
         import rendezvous_agreement as ga
         m = ga.LINE.search(line)
-        # THE PROVISIONAL GROUP IS ASSERTED, NOT MERELY TOLERATED. LINE has to
-        # keep that group optional so pre-generation-17 logs still parse, which
-        # means a node that stopped printing the flag would go on matching — the
-        # gate would quietly lose its ability to tell a tour-informed cell from
-        # a meet-at-the-centroid one and say nothing. Requiring the group HERE,
-        # against the node's live format string, is what makes that loud.
+        # LINE keeps the provisional group optional for old logs, so a node that
+        # stopped printing the flag would still parse; this case requires it
+        # against the node's live format string.
+        # (notes: calib-provisional-asserted)
         if not m:
             bad("the node's commit message renders as %r, which the gate's "
                 "LINE regex does not parse. Rewording it silently disables the "
                 "gate; update LINE in rendezvous_agreement.py." % rendered)
         elif "%" in rendered:
-            # EVERY CONVERSION MUST HAVE BEEN SUBSTITUTED. The replaces above
-            # are literal, so a node that changes `%.0f` to `%d` would leave a
-            # raw conversion in the rendered string, the regex could still match
-            # the parts it cares about, and this case would PASS while testing a
-            # message no node ever emits. Checked here rather than assumed,
-            # because that is precisely how a calibrator stops calibrating.
+            # The replaces above are literal, so a changed conversion leaves a
+            # raw % in the rendered string and the case would test a message no
+            # node emits; any % left fails the case.
+            # (notes: calib-conversions-substituted)
             bad("the node's format string has a conversion this calibrator "
                 "does not know how to render (%r). Add it to the replace chain "
                 "above, or case 1 is checking a message that does not exist."
@@ -257,17 +243,10 @@ try:
                 "not 64/168: %r"
                 % (m.group("cell"), m.group("interval"), rendered))
         elif m.group("tmeet") is not None:
-            # THE GEN-23 TAIL MUST NOT MATCH THE GEN-19 ONE. Generation 23 put
-            # the meeting time back on this line, and the gen-19 form carried the
-            # same two integers — so if the node had restored the OLD phrasing
-            # ("every Xs from t+Ys") the line would parse on the FIRST
-            # alternative, `interval`/`prov`/`echoes` would all come back None,
-            # and the parse loop coalesces those, so nothing would look broken
-            # while a gen-23 bank silently read as pre-gen-20 binaries.
-            #
-            # This is why the node appends `from t+Ys` to the interval term
-            # instead of reusing the old wording. Pin it: the tail the node is on
-            # is the third alternative and no other.
+            # The node's line must not parse on the oldest every-Xs alternative:
+            # interval, prov and echoes would come back None and current logs
+            # would silently read as the oldest binaries.
+            # (notes: calib-newest-tail-not-oldest)
             bad("the node's commit message parsed on the PRE-GENERATION-20 "
                 "tail (t_meet=%s). Generation 23 prints the meeting time again, "
                 "but as `interval Xs from t+Ys` precisely so that it CANNOT be "
@@ -276,14 +255,10 @@ try:
                 "ones; restore the gen-23 phrasing or split the two tails."
                 % m.group("tmeet"))
         elif m.group("tmeet_new") != "130":
-            # THE MEETING TIME IS ASSERTED, NOT MERELY TOLERATED, for the same
-            # reason the provisional flag is below: the group is optional so that
-            # banked gen-20..22 logs still parse, which means a node that stopped
-            # printing the agreed instant would go on matching and the gate would
-            # quietly lose the only evidence in the text logs that two robots
-            # armed the same MEETING rather than merely the same cell. On gen 23
-            # that instant is what armAppointment attends, so losing it is losing
-            # the arm's defining property.
+            # The meeting-time group is optional for older banked logs, so a
+            # node that stopped printing it would still parse; the case requires
+            # t+130s, the only text-log record of a shared meeting instant.
+            # (notes: calib-meeting-time-asserted)
             bad("the node's commit message does not carry the agreed meeting "
                 "time on the generation-23 tail (t_meet_new=%r, renders as %r). "
                 "Without it the banked logs cannot distinguish a fleet that "
@@ -379,18 +354,9 @@ try:
         bad("expected FAIL naming exactly the t_rel 321.0s arming, got: %r" % out)
 
     # --- 6b. G3's ordering field is missing -> UNRUN, not a silent pass -----
-    # THE REGRESSION THIS PINS. G3 read `float(d.get("t_wall_sec", 0.0))` until
-    # 2026-09-18, so a row without the field compared 0.0 > <epoch seconds>,
-    # which is False for every row that will ever exist. Drop the field from the
-    # envelope — one schema edit, one binary generation — and G3 stops finding
-    # contradictions and PASSes forever, emitting output IDENTICAL to a
-    # genuinely clean cell. Nothing downstream could tell the two apart.
-    #
-    # The arming below is case 6's contradiction with t_wall_sec deleted and
-    # nothing else changed, so the two cases differ by exactly the field under
-    # test: case 6 proves the check fires when it can run, this proves it
-    # refuses when it cannot. Under the old code THIS CASE PASSED — which is the
-    # only reason it is worth its lines.
+    # Case 6's contradiction with t_wall_sec deleted and nothing else changed:
+    # case 6 shows G3 fires when it can run, this that it is UNRUN when it
+    # cannot. (notes: calib-case6b-missing-t-wall)
     cases += 1
     d = cell(tmp, "no_t_wall", commits={
         "atlas":  (1789600010.0, 2, 56, 28, 72),
@@ -441,15 +407,9 @@ try:
         bad("expected UNRUN naming husky, got: %r" % out)
 
     # --- 10. THE UPGRADE: provisional first, final second, in ECHO ORDER -----
-    # This is the case that made the gate wrong before the flag existed. The
-    # proposer can derive its triple before the allocator has produced a tour;
-    # the argmin then has exactly one candidate (the centroid of the frozen
-    # snapshot) and the result is a placeholder, published provisional=1 and
-    # replaceable exactly once. Robots adopt the replacement whenever the echo
-    # reaches them, so their FIRST commits legitimately disagree — and keying
-    # G2 on first commits, which is what this gate used to do, scores a
-    # perfectly healthy run as a SPLIT FLEET and sends the cell back for a REDO
-    # that will do the same thing again.
+    # A provisional centroid placeholder replaced once by a final triple; robots
+    # adopt it in echo order, so first commits differ. Must PASS on the
+    # converged cell. (notes: calib-case10-upgrade)
     cases += 1
     d = cell(tmp, "upgrade", robots=("atlas", "bestla", "husky"), commits={
         "atlas":  [(1789600010.0, 3, 9, 240, 60, 1),
@@ -467,12 +427,9 @@ try:
         bad("expected PASS on cell 64 naming 3 upgrades, got: %r" % out)
 
     # --- 11. converged on the PLACEHOLDER: passes, but says which mechanism --
-    # A cell where nobody ever upgraded is a valid rendezvous cell — the team
-    # has one place and one time and will drive to it. It is ALSO a cell whose
-    # meeting point is the centroid of the spawn snapshot rather than an argmin
-    # over the allocator's tours, i.e. a different treatment from the one the
-    # arm name implies. It must not FAIL, and it must not pass silently either,
-    # because nothing else in the run's artifacts records the difference.
+    # A fleet that never left the centroid placeholder is valid but a different
+    # treatment: it must PASS, flagged PLACEHOLDER, since no other artifact
+    # records the difference. (notes: calib-case11-placeholder)
     cases += 1
     d = cell(tmp, "placeholder", commits={
         "atlas":  (1789600010.0, 2, 9, 240, 60, 1),
@@ -517,13 +474,10 @@ try:
             % out)
 
     # --- 13b. THE SAME THREE COMMITS, WITH A MEETING TO PAY FOR THE THIRD ----
-    # Generation 29's re-agreement: the fleet keeps its appointment, stands on
-    # the cell while the maps merge, and agrees the next place and time before
-    # it goes back out. That is a third commit on a healthy run, and the budget
-    # above is the ONLY thing separating it from case 13 — same commit lines,
-    # one extra release line in the log. Paired with 13 on purpose: a budget
-    # that counted nothing would pass both and a budget of two would fail both,
-    # and neither mistake is visible from one case alone.
+    # Case 13's commit lines plus one release line: the kept meeting pays for
+    # the third commit, so PASS. Paired with 13 so a budget that counts nothing,
+    # or a fixed budget of two, fails one of them.
+    # (notes: calib-case13b-paid-third-commit)
     cases += 1
     rel = ["Rendezvous: team reachable (1/1) -> re-planning against merged map "
            "(held 35.0s; the exchange applied 0 peer cell(s), the shared "
@@ -544,11 +498,9 @@ try:
         bad("expected PASS on cell 77 for the re-agreed triple, got: %r" % out)
 
     # --- 14. THE RELAXATION MUST STILL CATCH A REAL SPLIT -------------------
-    # Case 10 relaxed G2 from "every commit agrees" to "every robot ends in the
-    # same place". The thing that relaxation could plausibly hide is a fleet
-    # that started together and ended apart — one robot upgraded, another never
-    # heard the echo. It is the worst outcome the protocol has (two robots, two
-    # different cells, each waiting for the other) and it must still FAIL.
+    # Case 10's relaxation must not hide a fleet that started together and ended
+    # apart (one robot upgraded, the other never heard the echo); it must still
+    # FAIL as a split. (notes: calib-case14-real-split)
     cases += 1
     d = cell(tmp, "half_upgraded", commits={
         "atlas":  [(1789600010.0, 2, 9, 240, 60, 1),
@@ -563,10 +515,10 @@ try:
             % out)
 
     # --- 15. a binary that cannot report the flag makes the shape check sit out
-    # Written with prov=None, i.e. the pre-generation-17 line. Two commits with
-    # no flag could be [P, R] or a downgrade and there is no way to tell; the
-    # gate must not guess. It reports the convergence it CAN see and says the
-    # flag was unreported, rather than treating a missing group as a zero.
+    # Commits are written without the provisional flag. Two such commits could
+    # be [P, R] or a downgrade, so the gate must PASS on convergence and say the
+    # flag was unreported, not read it as 0.
+    # (notes: calib-case15-flag-unreported)
     cases += 1
     d = cell(tmp, "pre_gen17", commits={
         "atlas":  [(1789600010.0, 2, 9, 240, 60, None),
@@ -582,14 +534,9 @@ try:
         bad("expected PASS with provisional=unreported, got: %r" % out)
 
     # --- 16. A HEALED SPLIT IS STILL A SPLIT WHILE IT LASTS -----------------
-    # The case G2 structurally cannot see. Both robots end on the SAME triple,
-    # both shapes are the legal [P, R], so G1, G2 and the shape check are all
-    # satisfied — and between the two adoptions of the winning triple one robot
-    # was standing at cell 9 while the other drove to cell 64. 300 s of that is
-    # more than a whole appointment interval, i.e. a robot could have waited out
-    # an entire rendezvous at the wrong place, and the cell would have scored as
-    # a clean treated cell. If this ever goes quiet, the completion-time bias it
-    # guards lands in the two arms the campaign exists to compare.
+    # Both robots end on the same triple with legal [P, R] shapes, so G1, G2 and
+    # the shape check pass, but the adoptions are 300 s apart, over the bound:
+    # it must FAIL as SPLIT APPOINTMENT. (notes: calib-case16-wide-healed-split)
     cases += 1
     d = cell(tmp, "healed_split_wide", commits={
         "atlas":  [(1789600010.0, 2, 9, 240, 60, 1),
@@ -605,14 +552,9 @@ try:
         bad("expected FAIL SPLIT APPOINTMENT at 300.0 s, got: %r" % out)
 
     # --- 17. ...AND A NARROW ONE IS NOT, BUT IS STILL REPORTED --------------
-    # The matched half of case 16, and the one that stops G2b being a gate that
-    # fails every healthy upgrade. Same shape, same convergence, 120 s apart:
-    # under the bound, so PASS. What it also pins is that `span` and `split` are
-    # DIFFERENT numbers on the same cell — span 140.0 s (first commit of
-    # anything to last commit of anything) against split 120.0 s (first to last
-    # adoption of the winner). If a future edit collapses them into one, this
-    # case is what notices; reading span as split overstates the harm on every
-    # upgraded cell.
+    # The matched half of case 16: the same shape 120 s apart is under the
+    # bound, so PASS. Also pins span (140.0 s) and split (120.0 s) as different
+    # numbers. (notes: calib-case17-narrow-healed-split)
     cases += 1
     d = cell(tmp, "healed_split_narrow", commits={
         "atlas":  [(1789600010.0, 2, 9, 240, 60, 1),
@@ -628,12 +570,10 @@ try:
         bad("expected PASS with span 140.0s and split 120.0s, got: %r" % out)
 
     # --- 18. A RENAMED MANIFEST KEY MUST NOT READ AS "NOTHING TO CHECK" -----
-    # `rendezvous_schedule` absent used to take the same early `return 0` as
-    # `rendezvous_schedule=0`, i.e. an unscheduled arm — so renaming the key in
-    # the launcher would have turned this gate into a silent pass on every cell
-    # of a campaign, printing nothing, failing nothing. Absence is now UNRUN,
-    # which the teardown scores SUSPECT. This case is the only thing linking the
-    # launcher's spelling of the key to the gate that depends on it.
+    # An absent rendezvous_schedule key must be UNRUN, not the silent return of
+    # an unscheduled arm. This case is the only link between the launcher's
+    # spelling of the key and the gate.
+    # (notes: calib-case18-missing-schedule-key)
     cases += 1
     d = cell(tmp, "no_schedule_key", commits={
         "atlas":  (1789600010.0, 2, 9, 240, 60, 0),
@@ -650,18 +590,9 @@ try:
         bad("expected UNRUN on the missing manifest key, got: %r" % out)
 
     # --- 19. A PARTIAL PARSE FAILURE IS UNRUN, NOT A FAIL ON THE NODE -------
-    # The gate used to reach UNRUN only when NOTHING parsed. A partial break —
-    # this file current for some robots and stale for others, which is exactly
-    # what a wording change looks like while a campaign straddles two binaries —
-    # fell through to G1, where the unparsed robots were reported as never having
-    # committed and the cell FAILed as "SCHEDULED ARM WITH NO AGREEMENT". That is
-    # the gate's own blind spot charged to the node, in the INVALID direction, on
-    # a cell that may be perfectly healthy; three of them abort the campaign.
-    #
-    # THE POINT OF THE CASE IS THE WORD "FAIL" NOT APPEARING. A gate that
-    # misattributes its own breakage is worse than one that is merely broken,
-    # because the FAIL text names a defect in the node and sends the next hour
-    # to the wrong file.
+    # One robot's commit line in an unknown wording, the other parsable: must be
+    # UNRUN naming the unparsed robot, never a FAIL blaming the node.
+    # (notes: calib-case19-partial-parse)
     cases += 1
     d = cell(tmp, "partial_parse", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, 72, 0),
@@ -679,14 +610,9 @@ try:
         bad("expected UNRUN 'partial break' naming bestla, got: %r" % out)
 
     # --- 20. SAME CELL, DIFFERENT SCHEDULE INTEGERS: PASS WITH A NOTE -------
-    # The other half of the G2 relaxation, and the reason it is a relaxation
-    # rather than a deletion. Two robots holding cell 56 drive to the same place
-    # whatever `interval` and `t_meet` say — on gen 20-22 because nothing read
-    # those fields, and on gen 23 because the appointment barrier is unbounded,
-    # so the robot that picked the earlier occurrence waits at the cell for the
-    # others. Failing the cell would spend a healthy run. But a propose/echo path
-    # that had started dropping fields would look EXACTLY like this, so the
-    # disagreement has to stay visible. PASS, with the numbers on the line.
+    # Same cell, different interval: the robots still meet, so PASS, but a
+    # propose/echo path dropping fields would look the same, so the disagreement
+    # must be on the line. (notes: calib-case20-schedule-integers)
     cases += 1
     d = cell(tmp, "inert_disagreement", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, 72, 0),
@@ -701,13 +627,9 @@ try:
         bad("expected PASS with the schedule-integer NOTE, got: %r" % out)
 
     # --- 21. A BANKED GENERATION-20..22 CELL STILL PARSES -------------------
-    # The gate is re-run over banked campaigns, and the middle of the three
-    # printing formats — the one with no meeting time at all — is the one every
-    # cell between 2026-09-17 and generation 23 was written in. If the gen-23
-    # tail had been added by REPLACING the middle alternative rather than sitting
-    # beside it, every one of those cells would re-gate as UNRUN "the commit line
-    # changed shape" and a whole bank would stop being checkable. tmeet=None
-    # selects that tail in the fixture writer.
+    # Banked lines in the middle wording (no meeting time) must still parse and
+    # PASS; the newest wording extends that tail rather than replacing it. tmeet
+    # None selects it in the fixture. (notes: calib-case21-middle-wording-bank)
     cases += 1
     d = cell(tmp, "gen20_bank", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, None, 0),
@@ -720,11 +642,9 @@ try:
         bad("expected PASS on the generation-20..22 tail, got: %r" % out)
 
     # --- 22. GEN 23: SAME CELL, DIFFERENT MEETING TIME, COST REPORTED -------
-    # The failure the rendezvous arm is defined against is "N robots agreed on a
-    # place and went at N different times". On gen 23 that does not cost the
-    # meeting — the barrier is unbounded, so the early robot waits — but it does
-    # cost exploration time, and a reader who sees only PASS learns nothing. The
-    # spread has to be on the line, in seconds.
+    # Same cell, different meeting times: the early robot waits, so PASS, but
+    # the line must price the spread in seconds.
+    # (notes: calib-case22-meeting-time-spread)
     cases += 1
     d = cell(tmp, "gen23_time_split", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, 72, 0),
@@ -740,12 +660,9 @@ try:
             % out)
 
     # --- 23-28. G1b: THE ECHO TERMS, WHICH USED TO BE PARSED AND DROPPED ----
-    # LINE has captured `echoes E/P` since generation 20 and nothing compared
-    # them until 2026-09-18. On generation 23 the commit rule requires
-    # E == P == fleet-1 at EVERY commit, the node says so in a comment beside the
-    # log call, and the integers proving it are printed on the line. These six
-    # cases are the difference between that being an invariant and it being a
-    # decoration.
+    # The commit rule requires E == P == fleet-1 at every newest-wording commit,
+    # and the line prints the integers; cases 23-28 pin G1b's check of them.
+    # (notes: calib-g1b-echo-cases)
 
     # 23. E < P: the early return that guards the commit stopped guarding it.
     cases += 1
@@ -825,11 +742,9 @@ try:
     else:
         bad("expected PASS reporting 2 checked commit lines, got: %r" % out)
 
-    # 28. A gen-20..22 bank has no gen-23 lines, so the invariant is not
-    # exercised — and that is NOT the same PASS as case 27. E < P was legal on
-    # those binaries (a final triple could commit on first-hand evidence), so
-    # the check must sit out rather than fail them, and the PASS must say it sat
-    # out or a whole re-gated bank reads as verified when nothing was verified.
+    # 28. Middle-wording lines carry no meeting time, so G1b sits out (E < P was
+    # legal there) and the PASS must say the invariant was not exercised.
+    # (notes: calib-case28-echo-unexercised)
     cases += 1
     d = cell(tmp, "echo_pre23", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, None, 0, (0, 1)),
@@ -843,10 +758,9 @@ try:
         bad("expected PASS declaring the invariant unexercised, got: %r" % out)
 
     # --- 29. 0/0 ARMINGS IS SPELLED OUT, NOT PRINTED AS A RATIO -------------
-    # G3 passes vacuously when nothing armed, which is correct: armings only
-    # happen when the link drops. But "0/0 arming(s) carried the agreed cell"
-    # reads like a measurement, and the one thing a reader must not take from it
-    # is that the appointment machinery ran and was found sound.
+    # G3 passes vacuously when nothing armed (armings need a link drop); the
+    # PASS must say so in words, not print a 0/0 ratio that reads as evidence
+    # the machinery was exercised. (notes: calib-case29-zero-armings)
     cases += 1
     d = cell(tmp, "no_armings", robots=("atlas", "bestla"), commits={
         "atlas":  (1789600010.0, 2, 56, 28, 72, 0),

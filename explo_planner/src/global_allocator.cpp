@@ -1,3 +1,4 @@
+// Moved comments: doc/global_allocator_notes.md
 #include "explo_planner/global_allocator.hpp"
 
 #include <algorithm>
@@ -10,44 +11,19 @@ namespace explo_planner {
 
 namespace {
 
-/// Millimetres. The quantum has to be coarse enough that two robots'
-/// independently accumulated route costs land in the same bucket despite
-/// float rounding, and fine enough that genuinely different tours do not tie:
-/// cells are 10 m, so a millimetre is four orders of magnitude below anything
-/// the allocator is trying to distinguish.
+/// Millimetres per metre for integer route costs: coarse enough that two
+/// robots' float-accumulated costs round alike, fine enough that genuinely
+/// different tours do not tie. (notes: alloc-mm-quantum)
 constexpr double kMmPerM = 1000.0;
 
 inline uint32_t robotBit(int id) {
   return (id >= 0 && id < 32) ? (1u << id) : 0u;
 }
 
-/// FNV-1a 32-bit. A second local copy of the construction in cell_world.cpp,
-/// kept local for the reason stated there: the two hash different things, and
-/// a shared helper invites folding them into one value, which would stop a
-/// reader being told WHICH half disagrees.
-///
-/// The two copies do NOT have to stay byte-compatible with each other. Nothing
-/// compares an alloc_hash to a sharedHash; the only comparison is between two
-/// PROCESSES running the same binary, where both copies are identical by
-/// construction.
-///
-/// NOTHING PINS A LITERAL, and this said "test_global_allocator pins alloc_hash
-/// to a literal" until 2026-09-18. There is not one hash constant in that file
-/// or any other. What the AllocHash group actually pins is RELATIONAL — equal
-/// problems digest equal, an unformed problem digests 0, and each of six
-/// channels shared_hash is blind to moves the digest — and every one of those
-/// statements holds under ANY injective-enough hash. Swap FNV-1a for a
-/// different multiplier here and the whole suite still passes.
-///
-/// That gap is smaller than it sounds and is not worth a literal. The value is
-/// compared only within one binary, so a silent change costs nothing live; it
-/// costs only the offline join of alloc_hash columns ACROSS binary generations,
-/// which no analysis does (they join two robots of one campaign). And a literal
-/// would have to be re-baselined on every legitimate change to the digest input
-/// — plus it would ride on route costs that reach the digest through a double
-/// and an llround, so it would be pinning the optimiser's floating-point as
-/// well as the hash. Relational tests were the right call. Just do not read
-/// this paragraph as saying the construction itself is guarded.
+/// FNV-1a 32-bit, a local copy of cell_world.cpp's; do not share a helper, the
+/// two hash different things. Only compared within one binary. Tests pin
+/// relations, not a literal, so the construction is unguarded.
+/// (notes: alloc-fnv1a-local-copy)
 struct Fnv1a {
   uint32_t h = 2166136261u;
   void byte(uint8_t b) { h ^= b; h *= 16777619u; }
@@ -128,12 +104,9 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   }
 
   // --- candidate set ------------------------------------------------------
-  // Scanned BEFORE the vehicle filter, not because the solve needs it here but
-  // because the R3 digest below has to cover the whole problem and has to be
-  // written on every return path that formed one. The refusal ORDER is
-  // unchanged: the `cand.empty()` and max_candidates returns stay where they
-  // always were, after the vehicle refusal, so which reason a caller sees is
-  // exactly what it was.
+  // Scanned before the vehicle filter so the problem digest covers every return
+  // path. Refusal order is unchanged: the empty and max_candidates returns stay
+  // after the vehicle refusal. (notes: alloc-candidate-scan-first)
   std::vector<int> cand;
   for (int id = 0; id < world.size(); ++id) {
     const CellStatus s = world.status(id);
@@ -142,68 +115,10 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   }
 
   // --- R3 / §3.6: digest of the PROBLEM ------------------------------------
-  // Assembled here, once, from the same values the solve is about to use, and
-  // written before any refusal — a refused solve still had a problem, and
-  // "these two robots refused for different reasons" is only interpretable if
-  // you can first establish they were refusing the same thing.
-  //
-  // Ordering is imposed explicitly at every level, because the input vector's
-  // order is the caller's and must not reach a value two processes compare:
-  // vehicles by id, candidates ascending (the scan above already produces
-  // them that way, and it is asserted rather than assumed by construction
-  // since `world.size()` walks ids in order).
-  //
-  // The vehicle list hashed here is `robots_in` ENTIRE — including robots the
-  // filter below is about to drop as finished or unlocatable. That is
-  // deliberate: "my peer is finished" versus "my peer is still working" is a
-  // disagreement about the problem, and it is one of the two channels §3.6
-  // says nothing could see. Folding in only the survivors would hide exactly
-  // the case that matters.
-  //
-  // TWO OF Config's THREE FIELDS ARE PART OF THE PROBLEM (2026-09-18). All
-  // three were excluded before, deliberately and with a test asserting it
-  // (AllocHash.SolverConfigIsNotPartOfTheProblem), on the grounds that config
-  // is a property of the SOLVER and a mismatch is a deployment fault the run
-  // params already record. That reasoning is exactly right for one field and
-  // wrong for the other two, so the split is now drawn where the distinction
-  // actually falls rather than around the whole struct:
-  //
-  //   comms_mask     IN. It restricts which cells a disconnected robot may be
-  //                  assigned AT ALL, so it changes the feasible set — that is
-  //                  the problem, not an approach to it. And this is not a
-  //                  hypothetical misconfiguration: the flag exists so that the
-  //                  gap between a masked and an unmasked solve can be measured
-  //                  (see Config::comms_mask — "the cost gap ... IS the
-  //                  reconnection value P4 gates on"). Those two solves differ
-  //                  in NOTHING ELSE, so with comms_mask excluded the one
-  //                  comparison the flag was added to support is precisely the
-  //                  one where the digest declares both sides identical.
-  //
-  //   max_candidates IN. It decides refused versus solved. A refused solve
-  //                  carries its digest on purpose, so that "these two robots
-  //                  refused for different reasons" is interpretable — but with
-  //                  the threshold excluded, a robot that refused and a robot
-  //                  that solved the same candidate set under a laxer cap agree
-  //                  on the key, and the digest reports them as having faced
-  //                  the same thing when the cap is the entire difference.
-  //
-  //   polish_passes  OUT, and the old rationale survives intact here. 2-opt
-  //                  passes change the tours and nothing else: same vehicles,
-  //                  same candidates, same feasible set, same refusal. Two
-  //                  robots differing only in polish_passes ARE solving the
-  //                  same problem and getting different answers to it, which is
-  //                  the one thing the digest is supposed to be able to say.
-  //                  Folding it in would convert that finding into a silent
-  //                  "different problem" and lose it.
-  //
-  // Latent today either way: one launch supplies every robot in a cell, so all
-  // three are equal across the fleet by construction. That is a property of the
-  // CALLER, and it is not what the digest claims to depend on.
-  //
-  // Folded in LAST, after the world's edge hash, so the contribution order of
-  // everything already being logged is untouched. Values are not comparable
-  // across this change, which is the standing rule anyway: never join across
-  // generations.
+  // Problem digest (alloc_hash), written before any refusal. All of robots_in
+  // hashed by id (dropped ones too), candidates ascending; comms_mask and
+  // max_candidates folded in last, polish_passes deliberately not.
+  // (notes: alloc-problem-digest)
   {
     Fnv1a f;
     std::vector<const AllocRobot*> by_id;
@@ -219,11 +134,9 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
       f.i64(r->cell);
       f.byte(r->in_comms ? 1u : 0u);
       f.byte(r->finished ? 1u : 0u);
-      // IN, and not optional: it decides which vehicles the solve is given, so
-      // two robots disagreeing about a peer's mode are solving different
-      // problems and the digest has to say so. Leaving it out would let them
-      // agree on the key while allocating over different vehicle sets, which
-      // is the exact failure the split above exists to make visible.
+      // off_frontier must be hashed: it decides which vehicles the solve gets,
+      // so robots disagreeing about a peer's mode are solving different
+      // problems. (notes: alloc-digest-off-frontier)
       f.byte(r->off_frontier ? 1u : 0u);
     }
     f.i64(static_cast<int64_t>(cand.size()));
@@ -239,24 +152,17 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   }
 
   // --- vehicle set --------------------------------------------------------
-  // Sorted by id so the caller's vector order cannot reach the result, and
-  // carrying the caller's index so the output stays index-aligned with the
-  // input the caller passed. A robot that has left the frontier is removed
-  // outright and its cells return to the pool (§3.4) -- leaving it in with an
-  // empty tour would let the makespan balance keep reserving work for a robot
-  // that has stopped. `off_frontier` is the superset test and `finished`
-  // implies it, so the pair below is one condition written as two for the
-  // reader; see AllocRobot for why they are separate fields.
+  // Sorted by id, carrying the caller's index so the output stays index-aligned
+  // with the input. Robots off the frontier are dropped and their cells return
+  // to the pool; finished implies off_frontier. (notes: alloc-vehicle-set)
   struct Veh { int idx; int id; int cell; bool in_comms; };
   std::vector<Veh> veh;
   for (size_t i = 0; i < robots_in.size(); ++i) {
     const AllocRobot& r = robots_in[i];
     if (r.finished || r.off_frontier) continue;
-    // An unlocatable robot is dropped rather than defaulted to some cell: every
-    // cost involving it would be fiction, and a fiction that changes the
-    // makespan changes the OTHER robot's tour too. Dropped, it simply gets no
-    // focus cell and falls back to unrestricted planning, which is the
-    // documented degradation.
+    // An unlocatable robot is dropped, not defaulted to a cell: its costs would
+    // be fiction that changes the other robots' tours. It gets no focus cell
+    // and falls back to unrestricted planning. (notes: alloc-drop-unlocatable)
     if (!world.grid().valid(r.cell)) continue;
     if (r.id < 0 || r.id >= 32) continue;   // outside the known_by mask width
     veh.push_back({static_cast<int>(i), r.id, r.cell, r.in_comms});
@@ -293,12 +199,10 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   }
 
   // --- greedy makespan-balanced insertion ---------------------------------
-  // Each round: over every (unassigned cell, vehicle, insertion position),
-  // find the one whose insertion leaves the SMALLEST resulting makespan, and
-  // commit it. Ties break on (cell id, robot id, position) -- a total order
-  // over values both robots agree on -- and the scan visits them in exactly
-  // that order under a strict <, so the first minimum found is the tie-break
-  // winner without a separate comparison.
+  // Each round commits the (cell, vehicle, position) insertion with the
+  // smallest resulting makespan. Scanning in (cell id, robot id, position)
+  // order with a strict < makes the first minimum the tie-break winner.
+  // (notes: alloc-greedy-insertion)
   std::vector<uint8_t> taken(nc, 0);
   std::vector<std::vector<int>> tour(nv);
   std::vector<long long> cost(nv, 0);
