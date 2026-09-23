@@ -1840,6 +1840,12 @@ FINE_REGIONS="${FINE_REGIONS:-}"
 # appended last so they override the script's own -p values.
 PLANNER_EXTRA_ARR=()
 for _pe in ${PLANNER_EXTRA:-}; do PLANNER_EXTRA_ARR+=( -p "$_pe" ); done
+# POSE_NOISE=1: sim_tf_publisher.py publishes a drifting + jittering pose
+# estimate (TF odom->base_link and /<r>/odom_noisy) instead of ground truth,
+# and the nav stack is pointed at /<r>/odom_noisy, so mapping, the planner and
+# navigation all run on the same estimate. Knobs are read from the environment
+# by sim_tf_publisher.py (POSE_DRIFT_XY/_YAW, POSE_JITTER_XY/_YAW/_TAU, SEED).
+POSE_NOISE="${POSE_NOISE:-0}"
 FINE_LAUNCH_ARGS=()
 if [ "$FINE_BAND" = "1" ]; then
   [ -n "$FINE_REGIONS" ] || { echo "FATAL: FINE_BAND=1 needs FINE_REGIONS" >&2; exit 2; }
@@ -2437,7 +2443,8 @@ for r in $ROBOTS; do
       voxel_resolution_m:=$VOXEL_RES \
       global_planning_map_size_m:=$PLAN_MAP_SIZE \
       global_planning_map_resolution:=$PLAN_MAP_RES \
-      ${FINE_LAUNCH_ARGS[@]+"${FINE_LAUNCH_ARGS[@]}"}
+      ${FINE_LAUNCH_ARGS[@]+"${FINE_LAUNCH_ARGS[@]}"} \
+      $( [ "$POSE_NOISE" = "1" ] && echo odom_topic:=/$r/odom_noisy )
 done
 if [ "$FINE_BAND" = "1" ]; then
   _freg=()
@@ -2570,6 +2577,9 @@ if [ "$RECORD" != "0" ]; then
     # The node publishes this only while something subscribes; the recorder is
     # that subscriber. Full zero-crossing shell at 1 Hz per robot.
     for r in $ROBOTS; do BAG_TOPICS+=( /$r/scovox_node/fine_tsdf_pointcloud ); done
+  fi
+  if [ "$POSE_NOISE" = "1" ]; then
+    for r in $ROBOTS; do BAG_TOPICS+=( /$r/odom_noisy ); done
   fi
   if [ "$RECORD" = "1" ]; then
     BAG_TOPICS+=( /tf )
@@ -3139,6 +3149,8 @@ PYGEOM
     echo "world_nonstatic_models=missing"
   fi
   echo "planner_extra=${PLANNER_EXTRA:-}"
+  echo "pose_noise=$POSE_NOISE drift_xy=${POSE_DRIFT_XY:-0.01} drift_yaw_deg=${POSE_DRIFT_YAW:-0.01} jitter_xy=${POSE_JITTER_XY:-0.01} jitter_yaw_deg=${POSE_JITTER_YAW:-0.1} jitter_tau=${POSE_JITTER_TAU:-0.5} seed=${POSE_NOISE_SEED:-1}"
+  echo "lidar_noise_stddev=$(grep -A3 '<noise>' /ws/src/hmr_sim/hmr_sim/models/COSTAR_HUSKY_SENSOR_CONFIG_LIDAR/model.sdf | sed -n 's/.*<stddev>\(.*\)<\/stddev>.*/\1/p' | head -1)"
   echo "fine_band=$FINE_BAND"
   echo "fine_ratio_log2=$FINE_K"
   echo "fine_region_z_lo=$FINE_Z_LO"
