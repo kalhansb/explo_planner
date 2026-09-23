@@ -17,6 +17,8 @@
 #                     [--tx 30.0] [--record 0] [--tag phase3]
 #   ./run_campaign.sh --root DIR --duration 3000 --scenario ... \
 #                     --arms "off,hybrid" --seeds "1,2,3"   # cross product
+#   The arms are the planner's four ARM names (off, pursuit, rendezvous,
+#   hybrid), no suffixes, and --mission-return must stay 1 (DESIGN_gen34.md).
 # Moved comments: docs/sim_notes/run_campaign_notes.md
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,17 +100,6 @@ case "$DURATION" in
     echo "FATAL: --duration must be whole seconds (got '$DURATION')" >&2
     exit 2;;
 esac
-# EXTRA_ENV is expanded AFTER the per-cell assignments below, so a DONE_SEEK in
-# it would win over the arm-name suffix and flip every cell to the same side
-# while the OUTDIR names still claimed an A/B. That failure is invisible in the
-# campaign index and only recoverable from the manifests, so refuse it here.
-case " $EXTRA_ENV " in
-  *" DONE_SEEK="*|*"DONE_SEEK="*)
-    echo "FATAL: set the post-latch coast with the arm suffix (e.g. hybrid_seek)," >&2
-    echo "       not with --env DONE_SEEK=... -- --env applies to EVERY cell and" >&2
-    echo "       would silently collapse the A/B into one arm." >&2
-    exit 2;;
-esac
 # Same shape of failure, different mechanism: MISSION_RETURN in --env would
 # win over the explicit flag below, so the campaign index and the operator's
 # intent could disagree while every OUTDIR name looked right.
@@ -161,7 +152,7 @@ fi
 # (notes: guard-blocked-env-knobs)
 for _blocked in RECONNECT_MODE SEED GLOBAL_ALLOC RECONNECT_GATE \
                 RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR COORD_CLAIM_R \
-                ALLOC_POS_TTL; do
+                ALLOC_POS_TTL ARM; do
   if env_has "$_blocked"; then
     echo "FATAL: $_blocked is set per cell (see the env line at the bottom of" >&2
     echo "       this script) and --env is expanded after it, so --env" >&2
@@ -177,6 +168,21 @@ case "$MISSION_RETURN_FLAG" in
   0|1) ;;
   *) echo "FATAL: --mission-return must be 0 or 1 (got '$MISSION_RETURN_FLAG')" >&2; exit 2;;
 esac
+if [ "$MISSION_RETURN_FLAG" != "1" ]; then
+  echo "FATAL: the planner always homes; --mission-return 0 would be" >&2
+  echo "       recorded and never run." >&2
+  exit 2
+fi
+# Gen-33 knobs the planner never reads; the runner refuses them too, but a
+# cell that dies at launch costs a bring-up each.
+for _g33 in LINK_GATE MIDRUN_SILENCE DONE_SEEK EXPLOIT; do
+  if env_has "$_g33"; then
+    echo "FATAL: --env $_g33=...: the planner has no such knob (it was gen" >&2
+    echo "       33's), and the runner refuses it." >&2
+    exit 2
+  fi
+done
+unset _g33
 
 # Build the cell list. --cells wins; otherwise cross --arms with --seeds.
 if [ -z "$CELLS" ]; then
@@ -196,86 +202,25 @@ if [ -z "$CELLS" ]; then
   done
 fi
 
-# Refuses a treated arm running the mid-run trigger with no live link veto
-# unless MIDRUN_SILENCE reaches MIDRUN_SILENCE_FLOOR, above the ~180 s
-# heartbeat-suppression tail. Must run after the cell list is built.
-# (notes: guard-midrun-silence-no-veto)
-MIDRUN_SILENCE_FLOOR=200
-_link_gate_req="$(env_val LINK_GATE)"
-# The launcher's LINK_GATE default (1), duplicated because the guard decides
-# before launch; campaign_guard_calib.sh reads both literals and fails if they
-# disagree. (notes: guard-link-gate-default-mirror)
-env_has LINK_GATE || _link_gate_req=1
-# Mirrors run_explo_sim_rviz.sh: the veto is live only when the request is
-# exactly "1" AND the emulator is up. Every other value -- "0", "false", "2",
-# empty -- is off there, so it must be off here.
-_veto_live=0
-[ "$_link_gate_req" = "1" ] && [ "$COMMS_ON" = "1" ] && _veto_live=1
-# Only treated arms can chase a peer; every arm but off counts as treated, so a
-# new arm is guarded by default. The mtare_ prefix and the _seek, _ttl, _r
-# suffixes are stripped first: none changes reconnect_enabled.
-# (notes: guard-treated-arm-classification)
-_treated=0
+# The arms are the four ARM names, whole: gen 33's suffixes (_seek, _ttl, _r)
+# and mtare_ tokens mean nothing to the planner.
 for _a in $(printf '%s' "$CELLS" | tr ',' ' '); do
-  _a="${_a%%:*}"
-  _a="${_a%_seek}"
-  # Strip _ttl<N> after _seek and before _r<N>: suffixes come off in reverse of
-  # the append order <mode>_r<N>_ttl<N>_seek. (notes: guard-ttl-strip-order)
-  case "$_a" in
-    *_ttl[0-9]|*_ttl[0-9][0-9]|*_ttl[0-9][0-9][0-9]|*_ttl[0-9][0-9][0-9][0-9])
-      _a="${_a%_ttl*}";;
+  case "${_a%%:*}" in
+    off|pursuit|rendezvous|hybrid) ;;
+    *) echo "FATAL: arm '${_a%%:*}' is not an arm" >&2
+       echo "       (off|pursuit|rendezvous|hybrid, no suffixes)." >&2
+       exit 2;;
   esac
-  # The _r<N> claim-radius suffix is a runtime switch, not an arm. It takes 1-3
-  # digits, which must match the per-cell strip below and gate_g8.py's
-  # DESIGN_SUFFIXES. (notes: guard-claim-radius-three-digits)
-  case "$_a" in *_r[0-9]|*_r[0-9][0-9]|*_r[0-9][0-9][0-9]) _a="${_a%_r*}";; esac
-  _a="${_a#mtare_}"
-  [ "$_a" = "off" ] || _treated=1
 done
-_sil="$(env_val MIDRUN_SILENCE)"
-_sil_ok=0
-if env_has MIDRUN_SILENCE; then
-  case "$_sil" in
-    ''|*[!0-9.]*|*.*.*)
-      echo "FATAL: --env MIDRUN_SILENCE='$_sil' is not a number" >&2; exit 2;;
-  esac
-  # Integer compare on the whole-second part; the clock is never set in
-  # fractions and awk is not guaranteed to be on the path this early.
-  [ "${_sil%%.*}" -ge "$MIDRUN_SILENCE_FLOOR" ] 2>/dev/null && _sil_ok=1
-  # 0 DISABLES THE MID-RUN TRIGGER ENTIRELY -- it is the documented switch for
-  # reproducing pre-2026-08-17 behaviour bit-for-bit, and the node's own trigger
-  # requires reconnect_midrun_silence_sec_ > 0.0. Refusing it made the guard
-  # block the one configuration in which the hazard it names cannot occur.
-  case "${_sil%%.*}" in 0) _sil_ok=1;; esac
-fi
-if [ "$_treated" = "1" ] && [ "$_veto_live" = "0" ] && [ "$_sil_ok" = "0" ]; then
-  echo "FATAL: this campaign would run the mid-run trigger with NO link veto" >&2
-  echo "       (LINK_GATE=$_link_gate_req, --comms $COMMS_ON) while" >&2
-  echo "       reconnect_midrun_silence_sec is at ${_sil:-the generation-9 default of 90}s," >&2
-  echo "       below the ~180 s heartbeat-suppression tail. Without the veto the" >&2
-  echo "       trigger cannot tell a silent teammate from an absent one and the" >&2
-  echo "       treated arm will chase peers that are in range and fine." >&2
-  if [ "$COMMS_ON" = "0" ]; then
-    echo "       Under --comms 0 do NOT just raise MIDRUN_SILENCE: that makes the" >&2
-    echo "       ideal-comms control differ from the treated arm in two variables" >&2
-    echo "       at once. Either run --comms 0 with --arms off (the control needs" >&2
-    echo "       no reconnect trigger), or run the whole matrix at --comms 1." >&2
-  else
-    echo "       Add --env MIDRUN_SILENCE=$MIDRUN_SILENCE_FLOOR or more to" >&2
-    echo "       reproduce a record-age campaign, or drop LINK_GATE=0 to keep" >&2
-    echo "       the veto." >&2
-  fi
-  exit 2
-fi
-# Kept past the guard because the resume guard compares them. MIDRUN_SILENCE_REQ
-# and TEAM_WORLD_HZ_REQ mirror the runner's defaults (90, 1.0) and are compared
-# numerically since the launcher flt()s both.
+unset _a
+# What the resume guard expects of the gen-33 lines the runner still writes:
+# it pins LINK_GATE=0 and leaves MIDRUN_SILENCE at its default (90), and
+# TEAM_WORLD_HZ is compared numerically since the launcher flt()s it.
 # (notes: resume-req-values-outlive-guard)
-LINK_GATE_REQ="$_link_gate_req"
-LINK_GATE_EFFECTIVE_REQ="$_veto_live"
-MIDRUN_SILENCE_REQ="$(env_val MIDRUN_SILENCE 90)"
+LINK_GATE_REQ=0
+LINK_GATE_EFFECTIVE_REQ=0
+MIDRUN_SILENCE_REQ=90
 TEAM_WORLD_HZ_REQ="$(env_val TEAM_WORLD_HZ 1.0)"
-unset _link_gate_req _veto_live _treated _sil _sil_ok _a
 
 # Guards read only EXTRA_ENV and the launch line strips these names, so warn
 # when one is exported: only --env reaches the cells. MAP_AGREE_MAX_PCT is read
@@ -377,83 +322,13 @@ for cell in "${CELL_LIST[@]}"; do
   name="${TAG}_${arm}_seed${seed}"
   out="$ROOT/$name"
 
-  # Arm suffix _seek: same RECONNECT_MODE with the post-latch coast on. Encoded
-  # in the arm token so treated and control run interleaved in one invocation,
-  # in separately named OUTDIRs. (notes: arm-suffix-seek)
-  cell_mode="$arm"; cell_seek="0"
-  case "$arm" in
-    *_seek) cell_mode="${arm%_seek}"; cell_seek="1";;
-  esac
-
-  # Arm suffix _ttl<N>: allocator peer-position TTL forced to N s (1-4 digits).
-  # Strip after _seek and before _r<N>. 0 is legal (unbounded, the control
-  # level) and is passed explicitly like any level. (notes: arm-suffix-ttl)
-  cell_pos_ttl=""
-  case "$cell_mode" in
-    *_ttl[0-9]|*_ttl[0-9][0-9]|*_ttl[0-9][0-9][0-9]|*_ttl[0-9][0-9][0-9][0-9])
-      cell_pos_ttl="${cell_mode##*_ttl}.0"; cell_mode="${cell_mode%_ttl*}";;
-  esac
-
-  # Arm suffix _r<N>: MinPos claim radius forced to N m, stripped so the runner
-  # gets a clean token. Empty passes nothing (node keeps the yaml value). 1-3
-  # digits, matching the guard strip above and gate_g8.py.
-  # (notes: arm-suffix-claim-radius)
-  cell_claim_r=""
-  case "$cell_mode" in
-    *_r[0-9]|*_r[0-9][0-9]|*_r[0-9][0-9][0-9])
-      cell_claim_r="${cell_mode##*_r}.0"; cell_mode="${cell_mode%_r*}";;
-  esac
-
-  # What this cell's manifest will record for done_seek_enabled. The runner
-  # writes a ROS bool (true/false) and the resume guard compares text, so
-  # translate the 0/1 here. (notes: resume-done-seek-bool)
-  if [ "$cell_seek" = "1" ]; then cell_seek_arg="true"; else cell_seek_arg="false"; fi
-
-  # What this cell's manifest will record for the six M-TARE knobs; each mtare_*
-  # token sets its full stack, kept in step with run_explo_sim_rviz.sh by hand.
-  # A mismatch aborts a correct resume, the safe direction.
-  # (notes: resume-mtare-knob-expectations)
-  CELL_WORLD_REQ=$(env_val CELL_WORLD 0)
-  TEAM_WORLD_REQ=$(env_val TEAM_WORLD 0)
-  GLOBAL_ALLOC_REQ=$(env_val GLOBAL_ALLOC 0)
-  RECONNECT_GATE_REQ=$(env_val RECONNECT_GATE silence)
-  RENDEZVOUS_SCHEDULE_REQ=$(env_val RENDEZVOUS_SCHEDULE 0)
-  PURSUIT_PREDICTOR_REQ=$(env_val PURSUIT_PREDICTOR trail)
-  case "$cell_mode" in
-    mtare_off)
-      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=silence; RENDEZVOUS_SCHEDULE_REQ=0
-      PURSUIT_PREDICTOR_REQ=trail ;;
-    mtare_pursuit)
-      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0
-      PURSUIT_PREDICTOR_REQ=trail ;;
-    mtare_rendezvous|mtare_hybrid)
-      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1
-      PURSUIT_PREDICTOR_REQ=trail ;;
-    # The P6 pair: the same stacks as mtare_pursuit / mtare_hybrid with the
-    # predictor swapped. Listed separately rather than folded into those two
-    # branches so the one field that differs is visible at the point of use.
-    mtare_pursuit_mdp)
-      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=0
-      PURSUIT_PREDICTOR_REQ=mdp ;;
-    mtare_hybrid_mdp)
-      CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
-      GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=info;    RENDEZVOUS_SCHEDULE_REQ=1
-      PURSUIT_PREDICTOR_REQ=mdp ;;
-    # Refuse an unrecognised arm stack rather than record an untreated cell's
-    # expectations under a treated arm's name.
-    # (notes: resume-no-silent-arm-default)
-    *)
-      echo "FATAL: unrecognised arm stack '$cell_mode' (from arm '$arm')." >&2
-      echo "       Refusing rather than recording an untreated cell's" >&2
-      echo "       expectations under a treated arm's name. Add a case above" >&2
-      echo "       if this is a real stack; check the _r/_ttl/_seek suffix" >&2
-      echo "       strips if it is a token they failed to remove." >&2
-      exit 2;;
-  esac
+  # Every arm runs mtare_off's stack (the runner pins it), so the resume
+  # expectations below are mtare_off's; the arm itself is checked through the
+  # manifest's arm= line. The gen-33 knobs keep their manifest lines at these
+  # values. (notes: resume-mtare-knob-expectations)
+  CELL_WORLD_REQ=1; TEAM_WORLD_REQ=1
+  GLOBAL_ALLOC_REQ=1; RECONNECT_GATE_REQ=silence; RENDEZVOUS_SCHEDULE_REQ=0
+  PURSUIT_PREDICTOR_REQ=trail
 
   # "Complete" means reached an end reason AND passed its run-time gates. A run
   # that dropped relay traffic reaches all_done exactly like a good one, so
@@ -467,6 +342,17 @@ for cell in "${CELL_LIST[@]}"; do
     # Every key here changes what the endpoints mean; any mismatch aborts the
     # resume. An absent key counts as a mismatch, since an older manifest cannot
     # be shown to agree. (notes: resume-string-key-guard)
+    # node and arm: the cell must be a gen-34 cell of this arm. A gen-33 cell
+    # predates the key or says gen33. (notes: resume-string-key-guard)
+    have_node=$(sed -n "s/^node=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+    have_arm=$(sed -n "s/^arm=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+    if [ "$have_node" != "gen34" ] || [ "$have_arm" != "$arm" ]; then
+      log "ABORT: $name is complete but its manifest says node=${have_node:-<absent>}"
+      log "       arm=${have_arm:-<absent>}, while this campaign runs"
+      log "       node=gen34 arm=$arm. Same name, different"
+      log "       experiment — refusing to skip OR overwrite. Use a fresh --root/--tag."
+      exit 2
+    fi
     for kv in \
       "mission_return_enabled=$want_mr" \
       "scenario=$SCENARIO" \
@@ -480,7 +366,7 @@ for cell in "${CELL_LIST[@]}"; do
       "pursuit_predictor=$PURSUIT_PREDICTOR_REQ" \
       "link_gate=$LINK_GATE_REQ" \
       "link_gate_effective=$LINK_GATE_EFFECTIVE_REQ" \
-      "done_seek_enabled=$cell_seek_arg"
+      "done_seek_enabled=false"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
@@ -501,8 +387,8 @@ for cell in "${CELL_LIST[@]}"; do
       "tree_attenuation_db=$TREE_ATTEN_REQ" \
       "max_range_m=$MAX_RANGE_REQ" \
       "cell_size_m=$CELL_SIZE_REQ" \
-      "coord_claim_radius_override=${cell_claim_r:-none}" \
-      "alloc_peer_pos_max_age_sec=${cell_pos_ttl:-none}" \
+      "coord_claim_radius_override=none" \
+      "alloc_peer_pos_max_age_sec=none" \
       "separation_weight=$SEPARATION_WEIGHT_REQ" \
       "separation_radius_m=$SEPARATION_RADIUS_REQ" \
       "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ" \
@@ -603,7 +489,7 @@ for cell in "${CELL_LIST[@]}"; do
     break
   fi
 
-  log "START $name (reconnect_mode=$cell_mode done_seek=$cell_seek claim_r=${cell_claim_r:-yaml} pos_ttl=${cell_pos_ttl:-yaml} mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
+  log "START $name (arm=$arm mission_return=$MISSION_RETURN_FLAG free=${free_mb}MB)"
   t0=$(date +%s)
   # An ideal-comms cell has no link to drop, so demanding an outage would fail
   # every gate; force expect_outage off rather than trusting the caller.
@@ -625,9 +511,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \
       OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
-      RECONNECT_MODE="$cell_mode" DONE_SEEK="$cell_seek" \
-      COORD_CLAIM_R="$cell_claim_r" \
-      ALLOC_POS_TTL="$cell_pos_ttl" \
+      ARM="$arm" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \
       DURATION_S="$DURATION" STOP_ON_DONE=1 GATES_STRICT=1 \

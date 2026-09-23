@@ -113,11 +113,14 @@
 
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <string>
 #include <utility>  // std::pair, used by params_
 #include <vector>
 
 #include <rclcpp/logger.hpp>
+
+#include "explo_planner/log_fields.hpp"
 
 namespace explo_planner {
 
@@ -328,6 +331,11 @@ struct RunEndEvent {
   /// terminal-only reconnection. Can exceed the cap by one.
   /// (notes: explog-midrun-attempts-used)
   int    midrun_attempts_used = 0;
+
+  /// Gen 34 (schema 13): every mechanism's firing count, zeros included
+  /// (TeamCore::counts() plus the node's own), written as the
+  /// `mechanism_counts` object. Gen 33 leaves it empty and writes nothing.
+  std::map<std::string, long long> mechanism_counts;
 };
 
 /// cell_census payload: the cell world's status histogram plus the planner's
@@ -800,6 +808,30 @@ struct AppointmentLegEvent {
   double rolled_to_sec = -1.0;
 };
 
+/// Gen 34's periodic `tick` event (K20, schema 13), every
+/// tick_event_period_sec: what the robot is doing and how long it may go on.
+struct TickEvent {
+  double x = 0.0, y = 0.0;
+  std::string activity;          ///< explore, meet, chase, follow, wait, home, done
+  std::string drive;             ///< explore, hold, leg
+  std::string purpose;           ///< the Leg's purpose; "" when not a Leg
+  std::string leg_status;        ///< idle, driving, escaping, arrived
+  /// The nearest peer by its last directly heard position; -1 when none has
+  /// been heard. Its distance and the age of that position are written null
+  /// then.
+  int nearest_peer = -1;
+  double nearest_peer_m = -1.0;
+  double nearest_peer_age_sec = -1.0;
+  /// The current bounded wait, absolute sim seconds; -1 (written null) when
+  /// the activity has no bound.
+  double wait_start_sec = -1.0;
+  double wait_bound_sec = -1.0;
+  bool all_connected = false;
+  uint32_t contact_mask = 0;     ///< bit j: in contact with robot j
+  int booking_slot = -1;         ///< the held booking's slot; -1 none
+  bool proximity_hold = false;   ///< the proximity guard is holding the robot
+};
+
 // ==================================================================
 // ExperimentLog
 // ==================================================================
@@ -812,6 +844,11 @@ class ExperimentLog {
   /// alone do not. A behaviour change may bump it so readers can refuse to
   /// pool. (notes: explog-schema-version-history)
   static constexpr int kSchemaVersion = 12;
+  /// The schema the gen-34 node stamps (setSchemaVersion). It adds the team
+  /// kinds at the end of kEventKinds and drops gen 33's reconnect kinds; gen
+  /// 33 keeps kSchemaVersion. Named apart so the scripts that read
+  /// `kSchemaVersion = N` from this header keep reading gen 33's.
+  static constexpr int kGen34SchemaVersion = 13;
 
   /// Every event value this writer can emit, and the only authority on that
   /// set: the equivalence gate relies on it to tell whether a new kind
@@ -828,6 +865,9 @@ class ExperimentLog {
       // --- v4, all default-off ---
       "cell_census", "allocation", "rendezvous_agreed", "rendezvous_outcome",
       "reconnect_gate", "team_exchange", "appointment_leg",
+      // --- gen 34 (schema 13), the gen-34 node only ---
+      "team_activity", "plan", "booking", "exchange", "chase", "homing",
+      "team_finished", "tick",
   };
   static constexpr size_t kEventKindCount =
       sizeof(kEventKinds) / sizeof(kEventKinds[0]);
@@ -881,6 +921,11 @@ class ExperimentLog {
   // bool member silently selects the bool overload, which is exactly the
   // class of bug this file exists to prevent.
   // ----------------------------------------------------------------
+  /// The schema run_start stamps: kSchemaVersion unless set before
+  /// startRun(). Only the gen-34 node sets it (kGen34SchemaVersion).
+  void setSchemaVersion(int v) { schema_version_ = v; }
+  int schemaVersion() const { return schema_version_; }
+
   void addParamNum(const std::string& name, double value);
   void addParamBool(const std::string& name, bool value);
   void addParamStr(const std::string& name, const std::string& value);
@@ -1038,6 +1083,22 @@ class ExperimentLog {
   void logAppointmentLeg(const ExperimentContext& ctx,
                          const AppointmentLegEvent& e);
 
+  // ----------------------------------------------------------------
+  // Gen 34 (schema 13)
+  // ----------------------------------------------------------------
+
+  /// One TeamCore event (team_core.hpp TeamEvent): `kind` is the event value
+  /// and the fields follow the envelope in order. The kinds are
+  /// team_activity, plan, booking, exchange, chase, homing and team_finished.
+  /// Any other is not written; it is counted and reported in run_end as
+  /// team_events_unknown, so a kind added to TeamCore without a writer shows.
+  void logTeamEvent(const ExperimentContext& ctx, const std::string& kind,
+                    const LogFields& fields);
+  long long teamEventsUnknown() const { return team_events_unknown_; }
+
+  /// The periodic `tick` (K20).
+  void logTick(const ExperimentContext& ctx, const TickEvent& e);
+
   /// Number of ladder rungs already reached. Diagnostic / run_end field.
   int milestonesReached() const;
 
@@ -1056,6 +1117,8 @@ class ExperimentLog {
   /// Common tail for the reconnect/peer/step payloads that all carry the team
   /// counts, so the two field names cannot drift apart between event types.
   void teamCounts(int peers_live, int expected_peers);
+  /// A TeamCore field list, in order.
+  void fields(const LogFields& fs);
 
   std::ofstream file_;
   std::string   path_;
@@ -1094,6 +1157,8 @@ class ExperimentLog {
   long long seq_ = 0;                      ///< monotonic event index, from 0
   long long write_failures_ = 0;
   long long dropped_before_start_ = 0;
+  long long team_events_unknown_ = 0;
+  int schema_version_ = kSchemaVersion;
 
   /// Absolute sim seconds of the last and first exploration_complete. The last
   /// is THE completion time: a robot can resume on a merged map and exhaust

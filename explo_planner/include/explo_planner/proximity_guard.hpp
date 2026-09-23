@@ -108,6 +108,13 @@ public:
   /// can actually leave the trigger disc instead of re-holding next tick.
   void armEscape(const std::string& peer_id, const rclcpp::Time& now);
 
+  /// Peers that cannot force a hold until the next call (gen 34, Q65: both
+  /// robots are in Meet, driving to their own ring spots). Replaces the whole
+  /// set each call. Empty by default, so callers that never set it (gen 33)
+  /// are unaffected. An exempt peer still names itself in a no-hold decision,
+  /// with note "exempt".
+  void setExempt(std::vector<std::string> peer_ids) { exempt_ = std::move(peer_ids); }
+
   bool enabled() const { return cfg_.enabled; }
   const Config& config() const { return cfg_; }
   size_t trackedPeerCount() const { return peers_.size(); }
@@ -130,6 +137,7 @@ private:
   Config cfg_;
   std::string self_id_;
   std::vector<PeerTrack> peers_;  ///< Latest-per-peer; team sizes are small.
+  std::vector<std::string> exempt_;  ///< setExempt
 };
 
 }  // namespace explo_planner

@@ -75,6 +75,8 @@ add_library(explo_planner_lib
   src/vantage_planner.cpp
   src/tree_detector.cpp
   src/separation.cpp
+  src/team_core.cpp
+  src/leg.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -95,8 +97,9 @@ ament_target_dependencies(explo_planner_lib PUBLIC
 # ==================================================================
 
 # EIG NBV planner: self-contained node + main() in one file. Hard-wired to the
-# SCovox Beta expected-information-gain scorer (no planner_type knob). Multi-
-# robot MinPos coordination is built in and param-gated (coordination_enabled).
+# SCovox Beta expected-information-gain scorer (no planner_type knob). Since
+# generation 34 (DESIGN_gen34.md §8) the team layer (TeamCore, Leg, TeamBeacon)
+# drives it; the gen-33 node is kept, unbuilt, in ../backup/gen33/.
 add_executable(explo_planner_node
   src/explo_planner_node.cpp
 )
@@ -214,7 +217,8 @@ if(BUILD_TESTING)
   # params path below. Source tree, not install tree: the claim is about the
   # code that gets committed, and the installed copy can be stale or absent.
   target_compile_definitions(test_experiment_log PRIVATE
-    EXPERIMENT_LOG_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/experiment_log.cpp")
+    EXPERIMENT_LOG_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/experiment_log.cpp"
+    TEAM_CORE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/team_core.cpp")
 
   ament_add_gtest(test_planner_util test/test_planner_util.cpp)
   target_link_libraries(test_planner_util explo_planner_lib)
@@ -228,16 +232,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_team_model test/test_team_model.cpp)
   target_link_libraries(test_team_model explo_planner_lib)
 
-  # Runs the drain-release predicate extracted from doReturnSync into the lib;
-  # the node's wiring of it stays a scan in test_gen21_latched_hold.
+  # Runs the drain-release predicate extracted from gen 33's doReturnSync into
+  # the lib.
   # (notes: cmake-test-exchange-drain)
   ament_add_gtest(test_exchange_drain test/test_exchange_drain.cpp)
   target_link_libraries(test_exchange_drain explo_planner_lib)
 
   # Gen-33 §10 item 5: a finished robot still comes to the meeting and says
   # DONE only once it leaves; its partner waits for it until then. The two
-  # predicates run here; the node's wiring of them is a scan in
-  # test_gen21_latched_hold.
+  # predicates run here.
   ament_add_gtest(test_meeting_attendance test/test_meeting_attendance.cpp)
   target_link_libraries(test_meeting_attendance explo_planner_lib)
 
@@ -250,18 +253,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rendezvous_scheduler test/test_rendezvous_scheduler.cpp)
   target_link_libraries(test_rendezvous_scheduler explo_planner_lib)
 
-  # The endpoint contract: the logged rows plus two source scans of the node for
-  # the three events that end a run. test_experiment_log owns the writer; this
-  # owns the order and once-per-run-ness of what it emits.
+  # The endpoint contract: the rows that end a run. test_experiment_log owns
+  # the writer; this owns the order and once-per-run-ness of what it emits.
   # (notes: cmake-test-endpoint-contract)
   ament_add_gtest(test_endpoint test/test_endpoint.cpp)
   target_link_libraries(test_endpoint explo_planner_lib)
-  # explo_planner_node.cpp is not in explo_planner_lib, so no test can call the
-  # once-per-run mission-return guard; test_endpoint reads the node's source
-  # tree, not the install tree, for the latch and its order.
-  # (notes: cmake-test-endpoint-node-scan)
-  target_compile_definitions(test_endpoint PRIVATE
-    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
 
   ament_add_gtest(test_pursuit_predictor test/test_pursuit_predictor.cpp)
   target_link_libraries(test_pursuit_predictor explo_planner_lib)
@@ -278,41 +274,18 @@ if(BUILD_TESTING)
   ament_add_gtest(test_separation test/test_separation.cpp)
   target_link_libraries(test_separation explo_planner_lib)
 
-  # Source-scans the node for the rendezvous invariants: write-before-arm
-  # ordering, the five-site separation predicate, the appointment-manoeuvre
-  # latch keying. Links the library only for gtest; calls nothing in it.
-  # (notes: cmake-test-gen20-rendezvous)
-  ament_add_gtest(test_gen20_rendezvous test/test_gen20_rendezvous.cpp)
-  target_link_libraries(test_gen20_rendezvous explo_planner_lib)
-  target_compile_definitions(test_gen20_rendezvous PRIVATE
-    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+  # Gen 34 (DESIGN_gen34.md §8.10): the team logic's components, the leg
+  # tracker, and the in-process harness that runs whole missions of N cores in
+  # a toy world. The harness sweeps 1000 seeds per arm per team size by
+  # default (TEAM_HARNESS_SEEDS overrides), hence its timeout.
+  ament_add_gtest(test_team_core test/test_team_core.cpp)
+  target_link_libraries(test_team_core explo_planner_lib)
 
-  # Source-scans the node for the at-the-rendezvous hold. A separate target on
-  # purpose: most of its invariants are guards in functions a reader of the hold
-  # never opens. (notes: cmake-test-gen21-latched-hold)
-  ament_add_gtest(test_gen21_latched_hold test/test_gen21_latched_hold.cpp)
-  target_link_libraries(test_gen21_latched_hold explo_planner_lib)
-  target_compile_definitions(test_gen21_latched_hold PRIVATE
-    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+  ament_add_gtest(test_leg test/test_leg.cpp)
+  target_link_libraries(test_leg explo_planner_lib)
 
-  # Scans the node and run_explo_sim_rviz.sh: heartbeatTick's handshake must
-  # keep running while a robot is held, and the harness must pass
-  # mission_start_hold_sec to every robot, not via the arm-conditional EXTRA
-  # array. (notes: cmake-test-gen22-start-hold)
-  ament_add_gtest(test_gen22_start_hold test/test_gen22_start_hold.cpp)
-  target_link_libraries(test_gen22_start_hold explo_planner_lib)
-  target_compile_definitions(test_gen22_start_hold PRIVATE
-    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp"
-    EXPLO_PLANNER_SIM_SH="${CMAKE_CURRENT_SOURCE_DIR}/../sim/run_explo_sim_rviz.sh")
-
-  # Calls TeamModel for the armed bit's storage semantics and source-scans the
-  # node for the rest. The node TU defines main(), which collides with
-  # gtest_main, so making it testable means splitting main() off first.
-  # (notes: cmake-test-gen23-contagion)
-  ament_add_gtest(test_gen23_contagion test/test_gen23_contagion.cpp)
-  target_link_libraries(test_gen23_contagion explo_planner_lib)
-  target_compile_definitions(test_gen23_contagion PRIVATE
-    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+  ament_add_gtest(test_team_harness test/test_team_harness.cpp TIMEOUT 3600)
+  target_link_libraries(test_team_harness explo_planner_lib)
 endif()
 
 ament_package()

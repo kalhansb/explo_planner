@@ -152,6 +152,17 @@ void ExperimentLog::teamCounts(int peers_live, int expected_peers) {
   integer("expected_peers", expected_peers);
 }
 
+void ExperimentLog::fields(const LogFields& fs) {
+  for (const LogField& f : fs) {
+    switch (f.type) {
+      case LogField::Type::kNum:  num(f.name.c_str(), f.d); break;
+      case LogField::Type::kInt:  integer(f.name.c_str(), f.i); break;
+      case LogField::Type::kBool: boolean(f.name.c_str(), f.b); break;
+      case LogField::Type::kStr:  text(f.name.c_str(), f.s); break;
+    }
+  }
+}
+
 void ExperimentLog::begin(const char* event, const ExperimentContext& ctx) {
   line_.clear();
   nonfinite_.clear();
@@ -264,7 +275,7 @@ void ExperimentLog::startRun(const ExperimentContext& ctx,
   started_ = true;
 
   begin("run_start", ctx);
-  integer("schema_version", kSchemaVersion);
+  integer("schema_version", schema_version_);
   // The anchor, stated explicitly as well as through t_sim_sec: every consumer
   // computes run-relative time as (t_sim_sec - t0_sim_sec) with no wall-clock
   // mapping anywhere in the chain.
@@ -738,6 +749,24 @@ void ExperimentLog::logRunEnd(const ExperimentContext& ctx,
   integer("midrun_attempts_used", e.midrun_attempts_used);
   integer("milestones_reached", milestonesReached());
   integer("milestones_total", static_cast<long long>(milestones_.size()));
+  // Gen 34: every mechanism's firing count, zeros included (rule 3), and the
+  // TeamCore events that had no writer. Gen 33 writes neither, so its run_end
+  // is unchanged.
+  if (schema_version_ >= kGen34SchemaVersion) {
+    integer("team_events_unknown", team_events_unknown_);
+    key("mechanism_counts");
+    line_ += '{';
+    bool first = true;
+    for (const auto& kv : e.mechanism_counts) {
+      if (!first) line_ += ',';
+      first = false;
+      appendEscaped(kv.first);
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), ":%lld", kv.second);
+      line_ += buf;
+    }
+    line_ += '}';
+  }
   // Self-accounting. A file whose last line is a run_end with
   // logger_healthy=true and events_written == seq+1 is complete by its own
   // testimony; anything else is not, and says so.
@@ -1017,6 +1046,66 @@ void ExperimentLog::logAppointmentLeg(const ExperimentContext& ctx,
 int ExperimentLog::milestonesReached() const {
   return static_cast<int>(
       std::count(milestone_hit_.begin(), milestone_hit_.end(), true));
+}
+
+// ==================================================================
+// Gen 34 (schema 13)
+// ==================================================================
+
+void ExperimentLog::logTeamEvent(const ExperimentContext& ctx,
+                                 const std::string& kind,
+                                 const LogFields& fs) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  // One literal begin() per kind, so the vocabulary test sees each of them.
+  if (kind == "team_activity")      begin("team_activity", ctx);
+  else if (kind == "plan")          begin("plan", ctx);
+  else if (kind == "booking")       begin("booking", ctx);
+  else if (kind == "exchange")      begin("exchange", ctx);
+  else if (kind == "chase")         begin("chase", ctx);
+  else if (kind == "homing")        begin("homing", ctx);
+  else if (kind == "team_finished") begin("team_finished", ctx);
+  else {
+    if (team_events_unknown_++ == 0) {
+      RCLCPP_ERROR(logger_,
+          "ExperimentLog: TeamCore event kind '%s' has no writer; not written. "
+          "Further unknown kinds are counted in run_end.team_events_unknown.",
+          kind.c_str());
+    }
+    return;
+  }
+  fields(fs);
+  end();
+}
+
+void ExperimentLog::logTick(const ExperimentContext& ctx, const TickEvent& e) {
+  if (!open_ || !started_) { ++dropped_before_start_; return; }
+  begin("tick", ctx);
+  num("x", e.x);
+  num("y", e.y);
+  text("activity", e.activity);
+  text("drive", e.drive);
+  text("purpose", e.purpose);
+  text("leg_status", e.leg_status);
+  integer("nearest_peer", e.nearest_peer);
+  if (e.nearest_peer >= 0) {
+    num("nearest_peer_m", e.nearest_peer_m);
+    num("nearest_peer_age_sec", e.nearest_peer_age_sec);
+  } else {
+    key("nearest_peer_m"); line_ += "null";
+    key("nearest_peer_age_sec"); line_ += "null";
+  }
+  if (e.wait_bound_sec >= 0.0) {
+    num("wait_start_sec", e.wait_start_sec);
+    num("wait_bound_sec", e.wait_bound_sec);
+  } else {
+    key("wait_start_sec"); line_ += "null";
+    key("wait_bound_sec"); line_ += "null";
+  }
+  boolean("all_connected", e.all_connected);
+  integer("contact_mask", static_cast<long long>(e.contact_mask));
+  integer("booking_slot", e.booking_slot);
+  boolean("proximity_hold", e.proximity_hold);
+  end();
 }
 
 }  // namespace explo_planner

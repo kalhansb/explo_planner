@@ -56,8 +56,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "rendezvous_agreement.py")
+# Gen 33's node, backed up unbuilt when gen 34 took the name (2026-09-23).
 NODE = os.path.normpath(os.path.join(
-    HERE, "..", "explo_planner", "src", "explo_planner_node.cpp"))
+    HERE, "..", "backup", "gen33", "explo_planner_node.cpp"))
 
 fails = 0
 cases = 0

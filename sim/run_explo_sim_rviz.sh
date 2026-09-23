@@ -41,6 +41,11 @@
 #   DWELL_SYNC=0 ./run_explo_sim_rviz.sh    # A/B: drop the vantage-ring
 #                                           # rendezvous barrier (first robot to
 #                                           # arrive dwells alone) — see below
+#   ARM=rendezvous ./run_explo_sim_rviz.sh  # the team arm (DESIGN_gen34.md):
+#                                           # off | pursuit | rendezvous |
+#                                           # hybrid (default); RECONNECT_MODE
+#                                           # and EXPLOIT=1 are refused. See
+#                                           # the planner block below
 #   RECONNECT_MODE=mtare_rendezvous ./run_explo_sim_rviz.sh
 #                                           # A/B: reconnection manoeuvre when a
 #                                           # teammate goes out of comms. The
@@ -136,6 +141,49 @@ PROX_RESUME_M="$(flt "${PROX_RESUME_M:-2.5}")"
 # until every peer claiming the same trunk stands on its own angle. 0: the first
 # arrival dwells alone. (notes: dwell-sync-barrier)
 DWELL_SYNC="${DWELL_SYNC:-1}"
+# --- Planner generation (DESIGN_gen34.md §8.9) ------------------------------
+# explo_planner_node is generation 34 (the gen-33 node is backed up, unbuilt,
+# in ../backup/gen33/). ARM is its one team knob (off | pursuit | rendezvous |
+# hybrid, default hybrid). Every arm runs mtare_off's exploration stack (cell
+# world, the team exchange, the global allocator, no gen-33 manoeuvre), so the
+# arm is the only difference between cells. Refused: RECONNECT_MODE (gen 33's
+# arm token), EXPLOIT=1 (phase 2), DONE_SEEK=1, MISSION_RETURN=0 (gen 34
+# always homes) and LINK_GATE=1 (gen 34 has no link veto; presence is the
+# beacon's). The gen-33 knobs below stay pinned at those values.
+# NODE is the manifest's label, not a knob: the environment's NODE (npm sets
+# it) is never read.
+NODE=gen34
+PLANNER_EXE=explo_planner_node
+ARM="${ARM:-hybrid}"
+case "$ARM" in
+  off|pursuit|rendezvous|hybrid) ;;
+  *) echo "FATAL: ARM='$ARM' is not off|pursuit|rendezvous|hybrid." >&2
+     exit 2 ;;
+esac
+_g34_bad=""
+[ -z "${RECONNECT_MODE:-}" ] || _g34_bad="$_g34_bad RECONNECT_MODE=$RECONNECT_MODE"
+[ "${EXPLOIT:-0}" = "0" ] || _g34_bad="$_g34_bad EXPLOIT=$EXPLOIT"
+[ "${DONE_SEEK:-0}" = "0" ] || _g34_bad="$_g34_bad DONE_SEEK=$DONE_SEEK"
+[ "${MISSION_RETURN:-1}" = "1" ] || _g34_bad="$_g34_bad MISSION_RETURN=$MISSION_RETURN"
+[ "${LINK_GATE:-0}" = "0" ] || _g34_bad="$_g34_bad LINK_GATE=$LINK_GATE"
+if [ -n "$_g34_bad" ]; then
+  echo "FATAL: the planner refuses:$_g34_bad. It takes its arm from ARM," >&2
+  echo "       explores only (exploit is phase 2), always homes, and has no" >&2
+  echo "       done-seek coast or link veto; the cell would be recorded with" >&2
+  echo "       knobs the binary never read." >&2
+  exit 2
+fi
+unset _g34_bad
+RECONNECT_MODE=mtare_off
+EXPLOIT=0
+DONE_SEEK=0
+MISSION_RETURN=1
+LINK_GATE=0
+# The team exchange's topic, for the bag list, the relays and the gates.
+TEAM_XCHG_TOPIC=exploration/team_beacon
+# The beacon must reach a connected peer while a map backlog holds the
+# channel in airtime debt (Q52), so best-effort skips the airtime check.
+BEST_EFFORT_PRIORITY=true
 # EXPLOIT=0: pure exploration, exploitation disabled and no target_scheduler.
 # The comms/reconnection matrix requires it: ring claims ride the gated intents
 # stream and /exploration/targets is not relayed.
@@ -622,7 +670,8 @@ fi
 unset _pp_nochase
 # Arm name and node stamp must agree. The node prefixes mtare_ when
 # GLOBAL_ALLOC, RECONNECT_GATE=info, RENDEZVOUS_SCHEDULE or mdp is on, and
-# appends _mdp for mdp. Keep in lockstep with explo_planner_node.cpp.
+# appends _mdp for mdp. Kept in lockstep with gen 33's node (backup/gen33/);
+# the planner block above pins mtare_off, whose stamp is inert under gen 34.
 # (notes: arm-name-stamp-agreement)
 _mtare_stamped=0
 if [ "$GLOBAL_ALLOC" = "1" ] || [ "$RECONNECT_GATE" = "info" ] \
@@ -1089,7 +1138,10 @@ teardown() {
 # what run_end_t_sim means. (notes: run-control-knobs-before-trap)
 STOP_ON_DONE="${STOP_ON_DONE:-1}"
 DONE_GRACE_S="${DONE_GRACE_S:-30}"
-HANG_HB="${HANG_HB:-40}"
+# Gen 34's longest planned stretch with no robot stepping is a meeting that
+# runs its whole course (drive, 600 s backstop, 600 s exchange) right after a
+# chase (600 s); 50 heartbeats (3000 sim-s) sits above it. (Q61(c))
+HANG_HB="${HANG_HB:-50}"
 GATES_STRICT="${GATES_STRICT:-$COMMS}"
 POLL_S="${POLL_S:-2}"
 CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
@@ -1199,11 +1251,13 @@ if [ "$COMMS" = "1" ]; then
       tx_power_dbm:="$TX_POWER" \
       tree_attenuation_db:="$TREE_ATTEN" \
       max_range_m:="$MAX_RANGE" \
-      reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES"
+      reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES" \
+      ${BEST_EFFORT_PRIORITY:+best_effort_priority:="$BEST_EFFORT_PRIORITY"}
   sleep 3
   log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
       "tree_attenuation_db=$TREE_ATTEN max_range_m=$MAX_RANGE" \
-      "relay_queue=${RELAY_QUEUE_BYTES}B) ahead of the mappers"
+      "relay_queue=${RELAY_QUEUE_BYTES}B" \
+      "best_effort_priority=${BEST_EFFORT_PRIORITY:-params-file}) ahead of the mappers"
   # Per-run connectivity trace: link_states is kept nowhere else and every radio
   # metric derives from link_states.csv. Started here, before the mappers, so it
   # covers the run's start; the logger waits for the topic.
@@ -1285,18 +1339,18 @@ if [ "$COMMS" = "1" ]; then
   for r in $ROBOTS; do
     COMMS_BAG_TOPICS+=( "/$r/exploration/intents" )
     # Record what each robot sent and what arrived from each peer, so
-    # convergence is checkable offline. team_world topics only when
-    # TEAM_WORLD=1. Topic names grow as N(N-1); the bytes do not.
-    # (notes: bag-sent-and-received-intents)
+    # convergence is checkable offline. The team exchange (team_world, or gen
+    # 34's team_beacon) only when TEAM_WORLD=1. Topic names grow as N(N-1); the
+    # bytes do not. (notes: bag-sent-and-received-intents)
     for p in $(peers_of "$r"); do
       COMMS_BAG_TOPICS+=( "/$r/rx/$p/exploration/intents"
                           "/$r/rx/$p/scovox_node/scovox_bin" )
       if [ "$TEAM_WORLD" = "1" ]; then
-        COMMS_BAG_TOPICS+=( "/$r/rx/$p/exploration/team_world" )
+        COMMS_BAG_TOPICS+=( "/$r/rx/$p/$TEAM_XCHG_TOPIC" )
       fi
     done
     if [ "$TEAM_WORLD" = "1" ]; then
-      COMMS_BAG_TOPICS+=( "/$r/exploration/team_world" )
+      COMMS_BAG_TOPICS+=( "/$r/$TEAM_XCHG_TOPIC" )
     fi
   done
   # /hmr_comms_sim/stats carries backlog_bytes and the drop_* counters, the only
@@ -1453,6 +1507,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # Per-robot JSONL event stream: the run's primary record. The manifest names
   # it so a reader knows to look for it (and knows it is missing if it is).
   echo "experiment_log=<robot>.events.jsonl"
+  # Which planner ran, and its team knob. The gen-33 manoeuvre lines below
+  # (reconnect_*, rendezvous_*, pursuit_*, midrun, done_seek, hold_escalate,
+  # link_gate*, team_world_hz, reconnect_gate, rendezvous_schedule,
+  # pursuit_predictor) name knobs the binary never reads; arm is the arm.
+  echo "node=$NODE"
+  echo "planner_exe=$PLANNER_EXE"
+  echo "arm=${ARM:-none}"
+  echo "team_exchange_topic=$TEAM_XCHG_TOPIC"
+  echo "best_effort_priority=${BEST_EFFORT_PRIORITY:-params-file}"
   echo "reconnect_mode_requested=$RECONNECT_MODE"
   echo "reconnect_mode_param=$MODE_ARG"
   # none means no override was passed and the node took the yaml value.
@@ -1652,18 +1715,19 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # Commit hashes identify the source; this hash identifies the binary that ran.
   # The install is symlinked, so stat must dereference (-L) to date the real
   # file. (notes: manifest-planner-binary-hash)
-  planner_bin="$WS/install/explo_planner/lib/explo_planner/explo_planner_node"
+  # Keyed by the executable that ran (PLANNER_EXE).
+  planner_bin="$WS/install/explo_planner/lib/explo_planner/$PLANNER_EXE"
   if [ -e "$planner_bin" ]; then
-    echo "sha256_explo_planner_node=$(sha256sum -b "$planner_bin" 2>/dev/null \
+    echo "sha256_$PLANNER_EXE=$(sha256sum -b "$planner_bin" 2>/dev/null \
       | cut -c1-16)"
-    echo "mtime_explo_planner_node=$(stat -Lc '%y' "$planner_bin" 2>/dev/null)"
+    echo "mtime_$PLANNER_EXE=$(stat -Lc '%y' "$planner_bin" 2>/dev/null)"
   else
-    echo "sha256_explo_planner_node=missing"
+    echo "sha256_$PLANNER_EXE=missing"
     # Present and saying "missing" beats absent, for the same reason spelled
     # out twice for the params keys below: a consumer that greps for
     # mtime_explo_planner_node and gets no line cannot tell a binary that was
     # not there from a manifest written before the key existed.
-    echo "mtime_explo_planner_node=missing"
+    echo "mtime_$PLANNER_EXE=missing"
   fi
   # git_simple_nav_3d moves with the source, not with a rebuild, so hash what
   # ran. All four executables install as a unit; one hash moving alone means a
@@ -1831,18 +1895,17 @@ for r in $ROBOTS; do
              -p cell_covered_max_frontier_frac:="$CELL_FRONTIER_FRAC"
              -p publish_cell_markers:="$CELL_MARKERS_ARG" )
   fi
-  # Split pub/sub like the intent stream, so the emulator can relay it per link.
-  # With COMMS=0 both ends use the shared /exploration/team_world bus, so such a
-  # run says nothing about gating. (notes: team-world-split-topics)
-  if [ "$TEAM_WORLD" = "1" ]; then
-    EXTRA+=( -p team_world_hz:="$TEAM_WORLD_HZ" )
-    if [ "$COMMS" = "1" ]; then
-      EXTRA+=( -p team_world_pub_topic:=exploration/team_world
-               -p team_world_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/team_world')" )
-      log "$r team_world: pub /$r/exploration/team_world  sub $(peers_ros_array "$r" "/$r/rx/" '/exploration/team_world')"
-    else
-      log "$r team_world: ${TEAM_WORLD_HZ} Hz on the shared /exploration/team_world bus (COMMS=0)"
-    fi
+  # The team beacon is always on (1 Hz, beacon_hz). Split pub/sub like the
+  # intent stream under COMMS=1, so the emulator can relay it per link; with
+  # COMMS=0 both ends use the shared /exploration/team_beacon bus, where every
+  # peer reads present, so such a run says nothing about gating.
+  EXTRA+=( -p arm:="$ARM" )
+  if [ "$COMMS" = "1" ]; then
+    EXTRA+=( -p team_beacon_pub_topic:=exploration/team_beacon
+             -p team_beacon_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/team_beacon')" )
+    log "$r team_beacon: pub /$r/exploration/team_beacon  sub $(peers_ros_array "$r" "/$r/rx/" '/exploration/team_beacon')"
+  else
+    log "$r team_beacon: on the shared /exploration/team_beacon bus (COMMS=0)"
   fi
   # Global allocator and the §3.6 reconnect gate. Every other knob of both is
   # left at its compiled default on purpose: the arm under test is the
@@ -1882,7 +1945,7 @@ for r in $ROBOTS; do
     EXTRA+=( -p pursuit_predictor:=mdp )
   fi
   start planner_$r "$OUTDIR/planner_$r.log" \
-    ros2 run explo_planner explo_planner_node --ros-args \
+    ros2 run explo_planner "$PLANNER_EXE" --ros-args \
       -r __ns:=/$r -r __node:=explo_planner \
       --params-file "$PLANNER_SHARE/config/shared_params.yaml" \
       -p use_sim_time:=true -p robot_name:=$r -p max_steps:=$MAX_STEPS \
@@ -1973,9 +2036,9 @@ sleep 8
 # Count by the absolute install path only the real binary carries; the leading
 # [l] keeps the pattern from matching grep's own cmdline. count_own scopes to
 # this cell; expect exactly N_ROBOTS. (notes: planner-census-count)
-NPLAN=$(count_own "[l]ib/explo_planner/explo_planner_node")
-[ "$NPLAN" = "$N_ROBOTS" ] || die "expected exactly $N_ROBOTS explo_planner_node (own cell), found $NPLAN"
-log "planners up (exactly $N_ROBOTS explo_planner_node)"
+NPLAN=$(count_own "[l]ib/explo_planner/$PLANNER_EXE")
+[ "$NPLAN" = "$N_ROBOTS" ] || die "expected exactly $N_ROBOTS $PLANNER_EXE (own cell), found $NPLAN"
+log "planners up (exactly $N_ROBOTS $PLANNER_EXE)"
 
 # --- 6b. comms gates (COMMS=1) ----------------------------------------------
 # Runs after the planners: two of the four gates need the intent endpoints.
@@ -1991,8 +2054,8 @@ if [ "$COMMS" = "1" ]; then
   # team_world_hz defaults to 0.0. (notes: comms-gates-capture-status)
   GATE_EXTRA=()
   if [ "$TEAM_WORLD" = "1" ]; then
-    GATE_EXTRA=( --gated-extra exploration/team_world )
-    log "gates: also requiring the exploration/team_world relay"
+    GATE_EXTRA=( --gated-extra "$TEAM_XCHG_TOPIC" )
+    log "gates: also requiring the $TEAM_XCHG_TOPIC relay"
   fi
   python3 "$HERE/comms_gates.py" check --robots "$ROBOT_CSV" \
       --report "$GATE_REPORT" ${GATE_EXTRA[@]+"${GATE_EXTRA[@]}"} \

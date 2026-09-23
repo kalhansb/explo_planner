@@ -127,6 +127,7 @@ GateVerdict evaluateReconnectGate(const CellWorld& world,
     return v;
   }
   v.leg_mm = leg;
+  v.leg_peer_id = leg_peer_id;
 
   // --- 3. the two futures ------------------------------------------------
   // The two solves differ only in whether the peer leg was priced to can be

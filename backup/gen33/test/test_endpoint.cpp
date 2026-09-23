@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,68 @@ MissionCompleteEvent missionDone(const char* result, const char* reason,
   e.occurrence = occurrence;
   return e;
 }
+
+/// The body of a function definition, by brace matching from its signature.
+/// Returns "" when not found; callers must ASSERT on that, since a scan that
+/// matches nothing passes every assertion. (notes: endpoint-functionbody-scan)
+std::string functionBody(const std::string& text, const std::string& signature) {
+  const size_t sig = text.find(signature);
+  if (sig == std::string::npos) return "";
+  const size_t open = text.find('{', sig);
+  if (open == std::string::npos) return "";
+  int depth = 0;
+  for (size_t i = open; i < text.size(); ++i) {
+    if (text[i] == '{') ++depth;
+    else if (text[i] == '}' && --depth == 0) {
+      return text.substr(open, i - open + 1);
+    }
+  }
+  return "";
+}
+
+std::string readFile(const char* path) {
+  std::ifstream in(path);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  return buf.str();
+}
+
+/// Drops comments so scans assert on code, not on prose quoting the same
+/// identifiers. Tracks string and char literals so a // inside a literal is not
+/// cut. A per-file copy by convention; do not share it.
+/// (notes: endpoint-strip-comments)
+std::string stripComments(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  bool in_str = false, in_chr = false;
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (in_str || in_chr) {
+      out.push_back(c);
+      if (c == '\\' && i + 1 < text.size()) { out.push_back(text[++i]); continue; }
+      if (in_str && c == '"')  in_str = false;
+      if (in_chr && c == '\'') in_chr = false;
+      continue;
+    }
+    if (c == '"')  { in_str = true; out.push_back(c); continue; }
+    if (c == '\'') { in_chr = true; out.push_back(c); continue; }
+    if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+      while (i < text.size() && text[i] != '\n') ++i;
+      if (i < text.size()) out.push_back('\n');
+      continue;
+    }
+    if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/')) ++i;
+      ++i;
+      continue;
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+std::string nodeSource() { return stripComments(readFile(EXPLO_PLANNER_NODE_CPP)); }
 
 RunEndEvent runEnd() {
   RunEndEvent e;
@@ -616,4 +679,161 @@ TEST(RunEndRow, DuplicateEndpointCountersAreWrittenEvenAtZero) {
     EXPECT_NE(row.find("\"mission_completes_suppressed\":1"), std::string::npos)
         << row;
   }
+}
+
+// ===========================================================================
+// GROUP C. THE ONCE-PER-RUN MISSION RETURN, read from the node's source.
+//
+// The re-entry guard is in startReturnHome, in explo_planner_node.cpp, which no
+// test links, so these scan the node's source: they show the latch present and
+// ordered, not reached, and fail if the scan stops matching.
+// (notes: return-guard-source-scan)
+// ===========================================================================
+
+/// startReturnHome must read the mission_return_done_ latch before any of its
+/// resets: a guard after even one reset refills the escape budget and zeroes
+/// the approach window on a request it then refuses.
+/// (notes: return-guard-before-resets)
+TEST(MissionReturnGuard, TheLatchIsReadBeforeAnyReset) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string body =
+      functionBody(text, "bool ExploPlannerNode::startReturnHome(");
+  ASSERT_FALSE(body.empty())
+      << "the scan found no startReturnHome definition — it has been renamed "
+         "or reshaped and this test has stopped testing anything";
+
+  const size_t guard = body.find("if (mission_return_done_)");
+  ASSERT_NE(guard, std::string::npos)
+      << "startReturnHome has no once-per-run guard; the DONE -> RETURN_HOME "
+         "re-entry that produced 16 doubled ts1b endpoints is back";
+
+  // The counter has to be inside the guard, not somewhere later: a refusal
+  // that is not counted leaves run_end.mission_return_reentries reading 0 in
+  // a run where the guard fired, i.e. a check that reports its own failure as
+  // a pass.
+  const size_t counted = body.find("++mission_return_reentries_");
+  ASSERT_NE(counted, std::string::npos)
+      << "the guard refuses silently — nothing offline can tell a run where "
+         "it fired from a run where it never had to";
+  EXPECT_GT(counted, guard) << "the re-entry counter is incremented outside "
+                               "the guard it is meant to count";
+
+  // Three resets, spread across the function, each independently damaging.
+  for (const char* reset : {"return_home_dist_at_start_ =",
+                            "home_escapes_used_",
+                            "home_mode_"}) {
+    const size_t at = body.find(reset);
+    ASSERT_NE(at, std::string::npos)
+        << "the reset '" << reset << "' is gone from startReturnHome, so this "
+           "ordering assertion no longer constrains anything";
+    EXPECT_LT(guard, at)
+        << "'" << reset << "' runs before the once-per-run guard: a refused "
+           "re-entry still damages the homing leg already in progress";
+  }
+
+  // And the leg-scoped guard is still there beside it. They answer different
+  // questions (resolved vs in flight) and neither subsumes the other.
+  EXPECT_NE(body.find("if (state_ == State::RETURN_HOME)"), std::string::npos)
+      << "the in-flight re-entry guard has been dropped";
+}
+
+/// The latch must be SET before the run can end, and unconditionally — not
+/// inside the `if (exp_log_)` block. The damage a re-entry does (a second
+/// mission_return_max_sec budget, a refilled escape ladder) is behavioural and
+/// lands identically in a build with no event log.
+TEST(MissionReturnGuard, TheLatchIsSetBeforeTheEndingCommits) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string body =
+      functionBody(text, "bool ExploPlannerNode::finishMissionReturn(");
+  ASSERT_FALSE(body.empty())
+      << "the scan found no finishMissionReturn definition — it has been "
+         "renamed or reshaped and this test has stopped testing anything";
+
+  const size_t set = body.find("mission_return_done_  = true;");
+  ASSERT_NE(set, std::string::npos)
+      << "finishMissionReturn never latches the return as spent, so "
+         "startReturnHome's guard can never fire";
+
+  const size_t log_gate = body.find("if (exp_log_)");
+  ASSERT_NE(log_gate, std::string::npos);
+  EXPECT_LT(set, log_gate)
+      << "the latch is set inside or after the event-log block — a build "
+         "without an event log would still take a second homing leg";
+
+  const size_t finish = body.find("finishNow(");
+  ASSERT_NE(finish, std::string::npos);
+  EXPECT_LT(set, finish) << "the run ends before the return is marked spent";
+}
+
+// ===========================================================================
+// GROUP E. THE TERMINAL DISPATCH ALWAYS DISPOSES OF THE RUN.
+// ===========================================================================
+//
+// finishOrRendezvous returns whether the run was disposed of; false means
+// deferred to the next tick, safe only while bounded (the reconnect_confirm_sec
+// window). A terminal dispatch that declines must end the run.
+// (notes: terminal-dispatch-disposes-run)
+
+/// A terminal dispatch that declines must end the run, not report a deferral.
+TEST(TerminalDispatch, ADeclinedManoeuvreStillEndsTheRun) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string body =
+      functionBody(text, "bool ExploPlannerNode::finishOrRendezvous(");
+  ASSERT_FALSE(body.empty())
+      << "the scan found no finishOrRendezvous definition — it has been "
+         "renamed or reshaped and this test has stopped testing anything";
+
+  const size_t terminal = body.find("reconnect_terminal_ = true");
+  ASSERT_NE(terminal, std::string::npos)
+      << "finishOrRendezvous no longer marks its dispatch terminal, so there "
+         "is no longer a distinction between the bounded confirmation-window "
+         "deferral and an outright decline — which is the distinction this "
+         "whole group is about";
+
+  EXPECT_EQ(body.find("return dispatchReconnect("), std::string::npos)
+      << "finishOrRendezvous propagates dispatchReconnect's value directly. "
+         "On the terminal path that value is `false` exactly when the arm "
+         "declined outright and nothing will change its mind, and the caller "
+         "reads `false` as \"ask again next tick\" — a 10 Hz spin in PLAN with "
+         "step_ frozen and the endpoint already stamped";
+
+  const size_t dispatch = body.find("dispatchReconnect(", terminal);
+  ASSERT_NE(dispatch, std::string::npos)
+      << "nothing dispatches a manoeuvre after the terminal marker is set";
+  const size_t finish = body.find("finishNow(", dispatch);
+  EXPECT_NE(finish, std::string::npos)
+      << "there is no ending after the terminal dispatch. A decline has to "
+         "land on finishNow: the robot has finished exploring and has nowhere "
+         "agreed to be, so DONE is the honest answer and the only one that "
+         "terminates";
+}
+
+/// Pins that may_defer in dispatchReconnect excludes reconnect_terminal_, so a
+/// terminal dispatch cannot take the deferral path; the test above would not
+/// catch that. (notes: terminal-dispatch-may-defer)
+TEST(TerminalDispatch, TheDeferralIsRuledOutByTheTerminalFlag) {
+  const std::string text = nodeSource();
+  ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+  const std::string body =
+      functionBody(text, "bool ExploPlannerNode::dispatchReconnect(");
+  ASSERT_FALSE(body.empty())
+      << "the scan found no dispatchReconnect definition — it has been renamed "
+         "or reshaped and this test has stopped testing anything";
+
+  const size_t may_defer = body.find("may_defer =");
+  ASSERT_NE(may_defer, std::string::npos)
+      << "dispatchReconnect no longer computes may_defer, so whether a "
+         "terminal dispatch can defer is decided somewhere this test cannot "
+         "see";
+  const size_t eol = body.find('\n', may_defer);
+  const std::string expr = body.substr(may_defer, eol - may_defer);
+  EXPECT_NE(expr.find("reconnect_terminal_"), std::string::npos)
+      << "may_defer no longer excludes the terminal case:\n"
+      << expr
+      << "\nA robot whose exploration is already over cannot \"keep exploring "
+         "until the departure deadline\", and no caller on that path is "
+         "willing to wait for one";
 }

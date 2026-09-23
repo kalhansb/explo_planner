@@ -79,6 +79,12 @@ import sys
 # (notes: evlog-reader-vs-min-schema)
 READER_SCHEMA = 9
 MIN_SCHEMA = READER_SCHEMA
+# The newest schema read at all. 10-12 are gen 33's later stamps, read with a
+# warning as before. 13 is the gen-34 node: its endpoints are other events
+# (homing is a team event, there is no mission_complete or reconnect kind), so
+# this reader would compute wrong numbers from it without failing. Refused;
+# gen34_check.py reads those logs. (K21, DESIGN_gen34.md)
+MAX_SCHEMA = 12
 
 
 class EventLogError(Exception):
@@ -182,7 +188,8 @@ def summarise_robot(path):
 
     # Below MIN_SCHEMA (or no schema_version) is refused, so a summary cannot
     # silently pool older binary generations; --min-schema reads them
-    # deliberately. Above READER_SCHEMA only warns.
+    # deliberately. Above MAX_SCHEMA is refused; between READER_SCHEMA and
+    # MAX_SCHEMA only warns.
     # (notes: evlog-schema-version-check)
     ver = start.get("schema_version")
     if ver is None:
@@ -206,6 +213,12 @@ def summarise_robot(path):
     # Compare against READER_SCHEMA, not MIN_SCHEMA: the operator can lower the
     # floor, but the reader's own vintage does not move with it.
     # (notes: evlog-newer-than-reader-check)
+    if ver > MAX_SCHEMA:
+        raise EventLogError(
+            f"{path}: schema_version {ver} > {MAX_SCHEMA}, the newest this "
+            f"reader accepts. Schema 13 and later are the gen-34 node's, whose "
+            f"completion and homing are different events; read them with "
+            f"gen34_check.py.")
     if ver > READER_SCHEMA:
         print(f"warning: {path}: schema_version {ver} is newer than this "
               f"reader's {READER_SCHEMA}; unknown fields ignored",

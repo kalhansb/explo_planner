@@ -409,3 +409,173 @@ TEST(ExperimentLogSchema, DeclaredKindsMatchTheWriter) {
         << "' sits in the pre-v4 block but the writer does not emit it";
   }
 }
+
+// ── Gen 34 (schema 13) ──────────────────────────────────────────────────────
+
+namespace {
+
+std::vector<std::string> readLines(const std::string& path) {
+  std::ifstream in(path);
+  std::vector<std::string> out;
+  std::string line;
+  while (std::getline(in, line)) out.push_back(line);
+  return out;
+}
+
+std::string findRow(const std::vector<std::string>& lines, const std::string& event) {
+  const std::string tag = "\"event\":\"" + event + "\"";
+  for (const std::string& l : lines)
+    if (l.find(tag) != std::string::npos) return l;
+  return "";
+}
+
+}  // namespace
+
+TEST(ExperimentLogGen34, SchemaStampIsGen33UnlessTheNodeSetsIt) {
+  TempLogPath a("g34_schema_a"), b("g34_schema_b");
+  {
+    ExperimentLog log(a.path, "r", rclcpp::get_logger("t"));
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+  }
+  {
+    ExperimentLog log(b.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+  }
+  EXPECT_NE(findRow(readLines(a.path), "run_start").find("\"schema_version\":12"),
+            std::string::npos);
+  EXPECT_NE(findRow(readLines(b.path), "run_start").find("\"schema_version\":13"),
+            std::string::npos);
+}
+
+TEST(ExperimentLogGen34, TeamEventWritesItsKindAndFieldsInOrder) {
+  TempLogPath tmp("g34_team_event");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+    ExperimentContext ctx;
+    ctx.state = "MEET";
+    log.startRun(ctx, {});
+    log.logTeamEvent(ctx, "booking",
+                     {LogField::str("action", "departed"), LogField::integer("slot", 3),
+                      LogField::num("lead_sec", 12.5), LogField::boolean("finished", true)});
+  }
+  const std::string row = findRow(readLines(tmp.path), "booking");
+  ASSERT_FALSE(row.empty());
+  EXPECT_NE(row.find("\"state\":\"MEET\""), std::string::npos) << row;
+  EXPECT_NE(row.find("\"action\":\"departed\",\"slot\":3,\"lead_sec\":12.500000,"
+                     "\"finished\":true}"),
+            std::string::npos)
+      << row;
+}
+
+TEST(ExperimentLogGen34, UnknownKindIsNotWrittenAndIsCountedInRunEnd) {
+  TempLogPath tmp("g34_unknown");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    log.logTeamEvent(ctx, "no_such_kind", {LogField::integer("x", 1)});
+    EXPECT_EQ(log.teamEventsUnknown(), 1);
+    RunEndEvent e;
+    e.mechanism_counts = {{"booking_met", 4}, {"chase_pre-empted", 0}};
+    log.logRunEnd(ctx, e);
+  }
+  const auto lines = readLines(tmp.path);
+  EXPECT_TRUE(findRow(lines, "no_such_kind").empty());
+  const std::string end = findRow(lines, "run_end");
+  EXPECT_NE(end.find("\"team_events_unknown\":1"), std::string::npos) << end;
+  EXPECT_NE(end.find("\"mechanism_counts\":{\"booking_met\":4,\"chase_pre-empted\":0}"),
+            std::string::npos)
+      << end;
+  // events_written stays the last field (self-accounting).
+  EXPECT_NE(end.rfind("\"events_written\":"), std::string::npos);
+  EXPECT_GT(end.rfind("\"events_written\":"), end.find("\"mechanism_counts\""));
+}
+
+TEST(ExperimentLogGen34, Gen33RunEndIsUnchanged) {
+  TempLogPath tmp("g34_gen33_end");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    RunEndEvent e;
+    e.mechanism_counts = {{"x", 1}};   // ignored at schema 12
+    log.logRunEnd(ctx, e);
+  }
+  const std::string end = findRow(readLines(tmp.path), "run_end");
+  ASSERT_FALSE(end.empty());
+  EXPECT_EQ(end.find("mechanism_counts"), std::string::npos) << end;
+  EXPECT_EQ(end.find("team_events_unknown"), std::string::npos) << end;
+}
+
+TEST(ExperimentLogGen34, TickWritesNullForAbsentPeerAndWait) {
+  TempLogPath tmp("g34_tick");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    TickEvent t;
+    t.activity = "explore";
+    t.drive = "explore";
+    t.leg_status = "idle";
+    log.logTick(ctx, t);
+    t.activity = "meet";
+    t.nearest_peer = 2;
+    t.nearest_peer_m = 3.25;
+    t.nearest_peer_age_sec = 0.5;
+    t.wait_start_sec = 100.0;
+    t.wait_bound_sec = 700.0;
+    t.contact_mask = 4;
+    log.logTick(ctx, t);
+  }
+  std::vector<std::string> ticks;
+  for (const std::string& l : readLines(tmp.path))
+    if (l.find("\"event\":\"tick\"") != std::string::npos) ticks.push_back(l);
+  ASSERT_EQ(ticks.size(), 2u);
+  EXPECT_NE(ticks[0].find("\"nearest_peer\":-1,\"nearest_peer_m\":null,"
+                          "\"nearest_peer_age_sec\":null,\"wait_start_sec\":null,"
+                          "\"wait_bound_sec\":null"),
+            std::string::npos)
+      << ticks[0];
+  EXPECT_NE(ticks[1].find("\"nearest_peer_m\":3.250000"), std::string::npos) << ticks[1];
+  EXPECT_NE(ticks[1].find("\"wait_bound_sec\":700.000000"), std::string::npos) << ticks[1];
+  EXPECT_NE(ticks[1].find("\"contact_mask\":4"), std::string::npos) << ticks[1];
+}
+
+// Every kind TeamCore emits has a writer and a declaration: scanned from
+// TeamCore's own source, so a kind added there without a writer fails here
+// rather than in a campaign's team_events_unknown.
+TEST(ExperimentLogGen34, EveryTeamCoreKindHasAWriter) {
+  std::ifstream src(TEAM_CORE_CPP);
+  ASSERT_TRUE(src.good()) << "cannot read " << TEAM_CORE_CPP;
+  std::stringstream buf;
+  buf << src.rdbuf();
+  const std::string text = buf.str();
+  std::vector<std::string> kinds;
+  const std::string needle = "emit(\"";
+  for (size_t p = text.find(needle); p != std::string::npos; p = text.find(needle, p + 1)) {
+    const size_t s0 = p + needle.size();
+    const std::string k = text.substr(s0, text.find('"', s0) - s0);
+    if (std::find(kinds.begin(), kinds.end(), k) == kinds.end()) kinds.push_back(k);
+  }
+  ASSERT_GE(kinds.size(), 6u) << "the emit(\"...\") scan found too few kinds";
+  const std::vector<std::string> declared(
+      ExperimentLog::kEventKinds,
+      ExperimentLog::kEventKinds + ExperimentLog::kEventKindCount);
+  TempLogPath tmp("g34_kinds");
+  ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+  log.setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+  ExperimentContext ctx;
+  log.startRun(ctx, {});
+  for (const std::string& k : kinds) {
+    EXPECT_NE(std::find(declared.begin(), declared.end(), k), declared.end())
+        << "TeamCore emits '" << k << "' but kEventKinds does not declare it";
+    log.logTeamEvent(ctx, k, {});
+  }
+  EXPECT_EQ(log.teamEventsUnknown(), 0);
+}

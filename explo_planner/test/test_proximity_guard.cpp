@@ -266,3 +266,22 @@ TEST(ProximityGuard, GarbageConfigSanitised) {
   // The band fix runs after: cfg()'s resume (4.0) < the restored hold (5.0).
   EXPECT_FLOAT_EQ(g.config().resume_dist_m, dflt.hold_dist_m);
 }
+
+// 20. Gen 34 (Q65): an exempt peer cannot force a hold, even inside the disc;
+//     the exemption is replaced wholesale, so clearing it restores the hold.
+TEST(ProximityGuard, ExemptPeerCannotHold) {
+  ProximityGuard g(cfg(), "zulu");
+  g.onPeerPose("atlas", v(1.0f, 0.0f), at(100.0));
+  g.onPeerPose("rama", v(2.0f, 0.0f), at(100.0));
+  g.setExempt({"atlas"});
+  auto d = g.evaluate(v(0, 0), at(100.0), false);
+  EXPECT_TRUE(d.hold);               // rama is not exempt
+  EXPECT_EQ(d.peer_id, "rama");
+  g.setExempt({"atlas", "rama"});
+  d = g.evaluate(v(0, 0), at(100.0), true);
+  EXPECT_FALSE(d.hold);
+  EXPECT_EQ(d.peer_id, "atlas");
+  EXPECT_EQ(d.note, "exempt");
+  g.setExempt({});
+  EXPECT_TRUE(g.evaluate(v(0, 0), at(100.0), false).hold);
+}

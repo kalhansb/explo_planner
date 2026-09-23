@@ -16,6 +16,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # (notes: msgs-new-types-not-fields)
   "msg/CellState.msg"
   "msg/TeamWorld.msg"
+  # Gen 34: the one beacon the new node publishes and reads. A new type again,
+  # for the same reason as TeamWorld. See TeamBeacon.msg.
+  "msg/TeamBeacon.msg"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

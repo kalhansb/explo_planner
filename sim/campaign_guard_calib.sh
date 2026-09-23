@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Known-answer cases for run_campaign.sh's guards.
 #
-# Main sections: the link veto, which refuses a campaign arming the mid-run
-# reconnect trigger at the 90 s clock (below the ~180 s heartbeat-suppression
-# tail) with no link veto; launcher validation; the resume guard.
-# (notes: guardcal-link-veto-scope)
+# Main sections: the campaign's arm and knob refusals (the planner is gen 34:
+# four ARM names, no gen-33 knobs); launcher validation; the resume guard.
+# Gen 33's link-veto cases went with its node (backup/gen33/).
 #
 # No case may launch a simulation; the process-census section checks for started
 # processes. (notes: guardcal-nothing-launches)
@@ -25,91 +24,69 @@ cases=0
 CENSUS_BEFORE=$(ps -e -o pid=,comm= \
   | grep -c -E 'ruby|ign|gz|parameter_br|explo_planner|scovox|dscovox|robot_state|rviz')
 
-# want=BLOCK  -> the guard must fire: its FATAL text appears AND the run refuses
-# want=ALLOW  -> the guard must not fire AND the campaign must actually be
-#                accepted, i.e. exit 0
+# want=ALLOW   -> the campaign must be accepted, i.e. exit 0
+# want=<text>  -> the run must refuse (non-zero exit) AND print <text>
 #
-# ALLOW requires exit 0, not merely the absence of the guard's FATAL text, so an
-# unrelated refusal is not a pass; the planted --bogus case pins it.
+# ALLOW requires exit 0, not merely the absence of a FATAL, so an unrelated
+# refusal is not a pass; a refusal requires its own text, so a campaign that
+# died of something else is not one either.
 # (notes: guardcal-allow-needs-exit-zero)
-t() {
+g() {
   want="$1"; label="$2"; shift 2
   cases=$((cases+1))
   out=$(timeout 20 "$CS" --root "$TMP" --duration 3000 \
         --scenario flatforest_dense_2robot_lidar.yaml --dry-run "$@" 2>&1)
   rc=$?
-  if echo "$out" | grep -q "would run the mid-run trigger with NO link veto"; then
-    # The text alone is not the verdict: a guard that printed the FATAL and
-    # then launched anyway would be worse than no guard.
-    [ "$rc" = 0 ] && got="PRINTED-BUT-RAN" || got=BLOCK
-  elif [ "$rc" = 0 ]; then
-    got=ALLOW
+  ok=0
+  if [ "$want" = ALLOW ]; then
+    [ "$rc" = 0 ] && ok=1
   else
-    got="REFUSED(rc=$rc)"   # neither: something else stopped it first
+    [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -qF -- "$want" && ok=1
   fi
-  if [ "$got" = "$want" ]; then
-    echo "  PASS  $label ($got)"
-  else
-    echo "  FAIL  $label: want $want got $got"
-    echo "$out" | grep -E "FATAL|MIDRUN|LINK" | sed 's/^/          | /'
-    fails=$((fails+1))
-  fi
-}
-
-echo "=== the hazard itself ==="
-t BLOCK "LINK_GATE=0 at the default clock"        --arms hybrid,off --seeds 1 --env "LINK_GATE=0"
-t BLOCK "--comms 0 at the default clock"          --arms hybrid,off --seeds 1 --comms 0
-t BLOCK "LINK_GATE=false (not a 1, so off)"       --arms hybrid,off --seeds 1 --env "LINK_GATE=false"
-t BLOCK "LINK_GATE=2"                             --arms hybrid,off --seeds 1 --env "LINK_GATE=2"
-t BLOCK "LINK_GATE= (empty)"                      --arms hybrid,off --seeds 1 --env "LINK_GATE="
-
-echo "=== the escape hatch must clear the tail, not merely be mentioned ==="
-t ALLOW "MIDRUN_SILENCE=240 with the gate off"    --arms hybrid,off --seeds 1 --env "LINK_GATE=0 MIDRUN_SILENCE=240"
-t ALLOW "MIDRUN_SILENCE=200, exactly the floor"   --arms hybrid,off --seeds 1 --env "LINK_GATE=0 MIDRUN_SILENCE=200"
-t BLOCK "MIDRUN_SILENCE=5, worse than default"    --arms hybrid,off --seeds 1 --env "LINK_GATE=0 MIDRUN_SILENCE=5"
-t BLOCK "MIDRUN_SILENCE=199, just under"          --arms hybrid,off --seeds 1 --env "LINK_GATE=0 MIDRUN_SILENCE=199"
-
-echo "=== substring collisions, both directions ==="
-t BLOCK "GATE_MIDRUN_SILENCE=240 must NOT disarm" --arms hybrid,off --seeds 1 --env "LINK_GATE=0 GATE_MIDRUN_SILENCE=240"
-t ALLOW "MY_LINK_GATE=0 must NOT arm"             --arms hybrid,off --seeds 1 --env "MY_LINK_GATE=0"
-
-echo "=== arm awareness ==="
-t ALLOW "off-only campaign has no treatment"      --arms off --seeds 1 --comms 0
-t BLOCK "a --cells list containing a treated arm" --cells "off:1,hybrid:2" --comms 0
-t ALLOW "--cells with only off"                   --cells "off:1,off:2" --comms 0
-t BLOCK "a future arm is inside the guard"        --arms pursuit,off --seeds 1 --comms 0
-# The self-check for t()'s ALLOW verdict: an unrelated refusal must not be
-# reported as a permitted campaign. Before the exit code was checked, this line
-# printed "PASS ... (ALLOW)".
-t "REFUSED(rc=2)" "an unrelated refusal is not an ALLOW" --arms hybrid,off --seeds 1 --bogus
-
-echo "=== the happy path ==="
-t ALLOW "the real generation-9 campaign"          --arms hybrid,off --seeds 1
-
-echo
-echo "=== the other refusals (checked separately, they exit before the guard) ==="
-chk() {
-  want="$1"; label="$2"; shift 2
-  cases=$((cases+1))
-  out=$(timeout 20 "$CS" --root "$TMP" --duration 3000 \
-        --scenario flatforest_dense_2robot_lidar.yaml --dry-run "$@" 2>&1)
-  if echo "$out" | grep -q -e "$want"; then
+  if [ "$ok" = 1 ]; then
     echo "  PASS  $label"
   else
-    echo "  FAIL  $label: /$want/ not in output"
-    echo "$out" | grep -E "FATAL" | sed 's/^/          | /'
+    echo "  FAIL  $label: rc=$rc, wanted ${want}"
+    printf '%s\n' "$out" | grep -E "FATAL|unknown arg" | sed 's/^/          | /'
     fails=$((fails+1))
   fi
 }
-chk "not --env COMMS="        "--env COMMS=0 is refused"     --arms hybrid,off --seeds 1 --env "COMMS=0"
-chk "--comms must be 0 or 1"  "--comms 2 is refused"         --arms hybrid,off --seeds 1 --comms 2
-chk "is not a number"         "a non-numeric clock refused"  --arms hybrid,off --seeds 1 --env "LINK_GATE=0 MIDRUN_SILENCE=lots"
+
+echo "=== the arms are the planner's four names ==="
+g ALLOW "the reference campaign"                   --arms hybrid,off --seeds 1
+g ALLOW "all four arms"                            --arms off,pursuit,rendezvous,hybrid --seeds 1
+g ALLOW "a --cells list"                           --cells "off:1,hybrid:2"
+g ALLOW "the ideal-comms control"                  --arms hybrid,off --seeds 1 --comms 0
+g "is not an arm"  "a gen-33 mtare_ token is refused"        --arms mtare_hybrid,off --seeds 1
+g "is not an arm"  "a gen-33 _seek suffix is refused"        --arms hybrid_seek,hybrid --seeds 1
+g "is not an arm"  "a _r suffix inside --cells is refused"   --cells "off:1,hybrid_r40:2"
+g "is not an arm"  "a _ttl suffix is refused"                --arms hybrid_ttl120 --seeds 1
+g "is not an arm"  "a mis-cased arm is refused"              --arms Hybrid --seeds 1
+
+echo "=== gen 33's knobs and flags are refused, not carried ==="
+g "unknown arg: --node"    "--node is gone with the second planner"   --arms hybrid --seeds 1 --node gen33
+g "always homes"           "--mission-return 0 is refused"            --arms hybrid --seeds 1 --mission-return 0
+g "--env LINK_GATE=..."    "--env LINK_GATE is refused"               --arms hybrid --seeds 1 --env "LINK_GATE=0"
+g "--env MIDRUN_SILENCE=..." "--env MIDRUN_SILENCE is refused"        --arms hybrid --seeds 1 --env "MIDRUN_SILENCE=240"
+g "--env EXPLOIT=..."      "--env EXPLOIT is refused"                 --arms hybrid --seeds 1 --env "EXPLOIT=1"
+# The key matcher splits on whitespace and compares up to '=': a name that
+# merely ends in a refused key is not that key.
+g ALLOW "MY_LINK_GATE=0 is not LINK_GATE"          --arms hybrid --seeds 1 --env "MY_LINK_GATE=0"
+g ALLOW "GATE_MIDRUN_SILENCE=240 is not MIDRUN_SILENCE" \
+                                                   --arms hybrid --seeds 1 --env "GATE_MIDRUN_SILENCE=240"
+# The self-check for g()'s refusal verdict: the text has to be the guard's own.
+g "unknown arg: --bogus"   "an unrelated refusal names itself"        --arms hybrid,off --seeds 1 --bogus
+
+echo
+echo "=== the other refusals ==="
+g "not --env COMMS="       "--env COMMS=0 is refused"     --arms hybrid,off --seeds 1 --env "COMMS=0"
+g "--comms must be 0 or 1" "--comms 2 is refused"         --arms hybrid,off --seeds 1 --comms 2
 
 echo
 echo "=== the ambient environment must not reach the cells ==="
 # env without -i inherits the caller's environment, so the per-cell launch must
-# strip LINK_GATE and MIDRUN_SILENCE. Asserted on the launch line, since the
-# guard's verdict is the same either way.
+# strip LINK_GATE and MIDRUN_SILENCE, which the runner would otherwise refuse
+# on every cell. Asserted on the launch line.
 # (notes: guardcal-ambient-link-gate-strip)
 cases=$((cases+1))
 if grep -q -- '-u LINK_GATE -u MIDRUN_SILENCE' "$CS"; then
@@ -119,10 +96,9 @@ else
        "an exported value silently beats the guard"
   fails=$((fails+1))
 fi
-# And the strip must not break the channel the guard DOES read: env applies
-# assignments after unsets, so --env has to keep winning. If that ordering were
-# wrong, every escape-hatch case above would still pass (they check the guard,
-# which runs before the launch) while no cell ever received the setting.
+# And the strip must not break the channel the guards DO read: env applies
+# assignments after unsets, so --env has to keep winning, or no cell would
+# ever receive an --env setting.
 cases=$((cases+1))
 if env -u LINK_GATE LINK_GATE=7 sh -c '[ "${LINK_GATE-}" = 7 ]'; then
   echo "  PASS  env applies assignments after -u, so --env still reaches the cell"
@@ -137,51 +113,60 @@ out=$(LINK_GATE=0 timeout 20 "$CS" --root "$TMP" --duration 3000 \
 rc=$?
 cases=$((cases+1))
 if [ "$rc" = 0 ] && echo "$out" | grep -q "LINK_GATE=0 is exported in this shell and will be IGNORED"; then
-  echo "  PASS  an exported LINK_GATE is reported and does not trip the guard"
+  echo "  PASS  an exported LINK_GATE is reported and does not stop the campaign"
 else
   echo "  FAIL  an exported LINK_GATE was neither reported nor refused (rc=$rc)"
   fails=$((fails+1))
 fi
 
 echo
-echo "=== the guard's copy of the launcher default must still be true ==="
-# run_campaign.sh hard-codes the launcher's LINK_GATE default to decide before
-# launch whether the veto is live; nothing else links the two files, so read the
-# literal back and compare. (notes: guardcal-link-gate-default-readback)
+echo "=== the resume guard's copies of the runner's gen-33 pins must still be true ==="
+# The runner pins LINK_GATE=0 in its planner block and leaves MIDRUN_SILENCE
+# at its default; the resume guard predicts both manifest lines from its own
+# copies. Nothing else links the two files, so read the literals back.
+# (notes: guardcal-link-gate-default-readback)
 LAUNCHER="$(dirname "$CS")/run_explo_sim_rviz.sh"
-lg_default=$(sed -n 's/^LINK_GATE="\${LINK_GATE:-\([^}]*\)}"$/\1/p' "$LAUNCHER" | head -1)
-guard_assumes=$(sed -n 's/^env_has LINK_GATE || _link_gate_req=\([0-9]*\).*$/\1/p' "$CS" | head -1)
+_pin=$(sed -n '/^# --- Planner generation/,/^BEST_EFFORT_PRIORITY=/p' "$LAUNCHER" \
+       | sed -n 's/^LINK_GATE=\([0-9]*\)$/\1/p' | head -1)
+_req=$(sed -n 's/^LINK_GATE_REQ=\([0-9]*\)$/\1/p' "$CS" | head -1)
 cases=$((cases+1))
-if [ -n "$lg_default" ] && [ "$lg_default" = "$guard_assumes" ]; then
-  echo "  PASS  launcher default LINK_GATE=$lg_default matches the guard's assumption"
+if [ -n "$_pin" ] && [ "$_pin" = "$_req" ]; then
+  echo "  PASS  the runner's LINK_GATE pin ($_pin) matches the resume guard's copy"
 else
-  echo "  FAIL  launcher default is '${lg_default:-UNREADABLE}' but the guard" \
-       "assumes '${guard_assumes:-UNREADABLE}'"
+  echo "  FAIL  the runner pins LINK_GATE='${_pin:-UNREADABLE}' but the resume" \
+       "guard expects '${_req:-UNREADABLE}'"
   fails=$((fails+1))
 fi
+_ld=$(sed -n 's/^MIDRUN_SILENCE="$(flt "${MIDRUN_SILENCE:-\([0-9.]*\)}")"$/\1/p' "$LAUNCHER" | head -1)
+_req=$(sed -n 's/^MIDRUN_SILENCE_REQ=\([0-9.]*\)$/\1/p' "$CS" | head -1)
+cases=$((cases+1))
+if [ -n "$_ld" ] && [ "$_ld" = "$_req" ]; then
+  echo "  PASS  the runner's MIDRUN_SILENCE default ($_ld) matches the resume guard's copy"
+else
+  echo "  FAIL  the runner's MIDRUN_SILENCE default is '${_ld:-UNREADABLE}' but the" \
+       "resume guard expects '${_req:-UNREADABLE}'"
+  fails=$((fails+1))
+fi
+unset _pin _req _ld
 
 echo
 echo "=== --env passengers that would silently collapse the design ==="
 # Each of these is set per cell on the env line at the bottom of run_campaign.sh
 # and --env is expanded after it, so a passenger wins over the real value while
 # every name, index row and manifest still claims the intended one.
-chk "RECONNECT_MODE is set per cell" "--env RECONNECT_MODE is refused" \
+g "RECONNECT_MODE is set per cell" "--env RECONNECT_MODE is refused" \
     --arms hybrid,off --seeds 1 --env "RECONNECT_MODE=off"
-chk "SEED is set per cell"           "--env SEED is refused" \
+g "SEED is set per cell"           "--env SEED is refused" \
     --arms hybrid,off --seeds 1,2 --env "SEED=7"
-chk "DONE_SEEK"                      "--env DONE_SEEK is refused" \
+g "ARM is set per cell"            "--env ARM is refused" \
+    --arms hybrid,off --seeds 1 --env "ARM=off"
+g "--env DONE_SEEK=..."            "--env DONE_SEEK is refused" \
     --arms hybrid,off --seeds 1 --env "DONE_SEEK=1"
-chk "MISSION_RETURN"                 "--env MISSION_RETURN is refused" \
+g "MISSION_RETURN"                 "--env MISSION_RETURN is refused" \
     --arms hybrid,off --seeds 1 --env "MISSION_RETURN=0"
-# The quietest of the set: the claim radius comes from the _r<N> arm suffix, so
-# a passenger would run every cell of cr2 at one radius while half the
-# directories still said the other. Gate check 3i catches it from the manifest,
-# a campaign too late.
-chk "COORD_CLAIM_R is set per cell"  "--env COORD_CLAIM_R is refused" \
-    --arms mtare_hybrid_r10,mtare_hybrid_r40 --seeds 1 --env "COORD_CLAIM_R=40"
-# And the key matcher must not fire on a name that merely ends in the key --
-# env_has splits on whitespace and compares up to '=', so this must run.
-t ALLOW "MY_SEED=7 must not be read as SEED" --arms hybrid,off --seeds 1 --env "MY_SEED=7"
+g "COORD_CLAIM_R is set per cell"  "--env COORD_CLAIM_R is refused" \
+    --arms hybrid,off --seeds 1 --env "COORD_CLAIM_R=40"
+g ALLOW "MY_SEED=7 must not be read as SEED" --arms hybrid,off --seeds 1 --env "MY_SEED=7"
 
 echo
 echo "=== the harness itself must launch nothing ==="
@@ -232,7 +217,7 @@ else
 fi
 
 echo
-echo "=== the launcher's own validation blocks (the M-TARE knobs) ==="
+echo "=== the launcher's own validation blocks (the planner block, the M-TARE knobs) ==="
 # The launcher has no --dry-run, so its inert prelude, through unset
 # _rzv_needed, is cut from the shipped file and run alone. Write the cut into
 # sim/, not a tmpdir: the launcher derives paths from BASH_SOURCE[0].
@@ -262,12 +247,16 @@ if [ -n "$PRELUDE_END" ]; then
   # asserted without rewriting the expect string of every case above -- lg
   # matches a fixed substring of the whole output, not the whole output.
   printf '%s\n' 'echo "__ROSTER_OK__ n=$N_ROBOTS robots=[$ROBOTS]"' >> "$PROBE"
+  # And the planner block's resolution: the executable, the arm and the pins.
+  printf '%s\n' 'echo "__PLANNER_OK__ node=$NODE exe=$PLANNER_EXE arm=$ARM topic=$TEAM_XCHG_TOPIC bep=$BEST_EFFORT_PRIORITY ex=$EXPLOIT ds=$DONE_SEEK mr=$MISSION_RETURN"' >> "$PROBE"
 
   # And the cut has to CONTAIN the guards. A range that stopped short would
   # fail every BLOCK case for the wrong reason and pass every ALLOW one.
   for _need in "FATAL: CELL_WORLD" "FATAL: TEAM_WORLD=" "FATAL: TEAM_WORLD_HZ" \
                "FATAL: RENDEZVOUS_SCHEDULE" "FATAL: PURSUIT_PREDICTOR" \
-               "the arm name and the arm" "has no runnable configuration"; do
+               "the arm name and the arm" "has no runnable configuration" \
+               "FATAL: the planner refuses:" \
+               "is not off|pursuit|rendezvous|hybrid"; do
     cases=$((cases+1))
     if grep -qF "$_need" "$PROBE"; then
       echo "  PASS  the cut carries the guard: $_need"
@@ -310,166 +299,84 @@ if [ -n "$PRELUDE_END" ]; then
     fi
   }
 
-  # The two controls that give every refusal below its meaning. If the first
-  # ever fails, the launcher is refusing a bare invocation; if the second fails,
-  # the mtare_hybrid arm does not exist and the campaign has no treatment.
-  #
-  # Both cases assert the same vector by two routes: the shipped default and the
-  # mtare_hybrid token must not drift apart.
+  # The control that gives every refusal below its meaning: a bare invocation
+  # resolves. The runner pins mtare_off's stack for every arm, so the arm is
+  # the only difference between cells.
   # (notes: guardcal-default-is-mtare-hybrid)
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
-     "shipped defaults resolve to the mtare_hybrid stack"
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_hybrid' \
-     "RECONNECT_MODE=mtare_hybrid expands to the whole P1-P5 stack" \
-     RECONNECT_MODE=mtare_hybrid
-  # An all-knobs-off vector still has to resolve, or the launcher is refusing
-  # off-arm cells -- that is what the old bare-default case was really buying.
-  # `off` is one of the two plain tokens that survive, so it carries the job.
-  lg ALLOW '__PRELUDE_OK__ cw=0 tw=0 hz=1.0 ga=0 rg=silence rs=0 pp=trail rm=off' \
-     "an all-knobs-off vector still resolves" \
-     RECONNECT_MODE=off
+  STACK='__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 pp=trail rm=mtare_off'
+  lg ALLOW "$STACK" "shipped defaults resolve to the mtare_off stack"
+  # The resume guard predicts the same stack from its own copy; read it back.
+  cases=$((cases+1))
+  _req=$( eval "$(grep -E '^  (CELL_WORLD|GLOBAL_ALLOC|PURSUIT_PREDICTOR)_REQ=' "$CS")"
+          echo "cw=${CELL_WORLD_REQ-} tw=${TEAM_WORLD_REQ-} ga=${GLOBAL_ALLOC_REQ-} rg=${RECONNECT_GATE_REQ-} rs=${RENDEZVOUS_SCHEDULE_REQ-} pp=${PURSUIT_PREDICTOR_REQ-}" )
+  _res=$(printf '%s\n' "$STACK" | sed 's/^__PRELUDE_OK__ //; s/ hz=[^ ]*//; s/ rm=.*//')
+  if [ "$_req" = "$_res" ]; then
+    echo "  PASS  the resume guard's stack matches the runner's ($_req)"
+  else
+    echo "  FAIL  the resume guard expects '$_req' but the runner resolves '$_res'"
+    fails=$((fails+1))
+  fi
+  unset _req _res
+  lg ALLOW '__PLANNER_OK__ node=gen34 exe=explo_planner_node arm=hybrid topic=exploration/team_beacon bep=true ex=0 ds=0 mr=1' \
+     "shipped defaults run explo_planner_node at arm hybrid with the gen-34 pins"
+  for _arm in off pursuit rendezvous; do
+    lg ALLOW "$STACK" "ARM=$_arm runs the same stack" ARM=$_arm
+    lg ALLOW "__PLANNER_OK__ node=gen34 exe=explo_planner_node arm=$_arm topic=exploration/team_beacon bep=true ex=0 ds=0 mr=1" \
+       "ARM=$_arm reaches the planner" ARM=$_arm
+  done
+  unset _arm
+  # NODE is a label, not a knob: npm exports NODE as the path of its binary,
+  # and neither that nor a stale NODE=gen33 may change what runs.
+  lg ALLOW '__PLANNER_OK__ node=gen34 exe=explo_planner_node arm=hybrid topic=exploration/team_beacon bep=true ex=0 ds=0 mr=1' \
+     "an exported NODE=/usr/bin/node is not read" NODE=/usr/bin/node
+  lg ALLOW '__PLANNER_OK__ node=gen34 exe=explo_planner_node arm=hybrid topic=exploration/team_beacon bep=true ex=0 ds=0 mr=1' \
+     "a stale NODE=gen33 is not read" NODE=gen33
 
-  # The two plain tokens that CANNOT run, asserted in both directions so the
-  # dead end is a property under test rather than a comment. Either refusal
-  # going quiet means a cell can be filed under a name the node will not stamp.
-  lg BLOCK "has no runnable configuration" \
-     "plain hybrid at its default is refused (it would behave as pursuit)" \
-     RECONNECT_MODE=hybrid
-  lg BLOCK "has no runnable configuration" \
-     "plain rendezvous at its default is refused (it would behave as off)" \
-     CELL_WORLD=1 TEAM_WORLD=1 RECONNECT_MODE=rendezvous
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "and turning the schedule ON under a plain token is the other refusal" \
-     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=rendezvous
+  # The arm is one of four names, exactly.
+  lg BLOCK "FATAL: ARM='mtare_hybrid' is not off|pursuit|rendezvous|hybrid." \
+     "a gen-33 token as ARM is refused" ARM=mtare_hybrid
+  lg BLOCK "FATAL: ARM='Hybrid' is not off|pursuit|rendezvous|hybrid." \
+     "a mis-cased ARM is refused" ARM=Hybrid
 
-  # The other three factorial cells: mtare_pursuit is the chase without an
-  # appointment, mtare_rendezvous the appointment without a chase, mtare_off
-  # neither. Each full vector is asserted. (notes: guardcal-factorial-tokens)
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=silence rs=0 pp=trail rm=mtare_off' \
-     "RECONNECT_MODE=mtare_off expands to P1-P3 and NEITHER mechanism" \
-     RECONNECT_MODE=mtare_off
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 pp=trail rm=mtare_pursuit' \
-     "RECONNECT_MODE=mtare_pursuit expands to the chase WITHOUT an appointment" \
-     RECONNECT_MODE=mtare_pursuit
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=trail rm=mtare_rendezvous' \
-     "RECONNECT_MODE=mtare_rendezvous expands to the appointment WITHOUT a chase" \
-     RECONNECT_MODE=mtare_rendezvous
+  # The gen-33 knobs are refused, not overridden: a cell recorded with a knob
+  # the binary never read is a mislabelled cell. The values the runner pins
+  # are accepted when restated.
+  lg BLOCK "FATAL: the planner refuses: RECONNECT_MODE=mtare_hybrid." \
+     "RECONNECT_MODE is refused" RECONNECT_MODE=mtare_hybrid
+  lg BLOCK "FATAL: the planner refuses: RECONNECT_MODE=mtare_off." \
+     "RECONNECT_MODE is refused even at the pinned stack" RECONNECT_MODE=mtare_off
+  lg BLOCK "FATAL: the planner refuses: EXPLOIT=1." \
+     "EXPLOIT=1 is refused (exploit is phase 2)" EXPLOIT=1
+  lg BLOCK "FATAL: the planner refuses: DONE_SEEK=1." \
+     "DONE_SEEK=1 is refused" DONE_SEEK=1
+  lg BLOCK "FATAL: the planner refuses: MISSION_RETURN=0." \
+     "MISSION_RETURN=0 is refused (the planner always homes)" MISSION_RETURN=0
+  lg BLOCK "FATAL: the planner refuses: LINK_GATE=1." \
+     "LINK_GATE=1 is refused (no link veto)" LINK_GATE=1
+  lg BLOCK "FATAL: the planner refuses: EXPLOIT=1 LINK_GATE=1." \
+     "every refused knob is named, not just the first" EXPLOIT=1 LINK_GATE=1
+  lg ALLOW "$STACK" "the pinned values restated are accepted" \
+     EXPLOIT=0 DONE_SEEK=0 MISSION_RETURN=1 LINK_GATE=0
 
-  # A typo in a 0/1 knob would read as OFF and go unnoticed; only the launcher
-  # can catch it. RECONNECT_MODE is pursuit so the arm stack is empty and the
-  # 0/1 check, not the mtare_* contradiction check, fires.
-  # (notes: guardcal-01-knob-typos)
-  lg BLOCK "FATAL: CELL_WORLD='true'" \
-     "CELL_WORLD=true is refused, not silently read as off" \
-     CELL_WORLD=true RECONNECT_MODE=pursuit
-  lg BLOCK "FATAL: TEAM_WORLD='yes'" \
-     "TEAM_WORLD=yes is refused, not silently read as off" \
-     CELL_WORLD=1 TEAM_WORLD=yes RECONNECT_MODE=pursuit
-
-  # TEAM_WORLD_HZ is the exchange's on/off switch as well as its rate: the node
-  # builds no publisher and no timer at <=0, so these three would each have
-  # recorded team_world=1 on a cell that exchanged nothing.
+  # The pinned stack refuses a contradiction of any of its knobs, including a
+  # typo that would read as off. (notes: guardcal-arm-stamp-per-knob)
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies CELL_WORLD=1, but CELL_WORLD='true'" \
+     "CELL_WORLD=true is refused, not silently read as off" CELL_WORLD=true
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies TEAM_WORLD=1, but TEAM_WORLD='0'" \
+     "TEAM_WORLD=0 contradicts the stack" TEAM_WORLD=0
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies GLOBAL_ALLOC=1, but GLOBAL_ALLOC='0'" \
+     "GLOBAL_ALLOC=0 contradicts the stack" GLOBAL_ALLOC=0
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies RECONNECT_GATE=silence, but RECONNECT_GATE='info'" \
+     "RECONNECT_GATE=info contradicts the stack" RECONNECT_GATE=info
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies RENDEZVOUS_SCHEDULE=0, but RENDEZVOUS_SCHEDULE='1'" \
+     "RENDEZVOUS_SCHEDULE=1 contradicts the stack" RENDEZVOUS_SCHEDULE=1
+  lg BLOCK "FATAL: RECONNECT_MODE=mtare_off implies PURSUIT_PREDICTOR=trail, but PURSUIT_PREDICTOR='mdp'" \
+     "PURSUIT_PREDICTOR=mdp contradicts the stack" PURSUIT_PREDICTOR=mdp
   lg BLOCK "FATAL: TEAM_WORLD_HZ='0.0'" \
-     "TEAM_WORLD_HZ=0 is refused (it disables the exchange it records)" \
-     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=0
-  lg BLOCK "FATAL: TEAM_WORLD_HZ='-1.0'" \
-     "a negative TEAM_WORLD_HZ is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=-1
+     "TEAM_WORLD_HZ=0 is refused" TEAM_WORLD_HZ=0
   lg BLOCK "FATAL: TEAM_WORLD_HZ='<empty: rejected by flt>'" \
      "flt's empty return for nan is refused, not passed to ros2 as a bare -p" \
-     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=nan
-  # RECONNECT_MODE=pursuit, explicitly: this case is about TEAM_WORLD_HZ, and
-  # leaving the mode at its default would make it also assert the default's
-  # whole stack and fail the day that changes for an unrelated reason.
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=2.0 ga=0 rg=silence rs=0 pp=trail rm=pursuit' \
-     "a legitimate TEAM_WORLD_HZ still passes -- the guard is not a blanket no" \
-     CELL_WORLD=1 TEAM_WORLD=1 TEAM_WORLD_HZ=2 RECONNECT_MODE=pursuit
-
-  # The node stamps an mtare_ prefix from its knobs, but directories and
-  # analysis key off the name, so a knob set by hand under a plain name files a
-  # treated cell as control. Each knob gets its own case.
-  # (notes: guardcal-arm-stamp-per-knob)
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "GLOBAL_ALLOC=1 under the plain hybrid name is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "RECONNECT_GATE=info under the plain hybrid name is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_GATE=info RECONNECT_MODE=hybrid
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "RENDEZVOUS_SCHEDULE=1 under the plain hybrid name is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=hybrid
-
-  # The P5 knob's own preconditions, mirroring the node's fatals. Each names a
-  # configuration in which the cell would RECORD the treatment and not carry
-  # it, which is the failure mode the manifest cannot self-diagnose.
-  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 requires TEAM_WORLD=1" \
-     "the appointment without the exchange is refused" \
-     CELL_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=hybrid
-  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=off" \
-     "an appointment with no manoeuvre to schedule is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=off
-  lg BLOCK "FATAL: RENDEZVOUS_SCHEDULE=1 with RECONNECT_MODE=pursuit" \
-     "an appointment in the appointment-OFF cell of the 2x2 is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=pursuit
-  lg BLOCK "FATAL: RECONNECT_MODE=mtare_pursuit implies RENDEZVOUS_SCHEDULE=0" \
-     "contradicting the mtare_pursuit token's own stack is refused" \
-     RENDEZVOUS_SCHEDULE=1 RECONNECT_MODE=mtare_pursuit
-  lg BLOCK "FATAL: RECONNECT_MODE=mtare_rendezvous implies RECONNECT_GATE=info" \
-     "contradicting the mtare_rendezvous token's own stack is refused" \
-     RECONNECT_GATE=silence RECONNECT_MODE=mtare_rendezvous
-
-  # PURSUIT_PREDICTOR also flips the node's mtare_ prefix: typo, arm-stamp and
-  # precondition cases. RECONNECT_MODE is pursuit because every mtare_* token
-  # pins the predictor and would refuse MDP first.
-  # (notes: guardcal-pursuit-predictor-cases)
-  lg BLOCK "FATAL: PURSUIT_PREDICTOR='MDP'" \
-     "a mis-cased PURSUIT_PREDICTOR is refused, not read as trail" \
-     PURSUIT_PREDICTOR=MDP RECONNECT_MODE=pursuit
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "PURSUIT_PREDICTOR=mdp under the plain hybrid name is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 PURSUIT_PREDICTOR=mdp \
-     RECONNECT_MODE=hybrid
-  # Under a plain arm, because the mtare_* tokens all set GLOBAL_ALLOC=1
-  # themselves and this precondition is unreachable beneath any of them. The
-  # PURSUIT_PREDICTOR block runs BEFORE the arm-stamp guard, so a plain token
-  # reaches this refusal rather than the name/stamp one.
-  lg BLOCK "FATAL: PURSUIT_PREDICTOR=mdp requires GLOBAL_ALLOC=1" \
-     "the predictor without the allocator that makes tours is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 PURSUIT_PREDICTOR=mdp RECONNECT_MODE=hybrid
-  lg BLOCK "FATAL: PURSUIT_PREDICTOR=mdp with RECONNECT_MODE=rendezvous" \
-     "aiming a chase in the chase-OFF cell of the 2x2 is refused" \
-     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 PURSUIT_PREDICTOR=mdp \
-     RECONNECT_MODE=rendezvous
-  # The pin, in both directions. The four factorial tokens fix the predictor at
-  # `trail` (an mdp cell would be indexed as the arm it is not), and the ALLOW
-  # cases above already assert pp=trail comes out of each; this asserts the
-  # token REFUSES the override rather than quietly winning over it.
-  lg BLOCK "FATAL: RECONNECT_MODE=mtare_hybrid implies PURSUIT_PREDICTOR=trail" \
-     "contradicting the mtare_hybrid token's predictor pin is refused" \
-     PURSUIT_PREDICTOR=mdp RECONNECT_MODE=mtare_hybrid
-  lg BLOCK "FATAL: RECONNECT_MODE=mtare_pursuit implies PURSUIT_PREDICTOR=trail" \
-     "contradicting the mtare_pursuit token's predictor pin is refused" \
-     PURSUIT_PREDICTOR=mdp RECONNECT_MODE=mtare_pursuit
-
-  # The two _mdp tokens are the only way to request the predictor; the stack
-  # comes from the name, which the node stamps back. Asserted: the expansion,
-  # and refusal of an override that splits name from stamp.
-  # (notes: guardcal-mdp-tokens)
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=0 pp=mdp rm=mtare_pursuit_mdp' \
-     "mtare_pursuit_mdp expands to the mtare_pursuit stack with the predictor on" \
-     RECONNECT_MODE=mtare_pursuit_mdp
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=mdp rm=mtare_hybrid_mdp' \
-     "mtare_hybrid_mdp expands to the mtare_hybrid stack with the predictor on" \
-     RECONNECT_MODE=mtare_hybrid_mdp
-  lg BLOCK "FATAL: RECONNECT_MODE=mtare_hybrid_mdp implies PURSUIT_PREDICTOR=mdp" \
-     "turning the predictor back off under an _mdp token is refused" \
-     PURSUIT_PREDICTOR=trail RECONNECT_MODE=mtare_hybrid_mdp
-  # There is no _mdp counterpart for the two arms that never chase, and the
-  # name has to be refused as unknown rather than mapped to the nearest thing
-  # that parses -- a token that silently degrades is a mislabelled cell.
-  lg BLOCK "FATAL: RECONNECT_MODE='mtare_rendezvous_mdp' is not one of" \
-     "an _mdp name for a chase-OFF arm is not a token" \
-     RECONNECT_MODE=mtare_rendezvous_mdp
+     TEAM_WORLD_HZ=nan
 
   # --- the roster axis (P7) -------------------------------------------------
   # The roster is read from the scenario and cannot be overridden, so SCEN
@@ -480,15 +387,11 @@ if [ -n "$PRELUDE_END" ]; then
   SCEN=flatforest_3robot_lidar.yaml
   lg ALLOW '__ROSTER_OK__ n=3 robots=[atlas bestla husky]' \
      "the roster resolves to THREE at the 3-robot scenario"
-  # And the guards are not quietly conditioned on the pair: one refusal and one
-  # token expansion, re-run at N == 3. If either changed with the roster size the
-  # M-TARE knobs would mean something different in an N-robot campaign.
-  lg ALLOW '__PRELUDE_OK__ cw=1 tw=1 hz=1.0 ga=1 rg=info rs=1 pp=mdp rm=mtare_hybrid_mdp' \
-     "mtare_hybrid_mdp expands to the same stack at N == 3" \
-     RECONNECT_MODE=mtare_hybrid_mdp
-  lg BLOCK "FATAL: the arm name and the arm" \
-     "the arm-stamp guard still fires at N == 3" \
-     CELL_WORLD=1 TEAM_WORLD=1 GLOBAL_ALLOC=1 RECONNECT_MODE=hybrid
+  # And the planner block is not quietly conditioned on the pair.
+  lg ALLOW '__PLANNER_OK__ node=gen34 exe=explo_planner_node arm=rendezvous topic=exploration/team_beacon bep=true ex=0 ds=0 mr=1' \
+     "the planner block resolves the same at N == 3" ARM=rendezvous
+  lg BLOCK "FATAL: the planner refuses: RECONNECT_MODE=mtare_hybrid." \
+     "the planner block still refuses at N == 3" RECONNECT_MODE=mtare_hybrid
   SCEN=flatforest_dense_2robot_lidar.yaml
 fi
 
@@ -840,17 +743,18 @@ echo "=== the resume guard: a banked cell must have run THIS experiment ==="
 # experiment; floats compare numerically. No --dry-run (the guard sits below
 # it): a huge MIN_FREE_MB stops a let-through, which reads LAUNCHED.
 # (notes: guardcal-resume-guard-cases)
-RG_ARM=mtare_hybrid
+RG_ARM=hybrid
 # Agrees with the reference campaign below on every key the guard reads. Each
 # case overwrites, or deletes, exactly one line.
 #
 # run_gates_verdict is CLEAN, a token the harness can write: the teardown writes
 # exactly one of CLEAN, SUSPECT or INVALID.
 # (notes: guardcal-fixture-verdict-clean)
-rg_manifest() {
+rg_manifest() {  # $1 = the arm the fixture cell ran
   cat <<'EOF'
 run_end_reason=all_done
 run_gates_verdict=CLEAN
+node=gen34
 mission_return_enabled=true
 scenario=flatforest_dense_2robot_lidar.yaml
 duration_s=3000
@@ -858,8 +762,8 @@ done_criterion=latch
 cell_world=1
 team_world=1
 global_alloc=1
-reconnect_gate=info
-rendezvous_schedule=1
+reconnect_gate=silence
+rendezvous_schedule=0
 pursuit_predictor=trail
 done_unknown_fraction=0.64
 tx_power_dbm=30.0
@@ -871,12 +775,13 @@ alloc_peer_pos_max_age_sec=none
 separation_weight=0
 separation_radius_m=20
 separation_max_age_sec=10
-link_gate=1
-link_gate_effective=1
+link_gate=0
+link_gate_effective=0
 done_seek_enabled=false
 reconnect_midrun_silence_sec=90
 team_world_hz=1.0
 EOF
+  echo "arm=$1"
 }
 # Every key the guard reads must be here at the reference campaign's value
 # (launcher defaults, no --env), or every SKIP case aborts on the missing key.
@@ -890,17 +795,17 @@ rg() {
   _root="$TMP/resume_$cases"; _cell="$_root/rg_${_arm}_seed1"
   mkdir -p "$_cell"
   if [ -n "$_key" ]; then
-    rg_manifest | grep -v "^$_key=" > "$_cell/run_manifest.txt"
+    rg_manifest "$_arm" | grep -v "^$_key=" > "$_cell/run_manifest.txt"
     [ "$_val" = "<none>" ] || echo "$_key=$_val" >> "$_cell/run_manifest.txt"
   else
-    rg_manifest > "$_cell/run_manifest.txt"
+    rg_manifest "$_arm" > "$_cell/run_manifest.txt"
   fi
   _out=$(MIN_FREE_MB=999999999999 timeout 60 "$CS" --root "$_root" --tag rg \
            --duration 3000 --scenario flatforest_dense_2robot_lidar.yaml \
            --arms "$_arm" --seeds 1 2>&1)
   _rc=$?
   if echo "$_out" | grep -q "ABORT: rg_${_arm}_seed1 is complete but its manifest says"; then
-    # As with the link veto above, the text alone is not the verdict: a guard
+    # The text alone is not the verdict: a guard
     # that printed the refusal and then ran the cell anyway would be worse than
     # no guard at all.
     [ "$_rc" = 0 ] && _got=PRINTED-BUT-RAN || _got=ABORT
@@ -926,6 +831,19 @@ rg() {
 }
 
 rg SKIP  "an agreeing manifest is skipped, not re-run"        "$RG_ARM"
+rg SKIP  "an agreeing off cell is skipped too"                off
+# node and arm: a gen-33 cell, or a gen-34 cell of another arm, banked under
+# this name is a different experiment. (notes: resume-string-key-guard)
+rg ABORT "a gen-33 cell (no node= line) is not this experiment" "$RG_ARM" node "<none>"
+rg ABORT "a cell that says node=gen33 is not this experiment"   "$RG_ARM" node gen33
+rg ABORT "a hybrid-named cell that ran pursuit"               "$RG_ARM" arm pursuit
+rg ABORT "a cell with no arm= line"                           "$RG_ARM" arm "<none>"
+rg ABORT "a gen-33 mtare_ arm token on the arm= line"         "$RG_ARM" arm mtare_hybrid
+# The pinned gen-33 lines: the runner writes them at fixed values, so any
+# other value is a cell from another runner.
+rg ABORT "a cell banked with the link gate on"                "$RG_ARM" link_gate 1
+rg ABORT "a cell banked with the schedule on (gen-33 stack)"  "$RG_ARM" rendezvous_schedule 1
+rg ABORT "a cell banked with the post-latch coast"            "$RG_ARM" done_seek_enabled true
 # Anti-vacuity for the numeric compare, in the direction that costs wall time
 # rather than data: these are the SAME configuration, spelled the way a hand-
 # written or older manifest spells it.
@@ -946,39 +864,15 @@ rg ABORT "cell_size_m absent cannot be shown to agree"        "$RG_ARM" cell_siz
 # Regression cover for the key that WAS compared before this loop existed --
 # folding it in must not have dropped it.
 rg ABORT "done_unknown_fraction=0.50 still aborts"            "$RG_ARM" done_unknown_fraction 0.50
-# cr2's independent variable, and the only key with a sentinel. "none" and
-# "10.0" are different cells even though the yaml default is 10: one pinned the
-# radius, one took whatever the config said that day.
-rg SKIP  "_r40 with a matching 40.0 override is skipped"      mtare_hybrid_r40 coord_claim_radius_override 40.0
-rg ABORT "_r40 banked at 10.0 is a different level"           mtare_hybrid_r40 coord_claim_radius_override 10.0
-rg ABORT "_r40 banked with no override at all"                mtare_hybrid_r40 coord_claim_radius_override none
-rg ABORT "an unsuffixed arm banked at a pinned 10.0"          "$RG_ARM" coord_claim_radius_override 10.0
-# The sentinel branch itself. Compared numerically, awk reads EVERY non-number
-# as 0, so "unset" would equal "none" and a cell whose radius can no longer be
-# determined would score as agreeing. This is the case that separates the two
-# spellings; the four above pass either way.
+# The claim radius and the allocator TTL were gen-33 suffix levels; the runner
+# now passes neither, so "none" is the only agreeing value. The sentinel branch
+# still has to refuse a non-number: compared numerically, awk reads every
+# non-number as 0.
+rg ABORT "a cell banked at a pinned claim radius 10.0"        "$RG_ARM" coord_claim_radius_override 10.0
 rg ABORT "a non-numeric value is not the 'none' sentinel"     "$RG_ARM" coord_claim_radius_override unset
 rg ABORT "an empty value cannot be shown to agree"            "$RG_ARM" coord_claim_radius_override ""
-# alloc_peer_pos_max_age_sec comes from the _ttl<N> suffix; 0 is a real level
-# (unbounded, the control), so 0.0 and none are different cells. The two SKIP
-# cases are the only test of the suffix parser. (notes: guardcal-ttl-suffix)
-rg SKIP  "_ttl120 with a matching 120.0 is skipped"           mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec 120.0
-rg SKIP  "_ttl0 (the control level) matches an explicit 0.0"  mtare_hybrid_ttl0 alloc_peer_pos_max_age_sec 0.0
-# The case this key exists for: a cell named for the treatment, banked with the
-# control's behaviour. Nothing else in the manifest differs -- the arm token, the
-# six M-TARE knobs and the radio regime are all identical between the two levels.
-rg ABORT "_ttl120 banked at 0.0 ran unbounded under the treated name" \
-                                                              mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec 0.0
-rg ABORT "_ttl120 banked before the knob existed"             mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec "<none>"
-rg ABORT "_ttl0 banked with no -p at all is a different route" mtare_hybrid_ttl0 alloc_peer_pos_max_age_sec none
-rg ABORT "an unsuffixed arm banked at a pinned 120.0"         "$RG_ARM" alloc_peer_pos_max_age_sec 120.0
-rg ABORT "an unsuffixed arm predating the knob"               "$RG_ARM" alloc_peer_pos_max_age_sec "<none>"
-# The numeric branch at this key, exercised at a level that is NOT 0 so that the
-# `a + 0` reading of an unparseable string cannot accidentally agree.
-rg ABORT "_ttl120 banked as 'unset' is not a number"          mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec unset
-rg ABORT "_ttl120 banked as nan agrees with 120 under a bare +0" \
-                                                              mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec nan
-rg SKIP  "_ttl120 banked as ' 120.0 ' (padded) still resumes" mtare_hybrid_ttl120 alloc_peer_pos_max_age_sec " 120.0 "
+rg ABORT "a cell banked at a pinned allocator TTL 120.0"      "$RG_ARM" alloc_peer_pos_max_age_sec 120.0
+rg ABORT "a cell predating the allocator TTL key"             "$RG_ARM" alloc_peer_pos_max_age_sec "<none>"
 # The separation term's three knobs. The weight is the obvious one; the other
 # two are guarded because they are NOT inert at weight 0 -- sep_peer_dist_m and
 # sep_eligible_peers are measured on them in every arm, so a resume that moved
@@ -1037,7 +931,7 @@ for _rs in 1 0; do
   cases=$((cases+1))
   _root="$TMP/resume_redo_$_rs"; _cell="$_root/rg_${RG_ARM}_seed1"
   mkdir -p "$_cell"
-  rg_manifest | sed 's/^run_gates_verdict=.*/run_gates_verdict=SUSPECT/' \
+  rg_manifest "$RG_ARM" | sed 's/^run_gates_verdict=.*/run_gates_verdict=SUSPECT/' \
     > "$_cell/run_manifest.txt"
   _out=$(REDO_SUSPECT=$_rs MIN_FREE_MB=999999999999 timeout 60 "$CS" \
            --root "$_root" --tag rg --duration 3000 \
@@ -1059,7 +953,7 @@ done
 # "re-run everything", which would silently discard a finished campaign.
 cases=$((cases+1))
 _root="$TMP/resume_redo_clean"; _cell="$_root/rg_${RG_ARM}_seed1"
-mkdir -p "$_cell"; rg_manifest > "$_cell/run_manifest.txt"
+mkdir -p "$_cell"; rg_manifest "$RG_ARM" > "$_cell/run_manifest.txt"
 _out=$(REDO_SUSPECT=1 MIN_FREE_MB=999999999999 timeout 60 "$CS" \
          --root "$_root" --tag rg --duration 3000 \
          --scenario flatforest_dense_2robot_lidar.yaml \

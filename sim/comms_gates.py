@@ -647,12 +647,13 @@ def main():
                     help="watch mode poll period, seconds")
     ap.add_argument("--odom-timeout", type=float, default=10.0)
     # Extra gated suffixes for streams only some runs carry (e.g. TeamWorld, off
-    # unless team_world_hz > 0). The caller that turns a stream on is the one
-    # that passes it here. (notes: gates-gated-extra)
+    # unless team_world_hz > 0, or gen 34's team beacon). The caller that turns
+    # a stream on is the one that passes it here. (notes: gates-gated-extra)
     ap.add_argument("--gated-extra", default="",
                     help="comma-separated extra topic suffixes to treat as "
                          "must-cross-the-emulator (e.g. "
-                         "exploration/team_world when team_world_hz > 0)")
+                         "exploration/team_world when team_world_hz > 0, "
+                         "exploration/team_beacon for the gen-34 node)")
     # no is for a control arm run through the emulator at a tx_power_dbm where
     # the link should stay up: the outage gate still runs and reports, but
     # cannot fail the run. (notes: gates-expect-outage-control)

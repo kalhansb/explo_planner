@@ -26,7 +26,7 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
                                     (default "hybrid,off")
         GATE_CONTROL_ARMS           arms that run with the manoeuvre disabled
                                     (default "off")
-        GATE_SCHEMA_VERSION         event-log schema to require (default 11;
+        GATE_SCHEMA_VERSION         event-log schema to require (default 12;
                                     pass the banked generation's own number to
                                     re-gate an older campaign, e.g. 5 for a
                                     gen-16 one or 3 for a gen-9 one)
@@ -313,7 +313,7 @@ DONE_UNKNOWN_FRACTION = 0.640
 # The pin must move with the binary: check 3d is an exact equality.
 # kSchemaVersion in experiment_log.hpp is the authority on what each version
 # means; do not re-derive that list here. (notes: gate-schema-version-history)
-SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "11"))
+SCHEMA_VERSION = int(os.environ.get("GATE_SCHEMA_VERSION", "12"))
 # Check 3f treatment config. Every sub-check is overridable, so the check can be
 # calibrated on a known-answer case; re-gating a banked campaign needs both
 # overrides: (notes: gate-3f-treatment-overrides)

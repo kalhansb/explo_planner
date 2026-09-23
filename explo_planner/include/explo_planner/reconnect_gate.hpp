@@ -90,6 +90,9 @@ struct GateVerdict {
   long long c_no_mm = -1;
   long long c_re_mm = -1;
   long long leg_mm  = -1;
+  /// The missing peer `leg_mm` was priced against: the nearest locatable one.
+  /// -1 when no peer was priced. Gen 34 chases this peer (Q64(1)).
+  int leg_peer_id = -1;
 
   /// Cells no vehicle could take under the no-comms mask. Structurally zero
   /// while self, always in_comms and so exempt from the mask, is in the vehicle

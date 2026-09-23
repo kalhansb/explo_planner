@@ -68,7 +68,7 @@ Usage:  equiv_gate.py PARENT_ROOT CHILD_ROOT
         Each root is a campaign directory of cell subdirectories, or one cell
         directory. Cells are matched by nothing — the comparison is over the
         UNION of each side, since seeds and cell names differ between runs.
-Env:    EQUIV_NODE_SRC   explo_planner_node.cpp (default: alongside this file)
+Env:    EQUIV_NODE_SRC   gen 33's explo_planner_node.cpp (default: ../backup/gen33/)
         EQUIV_LOG_HPP    experiment_log.hpp     (default: alongside this file)
         EQUIV_ALLOW_NEW_KINDS   comma-separated event kinds permitted to appear
                                 in the child. For the phase that turns a
@@ -94,8 +94,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.join(HERE, "..", "explo_planner")
+# Gen 33's node, backed up unbuilt when gen 34 took the name (2026-09-23).
 NODE_SRC = os.environ.get(
-    "EQUIV_NODE_SRC", os.path.join(PKG, "src", "explo_planner_node.cpp"))
+    "EQUIV_NODE_SRC", os.path.join(HERE, "..", "backup", "gen33",
+                                   "explo_planner_node.cpp"))
 LOG_HPP = os.environ.get(
     "EQUIV_LOG_HPP",
     os.path.join(PKG, "include", "explo_planner", "experiment_log.hpp"))

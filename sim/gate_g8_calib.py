@@ -68,7 +68,7 @@ max_range_m=30.0
 # Must equal kSchemaVersion in experiment_log.hpp and gate_g8.py's default.
 # Exported to the gate as GATE_SCHEMA_VERSION, so a stale value passes silently;
 # audit_schema_pins_agree() checks it. (notes: g8cal-schema-pin)
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 # The schema the injected regression below downgrades TO. One less than the pin,
 # always: the case has to be a version the gate must reject, and hard-coding a 2
 # after the pin moved to 4 would have kept passing while testing a two-step
@@ -2246,7 +2246,8 @@ def audit_params_against_writers():
     being wrong. The C++ writers are the authority, and they are readable now.
     """
     global fails
-    src_path = os.path.join(HERE, os.pardir, "explo_planner", "src",
+    # Gen 33's node, backed up unbuilt when gen 34 took the name.
+    src_path = os.path.join(HERE, os.pardir, "backup", "gen33",
                             "explo_planner_node.cpp")
     if not os.path.exists(src_path):
         print(f"  UNRESOLVED  node source not found at {src_path}; fixture "

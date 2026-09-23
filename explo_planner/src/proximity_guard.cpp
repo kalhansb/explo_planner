@@ -1,6 +1,7 @@
 // Moved comments: doc/explo_planner_code_notes.md
 #include "explo_planner/proximity_guard.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -117,7 +118,11 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     const bool escaped =
         p.escape_active && (now - p.escape_until).seconds() < 0.0;
 
-    if (fresh && !parked && !escaped && dist < trigger) {
+    // setExempt: the caller has cleared this peer (both in Meet).
+    const bool exempt =
+        std::find(exempt_.begin(), exempt_.end(), p.id) != exempt_.end();
+
+    if (fresh && !parked && !escaped && !exempt && dist < trigger) {
       if (dist < best_hold) {
         best_hold = dist;
         d.hold = true;
@@ -128,8 +133,9 @@ ProximityGuard::Decision ProximityGuard::evaluate(
       best_near = dist;
       near_id = &p.id;
       near_note = !fresh ? "stale"
-                         : (parked ? "parked"
-                                   : (escaped ? "escaped" : "clear"));
+                         : (exempt ? "exempt"
+                                   : (parked ? "parked"
+                                             : (escaped ? "escaped" : "clear")));
     }
   }
   if (!d.hold) {
