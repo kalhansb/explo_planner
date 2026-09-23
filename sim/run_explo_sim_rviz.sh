@@ -3157,6 +3157,7 @@ PYGEOM
   echo "fine_region_z_hi=$FINE_Z_HI"
   echo "fine_anchor_enable=$FINE_ANCHOR"
   echo "fine_regions=$FINE_REGIONS"
+  echo "release_on_done=${RELEASE_ON_DONE:-0}"
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
 # Deferred from the defaults block, where log() does not exist yet. The pairing
@@ -3368,13 +3369,28 @@ done
 # EXPLOIT=0: exploitation_enabled=false already makes the planners ignore
 # releases, but leaving the scheduler running would still put TreeTarget traffic
 # on the ungated global /exploration/targets bus during a comms run.
-if [ "$EXPLOIT" = "0" ]; then
-  log "EXPLOIT=0 — pure exploration, target_scheduler NOT started"
-else
+# RELEASE_ON_DONE=1 (explore-then-exploit pilot): the scheduler is NOT started
+# here. The monitor loop starts it, with every release time at 0, on the first
+# tick where every planner is DONE (the explore-done cue), so the run explores
+# exactly as an EXPLOIT=0 run would and only then exploits. done_action=idle
+# and done_criterion=streak keep DONE revocable, so a DONE planner picks the
+# released targets up ("target-arrived-done-idle").
+RELEASE_ON_DONE="${RELEASE_ON_DONE:-0}"
+CUE_RELEASED=0; CUE_LEFT=0; CUE_HOLD_UNTIL=0
+start_scheduler() { # start_scheduler [extra ros args...]
   start sched "$OUTDIR/sched.log" \
     ros2 run explo_planner target_scheduler_node --ros-args \
       -r __node:=target_scheduler \
-      --params-file "$TARGETS" -p use_sim_time:=true
+      --params-file "$TARGETS" -p use_sim_time:=true "$@"
+}
+if [ "$EXPLOIT" = "0" ]; then
+  log "EXPLOIT=0 — pure exploration, target_scheduler NOT started"
+elif [ "$RELEASE_ON_DONE" = "1" ]; then
+  N_TGT=$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(len(d['target_scheduler']['ros__parameters']['target_ids']))" "$TARGETS")
+  CUE_RELEASE="[$(python3 -c "print(','.join(['0.0']*$N_TGT))")]"
+  log "RELEASE_ON_DONE=1 — target_scheduler held until every planner is DONE ($N_TGT targets, release $CUE_RELEASE)"
+else
+  start_scheduler
 fi
 sleep 8
 # Count real node binaries only, by the absolute install path that ONLY the
@@ -3790,6 +3806,27 @@ while true; do
       STALL=0
     fi
     LAST_STEPS=$STEPS_NOW
+  fi
+  if [ "$STOP_ON_DONE" = "1" ] && [ "$RELEASE_ON_DONE" = "1" ] && [ "$EXPLOIT" != "0" ]; then
+    # Explore-done cue: release every target the first time all planners are
+    # DONE, then hold the stop rule until a planner has actually left DONE (or
+    # 120 sim-s pass), so the release cannot race the all-DONE grace.
+    if [ "$all_done" = 1 ] && [ "$CUE_RELEASED" = 0 ]; then
+      CUE_RELEASED=1; CUE_HOLD_UNTIL=$((T + 120))
+      log "explore-done cue: every planner DONE at t_sim=$T (t_rel=$((T - T0)) s) — releasing targets"
+      echo "explore_done_cue_t_sim=$T" >> "$MANIFEST"
+      echo "explore_done_cue_t_rel=$((T - T0))" >> "$MANIFEST"
+      start_scheduler -p "target_release_sec:=$CUE_RELEASE"
+      all_done=0
+    elif [ "$CUE_RELEASED" = 1 ] && [ "$CUE_LEFT" = 0 ]; then
+      if [ "$all_done" = 0 ]; then
+        CUE_LEFT=1; log "a planner left DONE after the cue at t_sim=$T — exploiting"
+      elif [ "$T" -lt "$CUE_HOLD_UNTIL" ]; then
+        all_done=0
+      else
+        CUE_LEFT=1; log "WARN no planner left DONE within 120 s of the target release — stop rule re-armed"
+      fi
+    fi
   fi
   if [ "$STOP_ON_DONE" = "1" ]; then
     # all_done was computed above, before the clock read, so that a fast poll
