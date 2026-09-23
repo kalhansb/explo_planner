@@ -2504,6 +2504,14 @@ if [ "$RVIZ" = "1" ]; then
   sleep 5
 fi
 start targetviz "$OUTDIR/targetviz.log" python3 "$HERE/sim_target_markers.py"
+# cam_pilot: per-frame label pixel counts from the segmentation ("NDVI")
+# camera, when the scenario carries one. Opt-in: CAM_COUNTER=<path to
+# cam_counter.py>. Writes $OUTDIR/cam/ (counts.csv, frames.csv, best frames).
+if [ -n "${CAM_COUNTER:-}" ]; then
+  start camcount "$OUTDIR/cam_counter.log" \
+    python3 "$CAM_COUNTER" --out "$OUTDIR/cam" --robots "$(echo $ROBOTS | tr ' ' ',')" \
+      --ros-args -p use_sim_time:=true
+fi
 
 # --- 5. optional bag --------------------------------------------------------
 # Under COMMS=1 the interesting streams are the RELAYED ones: /exploration/intents
@@ -3158,6 +3166,7 @@ PYGEOM
   echo "fine_anchor_enable=$FINE_ANCHOR"
   echo "fine_regions=$FINE_REGIONS"
   echo "release_on_done=${RELEASE_ON_DONE:-0}"
+  echo "cam_counter=${CAM_COUNTER:-none}"
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
 # Deferred from the defaults block, where log() does not exist yet. The pairing
