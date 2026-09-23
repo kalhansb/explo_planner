@@ -84,7 +84,7 @@
 // than a landmark is one edit away from testing something else.
 //
 // MUTATION STATUS: M1-M14 are the gen-21 record above; GROUP E (M15-M22),
-// GROUP F (M23-M26), GROUP G (M32-M34, M38-M40) and GROUP H (M44-M53, M65) carry
+// GROUP F (M23-M26), GROUP G (M32-M34, M38-M40) and GROUP H (M44-M53, M68-M70) carry
 // their own below. One sequence for the whole file, and it continues outside
 // it: M27-M31, M35-M37, M43 and M54-M58 are in test_exchange_drain.cpp, where
 // the drain predicate GROUP G used to scan now runs; M41-M42 are scovox's
@@ -1016,9 +1016,14 @@ TEST(Gen33DrainRelease, TheThresholdsAreRefusedAndZeroIsRefusedWithThem) {
 // Ten mutations, ten failures, node restored byte-exact (sha256 re-checked).
 //
 // Known issue 2 (DESIGN_gen33 §10, found in ts4_33_n2 cell 12), verified
-// 2026-09-23 the same way:
+// 2026-09-23 the same way; M65-M67 are in test_meeting_attendance.cpp:
 //
-//   M65  `|| holdingForFinishedPeer()` dropped from doReturnSync's resume
+//   M68  the heartbeat's team-back window stepped on bare teamSettled
+//   M69  doReturnNav's settle conversion reads bare teamSettled(active)
+//   M70  doReturnSync's resume back to the generation-28 terms, no veto
+//
+// Each fails Gen33MeetingAttendance.TheWalkerAppliesTheVetoAtAllThreeSites;
+// node restored byte-exact (sha256 re-checked).
 
 namespace {
 
@@ -1197,29 +1202,49 @@ TEST(Gen33MeetingAttendance, EveryPeerLeavingIsLoggedAsItsOwnOutcome) {
   EXPECT_LT(at_drained, at_latch);
 }
 
-/// A settle-converted walker held for a finished peer it cannot hear resumes
-/// its drive to the cell. reachablePeerCount counts that peer, so the resume's
-/// "together" test must also read the veto, or two finished walkers stopped
-/// short both hold and neither moves (ts4_33_n2 cell 12: 420 s each, no
-/// exchange). (notes: return-sync-conversion-reversible)
-TEST(Gen33MeetingAttendance, AWalkerHeldForAFinishedPeerDrivesOn) {
+/// The walker's two moves go through walkerJoinsBarrier / walkerResumesDrive
+/// (run in test_meeting_attendance.cpp) with the veto as `holding`, at all three
+/// sites: the conversion's read, the window the heartbeat steps for it, and the
+/// resume. A site left on bare teamSettled counts a finished, unheard peer as
+/// present — ts4_33_n2 cell 12, where both walkers stood out the bound short of
+/// the cell. (notes: return-sync-conversion-reversible)
+TEST(Gen33MeetingAttendance, TheWalkerAppliesTheVetoAtAllThreeSites) {
   const std::string text = nodeSource();
   ASSERT_FALSE(text.empty()) << "cannot read " << EXPLO_PLANNER_NODE_CPP;
+
+  const std::string nav =
+      flatten(functionBody(text, "void ExploPlannerNode::doReturnNav("));
+  ASSERT_FALSE(nav.empty()) << "the scan found no doReturnNav definition";
+  EXPECT_NE(nav.find("dwellHeld(walkerJoinsBarrier(teamSettled(active),"
+                     "holdingForFinishedPeer()),"),
+            std::string::npos)
+      << "the settle conversion reads the team without the veto. A resumed "
+         "walker whose partner finished stops again on the next tick:\n"
+      << nav;
+  EXPECT_EQ(nav.find("dwellHeld(teamSettled("), std::string::npos)
+      << "a bare teamSettled read is back in doReturnNav";
+
+  const std::string hb =
+      flatten(functionBody(text, "void ExploPlannerNode::heartbeatTick("));
+  ASSERT_FALSE(hb.empty()) << "the scan found no heartbeatTick definition";
+  EXPECT_NE(hb.find("dwellConfirmed(walkerJoinsBarrier(teamSettled("
+                    "accountedPeerCount(pres_now)),holdingForFinishedPeer()),"),
+            std::string::npos)
+      << "the window the conversion reads is stepped on bare teamSettled: it "
+         "stays armed through the finished channel, and the conversion fires "
+         "on the first packet instead of after the dwell:\n"
+      << hb;
+
   const std::string sync =
       flatten(functionBody(text, "void ExploPlannerNode::doReturnSync("));
   ASSERT_FALSE(sync.empty()) << "the scan found no doReturnSync definition";
-
-  const size_t at_if =
-      sync.find("if(appointment_manoeuvre_&&appointment_settle_converted_&&");
-  ASSERT_NE(at_if, std::string::npos) << "the scan found no resume test";
-  const size_t at_body = sync.find("){", at_if);
-  ASSERT_NE(at_body, std::string::npos);
-  const std::string cond = sync.substr(at_if, at_body - at_if);
-  EXPECT_NE(cond.find("(!teamComplete(reachablePeerCount(),"
-                      "rendezvous_expected_peers_)||holdingForFinishedPeer())"),
+  EXPECT_NE(sync.find("!appointment_arrived_&&walkerResumesDrive(teamSettled("
+                      "active),teamComplete(reachablePeerCount(),"
+                      "rendezvous_expected_peers_),holdingForFinishedPeer()))"
+                      "{"),
             std::string::npos)
-      << "the resume no longer treats a finished peer the veto holds for as "
-         "absent, so two finished walkers stopped short of the cell both "
-         "hold for each other and neither drives on:\n"
-      << cond;
+      << "the resume no longer goes through walkerResumesDrive with the veto, "
+         "so two finished walkers stopped short both hold and neither drives "
+         "on:\n"
+      << sync;
 }

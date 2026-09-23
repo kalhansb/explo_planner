@@ -30,4 +30,12 @@ int finishedPeerStillComing(const TeamModel& team, int self_id) {
   return -1;
 }
 
+bool walkerJoinsBarrier(bool settled, bool holding) {
+  return settled && !holding;
+}
+
+bool walkerResumesDrive(bool settled, bool reachable, bool holding) {
+  return !((settled || reachable) && !holding);
+}
+
 }  // namespace explo_planner

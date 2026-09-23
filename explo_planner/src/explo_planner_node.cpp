@@ -8133,10 +8133,14 @@ void ExploPlannerNode::doReturnNav() {
   // Read team_back_ok_* via dwellHeld (heartbeatTick owns the clock), not
   // release_ok_*, which is frozen here; appointment_arrived_ stays false.
   // (notes: return-nav-settle-conversion)
+  // walkerJoinsBarrier: not while the veto holds for a finished peer, which
+  // teamSettled counts as present; the heartbeat steps the window on the same
+  // predicate.
   if (appointment_manoeuvre_ &&
-      dwellHeld(teamSettled(active), this->now().seconds(),
-                reconnect_release_confirm_sec_, team_back_ok_armed_,
-                team_back_ok_since_sec_)) {
+      dwellHeld(walkerJoinsBarrier(teamSettled(active),
+                                   holdingForFinishedPeer()),
+                this->now().seconds(), reconnect_release_confirm_sec_,
+                team_back_ok_armed_, team_back_ok_since_sec_)) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team settled while driving to %s (dist=%.2f) -> joining "
         "the barrier from here.", return_dest_label_.c_str(), dist);
@@ -8648,14 +8652,15 @@ void ExploPlannerNode::doReturnSync() {
   // together. The terms negate manoeuvreReleaseEligible's first half (change
   // both together); copy current_goal_ since startReturnTo overwrites it.
   // (notes: return-sync-conversion-reversible)
-  // A finished peer the veto holds for is not together, although
-  // reachablePeerCount counts it: without that term two finished walkers
-  // stopped short both hold and neither drives on (DESIGN_gen33 §10, known
+  // walkerResumesDrive applies the finished-peer veto as the release does:
+  // both counts include a finished peer, heard or not (DESIGN_gen33 §10, known
   // issue 2).
   if (appointment_manoeuvre_ && appointment_settle_converted_ &&
-      !appointment_arrived_ && !teamSettled(active) &&
-      (!teamComplete(reachablePeerCount(), rendezvous_expected_peers_) ||
-       holdingForFinishedPeer())) {
+      !appointment_arrived_ &&
+      walkerResumesDrive(
+          teamSettled(active),
+          teamComplete(reachablePeerCount(), rendezvous_expected_peers_),
+          holdingForFinishedPeer())) {
     const Eigen::Vector3f resume_target = current_goal_.position;
     const float rdx = resume_target.x() - latest_pos_.x();
     const float rdy = resume_target.y() - latest_pos_.y();
@@ -10104,8 +10109,13 @@ void ExploPlannerNode::heartbeatTick() {
     // has dwelt reconnect_release_confirm_sec_. Step dwellConfirmed every
     // heartbeat, outside the !appointment_armed_ test, or its clock freezes.
     // (notes: rzv-spent-release)
+    // The window is also the settle conversion's, so it applies the
+    // finished-peer veto; that is false outside an appointment manoeuvre, so
+    // the latch release and the supersede read teamSettled as before.
     const bool team_back_dwelt =
-        dwellConfirmed(teamSettled(accountedPeerCount(pres_now)),
+        dwellConfirmed(walkerJoinsBarrier(
+                           teamSettled(accountedPeerCount(pres_now)),
+                           holdingForFinishedPeer()),
                        pres_now.seconds(), reconnect_release_confirm_sec_,
                        &team_back_ok_armed_, &team_back_ok_since_sec_);
     if (!appointment_armed_ && team_back_dwelt) {

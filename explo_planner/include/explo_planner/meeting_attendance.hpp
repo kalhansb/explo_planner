@@ -63,4 +63,23 @@ uint8_t announcedMode(bool finished_announced, bool keeping_appointment,
 /// (notes: meeting-finished-peer-coming)
 int finishedPeerStillComing(const TeamModel& team, int self_id);
 
+/// An appointment walker's two moves, from the node's readings of the team.
+/// `settled` is teamSettled and `reachable` the release's door (teamComplete
+/// over reachablePeerCount); BOTH count a finished peer as present, heard or
+/// not. `holding` is holdingForFinishedPeer: such a peer, unheard and not
+/// leaving, is not present, and the veto says so. Only the release applied the
+/// veto before, so two finished walkers stopped short could neither release
+/// nor drive on (DESIGN_gen33.md §10, known issue 2).
+///
+/// walkerJoinsBarrier: the settle conversion, and the dwell that clocks it —
+/// stop on the road and join the barrier. Mesh only, never while the veto
+/// holds.
+bool walkerJoinsBarrier(bool settled, bool holding);
+
+/// walkerResumesDrive: a walker the conversion stopped short drives on. The
+/// negation of the release's "together" half, `(settled || reachable) &&
+/// !holding`. Never true on a reading where walkerJoinsBarrier is, so a walker
+/// cannot flip between the two each tick.
+bool walkerResumesDrive(bool settled, bool reachable, bool holding);
+
 }  // namespace explo_planner

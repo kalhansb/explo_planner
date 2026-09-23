@@ -904,7 +904,10 @@ TEST(Gen23ContagionFiveSites, TheLatchReleaseIsOnTheSamePredicate) {
   // that asking the question cannot advance or disarm it. doPlan's supersede
   // reads the same pair through dwellHeld.
   const size_t write = hb.find("const bool team_back_dwelt =");
-  const size_t call = hb.find("dwellConfirmed(teamSettled(");
+  // Generation 33 known issue 2: the predicate is teamSettled with the
+  // finished-peer veto (walkerJoinsBarrier), since the settle conversion reads
+  // this window too. The veto is false outside an appointment manoeuvre.
+  const size_t call = hb.find("dwellConfirmed(walkerJoinsBarrier(");
   EXPECT_NE(write, std::string::npos)
       << "the team-back dwell is no longer bound to a named standalone "
          "statement in heartbeatTick. If it was inlined into the "
@@ -914,7 +917,7 @@ TEST(Gen23ContagionFiveSites, TheLatchReleaseIsOnTheSamePredicate) {
          "back again, wearing the guard's name.";
   EXPECT_NE(call, std::string::npos)
       << "heartbeatTick no longer writes a dwell window over teamSettled";
-  EXPECT_EQ(countOf(text, "dwellConfirmed(teamSettled("), 1)
+  EXPECT_EQ(countOf(text, "dwellConfirmed(walkerJoinsBarrier("), 1)
       << "a second site writes the team-back window. Two writers over one pair "
          "means asking the question changes its answer — the supersede site "
          "must use dwellHeld.";
@@ -924,7 +927,8 @@ TEST(Gen23ContagionFiveSites, TheLatchReleaseIsOnTheSamePredicate) {
     EXPECT_LT(write, call);
     EXPECT_LT(call - write, size_t{40})
         << "`team_back_dwelt` is no longer initialised directly from "
-           "dwellConfirmed(teamSettled(...)) — something has been interposed";
+           "dwellConfirmed(walkerJoinsBarrier(teamSettled(...), ...)) — "
+           "something has been interposed";
     EXPECT_LT(call, release)
         << "the window is stepped after the latch is cleared, so the release "
            "acts on the previous heartbeat's answer";
@@ -1676,15 +1680,29 @@ TEST(Gen28SettleLapse, TheResumeFiresOnlyWhenTheTeamIsActuallyApart) {
 
   // Both halves of manoeuvreReleaseEligible's "together" disjunction have to
   // be negated here. Dropping either one resumes a robot whose team is fine.
-  EXPECT_NE(sq.find("!teamSettled(active)"), std::string::npos)
+  // Since generation 33 (known issue 2) the negation is walkerResumesDrive,
+  // which also takes the finished-peer veto; its logic runs in
+  // test_meeting_attendance.cpp (WalkerMoves).
+  const std::string flat = [&] {
+    std::string f;
+    for (const char c : fn)
+      if (c != ' ' && c != '\n' && c != '\t' && c != '\r') f.push_back(c);
+    return f;
+  }();
+  const size_t at_resume = flat.find("walkerResumesDrive(");
+  ASSERT_NE(at_resume, std::string::npos)
+      << "the resume test no longer asks walkerResumesDrive";
+  const std::string args = flat.substr(at_resume, 160);
+  EXPECT_NE(args.find("walkerResumesDrive(teamSettled(active),"),
+            std::string::npos)
       << "the mesh half is gone from the resume test: a robot whose team is "
-         "settled would be sent back onto the road.";
-  EXPECT_NE(sq.find("!teamComplete(reachablePeerCount(), "
-                    "rendezvous_expected_peers_)"),
+         "settled would be sent back onto the road.\n" << args;
+  EXPECT_NE(args.find(",teamComplete(reachablePeerCount(),"
+                      "rendezvous_expected_peers_),"),
             std::string::npos)
       << "the closure half is gone from the resume test: a bridged team — "
          "exactly what generation 27 releases on — would be torn up and sent "
-         "driving again.";
+         "driving again.\n" << args;
   EXPECT_NE(sq.find("!appointment_arrived_"), std::string::npos)
       << "a robot that reached the agreed cell can be resumed. There is "
          "nowhere for it to go and the vigil at the cell is the design.";

@@ -40,6 +40,16 @@
 ///   M64  the `finished` filter deleted
 ///        -> FinishedPeerStillComing.AnUnfinishedPeerIsNotThisCase
 ///
+/// Known issue 2 (the walker's moves), same method, 2026-09-23:
+///
+///   M65  walkerJoinsBarrier ignores `holding`
+///        -> WalkerMoves.CellTwelveDrivesOn and ...NeverBothOnOneReading
+///   M66  walkerResumesDrive drops `holding` (the gen-28 test alone)
+///        -> WalkerMoves.CellTwelveDrivesOn and ...TheResumeNegatesTheReleasesTogether
+///   M67  walkerResumesDrive as the first fix had it,
+///        `!settled && (!reachable || holding)`
+///        -> WalkerMoves.CellTwelveDrivesOn and ...TheResumeNegatesTheReleasesTogether
+///
 /// The self skip is not in the ledger: TeamModel never marks its own entry
 /// finished (the gossip loop skips self), so deleting it is equivalent.
 /// Moved comments: doc/explo_planner_code_notes.md
@@ -61,6 +71,8 @@ using explo_planner::kModeHoming;
 using explo_planner::makeFleetIdentity;
 using explo_planner::robotBit;
 using explo_planner::TeamModel;
+using explo_planner::walkerJoinsBarrier;
+using explo_planner::walkerResumesDrive;
 
 namespace {
 
@@ -319,4 +331,61 @@ TEST(FinishedPeerStillComing, SelfAndUnconfiguredAreNeverComing) {
   hear(m, msg(kAtlas, robotBit(kBestla), true, kModeExploring), 0.0);
   m.tick(kNowSec);
   EXPECT_EQ(finishedPeerStillComing(m, kBestla), kAtlas);
+}
+
+// ---------------------------------------------------------------------------
+// walkerJoinsBarrier / walkerResumesDrive — THE WALKER'S TWO MOVES.
+//
+// Inputs as the node reads them: settled = teamSettled, reachable = the
+// release's door, holding = holdingForFinishedPeer. A finished peer that cannot
+// be heard makes settled AND reachable true (peerAccounted and
+// reachablePeerCount both count `finished`) and holding true.
+// ---------------------------------------------------------------------------
+
+/// TS4_33_N2 CELL 12. Both robots joined the barrier short of the cell, the link
+/// died, and each read its finished, unheard partner as settled, reachable and
+/// held for. Before the fix neither drove on; both stood out the bound.
+TEST(WalkerMoves, CellTwelveDrivesOn) {
+  EXPECT_TRUE(walkerResumesDrive(/*settled=*/true, /*reachable=*/true,
+                                 /*holding=*/true))
+      << "a walker held for a finished peer it cannot hear stays where the "
+         "settle stopped it, short of the cell, until the bound runs out";
+  EXPECT_FALSE(walkerJoinsBarrier(/*settled=*/true, /*holding=*/true))
+      << "a resumed walker stops again on the next tick: teamSettled still "
+         "counts the finished peer, so it flips between driving and stopped";
+}
+
+/// NEVER BOTH ON ONE READING, over all eight inputs. A reading that both joins
+/// and resumes flips the walker every other tick.
+TEST(WalkerMoves, NeverBothOnOneReading) {
+  for (int bits = 0; bits < 8; ++bits) {
+    const bool settled = bits & 1, reachable = bits & 2, holding = bits & 4;
+    EXPECT_FALSE(walkerJoinsBarrier(settled, holding) &&
+                 walkerResumesDrive(settled, reachable, holding))
+        << "settled=" << settled << " reachable=" << reachable
+        << " holding=" << holding;
+  }
+}
+
+/// THE RESUME IS THE RELEASE'S "TOGETHER" HALF, NEGATED, VETO INCLUDED —
+/// `(settled || reachable) && !holding`, as manoeuvreReleaseEligible writes it.
+TEST(WalkerMoves, TheResumeNegatesTheReleasesTogether) {
+  for (int bits = 0; bits < 8; ++bits) {
+    const bool settled = bits & 1, reachable = bits & 2, holding = bits & 4;
+    EXPECT_EQ(walkerResumesDrive(settled, reachable, holding),
+              !((settled || reachable) && !holding))
+        << "settled=" << settled << " reachable=" << reachable
+        << " holding=" << holding;
+  }
+}
+
+/// WITHOUT THE VETO, GENERATION 28 IS UNCHANGED: join on settled, resume when
+/// neither half reads together.
+TEST(WalkerMoves, WithoutTheVetoGenerationTwentyEightIsUnchanged) {
+  for (int bits = 0; bits < 4; ++bits) {
+    const bool settled = bits & 1, reachable = bits & 2;
+    EXPECT_EQ(walkerJoinsBarrier(settled, false), settled);
+    EXPECT_EQ(walkerResumesDrive(settled, reachable, false),
+              !settled && !reachable);
+  }
 }
