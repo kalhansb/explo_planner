@@ -1,0 +1,88 @@
+# Fine-band pilot: targets_flatforest.yaml with early releases, so every
+# trunk is queued before either robot can reach the coverage stop (streak
+# criterion, tested only in PLAN, after the exploit check).
+# Tree-target schedule for the hmr_sim `flatforest` world (sim exploration +
+# exploitation run).
+#
+# Companion to config/targets.yaml (generic placeholders at (5,3)/(-4,-6),
+# which stand on empty ground in this world — exploitation there can only ever
+# close PARTIAL). Every centre below is a REAL trunk read straight out of the
+# world SDF that robot_sim.launch.py loads:
+#   hmr_sim/worlds/flatforest/flatforestv2.sdf  (world name "flatforest",
+#   80 "Oak tree*" models, ground_plane at z = 0, robot spawns at (0, 0, 0.5)).
+# The x/y are the models' own <pose> values, so they are exact, not measured
+# off a map.
+#
+# Trunk geometry (measured off the model's collision/visual mesh,
+# ~/.ignition/fuel/.../openrobotics/models/oak tree/7/meshes/oak_tree.dae,
+# whose node transform scales inches -> metres by 0.0254), radial extent about
+# the model origin — which is the target centre, and is NOT the trunk axis at
+# low z (the bark centroid sits ~0.4 m off it there):
+#   z 0.0-0.2 m (root flare / skirt)  bark radius <= 1.70 m  <- target_radius
+#   z 0.2-0.6 m (the sightline band)  bark radius <= 1.10 m
+#   z 0.6-1.2 m (clean trunk)         bark radius ~  0.40 m
+#   z 1.2-6.5 m                       canopy, out to ~4.7 m radius
+# `target_radius` is deliberately NOT the 0.4 m clean-trunk radius:
+# lineOfSightClear() stops the ray within (radius + one voxel) of the trunk
+# axis and treats anything inside that as the trunk itself, so under-declaring
+# it makes the tree's own root flare read as an occluder and fails the vantage.
+# It also sets the ring: standoff = radius + vantage_standoff_m (2.0).
+#
+# 1.80 m is set from a measured run, not from the mesh alone. The first pass
+# used 1.10 (the sightline-band extent) and 4 of the 5 vantages that were
+# actually driven and dwelled came back LoS BLOCKED, across two different
+# trunks and all three ring angles — target 1 closed PARTIAL 1/3, target 2
+# 0/3. The map is voxelised at 0.10 m, so a ray at ground + 0.30 m samples the
+# cell spanning z 0.2-0.3 and can clip the *flare* band, not just the
+# sightline band; the declared radius has to cover the flare's 1.70 m. At 1.80
+# the ray stops 1.9 m from the axis, outside all of it, and the ring moves to
+# 3.8 m — still well inside fov_max_range and under the canopy at ray height.
+#
+# Why these three trunks:
+#   * isolated — nearest neighbouring tree is 9.6-11.0 m away, so the 3.8 m
+#     vantage ring never lands inside another trunk;
+#   * spread over three directions (NE / S / NW) and 13-19 m from spawn, well
+#     apart from each other (28-34 m), so the planner traverses between them
+#     and exploration resumes in between;
+#   * FAR from spawn on purpose. A vantage needs mapped ground under it
+#     (terrain-relative z); when a target activates with its ring unmapped the
+#     vantages are rejected `noground` and the planner falls back to marching
+#     at the trunk to map the area — which only works if there is somewhere to
+#     march FROM. Released next to its own ring, the planner has no approach
+#     waypoint left, cannot map the far side, and idles out its give-up timer:
+#     a 7 m target closed PARTIAL 1/3 that way with `valid=1 noground=2`. Every
+#     target here is far enough that the approach march maps its ring first.
+#   * "Oak tree_19" at (1.88, 2.01) is deliberately NOT used: MaleVisitorOnPhone
+#     stands 0.12 m from that trunk and would occlude a vantage, and its ring
+#     would sit on top of the spawn point.
+# The canopy is invisible to the navigator (simple_nav_3d counts obstacles only
+# between 0.40 and 1.00 m above ground), so driving the ring under the branches
+# is fine.
+#
+#   id  SDF model      centre (x, y)     nearest tree   dist from spawn
+#   1   Oak tree_42    (  9.96,  8.34)     10.27 m         13.0 m
+#   2   Oak tree_4     (  4.40, -18.81)    11.01 m         19.3 m
+#   3   Oak tree_39    ( -9.85,  11.61)     9.60 m         15.2 m
+#
+# Release times are in SIM seconds from the scheduler's origin, which it latches
+# on its first tick with a live /clock — i.e. from when the scheduler starts,
+# not from when the sim started. 120 s of plain exploration first, then one
+# target every 300 s. That spacing covers the worst case for one trunk here —
+# a 20-30 m traverse, the approach march that maps the ring, then three ~4 m
+# vantage hops with 3 x exploit_dwell_sec — while matching
+# exploit_target_timeout_sec (300 s, measured from the last progress event, not
+# from activation), so a target that genuinely cannot be worked closes PARTIAL
+# rather than queueing up behind the next release.
+target_scheduler:
+  ros__parameters:
+    use_sim_time: true
+    targets_topic: "/exploration/targets"
+    frame_id: "map"
+
+    target_ids:         [1,      2,      3]
+    target_x:           [9.96,   4.40,  -9.85]
+    target_y:           [8.34,  -18.81, 11.61]
+    target_z:           [0.0,    0.0,    0.0]   # flat world: ground plane at z=0
+    target_radius:      [1.80,   1.80,   1.80]  # covers the root flare (see above)
+    target_height:      [6.5,    6.5,    6.5]   # informational
+    target_release_sec: [30.0,  45.0,   60.0]

@@ -1825,6 +1825,28 @@ DONE_UNKNOWN="$(flt "${DONE_UNKNOWN:-0.64}")"
 # be identical across arms and runs at a different value are not comparable.
 # Recorded in the manifest for that reason.
 DONE_CRITERION="${DONE_CRITERION:-latch}"
+# FINE-BAND PILOT (overlay patch, not in 5649afa). FINE_BAND=1 turns on the
+# scovox fine-TSDF band on every robot and registers FIXED regions around the
+# listed trunks for the whole run, identically in both arms (see
+# fine_region_registrar.py). FINE_REGIONS is "id,x,y,radius;..." in the world
+# (= <robot>/odom) frame; base_z is the flat ground, 0.
+FINE_BAND="${FINE_BAND:-0}"
+FINE_K="${FINE_K:-3}"
+FINE_Z_LO="$(flt "${FINE_Z_LO:-0.6}")"
+FINE_Z_HI="$(flt "${FINE_Z_HI:-1.2}")"
+FINE_ANCHOR="${FINE_ANCHOR:-false}"
+FINE_REGIONS="${FINE_REGIONS:-}"
+# PLANNER_EXTRA: extra "name:=value" planner parameters, space-separated,
+# appended last so they override the script's own -p values.
+PLANNER_EXTRA_ARR=()
+for _pe in ${PLANNER_EXTRA:-}; do PLANNER_EXTRA_ARR+=( -p "$_pe" ); done
+FINE_LAUNCH_ARGS=()
+if [ "$FINE_BAND" = "1" ]; then
+  [ -n "$FINE_REGIONS" ] || { echo "FATAL: FINE_BAND=1 needs FINE_REGIONS" >&2; exit 2; }
+  FINE_LAUNCH_ARGS=( fine_band:=true fine_ratio_log2:=$FINE_K
+                     fine_region_z_lo:=$FINE_Z_LO fine_region_z_hi:=$FINE_Z_HI
+                     fine_anchor_enable:=$FINE_ANCHOR )
+fi
 case "$DONE_CRITERION" in
   latch|streak) ;;
   *) echo "DONE_CRITERION must be 'latch' or 'streak', got '$DONE_CRITERION'" >&2
@@ -2414,8 +2436,19 @@ for r in $ROBOTS; do
       peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
       voxel_resolution_m:=$VOXEL_RES \
       global_planning_map_size_m:=$PLAN_MAP_SIZE \
-      global_planning_map_resolution:=$PLAN_MAP_RES
+      global_planning_map_resolution:=$PLAN_MAP_RES \
+      ${FINE_LAUNCH_ARGS[@]+"${FINE_LAUNCH_ARGS[@]}"}
 done
+if [ "$FINE_BAND" = "1" ]; then
+  _freg=()
+  IFS=';' read -ra _fr <<< "$FINE_REGIONS"
+  for _x in "${_fr[@]}"; do [ -n "$_x" ] && _freg+=( --region "$_x" ); done
+  start fineregions "$OUTDIR/fine_regions.log" \
+    python3 "$HERE/fine_region_registrar.py" \
+      --robots "$(echo $ROBOTS | tr ' ' ',')" "${_freg[@]}" \
+      --ros-args -p use_sim_time:=true
+  log "fine band: k=$FINE_K slab=[$FINE_Z_LO,$FINE_Z_HI] anchor=$FINE_ANCHOR regions=$FINE_REGIONS"
+fi
 for r in $ROBOTS; do
   wait_for 180 "$r planning_map" -- \
     timeout 8 ros2 topic echo /$r/scovox_node/planning_map --once \
@@ -2533,6 +2566,11 @@ if [ "$RECORD" != "0" ]; then
   # scheduler's own log clock. Cost is negligible; its absence would make a
   # RECORD=2 cell unscoreable for the matched-horizon curve.
   BAG_TOPICS+=( /exploration/intents /exploration/targets )
+  if [ "$FINE_BAND" = "1" ]; then
+    # The node publishes this only while something subscribes; the recorder is
+    # that subscriber. Full zero-crossing shell at 1 Hz per robot.
+    for r in $ROBOTS; do BAG_TOPICS+=( /$r/scovox_node/fine_tsdf_pointcloud ); done
+  fi
   if [ "$RECORD" = "1" ]; then
     BAG_TOPICS+=( /tf )
     for r in $ROBOTS; do
@@ -3100,6 +3138,13 @@ PYGEOM
     echo "world_collisions=missing"
     echo "world_nonstatic_models=missing"
   fi
+  echo "planner_extra=${PLANNER_EXTRA:-}"
+  echo "fine_band=$FINE_BAND"
+  echo "fine_ratio_log2=$FINE_K"
+  echo "fine_region_z_lo=$FINE_Z_LO"
+  echo "fine_region_z_hi=$FINE_Z_HI"
+  echo "fine_anchor_enable=$FINE_ANCHOR"
+  echo "fine_regions=$FINE_REGIONS"
 } > "$MANIFEST"
 log "run manifest written: $MANIFEST"
 # Deferred from the defaults block, where log() does not exist yet. The pairing
@@ -3303,6 +3348,7 @@ for r in $ROBOTS; do
       -p return_escape_leg_sec:=$RETURN_ESCAPE_LEG \
       ${FOV_ARGS[@]+"${FOV_ARGS[@]}"} \
       ${EXTRA[@]+"${EXTRA[@]}"} \
+      ${PLANNER_EXTRA_ARR[@]+"${PLANNER_EXTRA_ARR[@]}"} \
       -p output_csv:="$OUTDIR/planner_$r.csv"
 done
 # Scheduler last; its node name must stay target_scheduler in the root namespace
