@@ -47,12 +47,14 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <action_msgs/srv/cancel_goal.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -89,6 +91,7 @@
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
 #include "explo_planner/vantage_planner.hpp"
+#include "explo_planner/lookout.hpp"
 
 // Generated into the build tree on every build; defines EXPLO_PLANNER_GIT_REV.
 // Guarded because this translation unit must still compile in a tree that has
@@ -144,7 +147,15 @@ enum class State {
   // run_end after this leg resolves is the mission endpoint. Resolves into
   // DONE on arrival, give-up, or the mission_return_max_sec cap — it can not
   // loop back into exploration or a reconnect manoeuvre.
-  RETURN_HOME
+  RETURN_HOME,
+  // Lookout exploit mode (exploit_mode=lookout; see lookout.hpp). LOOKOUT_NAV
+  // drives to the configured lookout pose; LOOKOUT_HOLD holds it and reports
+  // in position; LOOKOUT_DELIVER carries an alarm to where the radio link to
+  // the machine comes up (the messenger), then LOOKOUT_NAV brings it back.
+  // Unreachable in tree mode.
+  LOOKOUT_NAV,
+  LOOKOUT_HOLD,
+  LOOKOUT_DELIVER
 };
 
 // Stable, machine-readable state names. These are wire/CSV values consumed by
@@ -168,6 +179,9 @@ inline const char* stateName(State s) {
     case State::PURSUE:         return "PURSUE";
     case State::PROXIMITY_HOLD: return "PROXIMITY_HOLD";
     case State::RETURN_HOME:    return "RETURN_HOME";
+    case State::LOOKOUT_NAV:    return "LOOKOUT_NAV";
+    case State::LOOKOUT_HOLD:   return "LOOKOUT_HOLD";
+    case State::LOOKOUT_DELIVER: return "LOOKOUT_DELIVER";
   }
   return "UNKNOWN";
 }
@@ -808,6 +822,17 @@ private:
   void onPeerExploitIntent(const explo_planner_msgs::msg::RobotIntent& msg);
   void doExploitPlan();
   void doExploitDwell();
+  // Lookout exploit mode: drive to lookout_pt_, then hold it and publish
+  // in_position. Only entered when exploit_mode_ == LOOKOUT.
+  void enterLookoutNav(const char* reason);
+  void doLookoutNav();
+  void doLookoutHold();
+  // Messenger: an alarm at the post is sent at once if the link is up,
+  // otherwise carried (LOOKOUT_DELIVER) until it is.
+  void onLookoutAlarm(const geometry_msgs::msg::PointStamped& msg);
+  void doLookoutDeliver();
+  bool lookoutLinkNow() const;
+  void lookoutSendWarning(const char* how);
   // The three peer-claim rules of the vantage filter (same-target exploit
   // claim = unconditional veto; other claim shapes = distance contest; parked
   // staged peer = position contest), extracted so doExploitPlan's candidate
@@ -2790,6 +2815,45 @@ private:
   // When false the exploitation overlay is inert (no target subscription is
   // consulted) and behaviour is bit-for-bit pure exploration.
   bool   exploitation_enabled_   = true;
+  // Which exploit behaviour runs. TREE: the vantage-ring loop (everything
+  // below). LOOKOUT: drive to lookout_pt_ and hold it (lookout.hpp).
+  ExploitMode  exploit_mode_  = ExploitMode::TREE;
+  LookoutStart lookout_start_ = LookoutStart::ON_DONE;
+  LookoutPoint lookout_pt_;
+  // Keep-alive re-send period for the lookout goal while driving (s).
+  double lookout_goal_republish_sec_ = 10.0;
+  // Settle test before reporting in position: pose within lookout_settle_pos_m_
+  // / lookout_settle_yaw_rad_ for lookout_settle_sec_.
+  double lookout_settle_sec_     = 2.0;
+  double lookout_settle_pos_m_   = 0.02;
+  double lookout_settle_yaw_rad_ = 0.0087;  // 0.5 deg
+  LookoutSettle lookout_settle_{0.02, 0.0087, 2.0};
+  bool   lookout_in_position_ = false;
+  bool   lookout_goal_fresh_  = false;   // set by enterLookoutNav
+  double lookout_nav_start_sim_ = 0.0;   // sim time of setting off (s)
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr lookout_in_position_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr lookout_pose_pub_;
+  // Messenger (lookout mode). The machine's position comes from configuration
+  // (lookout_mulcher_x/y); the link state from /<r>/lookout/link_up (radio
+  // model, e.g. lookout/radio_node.py), stale after lookout_link_stale_sec.
+  bool   lookout_messenger_          = true;
+  double lookout_mulcher_x_          = 0.0;
+  double lookout_mulcher_y_          = 0.0;
+  double lookout_mulcher_standoff_m_ = 5.0;
+  double lookout_link_stale_sec_     = 2.0;
+  bool   lookout_link_have_ = false;       // any link report yet
+  bool   lookout_link_up_   = false;       // the last report
+  double lookout_link_t_    = 0.0;         // its arrival time (s, node clock)
+  bool   lookout_have_last_link_ = false;  // a linked pose seen while driving
+  LookoutPoint lookout_last_link_;         // the last one (yaw: to the machine)
+  DeliverPhase lookout_deliver_phase_ = DeliverPhase::LAST_LINK;
+  LookoutPoint lookout_deliver_goal_;
+  bool   lookout_deliver_goal_fresh_ = false;
+  double lookout_alarm_t_ = 0.0;           // alarm arrival (s, node clock)
+  geometry_msgs::msg::PointStamped lookout_alarm_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr lookout_link_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr lookout_alarm_sub_;
+  rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr lookout_warning_pub_;
   double target_dedup_radius_m_  = 0.0;   // 0 = dedup by id only (no merge)
   int    min_vantages_required_  = 2;     // clear-LoS dwells for "success"
   double exploit_dwell_sec_      = 8.0;   // hold time at each vantage (s)
@@ -5000,6 +5064,61 @@ ExploPlannerNode::ExploPlannerNode()
         "/" + robot_name_ + "/scovox_node/refinement_region";
   }
 
+  // Exploit mode. "tree" (default) is the vantage-ring loop configured above,
+  // unchanged. "lookout" sends this robot to ONE configured pose and holds it:
+  // lookout_x / lookout_y in the map frame (m), lookout_yaw in radians, one set
+  // per robot (normally a params-file YAML keyed by the namespaced node). The
+  // robot makes no placement decision. lookout_start: "on_done" sets off once
+  // exploration is DONE; "immediate" at the first PLAN tick, with no
+  // exploration.
+  {
+    const std::string mode = dp("exploit_mode", std::string("tree"));
+    if (!parseExploitMode(mode, exploit_mode_)) {
+      throw std::runtime_error("unknown exploit_mode '" + mode +
+                               "' (tree | lookout)");
+    }
+    const std::string start = dp("lookout_start", std::string("on_done"));
+    if (!parseLookoutStart(start, lookout_start_)) {
+      throw std::runtime_error("unknown lookout_start '" + start +
+                               "' (on_done | immediate)");
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    lookout_pt_.x   = dp("lookout_x", nan);
+    lookout_pt_.y   = dp("lookout_y", nan);
+    lookout_pt_.yaw = dp("lookout_yaw", nan);
+    lookout_goal_republish_sec_ = dp("lookout_goal_republish_sec", 10.0);
+    lookout_settle_sec_         = dp("lookout_settle_sec", 2.0);
+    lookout_settle_pos_m_       = dp("lookout_settle_pos_m", 0.02);
+    lookout_settle_yaw_rad_     = dp("lookout_settle_yaw_rad", 0.0087);
+    lookout_settle_ = LookoutSettle(lookout_settle_pos_m_,
+                                    lookout_settle_yaw_rad_,
+                                    lookout_settle_sec_);
+    lookout_messenger_          = dp("lookout_messenger", true);
+    lookout_mulcher_x_          = dp("lookout_mulcher_x", nan);
+    lookout_mulcher_y_          = dp("lookout_mulcher_y", nan);
+    lookout_mulcher_standoff_m_ = dp("lookout_mulcher_standoff_m", 5.0);
+    lookout_link_stale_sec_     = dp("lookout_link_stale_sec", 2.0);
+    if (exploit_mode_ == ExploitMode::LOOKOUT) {
+      if (!std::isfinite(lookout_pt_.x) || !std::isfinite(lookout_pt_.y) ||
+          !std::isfinite(lookout_pt_.yaw)) {
+        throw std::runtime_error(
+            "exploit_mode=lookout needs finite lookout_x, lookout_y and "
+            "lookout_yaw for this robot");
+      }
+      if (lookout_messenger_ && (!std::isfinite(lookout_mulcher_x_) ||
+                                 !std::isfinite(lookout_mulcher_y_))) {
+        throw std::runtime_error(
+            "lookout_messenger needs finite lookout_mulcher_x and "
+            "lookout_mulcher_y (or lookout_messenger:=false)");
+      }
+      RCLCPP_INFO(get_logger(),
+          "Exploit mode LOOKOUT: point (%.2f, %.2f) yaw %.1f deg, start=%s, "
+          "messenger %s.",
+          lookout_pt_.x, lookout_pt_.y, lookout_pt_.yaw * 180.0 / M_PI,
+          start.c_str(), lookout_messenger_ ? "on" : "off");
+    }
+  }
+
   // Validate the vantage counts: n_vantages must be >= 1, and
   // min_vantages_required must be in [1, n_vantages] or success is unreachable
   // and every target would close PARTIAL. Clamp + warn rather than silently
@@ -5322,6 +5441,23 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("nav_min_timeout_sec", nav_min_timeout_sec_);
     exp_log_->addParamNum("nav_max_timeout_sec", nav_max_timeout_sec_);
     exp_log_->addParamBool("exploitation_enabled", exploitation_enabled_);
+    exp_log_->addParamStr("exploit_mode",
+        exploit_mode_ == ExploitMode::LOOKOUT ? "lookout" : "tree");
+    if (exploit_mode_ == ExploitMode::LOOKOUT) {
+      exp_log_->addParamStr("lookout_start",
+          lookout_start_ == LookoutStart::IMMEDIATE ? "immediate" : "on_done");
+      exp_log_->addParamNum("lookout_x", lookout_pt_.x);
+      exp_log_->addParamNum("lookout_y", lookout_pt_.y);
+      exp_log_->addParamNum("lookout_yaw", lookout_pt_.yaw);
+      exp_log_->addParamBool("lookout_messenger", lookout_messenger_);
+      if (lookout_messenger_) {
+        exp_log_->addParamNum("lookout_mulcher_x", lookout_mulcher_x_);
+        exp_log_->addParamNum("lookout_mulcher_y", lookout_mulcher_y_);
+        exp_log_->addParamNum("lookout_mulcher_standoff_m",
+                              lookout_mulcher_standoff_m_);
+        exp_log_->addParamNum("lookout_link_stale_sec", lookout_link_stale_sec_);
+      }
+    }
     exp_log_->addParamBool("proximity_stop_enabled", proximity_stop_enabled_);
     exp_log_->addParamBool("terrain_relative_z", terrain_relative_z_);
     // From ccfg, not the roi_*_ members: those are cached from it further down
@@ -6381,6 +6517,34 @@ ExploPlannerNode::ExploPlannerNode()
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
 
+  // Lookout reporting, created in lookout mode only. Latched, so a monitor
+  // that starts late still gets the current value.
+  if (exploit_mode_ == ExploitMode::LOOKOUT) {
+    lookout_in_position_pub_ = create_publisher<std_msgs::msg::Bool>(
+        "/" + robot_name_ + "/lookout/in_position", latchedQos());
+    lookout_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+        "/" + robot_name_ + "/lookout/pose", latchedQos());
+    std_msgs::msg::Bool b;
+    b.data = false;
+    lookout_in_position_pub_->publish(b);
+    // Messenger I/O. Alarms come from the detector watching this robot's
+    // lidar; the warning is what reaches the machine.
+    lookout_warning_pub_ = create_publisher<geometry_msgs::msg::PointStamped>(
+        "/" + robot_name_ + "/lookout/warning", rclcpp::QoS(10).reliable());
+    lookout_link_sub_ = create_subscription<std_msgs::msg::Bool>(
+        "/" + robot_name_ + "/lookout/link_up", rclcpp::QoS(10),
+        [this](const std_msgs::msg::Bool::SharedPtr m) {
+          lookout_link_have_ = true;
+          lookout_link_up_ = m->data;
+          lookout_link_t_ = this->now().seconds();
+        });
+    lookout_alarm_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
+        "/" + robot_name_ + "/lookout/alarm", rclcpp::QoS(10).reliable(),
+        [this](const geometry_msgs::msg::PointStamped::SharedPtr m) {
+          onLookoutAlarm(*m);
+        });
+  }
+
   viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "~/candidates", 10);
 
@@ -7269,6 +7433,12 @@ void ExploPlannerNode::tick() {
       break;
 
     case State::PLAN:
+      // Lookout mode, immediate start: no exploration, straight to the point.
+      if (exploit_mode_ == ExploitMode::LOOKOUT &&
+          lookout_start_ == LookoutStart::IMMEDIATE) {
+        enterLookoutNav("lookout-start-immediate");
+        break;
+      }
       doPlan();
       break;
 
@@ -7312,7 +7482,26 @@ void ExploPlannerNode::tick() {
       doReturnHome();
       break;
 
+    case State::LOOKOUT_NAV:
+      doLookoutNav();
+      break;
+
+    case State::LOOKOUT_HOLD:
+      doLookoutHold();
+      break;
+
+    case State::LOOKOUT_DELIVER:
+      doLookoutDeliver();
+      break;
+
     case State::DONE:
+      // Lookout mode, on_done start: exploration is over, go to the point.
+      // Ahead of the done_action handling, which is tree mode's.
+      if (exploit_mode_ == ExploitMode::LOOKOUT &&
+          lookout_start_ == LookoutStart::ON_DONE) {
+        enterLookoutNav("lookout-start-on-done");
+        break;
+      }
       // done_action == "idle": stay alive so targets released after
       // coverage-done still pull the planner into the exploit sub-loop
       // (field flow: the scheduler releases targets AT the coverage-done cue,
@@ -18083,6 +18272,217 @@ void ExploPlannerNode::republishGoal(const CandidateViewpoint& vp) {
   if (goal_republish_sec_ <= 0.0) return;  // publish-on-change only
   if ((this->now() - last_goal_pub_time_).seconds() >= goal_republish_sec_)
     publishGoal(vp);
+}
+
+// Every way into LOOKOUT_NAV goes through here, so the first tick in the state
+// sends the goal at once rather than waiting on the keep-alive.
+void ExploPlannerNode::enterLookoutNav(const char* reason) {
+  lookout_goal_fresh_ = true;
+  transitionTo(State::LOOKOUT_NAV, reason);
+}
+
+// Lookout exploit mode, drive leg. The goal is the configured pose, sent
+// through the same goal topic and navigator as every other goal; arrival is
+// the same planar + yaw test NAVIGATE applies to an exploit vantage. No
+// budget: the robot keeps driving until it arrives, and says so every 15 s.
+void ExploPlannerNode::doLookoutNav() {
+  const double tnow = this->now().seconds();
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(static_cast<float>(lookout_pt_.x),
+                                static_cast<float>(lookout_pt_.y), 0.0f);
+  vp.yaw = static_cast<float>(lookout_pt_.yaw);
+  vp.is_vantage = true;
+  // Messenger: remember the last pose where the link to the machine was up.
+  if (lookout_messenger_ && lookoutLinkNow()) {
+    lookout_have_last_link_ = true;
+    lookout_last_link_.x = latest_pos_.x();
+    lookout_last_link_.y = latest_pos_.y();
+    lookout_last_link_.yaw = std::atan2(lookout_mulcher_y_ - latest_pos_.y(),
+                                        lookout_mulcher_x_ - latest_pos_.x());
+  }
+  if (lookout_goal_fresh_) {
+    lookout_goal_fresh_ = false;
+    if (lookout_nav_start_sim_ <= 0.0) lookout_nav_start_sim_ = tnow;
+    publishGoal(vp);
+  } else {
+    const double saved = goal_republish_sec_;
+    goal_republish_sec_ = lookout_goal_republish_sec_;
+    republishGoal(vp);
+    goal_republish_sec_ = saved;
+  }
+  if (lookoutReached(latest_pos_.x(), latest_pos_.y(), latest_yaw_,
+                     lookout_pt_, goal_xy_tol_, goal_yaw_tol_)) {
+    lookout_settle_.reset();
+    transitionTo(State::LOOKOUT_HOLD, "lookout-arrived");
+    return;
+  }
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 15000,
+      "Lookout: driving to (%.1f, %.1f), %.1f m to go, %.0f s so far.",
+      lookout_pt_.x, lookout_pt_.y,
+      std::hypot(latest_pos_.x() - lookout_pt_.x,
+                 latest_pos_.y() - lookout_pt_.y),
+      tnow - lookout_nav_start_sim_);
+}
+
+// Lookout exploit mode, hold. Reports in position once the pose has settled
+// (the navigator may still be creeping inside its own tolerance when the
+// planner's arrival test first passes). Pushed off the point -- outside the
+// arrival tolerance -- it withdraws the report and drives back.
+void ExploPlannerNode::doLookoutHold() {
+  const double tnow = this->now().seconds();
+  if (!lookoutReached(latest_pos_.x(), latest_pos_.y(), latest_yaw_,
+                      lookout_pt_, goal_xy_tol_, goal_yaw_tol_)) {
+    RCLCPP_WARN(get_logger(),
+        "Lookout: pushed off the point (%.2f m, %.1f deg) -- driving back.",
+        std::hypot(latest_pos_.x() - lookout_pt_.x,
+                   latest_pos_.y() - lookout_pt_.y),
+        lookoutWrapAngle(latest_yaw_ - lookout_pt_.yaw) * 180.0 / M_PI);
+    if (lookout_in_position_) {
+      lookout_in_position_ = false;
+      std_msgs::msg::Bool b;
+      b.data = false;
+      lookout_in_position_pub_->publish(b);
+    }
+    enterLookoutNav("lookout-pushed-off");
+    return;
+  }
+  if (lookout_in_position_) return;
+  if (!lookout_settle_.update(tnow, latest_pos_.x(), latest_pos_.y(),
+                              latest_yaw_)) {
+    return;
+  }
+  lookout_in_position_ = true;
+  geometry_msgs::msg::PoseStamped ps;
+  ps.header.stamp = this->now();
+  ps.header.frame_id = map_frame_;
+  ps.pose.position.x = lookout_settle_.refX();
+  ps.pose.position.y = lookout_settle_.refY();
+  ps.pose.position.z = latest_pos_.z();
+  ps.pose.orientation = yawToQuat(static_cast<float>(lookout_settle_.refYaw()));
+  lookout_pose_pub_->publish(ps);
+  std_msgs::msg::Bool b;
+  b.data = true;
+  lookout_in_position_pub_->publish(b);
+  RCLCPP_INFO(get_logger(),
+      "Lookout in position at (%.2f, %.2f) yaw %.1f deg, %.2f m / %.1f deg "
+      "from the point, %.1f s after setting off.",
+      ps.pose.position.x, ps.pose.position.y,
+      lookout_settle_.refYaw() * 180.0 / M_PI,
+      std::hypot(lookout_settle_.refX() - lookout_pt_.x,
+                 lookout_settle_.refY() - lookout_pt_.y),
+      lookoutWrapAngle(lookout_settle_.refYaw() - lookout_pt_.yaw) * 180.0 / M_PI,
+      tnow - lookout_nav_start_sim_);
+}
+
+bool ExploPlannerNode::lookoutLinkNow() const {
+  return lookoutLinkUp(lookout_link_have_, lookout_link_up_, lookout_link_t_,
+                       this->now().seconds(), lookout_link_stale_sec_);
+}
+
+void ExploPlannerNode::lookoutSendWarning(const char* how) {
+  geometry_msgs::msg::PointStamped w = lookout_alarm_;
+  w.header.stamp = this->now();
+  lookout_warning_pub_->publish(w);
+  RCLCPP_INFO(get_logger(),
+      "Lookout: warning sent (%s), %.1f s after the alarm, from (%.1f, %.1f), "
+      "%.1f m from the machine.",
+      how, this->now().seconds() - lookout_alarm_t_, latest_pos_.x(),
+      latest_pos_.y(),
+      std::hypot(latest_pos_.x() - lookout_mulcher_x_,
+                 latest_pos_.y() - lookout_mulcher_y_));
+}
+
+// An alarm from the detector. Only a lookout that is in position is watching;
+// anything else (driving out, carrying an earlier warning, driving back) drops
+// it. Linked: send now and keep watching. Not linked: carry it.
+void ExploPlannerNode::onLookoutAlarm(const geometry_msgs::msg::PointStamped& msg) {
+  if (state_ != State::LOOKOUT_HOLD || !lookout_in_position_) {
+    RCLCPP_WARN(get_logger(),
+        "Lookout: alarm at (%.1f, %.1f) while not in position (%s) -- not "
+        "watching, dropped.",
+        msg.point.x, msg.point.y, stateName(state_));
+    return;
+  }
+  lookout_alarm_ = msg;
+  lookout_alarm_t_ = this->now().seconds();
+  if (lookoutLinkNow()) {
+    lookoutSendWarning("linked at the alarm");
+    return;
+  }
+  if (!lookout_messenger_) {
+    RCLCPP_WARN(get_logger(),
+        "Lookout: alarm with no link and the messenger off -- not delivered.");
+    return;
+  }
+  lookout_in_position_ = false;
+  std_msgs::msg::Bool b;
+  b.data = false;
+  lookout_in_position_pub_->publish(b);
+  if (lookout_have_last_link_) {
+    lookout_deliver_phase_ = DeliverPhase::LAST_LINK;
+    lookout_deliver_goal_ = lookout_last_link_;
+  } else {
+    lookout_deliver_phase_ = DeliverPhase::TO_MULCHER;
+    lookout_deliver_goal_ = mulcherStandoffGoal(
+        latest_pos_.x(), latest_pos_.y(), lookout_mulcher_x_,
+        lookout_mulcher_y_, lookout_mulcher_standoff_m_);
+  }
+  lookout_deliver_goal_fresh_ = true;
+  transitionTo(State::LOOKOUT_DELIVER,
+               lookout_have_last_link_ ? "lookout-alarm-to-last-link"
+                                       : "lookout-alarm-to-machine");
+}
+
+// Carrying a warning. The link is checked every tick, the whole way; the
+// moment it is up the warning goes and the robot heads back to its post.
+// Arrival at a delivery goal is planar only (its heading does not matter).
+void ExploPlannerNode::doLookoutDeliver() {
+  if (lookoutLinkNow()) {
+    lookoutSendWarning(lookout_deliver_phase_ == DeliverPhase::LAST_LINK
+                           ? "carried, towards the last-link point"
+                           : "carried, towards the machine");
+    lookout_nav_start_sim_ = 0.0;   // the return leg is timed from here
+    enterLookoutNav("lookout-return");
+    return;
+  }
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(static_cast<float>(lookout_deliver_goal_.x),
+                                static_cast<float>(lookout_deliver_goal_.y), 0.0f);
+  vp.yaw = static_cast<float>(lookout_deliver_goal_.yaw);
+  vp.is_vantage = true;
+  if (lookout_deliver_goal_fresh_) {
+    lookout_deliver_goal_fresh_ = false;
+    publishGoal(vp);
+  } else {
+    const double saved = goal_republish_sec_;
+    goal_republish_sec_ = lookout_goal_republish_sec_;
+    republishGoal(vp);
+    goal_republish_sec_ = saved;
+  }
+  const double to_go = std::hypot(latest_pos_.x() - lookout_deliver_goal_.x,
+                                  latest_pos_.y() - lookout_deliver_goal_.y);
+  if (to_go > goal_xy_tol_) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 15000,
+        "Lookout: carrying a warning, %.1f m to the %s, %.0f s since the alarm.",
+        to_go,
+        lookout_deliver_phase_ == DeliverPhase::LAST_LINK ? "last-link point"
+                                                          : "machine standoff",
+        this->now().seconds() - lookout_alarm_t_);
+    return;
+  }
+  if (lookout_deliver_phase_ == DeliverPhase::LAST_LINK) {
+    RCLCPP_WARN(get_logger(),
+        "Lookout: no link at the last-link point -- driving on towards the "
+        "machine.");
+    lookout_deliver_phase_ = DeliverPhase::TO_MULCHER;
+    lookout_deliver_goal_ = mulcherStandoffGoal(
+        latest_pos_.x(), latest_pos_.y(), lookout_mulcher_x_,
+        lookout_mulcher_y_, lookout_mulcher_standoff_m_);
+    lookout_deliver_goal_fresh_ = true;
+    return;
+  }
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 15000,
+      "Lookout: at the machine standoff and still no link -- waiting for it.");
 }
 
 void ExploPlannerNode::publishCandidateViz(

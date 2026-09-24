@@ -355,6 +355,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_gen23_contagion explo_planner_lib)
   target_compile_definitions(test_gen23_contagion PRIVATE
     EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp")
+
+  # Lookout exploit mode: lookout.hpp called directly, plus source scans of the
+  # node (tree mode stays the default and untouched) and of the harness (the
+  # mapping inputs read the 25 m crop relay).
+  ament_add_gtest(test_lookout test/test_lookout.cpp)
+  target_link_libraries(test_lookout explo_planner_lib)
+  target_compile_definitions(test_lookout PRIVATE
+    EXPLO_PLANNER_NODE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/explo_planner_node.cpp"
+    EXPLO_PLANNER_SIM_SH="${CMAKE_CURRENT_SOURCE_DIR}/../sim/run_explo_sim_rviz.sh")
 endif()
 
 ament_package()
