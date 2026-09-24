@@ -10,19 +10,31 @@ Per cell:
   bounds     the stamped bounds equal this checker's own copies (§9.4: the
              detector holds its own copy of every bound and checks the run
              against it, never reads it from the run)
-  contact    every exchange done, booking pair_met, chase contact and
-             all-connected tick has a live link in link_states.csv inside the
-             presence window before it (two windows for a pair the claiming
-             robot only hears about)
+  contact    every exchange done or done_late, booking pair_met, chase
+             contact and all-connected tick has a live link in link_states.csv
+             inside the presence window before it (two windows for a pair the
+             claiming robot only hears about)
   waits      no tick past its activity's wait bound; no homing gave_up or
-             no-home
+             no-home; the PLAN starvation counter (§11.7) keeps to its clock:
+             on consecutive ticks of one clock it runs no faster than time
+             and never backwards, and over 30 s it advances by at least half
   flipflop   at most 6 activity changes in any 60 s, and no more than two short
              stints (A -> B -> A with B under 3 s) in a row (the harness's P4)
   proximity  no pair closer than 1.0 m (link_states distance)
-  progress   no robot still for 120 s while it should be moving (Q4, K20)
+  progress   no robot still for 120 s while it should be moving (Q4, K20); a
+             tick on the starvation clock need not move. Backstop, whatever
+             the starvation clock claims: an exploring robot (Explore, not
+             WAIT_FOR_MAP or DONE) still for 540 s outside proximity holds
+             fails. A window closes at the first tick at least that far
+             past its start, so real tick spacing (2 s plus executor lag)
+             is covered, not only exact 2 s
   horizon    a censored run whose robots have all finished exploring has every
              robot home (Q61(a)); censored while someone explores is not a fail
   giveups    exchange give-ups at most a quarter of the non-trivial exchanges
+             (a give-up that finishes late is still a give-up)
+Notes list each starved finish with its clock's open time, paused time and
+goal count: a starved robot stopped for want of work, and the metric reader
+censors it.
 Per arm, over its cells:
   firing     the arm's required mechanisms fired at least once (§9.4). The
              optional ones are counted and printed, never failed: they fire
@@ -60,6 +72,7 @@ BOUNDS = {
     "meeting_backstop_sec": 600.0,
     "mission_return_max_sec": 600.0,
     "tick_event_period_sec": 2.0,
+    "plan_starve_finish_sec": 300.0,
 }
 
 # Beacon receipt is stamped at the node's next drain, the link trace at 5 Hz.
@@ -74,6 +87,12 @@ PROX_MIN_M = 1.0
 STILL_WINDOW_SEC = 120.0
 STILL_MAX_M = 0.5
 GIVEUP_FRAC = 0.25
+# The starvation counter against the tick clock (§11.7).
+STARVE_FAST_SLACK_SEC = 0.3
+STARVE_RATE_WINDOW_SEC = 30.0
+STARVE_RATE_MIN = 0.5
+# The claim-free backstop: the starvation limit plus two progress windows.
+BACKSTOP_WINDOW_SEC = 540.0
 
 # Required per arm: a zero over the arm's cells is a hard fail. Optional: shown.
 # exchange_nontrivial is derived here (exchange_done - exchange_done_trivial);
@@ -92,7 +111,10 @@ FIRING_OPTIONAL = ["chase_first_goal", "chase_first_last-position",
                    "reconnect_moves", "leg_escapes", "booking_missed",
                    "booking_patience", "booking_backstop", "booking_partial",
                    "plan_renewed", "chase_gate_declined", "exchange_gave_up",
-                   "exchange_lost", "homing_gave_up", "team_events_unknown"]
+                   "exchange_lost", "exchange_done_late", "homing_gave_up",
+                   "team_events_unknown", "plan_starved", "plan_starved_finish",
+                   "booking_retarget_late", "reconnect_fallback",
+                   "beacon_gossip_bad"]
 
 
 class Refused(Exception):
@@ -204,6 +226,35 @@ class Cell:
         self.unresolved.append((check, msg))
 
 
+def first_still(samples, window):
+    """(event, spread) at the first tick that ends `window` s of counted time
+    with the robot within STILL_MAX_M of where the window began, else None.
+
+    `samples` yields (event, t, x, y, paused), or None to restart the window.
+    The interval ending on a paused tick (a proximity hold) is not counted.
+    The window starts at the latest tick at least `window` counted seconds
+    back, so it spans the window whatever the tick spacing.
+    """
+    seg = []   # (t, x, y, counted seconds since the window's first tick)
+    for s in samples:
+        if s is None:
+            seg = []
+            continue
+        e, t, x, y, paused = s
+        c = 0.0
+        if seg:
+            c = seg[-1][3] + (0.0 if paused else max(0.0, t - seg[-1][0]))
+        seg.append((t, x, y, c))
+        while len(seg) > 1 and c - seg[1][3] >= window - 1e-6:
+            seg.pop(0)
+        if c - seg[0][3] >= window - 1e-6:
+            x0, y0 = seg[0][1], seg[0][2]
+            spread = max(math.hypot(px - x0, py - y0) for _, px, py, _ in seg)
+            if spread < STILL_MAX_M:
+                return e, spread
+    return None
+
+
 def check_cell(path):
     c = Cell(path)
     try:
@@ -298,8 +349,8 @@ def check_cell(path):
             if t is None:
                 continue
             act = e.get("action")
-            if (ev, act) in (("exchange", "done"), ("booking", "pair_met"),
-                             ("chase", "contact")):
+            if (ev, act) in (("exchange", "done"), ("exchange", "done_late"),
+                             ("booking", "pair_met"), ("chase", "contact")):
                 j = e.get("peer")
                 if not isinstance(j, int) or not 0 <= j < len(robots):
                     c.fail("contact", f"{r} t={t:.1f}: {ev} {act} names peer "
@@ -330,6 +381,40 @@ def check_cell(path):
                                                                   "no-home"):
                 c.fail("waits", f"{r} t={num(e.get('t_sim_sec'), -1):.1f}: "
                                 f"homing {e.get('action')}")
+        # The starvation counter exempts its ticks from progress, so it must
+        # keep to the clock: a stuck one would hold the exemption open.
+        run = []    # (t, counted) of consecutive counting ticks of one clock
+        prev_open = None
+        bad = None
+        for e in ticks:
+            t = num(e.get("t_sim_sec"))
+            cnt, opened = num(e.get("plan_starved_sec")), num(e.get("plan_starved_open_sec"))
+            if t is None or cnt is None or opened is None:
+                run, prev_open = [], None
+                continue
+            if prev_open is None or abs(opened - prev_open) > 1e-6:
+                run = []
+            prev_open = opened
+            if run:
+                t0, c0 = run[-1]
+                if cnt - c0 > (t - t0) + STARVE_FAST_SLACK_SEC:
+                    bad = (f"starvation counter ran {cnt - c0:.1f} s in "
+                           f"{t - t0:.1f} s")
+                elif cnt < c0 - STARVE_FAST_SLACK_SEC:
+                    bad = f"starvation counter ran back from {c0:.1f} to {cnt:.1f}"
+            run.append((t, cnt))
+            if bad is None:
+                # The latest tick at least a window back.
+                k = len(run) - 1
+                while k >= 0 and t - run[k][0] < STARVE_RATE_WINDOW_SEC:
+                    k -= 1
+                if k >= 0 and cnt - run[k][1] < STARVE_RATE_MIN * (t - run[k][0]):
+                    bad = (f"starvation counter advanced {cnt - run[k][1]:.1f} s "
+                           f"in {t - run[k][0]:.1f} s")
+            if bad is not None:
+                c.fail("waits", f"{r} t={t:.1f}: {bad} (clock opened "
+                                f"t={opened:.1f})")
+                break
 
         # --- flip-flop --------------------------------------------------------
         times = [num(e.get("t_sim_sec")) for e in acts]
@@ -362,6 +447,9 @@ def check_cell(path):
         def should_move(e):
             if e.get("proximity_hold") is True:
                 return False
+            if (num(e.get("plan_starved_sec")) is not None and
+                    num(e.get("plan_starved_open_sec")) is not None):
+                return False
             # A tick that lands in INTEGRATE or LOG_STEP still counts: a robot
             # cycling plan, fail, plan must not hide behind them.
             if e.get("state") in ("WAIT_FOR_MAP", "PROXIMITY_HOLD", "DONE",
@@ -371,26 +459,46 @@ def check_cell(path):
                 return True
             return (e.get("drive") == "leg" and
                     e.get("leg_status") in ("driving", "escaping"))
-        seg = []
-        for e in ticks:
+        def xy(e):
             t, x, y = (num(e.get("t_sim_sec")), num(e.get("x")),
                        num(e.get("y")))
-            if t is None or x is None or y is None or not should_move(e):
-                seg = []
-                continue
-            seg.append((t, x, y))
-            while seg and t - seg[0][0] > STILL_WINDOW_SEC:
-                seg.pop(0)
-            if seg and t - seg[0][0] >= STILL_WINDOW_SEC - 1e-6:
-                x0, y0 = seg[0][1], seg[0][2]
-                spread = max(math.hypot(px - x0, py - y0) for _, px, py in seg)
-                if spread < STILL_MAX_M:
-                    c.fail("progress", f"{r}: moved {spread:.2f} m in the "
-                                       f"{STILL_WINDOW_SEC:.0f} s to "
-                                       f"t={t:.1f} while it should be moving "
-                                       f"({e.get('activity')}, "
-                                       f"{e.get('state')})")
-                    break
+            return None if t is None or x is None or y is None else (t, x, y)
+
+        def moving():
+            for e in ticks:
+                p = xy(e)
+                ok = p is not None and should_move(e)
+                yield (e,) + p + (False,) if ok else None
+        hit = first_still(moving(), STILL_WINDOW_SEC)
+        if hit:
+            e, spread = hit
+            t = num(e.get("t_sim_sec"))
+            c.fail("progress", f"{r}: moved {spread:.2f} m in the "
+                               f"{STILL_WINDOW_SEC:.0f} s to "
+                               f"t={t:.1f} while it should be moving "
+                               f"({e.get('activity')}, {e.get('state')})")
+
+        # Backstop: an exploring robot moves within the starvation limit plus
+        # two progress windows, whatever its starvation clock claims. A hold
+        # pauses the window, as it pauses the node's clock (§11.7).
+        def exploring():
+            for e in ticks:
+                p = xy(e)
+                if (p is None or e.get("activity") != "explore" or
+                        e.get("state") in ("WAIT_FOR_MAP", "DONE")):
+                    yield None
+                    continue
+                held = (e.get("proximity_hold") is True or
+                        e.get("state") == "PROXIMITY_HOLD")
+                yield (e,) + p + (held,)
+        hit = first_still(exploring(), BACKSTOP_WINDOW_SEC)
+        if hit:
+            e, spread = hit
+            t = num(e.get("t_sim_sec"))
+            c.fail("progress", f"{r}: moved {spread:.2f} m in the "
+                               f"{BACKSTOP_WINDOW_SEC:.0f} s to "
+                               f"t={t:.1f} while exploring (backstop, "
+                               f"whatever the ticks claim)")
 
         # --- run_end counts ---------------------------------------------------
         end = next((e for e in reversed(evs) if e.get("event") == "run_end"),
@@ -422,6 +530,18 @@ def check_cell(path):
     # --- horizon ------------------------------------------------------------------
     finished = {r: any(e.get("event") == "exploration_complete" for e in evs)
                 for r, evs in events.items()}
+    for r, evs in events.items():
+        for e in evs:
+            if e.get("event") == "exploration_complete" and e.get("reason") == "starved":
+                opened = num(e.get("starved_open_t_sim"))
+                paused = num(e.get("starved_paused_sec"))
+                goals = e.get("starved_goals")
+                c.notes.append(
+                    f"{r} finished starved at t={num(e.get('t_sim_sec'), -1):.1f} "
+                    f"(clock opened t={opened if opened is not None else float('nan'):.1f}, "
+                    f"paused {paused if paused is not None else float('nan'):.1f} s, "
+                    f"{goals if isinstance(goals, int) else '?'} goals); "
+                    f"censored for the metric")
 
     def home_state(evs):
         last = None

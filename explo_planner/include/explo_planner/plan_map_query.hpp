@@ -49,6 +49,17 @@ bool isCellFree(const nav_msgs::msg::OccupancyGrid& grid,
 bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& grid,
                     const Eigen::Vector3f& pos);
 
+/// No occupied cell (isCellOccupied) on the XY segment a -> b, sampled every
+/// 0.2 m at a's Z. At each end, the run of occupied samples that starts at the
+/// end is skipped for up to `end_clear_m`, so a robot standing there (mapped
+/// as an obstacle, then inflated) does not block the ray; an occupied sample
+/// after the first free one always blocks. Ends under 2 * end_clear_m apart
+/// whose runs meet read clear: the map cannot tell two robots' discs from a
+/// wall between them. Unknown cells do not block.
+bool segmentClear(const nav_msgs::msg::OccupancyGrid& grid,
+                  const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                  double end_clear_m);
+
 /// Fraction of cells in `roi` (clipped to the grid) whose value is -1
 /// (unknown). Returns -1.0 if the grid is degenerate or the ROI doesn't
 /// overlap it.

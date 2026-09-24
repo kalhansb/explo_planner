@@ -199,7 +199,10 @@ private:
   // ----------------------------------------------------------------
   // State machine
   // ----------------------------------------------------------------
+  /// The tick timer's callback: tickBody(), then the K20 tick event when due,
+  /// so the event sees the state the dispatch left (§11.4).
   void tick();
+  void tickBody();
   /// reason is recorded verbatim in the state_change event. Pass a stable,
   /// machine-readable tag: it is an analysis interface like stateName().
   /// (notes: transition-reason-tags)
@@ -795,9 +798,10 @@ private:
   // event report the dwell in the state being left without that landing in a
   // ROS callback as an exception. Same bool-guard pattern as midrun_end_armed_.
   bool have_state_enter_ = false;
-  // Keyed on step_: one exploration_complete per exhaustion episode. The
-  // finished latch makes a second one impossible in gen 34; the key stays as a
-  // guard.
+  // Keyed on step_: one exploration_complete per exhaustion episode. In gen 34
+  // every ending goes through latchFinished, which runs once, and a coverage
+  // crossing after another ending records no second event (§11.7); the key
+  // stays as a guard.
   // (notes: exploration-complete-dedup)
   int exp_complete_step_  = -1;
   int exp_complete_count_ = 0;
@@ -934,9 +938,45 @@ private:
   std::string counters_topic_;
   double seq_wait_since_ = -1.0;
 
-  // K20 tick event cadence, sim seconds; <= 0 disables it.
+  // K20 tick event cadence, sim seconds; <= 0 disables it. teamTick marks it
+  // due and advances the next due time; tick() writes it after the dispatch.
   double tick_event_period_sec_ = 2.0;
   double next_tick_event_sec_   = -1.0;
+  bool   tick_event_due_        = false;
+  double tick_event_now_        = 0.0;
+
+  // The oracle's line of sight skips the occupied run at each end up to this
+  // far: the plan map's inflation (global_planning_map_inflation_m, 1.5 m in
+  // the sim launch) plus the body's half-diagonal and a cell of rounding at
+  // each end of the inflation, about 2.8 m for a Husky at 0.4 m cells.
+  double sight_end_clear_m_ = 3.0;
+
+  // §11.7 PLAN starvation clock. Opens on a starved PLAN tick (no candidates,
+  // or all rejected); counts while exploring and not in a proximity hold;
+  // closes on 1.0 m of motion from the anchor while counting; latches
+  // finished "starved" at plan_starve_finish_sec_ of counted time (0: off).
+  double plan_starve_finish_sec_ = 300.0;
+  struct StarveClock {
+    bool   open = false;
+    double open_t = -1.0;
+    double counted = 0.0;
+    double paused = 0.0;
+    double last_t = -1.0;
+    bool   counting = false;     ///< how the interval since last_t is booked
+    bool   team_paused = false;  ///< paused by a team activity: re-anchor on return
+    double ax = 0.0, ay = 0.0;   ///< anchor
+    int    goals = 0;
+  };
+  StarveClock starve_;
+  long long plan_starved_count_        = 0;
+  long long plan_starved_finish_count_ = 0;
+  /// The clock counts right now: open, exploring, not held.
+  bool starvationCounting() const;
+  /// A starved PLAN tick: opens the clock if it is shut.
+  void noteStarvedPlan();
+  /// Once per tick, before TeamCore: book the time since the last tick,
+  /// re-anchor, close on motion, latch at the limit.
+  void updateStarvation(double now);
 
   // Homing outcome for run_end: "arrived", "timeout" or "no-home"; "" while
   // unresolved, including a run killed mid-homing.
@@ -1831,6 +1871,19 @@ ExploPlannerNode::ExploPlannerNode()
   team_cfg_.finished_missed_slots      = dp("finished_missed_slots", 2);
   team_cfg_.leg_arrive_m               = dp("leg_arrive_m", 1.5);
   tick_event_period_sec_               = dp("tick_event_period_sec", 2.0);
+  plan_starve_finish_sec_              = dp("plan_starve_finish_sec", 300.0);
+  sight_end_clear_m_                   = dp("sight_end_clear_m", 3.0);
+  if (!std::isfinite(sight_end_clear_m_) || sight_end_clear_m_ < 0.0) {
+    RCLCPP_FATAL(get_logger(),
+        "sight_end_clear_m=%.3f must be finite and >= 0.", sight_end_clear_m_);
+    throw std::runtime_error("sight_end_clear_m must be >= 0");
+  }
+  if (!std::isfinite(plan_starve_finish_sec_) || plan_starve_finish_sec_ < 0.0) {
+    RCLCPP_FATAL(get_logger(),
+        "plan_starve_finish_sec=%.3f must be finite and >= 0 (0 disables the "
+        "starvation latch).", plan_starve_finish_sec_);
+    throw std::runtime_error("plan_starve_finish_sec must be >= 0");
+  }
   {
     // Every duration and distance here bounds a wait or places a robot; zero,
     // negative or NaN would end a wait at once, never end it, or stack robots.
@@ -1897,6 +1950,20 @@ ExploPlannerNode::ExploPlannerNode()
 
   team_cfg_.self_id   = fleet_.configured ? fleet_.self_id : 0;
   team_cfg_.n         = fleet_.configured ? fleet_.size() : 1;
+  // TeamCore picks a lost pair's walker by fleet id; the proximity guard
+  // yields by name. They agree when the roster is in name order (§11.3).
+  if (fleet_.configured) {
+    for (int j = 1; j < fleet_.size(); ++j) {
+      if (!(fleet_.nameOf(j - 1) < fleet_.nameOf(j))) {
+        RCLCPP_WARN(get_logger(),
+            "team_robot_names is not in name order ('%s' before '%s'): the "
+            "reconnect walker is picked by fleet id and the proximity guard "
+            "yields by name, so the two orders differ.",
+            fleet_.nameOf(j - 1).c_str(), fleet_.nameOf(j).c_str());
+        break;
+      }
+    }
+  }
   team_cfg_.team_hash = fleet_.team_hash;
   team_cfg_.grid_hash =
       cell_world_.configured() ? cell_world_.grid().configHash() : 0u;
@@ -1942,6 +2009,8 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamNum("leg_budget_slack_sec",
                           team_cfg_.leg_budget_slack_sec);
     exp_log_->addParamNum("tick_event_period_sec", tick_event_period_sec_);
+    exp_log_->addParamNum("plan_starve_finish_sec", plan_starve_finish_sec_);
+    exp_log_->addParamNum("sight_end_clear_m", sight_end_clear_m_);
   }
 
   // ---- Global allocator (P3) -----------------------------------------
@@ -2633,7 +2702,16 @@ bool ExploPlannerNode::scoreTrajectory(
 // State machine
 // ==================================================================
 
+// The K20 tick event is written here, after the body, so activity, state,
+// Leg status and the hold flag describe one instant, the proximity-hold
+// return included (§11.4). teamTick marks it due.
 void ExploPlannerNode::tick() {
+  tick_event_due_ = false;
+  tickBody();
+  if (tick_event_due_ && exp_log_) logTickEvent(tick_event_now_);
+}
+
+void ExploPlannerNode::tickBody() {
   // Event log first: run_start must be the file's first line and needs a live
   // clock. The peer sweep runs here, not in the coordination heartbeat, so
   // outage timing is recorded with coordination off.
@@ -2644,6 +2722,9 @@ void ExploPlannerNode::tick() {
 
   updatePoseFromTF();
   trackDistance();
+
+  // Before TeamCore, so a latch here is this tick's `finished` (§11.7).
+  updateStarvation(this->now().seconds());
 
   // Beacons, then TeamCore: after the pose (the local-priority merge anchors
   // on the current cell, and TeamCore reads the pose) and before the dispatch
@@ -2899,7 +2980,8 @@ void ExploPlannerNode::teamTick() {
 
   if (exp_log_ && tick_event_period_sec_ > 0.0 &&
       in.now >= next_tick_event_sec_) {
-    logTickEvent(in.now);
+    tick_event_due_ = true;
+    tick_event_now_ = in.now;
     next_tick_event_sec_ = in.now + tick_event_period_sec_;
   }
 }
@@ -2907,7 +2989,6 @@ void ExploPlannerNode::teamTick() {
 // The periodic tick event (K20): what the robot is doing, how long it may go
 // on, and how close its nearest teammate is.
 void ExploPlannerNode::logTickEvent(double now_sec) {
-  (void)now_sec;
   TickEvent e;
   e.x = latest_pos_.x();
   e.y = latest_pos_.y();
@@ -2942,7 +3023,17 @@ void ExploPlannerNode::logTickEvent(double now_sec) {
   e.contact_mask   = contact;
   e.booking_slot   = team_->booking().held ? team_->booking().slot : -1;
   e.proximity_hold = (state_ == State::PROXIMITY_HOLD);
-  exp_log_->logTick(expCtx(), e);
+  // §11.7: while the starvation clock counts, its bound is the wait.
+  if (starvationCounting()) {
+    e.plan_starved_sec      = starve_.counted;
+    e.plan_starved_open_sec = starve_.open_t;
+    e.wait_start_sec = now_sec - starve_.counted;
+    e.wait_bound_sec = now_sec - starve_.counted + plan_starve_finish_sec_;
+  }
+  // The tick's own time, not a second read of the clock.
+  ExperimentContext ctx = expCtx();
+  ctx.sim_time_sec = now_sec;
+  exp_log_->logTick(ctx, e);
 }
 
 State ExploPlannerNode::stateForActivity(gen34::Activity a) {
@@ -2978,6 +3069,11 @@ void ExploPlannerNode::applyActivity() {
     // (see abandonNavGoal), and PLAN may take a few ticks to publish the next.
     if (isLegState(cur)) abandonNavGoal("team-explore");
     leg_.reset();
+    // The run script's hang gate counts this line, and only this line may
+    // carry "Team activity:" (§11.6). Printed where the state follows, so a
+    // robot whose state machine is stuck prints nothing.
+    RCLCPP_INFO(get_logger(), "Team activity: explore (state %s -> PLAN)",
+                stateName(cur));
     transitionTo(State::PLAN, "team-explore");
     return;
   }
@@ -3001,6 +3097,8 @@ void ExploPlannerNode::applyActivity() {
   if (!have_pose_ && have_home_ && isLegState(want) &&
       (cur == State::NAVIGATE || isLegState(cur)))
     abandonNavGoal(reason);
+  RCLCPP_INFO(get_logger(), "Team activity: %s (state %s -> %s)", act,
+              stateName(cur), stateName(want));
   transitionTo(want, reason);
   // run_end's reason: how the mission ended, not the transition tag.
   if (want == State::DONE && !mission_home_result_.empty())
@@ -3105,6 +3203,73 @@ void ExploPlannerNode::latchFinished(const char* reason) {
   finished_        = true;
   finished_reason_ = reason;
   recordExplorationComplete(reason);
+}
+
+// ── PLAN starvation (§11.7) ─────────────────────────────────────────────────
+
+bool ExploPlannerNode::starvationCounting() const {
+  if (!starve_.open || finished_ || plan_starve_finish_sec_ <= 0.0) return false;
+  const bool exploring =
+      !team_ticked_ || team_out_.activity == gen34::Activity::kExplore;
+  return exploring && state_ != State::PROXIMITY_HOLD;
+}
+
+void ExploPlannerNode::noteStarvedPlan() {
+  if (starve_.open || finished_ || plan_starve_finish_sec_ <= 0.0) return;
+  const double now = this->now().seconds();
+  starve_ = StarveClock{};
+  starve_.open     = true;
+  starve_.open_t   = now;
+  starve_.last_t   = now;
+  starve_.counting = true;
+  starve_.ax = latest_pos_.x();
+  starve_.ay = latest_pos_.y();
+  ++plan_starved_count_;
+  RCLCPP_INFO(get_logger(),
+      "PLAN starved at t_sim=%.1f: this robot finishes after %.0f s of "
+      "exploring without moving %.1f m.", now, plan_starve_finish_sec_, 1.0);
+}
+
+void ExploPlannerNode::updateStarvation(double now) {
+  StarveClock& c = starve_;
+  if (!c.open) return;
+  if (finished_ || plan_starve_finish_sec_ <= 0.0) { c = StarveClock{}; return; }
+  // The interval since the last tick is booked the way that tick left it.
+  if (c.last_t >= 0.0 && now > c.last_t) {
+    if (c.counting) c.counted += now - c.last_t;
+    else            c.paused  += now - c.last_t;
+  }
+  c.last_t = now;
+  // TeamCore has not ticked yet: this is the activity the last tick applied.
+  const bool exploring =
+      !team_ticked_ || team_out_.activity == gen34::Activity::kExplore;
+  const bool counting = exploring && state_ != State::PROXIMITY_HOLD;
+  // A team activity took the robot somewhere else: the clock resumes from
+  // wherever it comes back to. A proximity hold does not move the anchor.
+  if (!exploring) c.team_paused = true;
+  if (exploring && c.team_paused) {
+    c.team_paused = false;
+    c.ax = latest_pos_.x();
+    c.ay = latest_pos_.y();
+  }
+  c.counting = counting;
+  if (counting && have_pose_ &&
+      std::hypot(latest_pos_.x() - c.ax, latest_pos_.y() - c.ay) >= 1.0) {
+    RCLCPP_INFO(get_logger(),
+        "PLAN starvation over: moved 1.0 m after %.0f s counted (%d goals "
+        "selected).", c.counted, c.goals);
+    c = StarveClock{};
+    return;
+  }
+  if (c.counted >= plan_starve_finish_sec_) {
+    ++plan_starved_finish_count_;
+    RCLCPP_WARN(get_logger(),
+        "PLAN starved for %.0f s of exploring (clock opened at t_sim=%.1f, "
+        "%.0f s paused, %d goals selected): finishing.",
+        c.counted, c.open_t, c.paused, c.goals);
+    latchFinished("starved");   // reads starve_ for the event
+    c = StarveClock{};
+  }
 }
 
 int ExploPlannerNode::presentPeerCount() const {
@@ -3329,7 +3494,9 @@ void ExploPlannerNode::doPlan() {
       n_radial, candidates.size() - n_radial, candidates.size());
 
   if (candidates.empty()) {
-    RCLCPP_WARN(get_logger(), "No valid candidates. Retrying next tick.");
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "No valid candidates. Retrying next tick.");
+    noteStarvedPlan();
     return;
   }
 
@@ -3861,6 +4028,7 @@ void ExploPlannerNode::doPlan() {
         rejected_map, rejected_unreachable,
         rejected_blacklist, rejected_visited, rejected_minpos,
         consecutive_all_rejected_);
+    noteStarvedPlan();
     return;  // stay in PLAN, retry next tick
   }
   // Reset only on a tick that actually selected a goal, so the counter measures
@@ -3877,6 +4045,9 @@ void ExploPlannerNode::doPlan() {
   // only on recovery would leave the last stall's length standing on every
   // healthy row after it.
   pending_plan_stall_ticks_ = 0;
+  // §11.7: a goal does not close the starvation clock (1 m of motion does),
+  // but the reader is told how many were tried under it.
+  if (starve_.open) ++starve_.goals;
 
   // Drain utility / coord diagnostics into pending_* fields for the
   // upcoming LOG_STEP. doLogStep() will copy these into StepMetrics.
@@ -4256,6 +4427,11 @@ void ExploPlannerNode::recordExplorationComplete(const char* reason) {
     e.peers_live        = active;
     e.expected_peers    = expectedPeers();
     e.occurrence        = ++exp_complete_count_;
+    if (std::strcmp(reason, "starved") == 0) {
+      e.starved_open_t_sim = starve_.open_t;
+      e.starved_paused_sec = starve_.paused;
+      e.starved_goals      = starve_.goals;
+    }
     exp_log_->logExplorationComplete(expCtx(), e);
   }
 }
@@ -4287,6 +4463,16 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   coverage_latched_       = true;
   coverage_latch_t_sim_   = this->now().seconds();
   coverage_latch_unknown_ = unk;
+  // Another ending came first (starvation, the step budget): the crossing is
+  // recorded as the coverage latch, but it is not a second exploration
+  // ending, and its line must not read "Exploration complete" (§11.7).
+  if (finished_) {
+    RCLCPP_INFO(get_logger(),
+        "Coverage reached after the finish [%s]: ROI unknown fraction %.3f <= "
+        "%.3f (source=%s) at t_sim=%.1f.", finished_reason_.c_str(), unk,
+        done_unknown_fraction_, source, coverage_latch_t_sim_);
+    return true;
+  }
   noteCoverageDecisionSample(unk, source);
   RCLCPP_INFO(get_logger(),
       "Exploration complete [latch]: ROI unknown fraction %.3f <= %.3f "
@@ -4299,16 +4485,11 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // in, before any transitionTo moves us. The latch can fire mid-drive: an
   // ending that is not meant to keep the nav goal must abandon it.
   // (notes: latch-order-record-then-stop)
-  recordExplorationComplete("coverage-latched");
-
-  // Finished is all the latch decides (K4); exploration_complete went out just
-  // above. What follows (wait, meet, home) is TeamCore's, and the next tick's
-  // activity switches the state. true stops the caller, so doPlan publishes
-  // no goal on the latch tick.
-  if (!finished_) {
-    finished_        = true;
-    finished_reason_ = "coverage-latched";
-  }
+  // Finished is all the latch decides (K4); latchFinished records
+  // exploration_complete before anything moves. What follows (wait, meet,
+  // home) is TeamCore's, and the next tick's activity switches the state.
+  // true stops the caller, so doPlan publishes no goal on the latch tick.
+  latchFinished("coverage-latched");
   return true;
 }
 
@@ -4966,6 +5147,9 @@ void ExploPlannerNode::logRunEnd(const char* reason) {
   e.mechanism_counts["beacons_rejected"]    = beacons_rejected_;
   e.mechanism_counts["cell_merges_refused"] = cell_merges_refused_;
   e.mechanism_counts["leg_legs"]            = leg_.legs();
+  e.mechanism_counts["leg_starts"]          = leg_.starts();
+  e.mechanism_counts["plan_starved"]        = plan_starved_count_;
+  e.mechanism_counts["plan_starved_finish"] = plan_starved_finish_count_;
   e.mechanism_counts["leg_escapes"]         = leg_.escapes();
   e.mechanism_counts["team_events_unknown"] = exp_log_->teamEventsUnknown();
   exp_log_->logRunEnd(expCtx(), e);
@@ -5549,6 +5733,13 @@ void ExploPlannerNode::publishBeacon() {
   m.plan_interval_sec    = b.plan.interval;
   m.plan_renewed_at_slot = b.plan.renewed_at_slot;
   m.plan_provisional     = b.plan.provisional;
+  m.plan_known_version   = b.plan_known_version;
+  m.plan_known_cell      = b.plan_known_cell;
+  m.plan_known_center.resize(b.plan_known_center.size());
+  for (size_t j = 0; j < b.plan_known_center.size(); ++j) {
+    m.plan_known_center[j].x = b.plan_known_center[j].x;
+    m.plan_known_center[j].y = b.plan_known_center[j].y;
+  }
   m.meeting_slot  = b.meeting_slot;
   m.met_mask      = b.met_mask;
 
@@ -5644,6 +5835,13 @@ void ExploPlannerNode::drainBeacons() {
     b.plan.interval = msg.plan_interval_sec;
     b.plan.renewed_at_slot = msg.plan_renewed_at_slot;
     b.plan.provisional     = msg.plan_provisional;
+    b.plan_known_version.assign(msg.plan_known_version.begin(),
+                                msg.plan_known_version.end());
+    b.plan_known_cell.assign(msg.plan_known_cell.begin(),
+                             msg.plan_known_cell.end());
+    b.plan_known_center.reserve(msg.plan_known_center.size());
+    for (const auto& c : msg.plan_known_center)
+      b.plan_known_center.push_back(gen34::Vec2{c.x, c.y});
     b.meeting_slot = msg.meeting_slot;
     b.met_mask     = msg.met_mask;
     // Tour cell ids name our ground only on the same grid; an id off our grid
@@ -5819,20 +6017,20 @@ bool ExploPlannerNode::oracleStandable(const gen34::Vec2& p) const {
 }
 
 // No occupied cell on the segment, sampled every 0.2 m; clear without a map.
-// Unknown cells do not block, as for the frontier goals.
+// Unknown cells do not block, as for the frontier goals. The occupied run at
+// each end, up to sight_end_clear_m, is skipped: a robot standing there (a
+// braked peer, the asker) is mapped as an obstacle and inflated with the rest
+// of the plan map, and would block every ray (§11.3).
 bool ExploPlannerNode::oracleLineOfSight(const gen34::Vec2& a,
                                          const gen34::Vec2& b) const {
   if (!latest_plan_map_) return true;
-  const double len = std::hypot(b.x - a.x, b.y - a.y);
-  const int n = std::max(1, static_cast<int>(std::ceil(len / 0.2)));
-  for (int i = 0; i <= n; ++i) {
-    const double t = static_cast<double>(i) / n;
-    const Eigen::Vector3f q(static_cast<float>(a.x + t * (b.x - a.x)),
-                            static_cast<float>(a.y + t * (b.y - a.y)),
-                            latest_pos_.z());
-    if (isCellOccupied(q)) return false;
-  }
-  return true;
+  const float z = latest_pos_.z();
+  return segmentClear(*latest_plan_map_,
+                      Eigen::Vector3f(static_cast<float>(a.x),
+                                      static_cast<float>(a.y), z),
+                      Eigen::Vector3f(static_cast<float>(b.x),
+                                      static_cast<float>(b.y), z),
+                      sight_end_clear_m_);
 }
 
 // The value gate over the missing peers (evaluateReconnectGate). Without the

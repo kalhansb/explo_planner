@@ -1138,10 +1138,26 @@ teardown() {
 # what run_end_t_sim means. (notes: run-control-knobs-before-trap)
 STOP_ON_DONE="${STOP_ON_DONE:-1}"
 DONE_GRACE_S="${DONE_GRACE_S:-30}"
-# Gen 34's longest planned stretch with no robot stepping is a meeting that
-# runs its whole course (drive, 600 s backstop, 600 s exchange) right after a
-# chase (600 s); 50 heartbeats (3000 sim-s) sits above it. (Q61(c))
-HANG_HB="${HANG_HB:-50}"
+# The hang gate counts 60-sim-s heartbeats in which no robot still exploring
+# selected a goal or printed a "Team activity:" line (DESIGN_gen34.md §11.6).
+# The longest planned such stretch is one meeting: the latest departer's lead
+# (3 s per metre over a path of at most 4*ROI_HALF) plus the 600 s backstop,
+# 1200 sim-s at ROI_HALF=50. A chase is 600 s, PLAN starvation ends in its
+# 300 s latch, and Wait and Home need a finished robot, which leaves the gate.
+# The 4*ROI_HALF path is assumed, not enforced (the lead has no cap): on a map
+# whose paths run longer, raise HANG_HB.
+# Default: max(25, ceil((12*ROI_HALF + 600) / 60)); a smaller HANG_HB warns.
+# There is no off value: 0 would kill the cell at its first quiet heartbeat.
+HANG_HB_MIN="$(awk -v h="$ROI_HALF" 'BEGIN{v=(12*h+600)/60; n=int(v); if (n<v) n++; if (n<25) n=25; print n}')"
+HANG_HB="${HANG_HB:-$HANG_HB_MIN}"
+case "$HANG_HB" in
+  ''|*[!0-9]*) echo "HANG_HB must be a whole number of heartbeats, got '$HANG_HB'" >&2; exit 2 ;;
+esac
+HANG_HB=$((10#$HANG_HB))
+if [ "$HANG_HB" -lt 1 ]; then
+  echo "HANG_HB must be at least 1; to disarm the hang gate, set it above the run's length in minutes" >&2
+  exit 2
+fi
 GATES_STRICT="${GATES_STRICT:-$COMMS}"
 POLL_S="${POLL_S:-2}"
 CLOCK_EVERY_S="${CLOCK_EVERY_S:-15}"
@@ -1675,7 +1691,8 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # whether a slow cell is killed or banked. (notes: manifest-run-control-knobs)
   echo "stop_on_done=$STOP_ON_DONE"
   echo "done_grace_s=$DONE_GRACE_S"
-  echo "hang_hb_sim_s=$HANG_HB"
+  echo "hang_hb=$HANG_HB"
+  echo "hang_window_sim_s=$((HANG_HB * 60))"
   echo "gates_strict=$GATES_STRICT"
   echo "poll_s=$POLL_S"
   echo "clock_every_s=$CLOCK_EVERY_S"
@@ -2092,13 +2109,19 @@ fi
 
 # --- 7. hold, watching component health -------------------------------------
 LAST_HB=0
-# HANG_HB counts 60-sim-s heartbeats with no step (default 40 = 2400 sim-s),
-# sized above the configured manoeuvre budgets. If HANG_HB*60 >= DURATION_S the
-# gate cannot fire, so warn. (notes: hang-gate-threshold-sizing)
+# HANG_HB counts 60-sim-s heartbeats with no goal and no team activity change
+# from a robot still exploring, sized off ROI_HALF above. If HANG_HB*60 >=
+# DURATION_S the gate cannot fire, so warn. (notes: hang-gate-threshold-sizing)
+if [ "$HANG_HB" -lt "$HANG_HB_MIN" ]; then
+  log "WARNING: HANG_HB=$HANG_HB is below $HANG_HB_MIN, the heartbeats one" \
+      "meeting's course can take at ROI_HALF=$ROI_HALF. A valid cell may be" \
+      "killed as hung."
+fi
 if [ "$DURATION_S" != "0" ] && [ "$((HANG_HB * 60))" -ge "$DURATION_S" ]; then
-  log "WARNING: hang gate is INERT — needs $((HANG_HB * 60)) sim-s of frozen" \
-      "steps but DURATION_S=$DURATION_S ends the run first. A hung planner" \
-      "will run to the censoring horizon instead of aborting early."
+  log "WARNING: hang gate is INERT — needs $((HANG_HB * 60)) sim-s with no" \
+      "goal or team activity change but DURATION_S=$DURATION_S ends the run" \
+      "first. A hung planner will run to the censoring horizon instead of" \
+      "aborting early."
 fi
 # STOP_ON_DONE=1 ends the run when every planner CSV's state column (found by
 # header, never a fixed index) reads DONE; a log line is not terminal.
@@ -2118,7 +2141,7 @@ planner_state() {
 # CLOCK_EVERY_S for sim_clock, which spawns a ros2 process, forced to POLL_S
 # only on the all-DONE edge and in the grace window.
 # (notes: poll-cadence-two-budgets)
-LAST_STEPS=-1; STALL=0
+LAST_LIVE="-"; STALL=0
 LAST_CLOCK_WALL=0
 # Wall-clock deadman on the sim clock: a deadlocked Gazebo keeps every process
 # alive and the clock frozen, which no sim-time condition catches.
@@ -2180,47 +2203,49 @@ while true; do
   fi
   if [ $((T - LAST_HB)) -ge 60 ]; then
     LAST_HB=$T
-    # One slash-joined step and completion count per robot, in roster order.
-    # Empty counts become 0: grep -c prints nothing for a missing log, which
-    # would otherwise reset STALL every heartbeat.
+    # Per robot, in roster order: goal and "Team activity:" lines (the node
+    # prints the latter where the state machine follows a new activity), and
+    # completions. Empty counts become 0: grep -c prints nothing for a missing
+    # log, which would otherwise reset STALL every heartbeat.
     # (notes: hang-gate-step-counts)
-    STEPS_NOW=""; COMPLETE_NOW=""
+    # DONE_PAT must match only the completion prefixes the node prints. Empty
+    # grep output counts as 0 (missing log); do not append echo 0, which
+    # doubles the output. (notes: hang-gate-done-pattern)
+    DONE_PAT="Exploration complete\|Exploration finished"
+    STEPS_NOW=""; COMPLETE_NOW=""; LIVE_NOW=""
     for r in $ROBOTS; do
-      s=$(grep -c "selected goal" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
+      s=$(grep -c "selected goal\|Team activity:" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
       c=$(grep -c "exploitation COMPLETE" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
+      d=$(grep -c "$DONE_PAT" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
       STEPS_NOW="$STEPS_NOW${STEPS_NOW:+/}${s:-0}"
       COMPLETE_NOW="$COMPLETE_NOW${COMPLETE_NOW:+/}${c:-0}"
+      [ "${d:-0}" = 0 ] && LIVE_NOW="$LIVE_NOW${LIVE_NOW:+ }$r=${s:-0}"
     done
-    log "HB t_sim=$T steps($(echo $ROBOTS | tr ' ' '/'))=$STEPS_NOW complete=$COMPLETE_NOW"
+    log "HB t_sim=$T goals+activity($(echo $ROBOTS | tr ' ' '/'))=$STEPS_NOW" \
+        "complete=$COMPLETE_NOW exploring: ${LIVE_NOW:-none}"
     # A planner stuck re-entering PLAN keeps every process alive and the CSV
-    # growing, so only the step count stalls. Not fatal once a robot has
-    # finished: DONE-idle stops its steps by design.
-    # (notes: hang-gate-what-stalls)
-    if [ "$STEPS_NOW" = "$LAST_STEPS" ]; then
+    # growing, so only its goal and activity lines stall. Only robots still
+    # exploring feed the gate: a finished robot's lines stop by design. With
+    # every robot finished the gate does not run; a robot finishing is a
+    # change. (notes: hang-gate-what-stalls)
+    if [ -z "$LIVE_NOW" ]; then
+      STALL=0
+    elif [ "$LIVE_NOW" = "$LAST_LIVE" ]; then
       STALL=$((STALL + 1))
-      # DONE_PAT must match only the completion prefixes the node prints. Empty
-      # grep output counts as 0 (missing log); do not append echo 0, which
-      # doubles the output. Any robot DONE disarms the gate.
-      # (notes: hang-gate-done-pattern)
-      DONE_PAT="Exploration complete\|Exploration finished"
-      ANY_DONE=0
-      for r in $ROBOTS; do
-        d=$(grep -c "$DONE_PAT" "$OUTDIR/planner_$r.log" 2>/dev/null || true)
-        [ "${d:-0}" = 0 ] || { ANY_DONE=1; break; }
-      done
       # The threshold is sized off the configured budgets (see HANG_HB), not
       # observed stalls: aborting a valid cell is worse than a gate that never
       # fires. (notes: hang-gate-false-abort-calibration)
-      if [ "$STALL" -ge "$HANG_HB" ] && [ "$ANY_DONE" = 0 ]; then
-        die "HUNG: no planner advanced a step in $((STALL * 60)) sim-s \
-(steps still $STEPS_NOW) and none reports DONE. Run is invalid — check \
+      if [ "$STALL" -ge "$HANG_HB" ]; then
+        die "HUNG: no robot still exploring selected a goal or changed team \
+activity in $((STALL * 60)) sim-s ($LIVE_NOW). Run is invalid — check \
 'rejected' counts in $OUTDIR/planner_*.log (cost_grid_radius_cap_m=$COST_CAP)."
       fi
-      [ "$STALL" -ge 2 ] && log "WARNING no step progress for $((STALL * 60)) sim-s"
+      [ "$STALL" -ge 2 ] && log "WARNING no goal or team activity change from" \
+          "an exploring robot for $((STALL * 60)) sim-s"
     else
       STALL=0
     fi
-    LAST_STEPS=$STEPS_NOW
+    LAST_LIVE=$LIVE_NOW
   fi
   if [ "$STOP_ON_DONE" = "1" ]; then
     # all_done was computed above, before the clock read, so that a fast poll

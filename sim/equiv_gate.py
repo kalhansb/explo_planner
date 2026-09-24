@@ -68,8 +68,11 @@ Usage:  equiv_gate.py PARENT_ROOT CHILD_ROOT
         Each root is a campaign directory of cell subdirectories, or one cell
         directory. Cells are matched by nothing — the comparison is over the
         UNION of each side, since seeds and cell names differ between runs.
+        Gen 33 only: a cell whose manifest names another node (gen 34's
+        records node=gen34) is refused. This gate reads gen 33's node source
+        and vocabulary; gen-34 cells are checked by gen34_check.py.
 Env:    EQUIV_NODE_SRC   gen 33's explo_planner_node.cpp (default: ../backup/gen33/)
-        EQUIV_LOG_HPP    experiment_log.hpp     (default: alongside this file)
+        EQUIV_LOG_HPP    gen 33's experiment_log.hpp (default: ../backup/gen33/)
         EQUIV_ALLOW_NEW_KINDS   comma-separated event kinds permitted to appear
                                 in the child. For the phase that turns a
                                 mechanism ON, so the same file can score a
@@ -80,7 +83,8 @@ Env:    EQUIV_NODE_SRC   gen 33's explo_planner_node.cpp (default: ../backup/gen
                                 an existing event, NEVER for a defaults run.
 Exit:   0  equivalent
         1  a difference that defeats the default-off claim
-        2  usage, or a default the parser refused to guess at
+        2  usage, a default the parser refused to guess at, or a cell that is
+           not gen 33's
         3  something was not actually compared: a population was empty, or an
            invariant could not be checked (a param whose compiled "default" is
            an AUTO sentinel, or a derived one whose inputs the run did not log)
@@ -90,6 +94,7 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,9 +103,10 @@ PKG = os.path.join(HERE, "..", "explo_planner")
 NODE_SRC = os.environ.get(
     "EQUIV_NODE_SRC", os.path.join(HERE, "..", "backup", "gen33",
                                    "explo_planner_node.cpp"))
+# Its event vocabulary, backed up beside it: the current header is gen 34's.
 LOG_HPP = os.environ.get(
-    "EQUIV_LOG_HPP",
-    os.path.join(PKG, "include", "explo_planner", "experiment_log.hpp"))
+    "EQUIV_LOG_HPP", os.path.join(HERE, "..", "backup", "gen33",
+                                  "experiment_log.hpp"))
 
 # Dumped params with no dp() call. Each value is what the derivation yields at
 # default inputs, or a callable on the child's param dump. Used only when dp()
@@ -316,18 +322,28 @@ def _literal(expr):
     return UNPARSEABLE
 
 
+def _float32(x):
+    """x as a C++ static_cast<float> leaves it, widened back to a double."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
 def source_defaults(path):
-    """Map param name -> compiled default (or UNPARSEABLE) from dp(...) calls."""
+    """Map param name -> compiled default (or UNPARSEABLE) from dp(...) and
+    dp_f(...) calls. dp_f declares a double and narrows it to float, and the
+    run logs the float widened back, so its defaults are narrowed here too."""
     try:
         src = open(path, errors="replace").read()
     except OSError as e:
         raise GateError(f"cannot read the param defaults: {e}")
     out = {}
-    for m in re.finditer(r'\bdp\s*\(\s*"([A-Za-z0-9_]+)"\s*,', src):
-        name = m.group(1)
+    for m in re.finditer(r'\bdp(_f)?\s*\(\s*"([A-Za-z0-9_]+)"\s*,', src):
+        name = m.group(2)
         open_paren = src.index("(", m.start())
         expr = _default_expr(src, open_paren)
-        out[name] = UNPARSEABLE if expr is None else _literal(expr)
+        v = UNPARSEABLE if expr is None else _literal(expr)
+        if m.group(1) and isinstance(v, float):
+            v = _float32(v)
+        out[name] = v
     if not out:
         raise GateError(f"{path}: no dp(\"name\", default) calls found — the "
                         f"param block was renamed and this gate went blind")
@@ -365,6 +381,14 @@ def read_side(root, label):
     runs = []
     for d in _cell_dirs(root):
         manifest = _read_manifest(os.path.join(d, "run_manifest.txt"))
+        # The node key arrived with gen 34, so an absent one is gen 33.
+        node = manifest.get("node", "gen33")
+        if node != "gen33":
+            raise GateError(
+                f"{label}: {os.path.basename(d)} was run by node={node}. This "
+                f"gate reads gen 33's node source and event vocabulary, so it "
+                f"cannot score that cell; check gen-34 cells with "
+                f"gen34_check.py")
         gates = set()
         gpath = os.path.join(d, "comms_gates.txt")
         if os.path.exists(gpath):

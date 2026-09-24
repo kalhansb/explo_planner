@@ -3104,6 +3104,12 @@ Not fatal if a robot has legitimately finished: DONE-idle is a terminal
 state by design and its step count is supposed to stop.
 ```
 
+Gen 34 (DESIGN_gen34.md §11.6, 2026-09-24): the gate also counts the node's
+"Team activity:" lines, printed where the state machine follows a new team
+activity, so a meeting or a chase is progress. Only robots still exploring
+(no completion line) feed it, and the default HANG_HB is derived from
+ROI_HALF: max(25, ceil((12*ROI_HALF + 600) / 60)).
+
 ### hang-gate-done-pattern
 
 **The DONE pattern and empty counts** — attached to `DONE_PAT="Exploration complete\|Exploration finished"` (line 3661)
@@ -3144,6 +3150,10 @@ ANY robot reporting DONE disarms the gate, which is what the two-term
 one robot legitimately finished the team's step counter can sit still
 for reasons that are not a hang.
 ```
+
+Gen 34 (DESIGN_gen34.md §11.6): no longer any robot. A finished robot leaves
+the gate and the rest still feed it; the gate stops only when every robot
+has finished.
 
 ### hang-gate-false-abort-calibration
 

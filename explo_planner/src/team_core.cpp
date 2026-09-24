@@ -49,18 +49,20 @@ const char* activityName(Activity a) {
 const std::vector<std::string>& TeamCore::counterNames() {
   static const std::vector<std::string> names = {
       "beacons_heard", "beacon_bad_id", "beacon_foreign_team",
-      "beacon_grid_mismatch", "beacon_stale",
+      "beacon_grid_mismatch", "beacon_stale", "beacon_gossip_bad",
       "exchange_start", "exchange_done", "exchange_gave_up",
-      "exchange_done_trivial", "exchange_lost",
+      "exchange_done_trivial", "exchange_lost", "exchange_done_late",
       "plan_proposed", "plan_firmed", "plan_renewed", "plan_adopted",
       "plan_solve_refused",
       "booking_booked", "booking_departed", "booking_depart_deferred",
       "booking_arrived", "booking_pair_met", "booking_full_met",
-      "booking_retargeted", "booking_split_alternate", "booking_no_slot",
+      "booking_retargeted", "booking_retarget_late", "booking_split_alternate",
+      "booking_no_slot",
       "booking_renewal_unseen", "booking_met", "booking_partial",
       "booking_missed", "booking_patience", "booking_backstop",
       "booking_encounter", "booking_team-finished", "booking_renewed",
       "reconnect_moves", "reconnect_contact", "reconnect_no_contact",
+      "reconnect_fallback",
       "chase_gate_dispatch", "chase_gate_declined", "chase_gate_failopen",
       "chase_start", "chase_first_intercept", "chase_first_goal",
       "chase_first_last-position", "chase_point_reached", "chase_point_expired",
@@ -82,6 +84,7 @@ TeamCore::TeamCore(const TeamConfig& cfg, TeamOracle* oracle)
   present_.assign(cfg_.n, false);
   contact_.assign(cfg_.n, false);
   ex_.resize(cfg_.n);
+  known_.resize(cfg_.n);
   for (const std::string& k : counterNames()) counts_[k] = 0;
 }
 
@@ -101,8 +104,13 @@ bool TeamCore::onBeacon(const Beacon& b, double rx_time) {
   r.rx_time = rx_time;
   r.b = b;
   r.grid_ok = (b.grid_hash == cfg_.grid_hash);
-  if (r.grid_ok) r.version_seen = b.plan.version;
-  else count("beacon_grid_mismatch");
+  if (!r.grid_ok) count("beacon_grid_mismatch");
+  // §11.1: the table merges in updatePlan, from the stored beacon, so it is
+  // judged once here.
+  const size_t n = static_cast<size_t>(cfg_.n);
+  r.table_ok = b.plan_known_version.size() == n && b.plan_known_cell.size() == n &&
+               b.plan_known_center.size() == n;
+  if (!r.table_ok) count("beacon_gossip_bad");
   count("beacons_heard");
   return true;
 }
@@ -158,8 +166,11 @@ bool TeamCore::lastHeardPosition(int j, Vec2* p, double* age) const {
 }
 
 bool TeamCore::proximityExempt(int j) const {
-  return activity_ == Activity::kMeet && present(j) &&
-         peers_[j].b.activity == Activity::kMeet;
+  if (activity_ != Activity::kMeet || !booking_.held || booking_.rc_active) return false;
+  if (!in_.have_pose || !present(j) || peers_[j].b.activity != Activity::kMeet) return false;
+  const double r = cfg_.meet_exempt_radius_m;
+  return dist(in_.pose, booking_.center) <= r &&
+         dist(peers_[j].b.position, booking_.center) <= r;
 }
 
 // ── Exchange (Q18, Q27, Q51) ────────────────────────────────────────────────
@@ -195,6 +206,20 @@ void TeamCore::updateExchanges() {
         e.trivial = rx >= e.target_rx && prx >= e.target_tx;
         count("exchange_start");
         emit("exchange", {F::str("action", "start"), F::integer("peer", j),
+                          F::integer("target_rx", (long long)e.target_rx),
+                          F::integer("target_tx", (long long)e.target_tx),
+                          F::integer("rx", (long long)rx),
+                          F::integer("peer_rx", (long long)prx)});
+      }
+      // §11.2: a give-up keeps watching the live numbers while the contact
+      // lasts. Its own branch, not the end block below: exchange_done is not
+      // raised, so starts = done + gave-up + lost + open still holds.
+      if (e.state == ExchangeRecord::State::kGaveUp &&
+          rx >= e.target_rx && prx >= e.target_tx) {
+        e.state = ExchangeRecord::State::kDone;
+        count("exchange_done_late");
+        emit("exchange", {F::str("action", "done_late"), F::integer("peer", j),
+                          F::num("duration_sec", now_ - e.start),
                           F::integer("target_rx", (long long)e.target_rx),
                           F::integer("target_tx", (long long)e.target_tx),
                           F::integer("rx", (long long)rx),
@@ -308,9 +333,25 @@ std::vector<TeamRobotView> TeamCore::teamView() const {
   return v;
 }
 
+void TeamCore::mergeKnown(int j, uint32_t version, int cell, const Vec2& center) {
+  KnownPlan& k = known_[j];
+  if (version <= k.version) return;
+  k.version = version;
+  k.cell = cell;
+  k.center = center;
+}
+
+void TeamCore::setOwnKnown() {
+  KnownPlan& k = known_[cfg_.self_id];
+  k.version = plan_.version;
+  k.cell = plan_.cell;
+  k.center = plan_.center;
+}
+
 void TeamCore::adoptPlan(const Plan& p, int from) {
   prev_plan_ = plan_;
   plan_ = p;
+  setOwnKnown();
   count("plan_adopted");
   emit("plan", {F::str("action", "adopted"), F::integer("from", from),
                 F::integer("version", p.version), F::integer("cell", p.cell),
@@ -359,6 +400,7 @@ void TeamCore::proposePlan(const char* why, int renewed_at_slot) {
   p.renewed_at_slot = std::string(why) == "firmed" ? plan_.renewed_at_slot : renewed_at_slot;
   prev_plan_ = plan_;
   plan_ = p;
+  setOwnKnown();
   count(std::string("plan_") + why);
   emit("plan", {F::str("action", why), F::integer("version", p.version),
                 F::integer("cell", p.cell), F::num("cx", p.center.x),
@@ -372,6 +414,24 @@ void TeamCore::proposePlan(const char* why, int renewed_at_slot) {
 void TeamCore::updatePlan() {
   if (!armBooks(cfg_.arm) || cfg_.n < 2) return;
   const int self = cfg_.self_id;
+  // §11.1: the table of what every robot holds. Merged here, every tick, from
+  // the stored beacons (a merge by maximum is idempotent). A sender's own
+  // entry comes from its plan fields, never from its table, and nobody tells
+  // me what I hold. Merge and adoption happen in the same pass, so the table's
+  // highest entry is my own version when this returns (harness P6).
+  for (int j = 0; j < cfg_.n; ++j) {
+    if (j == self) continue;
+    const PeerRecord& r = peers_[j];
+    if (!r.ever || !r.grid_ok) continue;
+    if (r.b.plan.valid()) mergeKnown(j, r.b.plan.version, r.b.plan.cell, r.b.plan.center);
+    if (!r.table_ok) continue;
+    for (int k = 0; k < cfg_.n; ++k) {
+      if (k == self || k == j) continue;
+      const size_t u = static_cast<size_t>(k);
+      mergeKnown(k, r.b.plan_known_version[u], r.b.plan_known_cell[u],
+                 r.b.plan_known_center[u]);
+    }
+  }
   for (int j = 0; j < cfg_.n; ++j) {
     if (j == self) continue;
     const PeerRecord& r = peers_[j];
@@ -389,18 +449,18 @@ void TeamCore::updatePlan() {
 void TeamCore::cellForSlot(int k, int* cell, Vec2* center) const {
   *cell = plan_.cell;
   *center = plan_.center;
-  if (!prev_plan_.valid() || prev_plan_.version >= plan_.version) return;
-  if (prev_plan_.cell == plan_.cell) return;
   if (k % 2 == 0) return;
+  // §11.1: odd slots go where the lowest known plan puts the laggard. Its
+  // holder goes to its own cell every slot, and so does everyone who knows
+  // it, so the odd slots gather the team once the tables agree.
+  const KnownPlan* low = nullptr;
   for (int j = 0; j < cfg_.n; ++j) {
-    if (j == cfg_.self_id) continue;
-    const PeerRecord& r = peers_[j];
-    if (r.ever && r.grid_ok && r.version_seen == prev_plan_.version) {
-      *cell = prev_plan_.cell;
-      *center = prev_plan_.center;
-      return;
-    }
+    if (j == cfg_.self_id || known_[j].version == 0) continue;
+    if (!low || known_[j].version < low->version) low = &known_[j];
   }
+  if (!low || low->version >= plan_.version) return;
+  *cell = low->cell;
+  *center = low->center;
 }
 
 // ── Booking (rendezvous, hybrid) ────────────────────────────────────────────
@@ -547,18 +607,38 @@ void TeamCore::bookingPass() {
   if (!booking_.held) return;
   Booking& B = booking_;
 
-  // A plan adopted before arrival moves the meeting (Q54).
-  if (!B.arrived) {
+  // A plan adopted, or a laggard learned of, moves the meeting (Q54, §11.1).
+  // Before arrival the move is always taken; after it, only while the robot
+  // can still make the slot at the new cell. A fully met booking stays: it
+  // waits for the renewal where it is.
+  if (!B.full_met) {
     int c;
     Vec2 ctr;
     cellForSlot(B.slot, &c, &ctr);
     if (c != B.cell || dist(ctr, B.center) > 1e-6) {
-      B.cell = c;
-      B.center = ctr;
-      if (B.departed) B.spot = ringSpot(B.center, &B.spot_radius);
-      count("booking_retargeted");
-      emit("booking", {F::str("action", "retargeted"), F::integer("slot", B.slot),
-                       F::integer("cell", c), F::integer("plan_version", plan_.version)});
+      const double lead = in_.have_pose ? leadFrom(in_.pose, c, ctr) : 0.0;
+      const bool late = now_ + lead > B.slot_time;
+      if (!B.arrived || !late) {
+        const bool was_arrived = B.arrived;
+        B.cell = c;
+        B.center = ctr;
+        if (B.arrived) {
+          B.arrived = false;
+          B.rc_active = false;
+          B.rc_holding = false;
+          B.rc_sight = false;
+          B.rc_peer = -1;
+          B.rc_used_mask = 0;
+          B.contact_mask = 0;
+          B.leg_key = next_leg_key_++;
+        }
+        if (B.departed) B.spot = ringSpot(B.center, &B.spot_radius);
+        count("booking_retargeted");
+        if (late) count("booking_retarget_late");
+        emit("booking", {F::str("action", "retargeted"), F::integer("slot", B.slot),
+                         F::integer("cell", c), F::integer("plan_version", plan_.version),
+                         F::boolean("late", late), F::boolean("after_arrival", was_arrived)});
+      }
     }
   }
 
@@ -648,8 +728,9 @@ void TeamCore::bookingPass() {
   }
   if (B.full_met) {
     bool renewed = team_finished_ || plan_.renewed_at_slot == B.slot;
+    // §11.1: a renewal relayed by a third robot counts.
     for (int j = 0; j < cfg_.n && renewed; ++j)
-      if (j != self) renewed = peers_[j].ever && peers_[j].b.plan.version >= plan_.version;
+      if (j != self) renewed = known_[j].version >= plan_.version;
     if (renewed) { clearBooking("met"); return; }
     // Unseen renewal: patience from the full meeting, capped by the backstop
     // that wait_bound and the drive's deadline report.
@@ -681,8 +762,9 @@ void TeamCore::bookingPass() {
     }
   }
 
-  // Q32 / Q53: of a pair that lost each other at the cell, the higher id drives
-  // to the other's last heard position; the lower id holds.
+  // Q32 / Q53: of a pair that lost each other at the cell, the higher id walks
+  // and the lower id holds. §11.3: the walk goes to a point with sight of the
+  // other, then to its last heard position.
   if (!B.arrived) return;
   if (B.rc_active || B.rc_holding) {
     const int j = B.rc_peer;
@@ -691,6 +773,14 @@ void TeamCore::bookingPass() {
       B.rc_holding = true;
       count("reconnect_contact");
       emit("booking", {F::str("action", "reconnect_contact"), F::integer("peer", j)});
+    } else if (B.rc_active && in_.have_pose && B.rc_sight &&
+               dist(in_.pose, B.rc_point) <= cfg_.leg_arrive_m) {
+      B.rc_sight = false;
+      B.rc_point = peers_[j].b.position;
+      B.leg_key = next_leg_key_++;
+      count("reconnect_fallback");
+      emit("booking", {F::str("action", "reconnect_fallback"), F::integer("peer", j),
+                       F::num("x", B.rc_point.x), F::num("y", B.rc_point.y)});
     } else if (B.rc_active && in_.have_pose &&
                dist(in_.pose, B.rc_point) <= cfg_.leg_arrive_m) {
       B.rc_active = false;
@@ -711,11 +801,12 @@ void TeamCore::bookingPass() {
       if (pairMet(self, j, B.slot) || !peers_[j].ever) continue;
       B.rc_active = true;
       B.rc_peer = j;
-      B.rc_point = peers_[j].b.position;
+      B.rc_point = reconnectPoint(peers_[j].b.position, &B.rc_sight);
       B.rc_used_mask |= bit;
       B.leg_key = next_leg_key_++;
       count("reconnect_moves");
       emit("booking", {F::str("action", "reconnect_move"), F::integer("peer", j),
+                       F::str("kind", B.rc_sight ? "sight" : "peer"),
                        F::num("x", B.rc_point.x), F::num("y", B.rc_point.y)});
       break;
     }
@@ -748,6 +839,33 @@ Vec2 TeamCore::followPoint(const Vec2& peer_pos) {
   }
   return {peer_pos.x + dx * cfg_.follow_min_distance_m,
           peer_pos.y + dy * cfg_.follow_min_distance_m};
+}
+
+Vec2 TeamCore::reconnectPoint(const Vec2& peer_pos, bool* sight) {
+  *sight = false;
+  if (!in_.have_pose) return peer_pos;
+  const Vec2 w = in_.pose;
+  // Sight on the map but no link: the map does not explain the loss, so
+  // closing the distance is the move (Q32 as before).
+  if (oracle_->lineOfSight(peer_pos, w)) return peer_pos;
+  const double lo = cfg_.meeting_ring_m, hi = std::max(cfg_.meeting_ring_m, cfg_.ring_max_m);
+  const double r = std::min(hi, std::max(lo, dist(w, peer_pos)));
+  const double base = std::atan2(w.y - peer_pos.y, w.x - peer_pos.x);
+  const double min_move = 2.0 * cfg_.leg_arrive_m;
+  // Around the peer from the walker's side outward, nearest first, so the
+  // walk is the shortest one that buys sight.
+  for (int deg = 30; deg <= 150; deg += 30) {
+    for (int sgn : {1, -1}) {
+      const double a = base + sgn * deg * kPi / 180.0;
+      const Vec2 p{peer_pos.x + r * std::cos(a), peer_pos.y + r * std::sin(a)};
+      if (dist(p, w) < min_move) continue;
+      if (oracle_->standable(p) && oracle_->lineOfSight(peer_pos, p)) {
+        *sight = true;
+        return p;
+      }
+    }
+  }
+  return peer_pos;
 }
 
 void TeamCore::clearChase(const char* reason) {
@@ -1068,6 +1186,18 @@ Beacon TeamCore::beacon() const {
   for (int j = 0; j < cfg_.n; ++j)
     if (exchanged(j)) b.exchanged_mask |= robotBit(j);
   b.plan = plan_;
+  const size_t n = static_cast<size_t>(cfg_.n);
+  b.plan_known_version.resize(n);
+  b.plan_known_cell.resize(n);
+  b.plan_known_center.resize(n);
+  for (size_t j = 0; j < n; ++j) {
+    const KnownPlan& k = static_cast<int>(j) == cfg_.self_id
+                             ? KnownPlan{plan_.version, plan_.cell, plan_.center}
+                             : known_[j];
+    b.plan_known_version[j] = k.version;
+    b.plan_known_cell[j] = k.cell;
+    b.plan_known_center[j] = k.center;
+  }
   if (booking_.held && booking_.departed) {
     b.meeting_slot = booking_.slot;
     b.met_mask = booking_.met_mask;

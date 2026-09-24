@@ -167,3 +167,57 @@ TEST(PlanMapQuery, ShortDataBufferIsNoDataNotAnOverread) {
   EXPECT_EQ(planMapCellAt(big, cellCenter(big, 3, 4)), kCellNoData);
   EXPECT_EQ(unknownFractionInRoi(big, {0.0f, 10.0f, 0.0f, 10.0f}), -1.0);
 }
+
+// §11.3: a robot standing at either end of a sight ray is mapped as an
+// obstacle. The ray skips the last end_clear_m at each end, so a braked peer
+// does not block every ray to it; a wall in the middle still does.
+TEST(PlanMapQuery, SegmentClearSkipsTheEndsNotTheMiddle) {
+  auto g = makeGrid(40, 10, 0.2f);   // 8 m x 2 m, free
+  // Cell centres, not cell edges: y = 1.0 lands in row 4, not 5, because the
+  // float resolution 0.2f is a hair over 0.2.
+  const Eigen::Vector3f a = cellCenter(g, 2, 5), b = cellCenter(g, 37, 5);
+  EXPECT_TRUE(segmentClear(g, a, b, 0.5));
+  // The peer's own cell at b, and the asker's at a: still clear.
+  setCell(g, 37, 5, 100);   // x 7.4-7.6, holds b
+  setCell(g, 2, 5, 100);    // x 0.4-0.6, holds a
+  EXPECT_TRUE(segmentClear(g, a, b, 0.5));
+  // Without the clearance the endpoint cell blocks.
+  EXPECT_FALSE(segmentClear(g, a, b, 0.0));
+  // A wall midway blocks with or without it.
+  setCell(g, 20, 5, 100);
+  EXPECT_FALSE(segmentClear(g, a, b, 0.5));
+  // Unknown does not block.
+  auto u = makeGrid(40, 10, 0.2f);
+  setCell(u, 20, 5, -1);
+  EXPECT_TRUE(segmentClear(u, a, b, 0.5));
+}
+
+// The sim's plan map inflates obstacles by 1.5 m, so a mapped robot is a disc
+// about 2 m in radius around it. The occupied run touching an end is skipped
+// up to end_clear_m; past the first free sample an obstacle blocks, even
+// inside end_clear_m, and a run longer than end_clear_m blocks too.
+TEST(PlanMapQuery, SegmentClearSkipsAnInflatedRobotButNotAWallBeyondIt) {
+  auto disc = [](nav_msgs::msg::OccupancyGrid& g, int cx, int cy, int r) {
+    for (int dy = -r; dy <= r; ++dy)
+      for (int dx = -r; dx <= r; ++dx)
+        if (dx * dx + dy * dy <= r * r) setCell(g, cx + dx, cy + dy, 100);
+  };
+  auto g = makeGrid(50, 20, 0.4f);   // 20 m x 8 m, free
+  const Eigen::Vector3f a = cellCenter(g, 5, 10), b = cellCenter(g, 20, 10);
+  disc(g, 5, 10, 5);                 // 2 m around a
+  disc(g, 20, 10, 5);                // and around b, 6 m away
+  EXPECT_FALSE(segmentClear(g, a, b, 0.5));
+  EXPECT_TRUE(segmentClear(g, a, b, 3.0));
+  // A trunk 2.8 m from a, past a free cell: inside end_clear_m, yet it blocks.
+  auto t = g;
+  setCell(t, 12, 10, 100);
+  EXPECT_FALSE(segmentClear(t, a, b, 3.0));
+  // A run from a longer than end_clear_m blocks. (With the ends under
+  // 2 * end_clear_m apart the two skips would meet, and the ray reads clear.)
+  auto w = makeGrid(50, 20, 0.4f);
+  const Eigen::Vector3f c = cellCenter(w, 30, 10);   // 10 m from a
+  disc(w, 5, 10, 9);                 // 3.6 m around a
+  disc(w, 30, 10, 5);
+  EXPECT_FALSE(segmentClear(w, a, c, 3.0));
+  EXPECT_TRUE(segmentClear(w, a, c, 4.0));
+}

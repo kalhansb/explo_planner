@@ -18,7 +18,8 @@
 /// PRESENCE IS DIRECT ONLY (Q8). A beacon arrives straight from its sender over
 /// one emulator link; relays count for nothing. Plan data is the exception: a
 /// robot adopts a higher plan version from any beacon, since a plan is data,
-/// not presence (Q54).
+/// not presence (Q54), and the beacon carries what its sender knows every
+/// robot holds (§11.1).
 ///
 /// TIME. Every time here is seconds on the shared sim clock (E20): the node
 /// passes now() and the beacons' header stamps on that clock.
@@ -96,6 +97,11 @@ struct Beacon {
   int meeting_slot = -1;
   uint32_t met_mask = 0;
   std::vector<int> tour;                ///< my_tour, for the intercept predictor
+  /// §11.1: by fleet id, the highest plan the sender knows robot j holds.
+  /// Length n, all three, or the table is ignored. Version 0 = unknown.
+  std::vector<uint32_t> plan_known_version;
+  std::vector<int> plan_known_cell;
+  std::vector<Vec2> plan_known_center;
 };
 
 // ── Configuration (§8.7) ────────────────────────────────────────────────────
@@ -146,6 +152,9 @@ struct TeamConfig {
   double gate_period_sec = 10.0;         ///< value-gate re-evaluation period
   double ring_step_m = 1.0;              ///< Q65: step outward when blocked
   double ring_max_m = 6.0;
+  /// §11.3: the Q65 exemption holds only within this of the booking's centre
+  /// (ring_max_m + 2).
+  double meet_exempt_radius_m = 8.0;
 };
 
 // ── The world questions (implemented by the node and by the harness) ───────
@@ -194,7 +203,9 @@ class TeamOracle {
   /// A robot may stand here: the planning map shows it free (true when there
   /// is no map).
   virtual bool standable(const Vec2& p) = 0;
-  /// Clear line of sight between the two points on the map.
+  /// Clear line of sight between the two points on the map. The last 0.5 m
+  /// at each end is not tested: a robot standing there is mapped as an
+  /// obstacle (§11.3).
   virtual bool lineOfSight(const Vec2& a, const Vec2& b) = 0;
   /// The value gate over the missing peers (evaluateReconnectGate).
   virtual ChaseGateVerdict chaseGate(const std::vector<ChaseGateView>& missing) = 0;
@@ -209,8 +220,9 @@ struct TickInputs {
   double now = 0.0;
   Vec2 pose;
   bool have_pose = false;
-  /// Exploration finished: the coverage latch or the step budget, latched by
-  /// the node (K4). The only source of the beacon's `finished`.
+  /// Exploration finished: the coverage latch, the step budget or PLAN
+  /// starvation, latched by the node (K4, §11.7). The only source of the
+  /// beacon's `finished`.
   bool finished = false;
   /// The seq inputs are measured: the node has had a fusion-counters sample
   /// that carries them. Until then no exchange starts, because every target
@@ -264,7 +276,14 @@ struct PeerRecord {
   Beacon b;                     ///< that beacon
   bool grid_ok = false;         ///< its grid hash matches ours
   double last_contact = -1.0;   ///< last tick inContact() held
-  uint32_t version_seen = 0;    ///< plan version it last showed (directly)
+  bool table_ok = false;        ///< its plan_known_* table has the team's length
+};
+
+/// §11.1: the highest plan a robot is known to hold. Version 0 = unknown.
+struct KnownPlan {
+  uint32_t version = 0;
+  int cell = -1;
+  Vec2 center;
 };
 
 struct ExchangeRecord {
@@ -304,10 +323,11 @@ struct Booking {
   bool full_met = false;
   double full_met_time = 0.0;
   // Q32 / Q53: one mover per lost pair, the higher id.
-  bool rc_active = false;       ///< driving to the lost peer's last position
+  bool rc_active = false;       ///< driving to rc_point
   bool rc_holding = false;      ///< made contact on the way; holding there
   int rc_peer = -1;
   Vec2 rc_point;
+  bool rc_sight = false;        ///< §11.3: rc_point is a sight point, not the peer
   uint32_t rc_used_mask = 0;    ///< used for the current lost contact
   uint64_t leg_key = 0;
 };
@@ -356,6 +376,8 @@ class TeamCore {
   const ExchangeRecord& exchange(int j) const { return ex_[j]; }
   const Plan& plan() const { return plan_; }
   const Plan& previousPlan() const { return prev_plan_; }
+  /// §11.1: the highest plan robot j is known to hold ([self] = my plan).
+  const KnownPlan& knownPlan(int j) const { return known_[j]; }
   const Booking& booking() const { return booking_; }
   const Chase& chase() const { return chase_; }
   Activity activity() const { return activity_; }
@@ -363,7 +385,9 @@ class TeamCore {
   bool homeDone() const { return home_done_; }
   int missedStreak() const { return missed_streak_; }
   const TeamConfig& config() const { return cfg_; }
-  /// The cell (and centre) the plan puts slot k at, with split recovery (Q54).
+  /// The cell (and centre) the plan puts slot k at, with split recovery
+  /// (§11.1): odd slots go to the lowest known version's cell while it is
+  /// below mine.
   void cellForSlot(int k, int* cell, Vec2* center) const;
   /// Every mechanism's firing count, for run_end (rule 3).
   const std::map<std::string, long long>& counts() const { return counts_; }
@@ -373,7 +397,8 @@ class TeamCore {
   /// A peer's last directly heard position, for the allocator and separation
   /// (K2). False if never heard.
   bool lastHeardPosition(int j, Vec2* p, double* age) const;
-  /// Proximity exemption (Q65): both this robot and peer j are in Meet.
+  /// Proximity exemption (Q65, §11.3): both this robot and peer j are in
+  /// Meet near my booking's centre, and I am not walking to reconnect.
   bool proximityExempt(int j) const;
 
  private:
@@ -399,6 +424,11 @@ class TeamCore {
   double leadFrom(const Vec2& from, int cell, const Vec2& center);
   Vec2 ringSpot(const Vec2& center, double* radius);
   Vec2 followPoint(const Vec2& peer_pos);
+  /// §11.3: where the walker of a lost pair drives. *sight is true for a
+  /// point chosen for line of sight, false for the peer's own position.
+  Vec2 reconnectPoint(const Vec2& peer_pos, bool* sight);
+  void mergeKnown(int j, uint32_t version, int cell, const Vec2& center);
+  void setOwnKnown();
   bool anyExchangeRunning() const;
   uint32_t othersMask() const;
   std::vector<TeamRobotView> teamView() const;
@@ -419,6 +449,7 @@ class TeamCore {
   bool team_was_all_connected_ = false;
 
   Plan plan_, prev_plan_;
+  std::vector<KnownPlan> known_;   ///< §11.1, by fleet id; [self] = plan_
   double last_solve_ = -1e18;
   int renewed_for_slot_ = -1;
 

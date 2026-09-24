@@ -9,8 +9,8 @@
 # DIRECT ONLY FOR PRESENCE. A beacon is relayed by nobody: it arrives on
 # /<me>/rx/<sender>/exploration/team_beacon straight from the emulator link
 # between the two robots. Plan fields may still spread robot to robot (each
-# robot re-publishes the highest plan it holds), but that is plan data, not
-# presence.
+# robot re-publishes the highest plan it holds, and the plan_known_* table of
+# what it knows the others hold), but that is plan data, not presence.
 #
 # TeamWorld is unchanged and stays the gen-33 node's message.
 
@@ -45,7 +45,8 @@ uint8 ACT_WAIT    = 4
 uint8 ACT_HOME    = 5
 uint8 ACT_DONE    = 6
 uint8 activity
-# Exploration finished (coverage latch or step budget). Latched; never clears.
+# Exploration finished (coverage latch, step budget or PLAN starvation). Latched;
+# never clears.
 bool finished
 # Every robot finished and known to be: set once heard directly from all with
 # finished, or copied from any beacon that carries it. Never clears.
@@ -77,6 +78,17 @@ float64 plan_interval_sec
 # re-solve that firms a provisional plan carries its predecessor's value.
 int32 plan_renewed_at_slot
 bool plan_provisional
+
+# ── What this robot knows the others hold (split recovery, DESIGN_gen34 §11.1)
+# Indexed by fleet id, length = team size, all three or none: the highest plan
+# version this robot knows robot j to hold, and that plan's cell and centre.
+# 0 = nothing known. Entry [robot_id] is the sender's own plan. A receiver
+# takes the sender's own plan from the plan_* fields above, never from here,
+# and never takes an entry for itself. Versions only rise, so an entry is a
+# lower bound on what j holds.
+uint32[] plan_known_version
+int32[] plan_known_cell
+geometry_msgs/Point[] plan_known_center
 
 # ── Meeting attendance ──────────────────────────────────────────────────────
 # The slot of the booking this robot has departed for, -1 if none.

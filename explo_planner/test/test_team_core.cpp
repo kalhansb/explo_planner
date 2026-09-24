@@ -8,8 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "explo_planner/team_core.hpp"
@@ -28,6 +31,7 @@ struct FakeOracle : TeamOracle {
   bool has_intercept = false;
   Vec2 intercept_at;
   std::vector<Vec2> blocked;   // not standable within 0.5 m of these
+  std::vector<std::pair<Vec2, Vec2>> walls;   // segments that cut line of sight
 
   FakeOracle() {
     solve.ok = true;
@@ -47,7 +51,17 @@ struct FakeOracle : TeamOracle {
       if (dist(p, b) < 0.5) return false;
     return true;
   }
-  bool lineOfSight(const Vec2&, const Vec2&) override { return true; }
+  // A proper crossing only: a segment that ends on a wall's line is clear.
+  bool lineOfSight(const Vec2& a, const Vec2& b) override {
+    auto side = [](const Vec2& o, const Vec2& p, const Vec2& q) {
+      return (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+    };
+    for (const auto& w : walls)
+      if (side(w.first, w.second, a) * side(w.first, w.second, b) < 0.0 &&
+          side(a, b, w.first) * side(a, b, w.second) < 0.0)
+        return false;
+    return true;
+  }
   ChaseGateVerdict chaseGate(const std::vector<ChaseGateView>&) override {
     ++gate_calls;
     return gate;
@@ -168,6 +182,104 @@ Rig splitPair() {
   r.allLinks(false);
   return r;
 }
+
+// splitPair at the cell: robot 0 at its spot (13,10), robot 1 at its spot
+// (7,10), in contact with an exchange running, then they lose each other and
+// robot 1 (the higher id) starts the reconnect walk. Robot 1's map has `walls`.
+Rig lostPairAtTheCell(std::vector<std::pair<Vec2, Vec2>> walls) {
+  Rig r = splitPair();
+  EXPECT_TRUE(r.until([&] { return r.core(0).booking().departed &&
+                                   r.core(1).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.b[1].in.pose = r.core(1).booking().spot;
+  r.b[1].in.sent_seq = 1000;   // keeps the exchange running
+  r.b[1].oracle.walls = std::move(walls);
+  r.allLinks(true);
+  r.run(5);
+  r.allLinks(false);
+  r.run(12);
+  return r;
+}
+
+// Robot 0 of splitPair hears robot 1 on a v2 that moves the meeting to cell 5
+// at (cx, 10).
+void hearMovedPlan(Rig& r, double cx) {
+  Beacon b = r.core(1).beacon();
+  b.stamp = r.now;
+  b.plan.version = 2;
+  b.plan.cell = 5;
+  b.plan.center = {cx, 10};
+  r.core(0).onBeacon(b, r.now);
+  r.run(1);
+}
+
+Plan planAt(uint32_t v, int cell, double cx) {
+  Plan p;
+  p.version = v;
+  p.cell = cell;
+  p.center = {cx, 0};
+  p.t0 = 100;
+  p.interval = 300;
+  return p;
+}
+
+// A beacon from robot `from` of an n-robot team, holding plan p. Its table
+// knows only the sender's own plan until setKnown adds more.
+Beacon planBeacon(int from, int n, const Plan& p) {
+  Beacon b;
+  b.team_hash = 7;
+  b.grid_hash = 9;
+  b.robot_id = from;
+  b.plan = p;
+  b.plan_known_version.assign(n, 0);
+  b.plan_known_cell.assign(n, -1);
+  b.plan_known_center.assign(n, Vec2{});
+  b.plan_known_version[from] = p.version;
+  b.plan_known_cell[from] = p.cell;
+  b.plan_known_center[from] = p.center;
+  return b;
+}
+
+void setKnown(Beacon& b, int k, const Plan& p) {
+  b.plan_known_version[k] = p.version;
+  b.plan_known_cell[k] = p.cell;
+  b.plan_known_center[k] = p.center;
+}
+
+// One rendezvous core fed by hand: robot `self` of an n-robot team.
+struct Solo {
+  FakeOracle o;
+  TeamCore core;
+  double now = 0.0;
+  Solo(int n, int self) : core(config(n, self), &o) {}
+  static TeamConfig config(int n, int self) {
+    TeamConfig c;
+    c.arm = Arm::kRendezvous;
+    c.n = n;
+    c.self_id = self;
+    c.team_hash = 7;
+    c.grid_hash = 9;
+    return c;
+  }
+  // Delivers the beacons, stamped now, and ticks a second later.
+  void hear(std::initializer_list<Beacon> bs) {
+    for (Beacon b : bs) {
+      b.stamp = now;
+      core.onBeacon(b, now);
+    }
+    now += 1.0;
+    TickInputs in;
+    in.now = now;
+    core.tick(in);
+  }
+  int cellOf(int slot, Vec2* center = nullptr) const {
+    int c;
+    Vec2 x;
+    core.cellForSlot(slot, &c, &x);
+    if (center) *center = x;
+    return c;
+  }
+};
 
 }  // namespace
 
@@ -395,6 +507,71 @@ TEST(TeamCoreExchange, ContactLostMidwayIsLogged) {
   EXPECT_FALSE(r.core(0).exchange(1).active);
 }
 
+// §11.2: a give-up keeps watching the live numbers while the contact lasts.
+TEST(TeamCoreExchange, AStalledExchangeCanStillFinishLate) {
+  Rig r(2, Arm::kOff);
+  r.b[0].in.sent_seq = 5;
+  r.b[1].in.sent_seq = 8;
+  r.run(3);
+  r.b[0].in.rcvd_seq[1] = 3;
+  r.run(1);
+  ASSERT_TRUE(r.until([&] { return r.core(0).exchangeGaveUp(1); }, 200));
+  EXPECT_FALSE(r.core(0).exchanged(1));
+  // The rest goes through in the same contact.
+  r.b[0].in.rcvd_seq[1] = 8;
+  r.b[1].in.rcvd_seq[0] = 5;
+  r.run(2);
+  EXPECT_TRUE(r.core(0).exchanged(1));
+  EXPECT_FALSE(r.core(0).exchangeGaveUp(1));
+  EXPECT_TRUE(r.core(0).beacon().exchanged_mask & 0x2u);
+  EXPECT_EQ(countEvents(r.b[0], "exchange", "done_late"), 1);
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_late"), 1);
+  // Still one give-up, and not a done: starts = done + gave-up + lost + open.
+  EXPECT_EQ(countOf(r.core(0), "exchange_gave_up"), 1);
+  EXPECT_EQ(countOf(r.core(0), "exchange_done"), 0);
+  r.run(10);
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_late"), 1);
+}
+
+TEST(TeamCoreExchange, ATotalGiveUpCanStillFinishLate) {
+  Rig r(2, Arm::kOff);
+  r.b[1].in.sent_seq = 100000;
+  r.run(3);
+  for (int t = 0; t < 700 && !r.core(0).exchangeGaveUp(1); ++t) {
+    r.b[0].in.rcvd_seq[1] += 1;
+    r.step();
+  }
+  ASSERT_NE(lastEvent(r.b[0], "exchange", "gave_up_total"), nullptr);
+  r.b[0].in.rcvd_seq[1] = 100000;
+  r.run(1);
+  EXPECT_TRUE(r.core(0).exchanged(1));
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_late"), 1);
+  EXPECT_EQ(countOf(r.core(0), "exchange_done"), 0);
+}
+
+TEST(TeamCoreExchange, NoLateFinishOnceTheContactHasEnded) {
+  Rig r(2, Arm::kOff);
+  r.b[0].in.sent_seq = 5;
+  r.b[1].in.sent_seq = 8;
+  r.run(3);
+  ASSERT_TRUE(r.until([&] { return r.core(0).exchangeGaveUp(1); }, 200));
+  r.allLinks(false);
+  r.run(15);
+  ASSERT_FALSE(r.core(0).exchange(1).active);
+  // The maps catch up after the contact: the record has ended.
+  r.b[0].in.rcvd_seq[1] = 8;
+  r.b[1].in.rcvd_seq[0] = 5;
+  r.run(5);
+  EXPECT_FALSE(r.core(0).exchanged(1));
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_late"), 0);
+  // The next contact is a new record, current from its start.
+  r.allLinks(true);
+  r.run(3);
+  EXPECT_TRUE(r.core(0).exchanged(1));
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_trivial"), 1);
+  EXPECT_EQ(countOf(r.core(0), "exchange_done_late"), 0);
+}
+
 // ── team_finished ───────────────────────────────────────────────────────────
 
 TEST(TeamCoreFinished, AllHeardFinishedLatchesIt) {
@@ -519,55 +696,179 @@ TEST(TeamCorePlan, ArmsWithoutBookingsNeverPlan) {
   }
 }
 
-TEST(TeamCorePlan, SplitRecoveryAlternatesOddSlotsToThePreviousCell) {
-  FakeOracle o;
-  TeamConfig c;
-  c.arm = Arm::kRendezvous;
-  c.n = 2;
-  c.self_id = 1;
-  c.team_hash = 7;
-  c.grid_hash = 9;
-  TeamCore core(c, &o);
-  auto plan = [](uint32_t v, int cell, double cx) {
-    Plan p;
-    p.version = v;
-    p.cell = cell;
-    p.center = {cx, 0};
-    p.t0 = 100;
-    p.interval = 300;
-    return p;
-  };
-  Beacon b;
-  b.team_hash = 7;
-  b.grid_hash = 9;
-  b.robot_id = 0;
-  b.stamp = 1;
-  b.plan = plan(1, 3, 30);
-  core.onBeacon(b, 1);
-  TickInputs in;
-  in.now = 1;
-  core.tick(in);
-  ASSERT_EQ(core.plan().version, 1u);
-  b.stamp = 2;
-  b.plan = plan(2, 8, 80);
-  core.onBeacon(b, 2);
-  in.now = 2;
-  core.tick(in);
-  ASSERT_EQ(core.plan().version, 2u);
-  int cell;
+// ── Plan gossip (§11.1) ─────────────────────────────────────────────────────
+
+TEST(TeamCoreGossip, ASkippedVersionSendsOddSlotsToTheRobotHoldingIt) {
+  // Robot 2 jumps from v1 to v3; robot 0's table says robot 1 holds v2.
+  Solo s(3, 2);
+  const Plan v1 = planAt(1, 3, 30), v2 = planAt(2, 5, 50), v3 = planAt(3, 8, 80);
+  s.hear({planBeacon(0, 3, v1)});
+  ASSERT_EQ(s.core.plan().version, 1u);
+  Beacon b = planBeacon(0, 3, v3);
+  setKnown(b, 1, v2);
+  s.hear({b});
+  ASSERT_EQ(s.core.plan().version, 3u);
+  ASSERT_EQ(s.core.previousPlan().version, 1u);
+  EXPECT_EQ(s.core.knownPlan(1).version, 2u);
+  // Odd slots go to v2's cell, where robot 1 is; not to v1's.
   Vec2 ctr;
-  // The only peer shows v2: no split.
-  core.cellForSlot(3, &cell, &ctr);
-  EXPECT_EQ(cell, 8);
-  // Robot 0 shows v1 again (a stale peer view): odd slots use v1's cell.
-  b.stamp = 3;
-  b.plan = plan(1, 3, 30);
-  core.onBeacon(b, 3);
-  core.cellForSlot(3, &cell, &ctr);
-  EXPECT_EQ(cell, 3);
+  EXPECT_EQ(s.cellOf(3, &ctr), 5);
+  EXPECT_DOUBLE_EQ(ctr.x, 50.0);
+  EXPECT_EQ(s.cellOf(4), 8);
+  // Robot 1 catches up, heard through robot 0: odd slots come back.
+  setKnown(b, 1, v3);
+  s.hear({b});
+  EXPECT_EQ(s.cellOf(3), 8);
+}
+
+TEST(TeamCoreGossip, AStaleDirectViewIsHealedThroughAThirdRobot) {
+  // Robot 1 was last heard directly on v1; robot 0 has since heard it on v2.
+  Solo s(3, 2);
+  const Plan v1 = planAt(1, 3, 30), v2 = planAt(2, 5, 50);
+  s.hear({planBeacon(0, 3, v1), planBeacon(1, 3, v1)});
+  Beacon b = planBeacon(0, 3, v2);
+  setKnown(b, 1, v2);
+  s.hear({b});
+  ASSERT_EQ(s.core.plan().version, 2u);
+  EXPECT_EQ(s.core.knownPlan(1).version, 2u);
+  EXPECT_EQ(s.cellOf(3), 5);   // no alternation
+  // Robot 1's stored v1 beacon merges again every tick, and loses.
+  s.hear({});
+  EXPECT_EQ(s.core.knownPlan(1).version, 2u);
+  EXPECT_EQ(s.cellOf(3), 5);
+}
+
+TEST(TeamCoreGossip, ALaggardTwoVersionsBehindGetsTheOddSlots) {
+  Solo s(3, 2);
+  const Plan v1 = planAt(1, 3, 30), v2 = planAt(2, 5, 50), v3 = planAt(3, 8, 80);
+  s.hear({planBeacon(0, 3, v1), planBeacon(1, 3, v1)});
+  s.hear({planBeacon(0, 3, v2)});
+  s.hear({planBeacon(0, 3, v3)});
+  ASSERT_EQ(s.core.plan().version, 3u);
+  ASSERT_EQ(s.core.previousPlan().version, 2u);
+  EXPECT_EQ(s.core.knownPlan(1).version, 1u);
+  // v1's cell, where robot 1 goes; not prev_plan_'s (v2).
+  Vec2 ctr;
+  EXPECT_EQ(s.cellOf(3, &ctr), 3);
   EXPECT_DOUBLE_EQ(ctr.x, 30.0);
-  core.cellForSlot(4, &cell, &ctr);
-  EXPECT_EQ(cell, 8);
+  EXPECT_EQ(s.cellOf(4), 8);
+}
+
+TEST(TeamCoreGossip, TheMergeOnlyRisesAndSkipsMyEntryAndTheSendersOwn) {
+  Solo s(3, 2);
+  const Plan v2 = planAt(2, 5, 50);
+  Beacon b = planBeacon(0, 3, v2);
+  setKnown(b, 0, planAt(5, 99, 990));   // the sender's table entry for itself
+  setKnown(b, 1, v2);
+  setKnown(b, 2, planAt(7, 77, 770));   // what the sender thinks I hold
+  s.hear({b});
+  EXPECT_EQ(s.core.plan().version, 2u);
+  EXPECT_EQ(s.core.knownPlan(0).version, 2u);   // from its plan fields
+  EXPECT_EQ(s.core.knownPlan(0).cell, 5);
+  EXPECT_EQ(s.core.knownPlan(2).version, 2u);   // my own plan
+  EXPECT_EQ(s.core.knownPlan(2).cell, 5);
+  EXPECT_EQ(s.core.knownPlan(1).version, 2u);
+  // A later, lower entry does not lower the table. This beacon adopts
+  // nothing, so my own entry is not rewritten after the merge: a higher
+  // claim about me must be skipped by the merge itself.
+  Beacon c = planBeacon(0, 3, v2);
+  setKnown(c, 1, planAt(1, 3, 30));
+  setKnown(c, 2, planAt(7, 77, 770));
+  s.hear({c});
+  EXPECT_EQ(s.core.plan().version, 2u);
+  EXPECT_EQ(s.core.knownPlan(1).version, 2u);
+  EXPECT_EQ(s.core.knownPlan(1).cell, 5);
+  EXPECT_EQ(s.core.knownPlan(2).version, 2u);
+  EXPECT_EQ(s.core.knownPlan(2).cell, 5);
+}
+
+TEST(TeamCoreGossip, AGridMismatchMergesNothingAndABadTableIsCounted) {
+  Solo s(3, 2);
+  const Plan v2 = planAt(2, 5, 50);
+  Beacon m = planBeacon(0, 3, v2);
+  m.grid_hash = 10;
+  setKnown(m, 1, v2);
+  s.hear({m});
+  EXPECT_EQ(s.core.knownPlan(0).version, 0u);
+  EXPECT_EQ(s.core.knownPlan(1).version, 0u);
+  EXPECT_EQ(countOf(s.core, "beacon_gossip_bad"), 0);
+  // A table of the wrong length: the plan fields count, the table does not.
+  Beacon w = planBeacon(1, 3, planAt(1, 3, 30));
+  w.plan_known_version = {9, 1};
+  s.hear({w});
+  EXPECT_EQ(countOf(s.core, "beacon_gossip_bad"), 1);
+  EXPECT_EQ(s.core.knownPlan(1).version, 1u);
+  EXPECT_EQ(s.core.knownPlan(0).version, 0u);
+  // Judged once, on receipt, not on every merge.
+  s.hear({});
+  EXPECT_EQ(countOf(s.core, "beacon_gossip_bad"), 1);
+}
+
+TEST(TeamCoreGossip, AnArrivedBookingMovesWhileTheSlotIsStillMakeable) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.run(2);
+  ASSERT_TRUE(r.core(0).booking().arrived);
+  hearMovedPlan(r, 12.0);   // 1 m from the spot: 3 s of lead, 40 s to go
+  const Booking& B = r.core(0).booking();
+  EXPECT_EQ(B.cell, 5);
+  EXPECT_FALSE(B.arrived);
+  EXPECT_NEAR(r.b[0].out.drive.point.x, 15.0, 1e-9);   // the new ring spot
+  const TeamEvent* e = lastEvent(r.b[0], "booking", "retargeted");
+  ASSERT_NE(e, nullptr);
+  EXPECT_TRUE(findField(e->fields, "after_arrival")->b);
+  EXPECT_FALSE(findField(e->fields, "late")->b);
+  EXPECT_EQ(countOf(r.core(0), "booking_retarget_late"), 0);
+}
+
+TEST(TeamCoreGossip, AnArrivedBookingStaysWhenTheMoveCannotMakeTheSlot) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.run(2);
+  ASSERT_TRUE(r.core(0).booking().arrived);
+  hearMovedPlan(r, 200.0);   // 561 s of lead, 40 s to go
+  EXPECT_EQ(r.core(0).plan().cell, 5);
+  EXPECT_EQ(r.core(0).booking().cell, 3);
+  EXPECT_TRUE(r.core(0).booking().arrived);
+  EXPECT_EQ(countEvents(r.b[0], "booking", "retargeted"), 0);
+}
+
+TEST(TeamCoreGossip, ALateMoveBeforeArrivalIsTakenAndCounted) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed; }, 400));
+  ASSERT_FALSE(r.core(0).booking().arrived);
+  hearMovedPlan(r, 200.0);
+  EXPECT_EQ(r.core(0).booking().cell, 5);
+  const TeamEvent* e = lastEvent(r.b[0], "booking", "retargeted");
+  ASSERT_NE(e, nullptr);
+  EXPECT_TRUE(findField(e->fields, "late")->b);
+  EXPECT_FALSE(findField(e->fields, "after_arrival")->b);
+  EXPECT_EQ(countOf(r.core(0), "booking_retarget_late"), 1);
+}
+
+TEST(TeamCoreGossip, ARenewalRelayedByAThirdRobotEndsTheWait) {
+  Rig r(3, Arm::kRendezvous);
+  r.run(4);
+  r.allLinks(false);
+  auto all = [&](auto pred) {
+    for (int i = 0; i < 3; ++i)
+      if (!pred(r.core(i).booking())) return false;
+    return true;
+  };
+  ASSERT_TRUE(r.until([&] { return all([](const Booking& B) { return B.departed; }); }, 400));
+  for (int i = 0; i < 3; ++i) r.b[i].in.pose = r.core(i).booking().spot;
+  r.allLinks(true);
+  ASSERT_TRUE(r.until([&] { return countEvents(r.b[0], "plan", "renewed") == 1; }, 30));
+  ASSERT_TRUE(r.core(2).booking().full_met);
+  // From here robot 2 never hears robot 1: robot 1's adoption of the renewal
+  // reaches robot 2 only in robot 0's table.
+  r.up[1][2] = false;
+  ASSERT_TRUE(r.until([&] { return !r.core(2).booking().held; }, 10));
+  EXPECT_EQ(countEvents(r.b[2], "booking", "met"), 1);
+  EXPECT_EQ(countOf(r.core(2), "booking_renewal_unseen"), 0);
+  EXPECT_EQ(r.core(2).knownPlan(1).version, 2u);
 }
 
 // ── Booking ─────────────────────────────────────────────────────────────────
@@ -873,6 +1174,26 @@ TEST(TeamCoreBooking, StalledExchangeClosesAtTheWindowWithoutMet) {
   EXPECT_EQ(r.core(0).missedStreak(), 0);   // robot 1 was heard
 }
 
+TEST(TeamCoreBooking, ALateFinishInsideTheWindowMeetsTheSlot) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed &&
+                                   r.core(1).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.b[1].in.pose = r.core(1).booking().spot;
+  r.b[1].in.sent_seq = 1000;
+  r.allLinks(true);
+  // Contact at 263, a stall from it: gave up at 383, before the window (422).
+  ASSERT_TRUE(r.until([&] { return r.core(0).exchangeGaveUp(1); }, 200));
+  ASSERT_TRUE(r.core(0).booking().held);
+  while (r.now < 400) r.step();
+  r.b[0].in.rcvd_seq[1] = 1000;
+  ASSERT_TRUE(r.until([&] { return !r.core(0).booking().held; }, 20));
+  EXPECT_LT(r.now - 1.0, 422.0);
+  EXPECT_EQ(countEvents(r.b[0], "exchange", "done_late"), 1);
+  EXPECT_EQ(countEvents(r.b[0], "booking", "full_met"), 1);
+  EXPECT_EQ(countEvents(r.b[0], "booking", "met"), 1);
+}
+
 TEST(TeamCoreBooking, ProgressingExchangeHoldsTheWindowOpen) {
   Rig r = splitPair();
   ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed &&
@@ -960,6 +1281,10 @@ TEST(TeamCoreBooking, LostPairAtTheCellHigherIdMovesLowerHolds) {
   EXPECT_TRUE(B1.rc_active);
   EXPECT_EQ(B1.rc_peer, 0);
   EXPECT_EQ(r.b[1].out.drive.purpose, "reconnect");
+  // The map shows sight between them: the walk goes to robot 0 itself.
+  EXPECT_FALSE(B1.rc_sight);
+  EXPECT_EQ(findField(lastEvent(r.b[1], "booking", "reconnect_move")->fields, "kind")->s,
+            "peer");
   EXPECT_NEAR(r.b[1].out.drive.point.x, 5.0, 1e-9);
   EXPECT_FALSE(r.core(0).booking().rc_active);   // the lower id holds
   EXPECT_EQ(r.b[0].out.drive.purpose, "meet");
@@ -990,6 +1315,95 @@ TEST(TeamCoreBooking, ReconnectMoveIsOncePerLostContact) {
   r.run(20);
   EXPECT_EQ(countOf(r.core(1), "reconnect_moves"), 1);
   EXPECT_EQ(countOf(r.core(1), "reconnect_no_contact"), 1);
+}
+
+TEST(TeamCoreBooking, ReconnectGoesRoundAWallToAPointWithSight) {
+  // A wall between the two spots on robot 1's map.
+  Rig r = lostPairAtTheCell({{{10, 8}, {10, 12}}});
+  const Booking& B = r.core(1).booking();
+  ASSERT_TRUE(B.rc_active);
+  EXPECT_TRUE(B.rc_sight);
+  // 6 m from robot 0 (13,10); 30 degrees off the bearing to robot 1 still
+  // looks through the wall, 60 degrees clears it.
+  const Vec2 point = B.rc_point;
+  EXPECT_NEAR(point.x, 10.0, 1e-6);
+  EXPECT_NEAR(point.y, 10.0 - std::sqrt(27.0), 1e-6);
+  EXPECT_GE(dist(point, Vec2{7, 10}), 3.0);
+  EXPECT_EQ(findField(lastEvent(r.b[1], "booking", "reconnect_move")->fields, "kind")->s,
+            "sight");
+  EXPECT_EQ(r.b[1].out.drive.purpose, "reconnect");
+  EXPECT_NEAR(r.b[1].out.drive.point.y, point.y, 1e-9);
+  // There with no contact: on to robot 0's last position.
+  r.b[1].in.pose = point;
+  r.run(1);
+  EXPECT_TRUE(r.core(1).booking().rc_active);
+  EXPECT_FALSE(r.core(1).booking().rc_sight);
+  EXPECT_EQ(countOf(r.core(1), "reconnect_fallback"), 1);
+  EXPECT_EQ(r.b[1].out.drive.purpose, "reconnect");
+  EXPECT_NEAR(r.b[1].out.drive.point.x, 13.0, 1e-9);
+  EXPECT_NEAR(r.b[1].out.drive.point.y, 10.0, 1e-9);
+  // Still nothing there: the walk ends, once.
+  r.b[1].in.pose = {13, 10};
+  r.run(1);
+  EXPECT_FALSE(r.core(1).booking().rc_active);
+  EXPECT_EQ(countOf(r.core(1), "reconnect_no_contact"), 1);
+  r.run(20);
+  EXPECT_EQ(countOf(r.core(1), "reconnect_moves"), 1);
+  EXPECT_EQ(countOf(r.core(1), "reconnect_fallback"), 1);
+}
+
+TEST(TeamCoreBooking, ReconnectWalksToThePeerWhenNoPointHasSight) {
+  // Robot 0 boxed in on robot 1's map.
+  Rig r = lostPairAtTheCell({{{11, 8}, {15, 8}}, {{15, 8}, {15, 12}},
+                             {{15, 12}, {11, 12}}, {{11, 12}, {11, 8}}});
+  const Booking& B = r.core(1).booking();
+  ASSERT_TRUE(B.rc_active);
+  EXPECT_FALSE(B.rc_sight);
+  EXPECT_NEAR(B.rc_point.x, 13.0, 1e-9);
+  EXPECT_NEAR(B.rc_point.y, 10.0, 1e-9);
+  EXPECT_EQ(findField(lastEvent(r.b[1], "booking", "reconnect_move")->fields, "kind")->s,
+            "peer");
+}
+
+// ── Proximity exemption (§11.3) ─────────────────────────────────────────────
+
+TEST(TeamCoreBooking, TheMeetExemptionHoldsOnlyNearMyCellsCentre) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed &&
+                                   r.core(1).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;   // (13,10)
+  r.b[1].in.pose = r.core(1).booking().spot;   // (7,10)
+  r.b[1].in.sent_seq = 1000;   // keeps them at the cell
+  r.allLinks(true);
+  r.run(4);
+  EXPECT_TRUE(r.core(0).proximityExempt(1));
+  EXPECT_TRUE(r.core(1).proximityExempt(0));
+  // Robot 1 9 m from the centre (as a peer booked at another cell would be):
+  // neither side is exempt.
+  r.b[1].in.pose = {10, 19};
+  r.run(2);
+  EXPECT_FALSE(r.core(0).proximityExempt(1));
+  EXPECT_FALSE(r.core(1).proximityExempt(0));
+  r.b[1].in.pose = {7, 10};
+  r.run(2);
+  EXPECT_TRUE(r.core(0).proximityExempt(1));
+  EXPECT_TRUE(r.core(1).proximityExempt(0));
+}
+
+TEST(TeamCoreBooking, NoMeetExemptionWhileTheReconnectWalkRuns) {
+  Rig r = lostPairAtTheCell({});
+  ASSERT_TRUE(r.core(1).booking().rc_active);
+  // Robot 1 hears robot 0 again, one way: present, no contact, still walking.
+  r.up[0][1] = true;
+  r.run(2);
+  ASSERT_TRUE(r.core(1).present(0));
+  ASSERT_TRUE(r.core(1).booking().rc_active);
+  EXPECT_FALSE(r.core(1).proximityExempt(0));
+  // The walk ends at robot 0's position, still without contact: exempt again.
+  r.b[1].in.pose = r.core(1).booking().rc_point;
+  r.run(1);
+  ASSERT_FALSE(r.core(1).booking().rc_active);
+  EXPECT_TRUE(r.core(1).proximityExempt(0));
 }
 
 TEST(TeamCoreBooking, TeamFinishedCancelsAPendingBooking) {

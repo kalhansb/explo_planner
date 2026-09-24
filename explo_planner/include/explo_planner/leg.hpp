@@ -62,7 +62,12 @@ class LegTracker {
   Vec2 currentGoal() const { return status_ == Status::kEscaping ? escape_ : target_; }
   bool active() const { return status_ == Status::kDriving || status_ == Status::kEscaping; }
   long long escapes() const { return escapes_total_; }
+  /// Distinct drive keys driven (§11.5). TeamCore's keys are unique and rise,
+  /// so a hold or an explore stint inside one drive is not a new leg. A key is
+  /// a TeamCore drive segment, not a trip.
   long long legs() const { return legs_total_; }
+  /// Every (re)start: a new key, or the same key after reset().
+  long long starts() const { return starts_total_; }
   /// Escapes taken on the current leg.
   int legEscapes() const { return leg_escapes_; }
 
@@ -81,6 +86,11 @@ class LegTracker {
   int leg_escapes_ = 0;
   long long escapes_total_ = 0;
   long long legs_total_ = 0;
+  long long starts_total_ = 0;
+  // The last key legs() counted. reset() zeroes key_, not this, so the same
+  // key resumed after a reset is a start, not a leg.
+  bool counted_any_ = false;
+  uint64_t counted_key_ = 0;
 };
 
 }  // namespace gen34

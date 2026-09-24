@@ -250,6 +250,11 @@ S = G.LINK_SLACK_SEC
 case("exchange done on a dead link",
      lambda f: f.down.append(((0, 1), T_EXCHANGE - W - S - 1, T_EXCHANGE + 5)),
      1, r"\[contact\] atlas t=200\.0: exchange done with bestla")
+case("exchange done_late on a dead link",
+     lambda f: [insert(f, 0, f._ev(0, 250.0, "exchange", action="done_late",
+                                   peer=1, duration_sec=150.0)),
+                f.down.append(((0, 1), 250.0 - W - S - 1, 255.0))],
+     1, r"\[contact\] atlas t=250\.0: exchange done_late with bestla")
 case("exchange done, link up inside the window only (clean)",
      lambda f: f.down.append(((0, 1), T_EXCHANGE - 30, T_EXCHANGE - W + 1)),
      0)
@@ -323,6 +328,33 @@ def gave_up(f):
     first(f, 1, lambda e: e.get("action") == "arrived").update(action="gave_up")
 case("homing gave_up", gave_up, 1, r"\[waits\] bestla t=650\.0: homing gave_up")
 
+
+def starve_clock(fn):
+    """Robot 2's ticks on [300, 560] on one starvation clock opened at 250,
+    counter fn(t); the wait fields follow the counter."""
+    def m(f):
+        for e in robot_evs(f, 2):
+            t = e["t_sim_sec"]
+            if e["event"] == "tick" and 300.0 <= t <= 560.0:
+                cnt = fn(t)
+                e.update(x=500.0, plan_starved_sec=cnt, plan_starved_open_sec=250.0,
+                         wait_start_sec=t - cnt, wait_bound_sec=t - cnt + 300.0,
+                         state="PLAN")
+    return m
+case("starved past the latch's bound",
+     starve_clock(lambda t: t - 250.0), 1,
+     r"\[waits\] husky t=552\.0: explore is 2\.0 s past its bound 550\.0")
+case("a stuck starvation counter",
+     starve_clock(lambda t: 10.0), 1,
+     r"\[waits\] husky t=330\.0: starvation counter advanced 0\.0 s in "
+     r"30\.0 s")
+case("a starvation counter faster than time",
+     starve_clock(lambda t: 2.0 * (t - 290.0)), 1,
+     r"\[waits\] husky t=302\.0: starvation counter ran 4\.0 s in 2\.0 s")
+case("a starvation counter running back",
+     starve_clock(lambda t: 100.0 - 0.5 * (t - 300.0) if t < 320 else 40.0), 1,
+     r"\[waits\] husky t=302\.0: starvation counter ran back")
+
 print("flipflop")
 
 
@@ -375,6 +407,110 @@ case("still for 130 s in a proximity hold (clean)",
 case("still for 130 s at a leg's end (clean)",
      still(130.0, activity="meet", drive="leg", leg_status="arrived",
            state="MEET"), 0)
+case("a starvation count with no open time is not exempt",
+     still(130.0, plan_starved_sec=10.0), 1,
+     r"\[progress\] husky: moved 0\.00 m in the 120 s to t=420\.0")
+
+
+def jittered(m=None):
+    """`m`, then robot 2's ticks off the 2 s grid by 0-0.12 s, as executor lag
+    puts them, so no two ticks are a whole window apart. Wait times move with
+    their tick."""
+    def mj(f):
+        if m:
+            m(f)
+        for e in robot_evs(f, 2):
+            if e["event"] == "tick":
+                d = 0.01 * (int(round(e["t_sim_sec"] / 2.0)) % 13)
+                e["t_sim_sec"] += d
+                for k in ("wait_start_sec", "wait_bound_sec"):
+                    if e.get(k) is not None:
+                        e[k] += d
+    return mj
+case("jittered tick spacing (clean)", jittered(), 0)
+case("still for 130 s on jittered ticks",
+     jittered(still(130.0)), 1,
+     r"\[progress\] husky: moved 0\.00 m in the 120 s to t=42\d\.\d")
+
+
+def explore_to_end(f, k):
+    """Robot k explores to the end of the run; the run is censored."""
+    f.manifest["run_end_reason"] = "censored_at_T"
+    drop(f, k, lambda e: e["event"] in ("exploration_complete", "homing") or
+         (e["event"] == "team_activity" and e["from"]) or
+         (e["event"] == "tick" and e["activity"] != "explore"))
+    t = T_DONE
+    while t < T_END:
+        insert(f, k, f._tick(k, t, 0.2 * (t - T0) / 2.0))
+        t += 2.0
+
+
+def starved(lo, hi, clocks, rate=1.0, to_end=False):
+    """Robot 2 still on [lo, hi], each tick on a starvation clock: `clocks` are
+    the open times; the counter runs at `rate` of the clock from each."""
+    def m(f):
+        if to_end:
+            explore_to_end(f, 2)
+        for e in robot_evs(f, 2):
+            t = e["t_sim_sec"]
+            if e["event"] != "tick" or not lo <= t <= hi:
+                continue
+            opened = max(c for c in clocks if c <= t)
+            cnt = rate * (t - opened)
+            e.update(x=500.0, plan_starved_sec=cnt, plan_starved_open_sec=opened,
+                     wait_start_sec=t - cnt, wait_bound_sec=t - cnt + 300.0,
+                     state="PLAN")
+    return m
+case("starved and still for 250 s (clean)", starved(300.0, 550.0, [300.0]), 0)
+case("starved, the counter at 0.6 of the clock (clean)",
+     starved(300.0, 400.0, [300.0], rate=0.6), 0)
+case("starved, the counter 0.2 s ahead per tick (clean)",
+     starved(300.0, 400.0, [300.0], rate=1.1), 0)
+case("still 560 s on reopening clocks: the backstop",
+     starved(120.0, 680.0, [120.0, 370.0, 620.0], to_end=True), 1,
+     r"\[progress\] husky: moved 0\.00 m in the 540 s to t=660\.0 while "
+     r"exploring \(backstop")
+case("still 530 s on reopening clocks (clean)",
+     starved(120.0, 650.0, [120.0, 370.0, 620.0], to_end=True), 0)
+case("still 560 s on reopening clocks, jittered ticks: the backstop",
+     jittered(starved(120.0, 680.0, [120.0, 370.0, 620.0], to_end=True)), 1,
+     r"\[progress\] husky: moved 0\.00 m in the 540 s to t=66\d\.\d+ "
+     r"while exploring \(backstop")
+
+
+def held(lo, hi):
+    """Robot 2 in a proximity hold on [lo, hi]: the clock pauses (null)."""
+    def m(f):
+        for e in robot_evs(f, 2):
+            if e["event"] == "tick" and lo <= e["t_sim_sec"] <= hi:
+                e.update(proximity_hold=True, state="PROXIMITY_HOLD",
+                         plan_starved_sec=None, plan_starved_open_sec=None,
+                         wait_start_sec=None, wait_bound_sec=None)
+    return m
+
+
+def both(*ms):
+    def m(f):
+        for x in ms:
+            x(f)
+    return m
+case("still 560 s on reopening clocks, 40 s of it held (clean)",
+     both(starved(120.0, 680.0, [120.0, 370.0, 620.0], to_end=True),
+          held(400.0, 438.0)), 0)
+case("still 580 s on reopening clocks, 20 s of it held: the backstop",
+     both(starved(120.0, 700.0, [120.0, 370.0, 620.0], to_end=True),
+          held(400.0, 418.0)), 1,
+     r"\[progress\] husky: moved 0\.00 m in the 540 s to t=680\.0 while "
+     r"exploring \(backstop")
+
+
+def starved_note(f):
+    first(f, 2, lambda e: e["event"] == "exploration_complete").update(
+        reason="starved", starved_open_t_sim=250.0, starved_paused_sec=12.5,
+        starved_goals=3)
+case("a starved finish is noted (clean)", starved_note, 0,
+     r"note\s+husky finished starved at t=600\.0 \(clock opened t=250\.0, "
+     r"paused 12\.5 s, 3 goals\)")
 case("still for 130 s on a leg still driving",
      still(130.0, activity="meet", drive="leg", leg_status="driving",
            state="MEET"), 1, r"\[progress\] husky: moved 0\.00 m .*meet, MEET")
@@ -434,6 +570,10 @@ case("stamped arm differs from the manifest",
      lambda f: f.params.update(arm="pursuit"), 1,
      r"\[bounds\] atlas: run_start arm='pursuit' but the manifest says "
      r"'hybrid'")
+case("stamped starvation latch differs",
+     lambda f: f.params.update(plan_starve_finish_sec=200.0), 1,
+     r"\[bounds\] atlas: plan_starve_finish_sec=200, the checker's bound is "
+     r"300")
 case("a bound not stamped",
      lambda f: f.params.pop("chase_limit_sec"), 3,
      r"\[bounds\] atlas: chase_limit_sec not stamped")

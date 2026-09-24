@@ -603,6 +603,19 @@ case("a robot-run with no run_start refuses instead of comparing nothing", 2,
 
 print("\n=== the gate must refuse rather than guess ===")
 
+# Gen 34's manifest says node=gen34. The gate reads gen 33's node source and
+# vocabulary, so either side run by another node is refused before anything is
+# compared, and the refusal names the checker that does read it.
+case("a gen-34 child is refused", 2,
+     r"child: s1 was run by node=gen34.*gen34_check\.py",
+     child_kw={"manifest": MANIFEST + "node=gen34\n"})
+case("a gen-34 parent is refused", 2,
+     r"parent: s1 was run by node=gen34.*gen34_check\.py",
+     parent_kw={"manifest": MANIFEST + "node=gen34\n"})
+case("a manifest that names gen33 is scored", 0, r"EQUIVALENT",
+     parent_kw={"manifest": MANIFEST + "node=gen33\n"},
+     child_kw={"manifest": MANIFEST + "node=gen33\n"})
+
 case("a new param with no dp() call and no derived entry", 1,
      r"no dp\(\"invented_knob\", \.\.\.\) call was found",
      child_ev=set_param(child_side(), invented_knob=1.0))
@@ -662,7 +675,10 @@ print("\n=== D1: derived and auto-sentinel params ===")
 
 # A 360 deg comb: 2*pi over 96 rays, one h_step of slack. The node's own
 # formula, so the derived flag must come out true and the pair must be clean.
-OMNI = {"fov_hfov": 6.28318, "fov_h_rays": 96, "fov_is_omnidirectional": True}
+# fov_hfov is declared through dp_f, which narrows 6.28318 to float, and the
+# run logs that float widened back: the value a real dump carries.
+OMNI = {"fov_hfov": 6.283180236816406, "fov_h_rays": 96,
+        "fov_is_omnidirectional": True}
 
 case("a 360 deg FOV with a flag matching its own geometry is clean",
      0, r"new param\(s\) at defaults",
@@ -797,6 +813,19 @@ def audit_fixture_against_real_cell():
             d = os.path.join(parent, cell)
             if not os.path.isdir(d):
                 continue
+            # The gate scores gen 33's cells only, so the fixture is audited
+            # against those: a banked gen-34 cell has another run_start.
+            node = "gen33"
+            try:
+                for ln in open(os.path.join(d, "run_manifest.txt"),
+                               errors="replace"):
+                    if ln.startswith("node="):
+                        node = ln.strip().partition("=")[2]
+                        break
+            except OSError:
+                pass
+            if node != "gen33":
+                continue
             for r in ROBOTS:
                 p = os.path.join(d, f"{r}.events.jsonl")
                 if not os.path.exists(p):
@@ -862,8 +891,8 @@ def audit_fixture_against_real_cell():
     # reference's schema is compared to kSchemaVersion read from
     # experiment_log.hpp: one behind passes, two or more fails.
     # (notes: calib-audit-reference-age)
-    hdr = os.path.join(HERE, os.pardir, "explo_planner", "include",
-                       "explo_planner", "experiment_log.hpp")
+    hdr = os.path.join(HERE, os.pardir, "backup", "gen33",
+                       "experiment_log.hpp")
     m = (re.search(r"kSchemaVersion\s*=\s*(\d+)", open(hdr, errors="replace")
                    .read()) if os.path.exists(hdr) else None)
     if not m:

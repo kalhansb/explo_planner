@@ -499,6 +499,15 @@ void ExperimentLog::logExplorationComplete(
   // own map" and the last one for "when did it stop trying".
   integer("occurrence", e.occurrence);
   teamCounts(e.peers_live, e.expected_peers);
+  if (e.starved_goals >= 0) {
+    num("starved_open_t_sim", e.starved_open_t_sim);
+    num("starved_paused_sec", e.starved_paused_sec);
+    integer("starved_goals", e.starved_goals);
+  } else {
+    key("starved_open_t_sim"); line_ += "null";
+    key("starved_paused_sec"); line_ += "null";
+    key("starved_goals"); line_ += "null";
+  }
   end();
 }
 
@@ -1105,6 +1114,13 @@ void ExperimentLog::logTick(const ExperimentContext& ctx, const TickEvent& e) {
   integer("contact_mask", static_cast<long long>(e.contact_mask));
   integer("booking_slot", e.booking_slot);
   boolean("proximity_hold", e.proximity_hold);
+  if (e.plan_starved_sec >= 0.0) {
+    num("plan_starved_sec", e.plan_starved_sec);
+    num("plan_starved_open_sec", e.plan_starved_open_sec);
+  } else {
+    key("plan_starved_sec"); line_ += "null";
+    key("plan_starved_open_sec"); line_ += "null";
+  }
   end();
 }
 

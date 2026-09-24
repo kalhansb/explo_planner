@@ -55,6 +55,16 @@ git -C "$SRC" merge-base --is-ancestor "$PARENT_SHA" "$CHILD_REV" \
   || die "$PARENT_REV is not an ancestor of HEAD ($CHILD_REV) — 'equivalent to
        its parent' is a claim about one lineage, and these are two branches"
 
+# equiv_gate.py scores gen 33's cells only: it reads gen 33's node source and
+# vocabulary. A child whose run script pins another node is refused here,
+# before two builds and two runs the gate would then refuse to score. The
+# parent is an ancestor, so it cannot be the newer node.
+NODE_PIN="$(sed -n 's/^NODE=//p' "$HERE/run_explo_sim_rviz.sh" | head -1)"
+if [ -n "$NODE_PIN" ] && [ "$NODE_PIN" != "gen33" ]; then
+  die "HEAD's run script pins NODE=$NODE_PIN; equiv_gate.py scores gen-33
+       cells only. Check gen-34 cells with gen34_check.py"
+fi
+
 # Restore the child rev no matter how this exits, including on Ctrl-C. Leaving
 # the tree detached at the parent is how a later session ends up measuring the
 # old binary and not noticing.

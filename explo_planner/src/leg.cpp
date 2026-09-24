@@ -21,7 +21,12 @@ LegTracker::Command LegTracker::update(double now, const Vec2& pose, const Drive
     target_ = d.point;
     tol_ = d.tol;
     leg_escapes_ = 0;
-    ++legs_total_;
+    ++starts_total_;
+    if (!counted_any_ || d.key != counted_key_) {
+      counted_any_ = true;
+      counted_key_ = d.key;
+      ++legs_total_;
+    }
     startWindow(now, pose);
     if (dist(pose, target_) <= tol_) {
       status_ = Status::kArrived;

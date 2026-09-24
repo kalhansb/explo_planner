@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <vector>
 
 namespace explo_planner {
 
@@ -42,6 +43,33 @@ bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& m,
                     const Eigen::Vector3f& pos) {
   int8_t v = planMapCellAt(m, pos);
   return v == kCellNoData || v >= 50;
+}
+
+bool segmentClear(const nav_msgs::msg::OccupancyGrid& m,
+                  const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                  double end_clear_m) {
+  const double dx = static_cast<double>(b.x()) - a.x();
+  const double dy = static_cast<double>(b.y()) - a.y();
+  const double len = std::hypot(dx, dy);
+  const int n = std::max(1, static_cast<int>(std::ceil(len / 0.2)));
+  std::vector<char> occ(static_cast<size_t>(n) + 1);
+  for (int i = 0; i <= n; ++i) {
+    const double t = static_cast<double>(i) / n;
+    const Eigen::Vector3f q(static_cast<float>(a.x() + t * dx),
+                            static_cast<float>(a.y() + t * dy), a.z());
+    occ[i] = isCellOccupied(m, q) ? 1 : 0;
+  }
+  // Only the occupied run that touches an end is skipped, and only within
+  // end_clear_m of it: that run is the robot standing there. Past the first
+  // free sample, anything occupied is in the way.
+  const double step = len / n;
+  int lo = 0, hi = n;
+  while (lo <= n && occ[lo] && lo * step < end_clear_m) ++lo;
+  while (hi >= lo && occ[hi] && (n - hi) * step < end_clear_m) --hi;
+  for (int i = lo; i <= hi; ++i) {
+    if (occ[i]) return false;
+  }
+  return true;
 }
 
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,

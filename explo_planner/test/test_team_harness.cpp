@@ -14,11 +14,14 @@
 //      with B under 3 s) are counted in the summary line.
 //   P5 no slot burn: a full meeting is never more than one interval ahead of
 //      its slot.
+//   P6 gossip bound (§11.1): after every tick, the highest version in a
+//      robot's plan table is its own plan's.
 // Replays:
 //   cell 12: a finished robot at the cell, its peer stuck out of reach, goes
 //      home after two missed slots.
-//   plan split: one robot misses the v2 renewal; the odd-slot alternation
-//      brings the team back to one cell and the robot adopts v2.
+//   plan split: one robot misses the v2 renewal; odd slots go to the
+//      laggard's cell (the plan table), which brings the team back to one
+//      cell, and the robot adopts v2.
 
 #include <gtest/gtest.h>
 
@@ -97,6 +100,15 @@ Verdict runMission(const Params& p) {
     sim.step();
     const double now = sim.now() - p.dt;   // the tick just run
     for (int i = 0; i < p.n; ++i) {
+      const TeamCore& c = *sim.robot(i).core;
+      uint32_t top = 0;
+      for (int j = 0; j < p.n; ++j) top = std::max(top, c.knownPlan(j).version);
+      if (top != c.plan().version) {
+        std::ostringstream s;
+        s << "P6 t=" << now << " robot " << i << " table holds v" << top
+          << " but the plan is v" << c.plan().version;
+        fault(s.str());
+      }
       const TickOutputs& o = sim.robot(i).out;
       if (o.wait_bound >= 0.0 && now > o.wait_bound + p.dt + 1e-9) {
         std::ostringstream s;
@@ -187,8 +199,10 @@ void sweep(Arm arm, int n) {
                         "booking_renewal_unseen", "booking_split_alternate",
                         "booking_renewed", "booking_depart_deferred",
                         "met_ahead", "chase_start", "chase_done", "chase_failed", "chase_limit",
-                        "chase_pre-empted", "reconnect_moves", "exchange_done",
-                        "exchange_gave_up", "homing_gave_up", "team_finished"})
+                        "chase_pre-empted", "reconnect_moves", "reconnect_fallback",
+                        "booking_retargeted", "booking_retarget_late", "exchange_done",
+                        "exchange_gave_up", "exchange_done_late", "homing_gave_up",
+                        "team_finished"})
     o << " " << k << "=" << totals[k];
   std::cout << "[ harness  ] " << o.str() << std::endl;
 }
@@ -241,13 +255,14 @@ TEST(TeamHarnessReplay, Cell12FinishedRobotGoesHomeAfterTwoMissedSlots) {
 }
 
 // A three-robot team meets; robot 2 does not hear the v2 renewal before the
-// team disperses. Robots 0 and 1 see robot 2 still on v1 and send odd slots to
-// v1's cell, where robot 2 still goes; that meeting heals the split.
+// team disperses. Robots 0 and 1 know robot 2 is still on v1 and send odd
+// slots to v1's cell, where robot 2 still goes; that meeting heals the split.
 //
 // Staging: a 12 m radio, so robots hear each other only at meetings (in the
 // full world a chance encounter heals a split directly, before any slot). Every
 // beacon to robot 2 shows v1 from the renewal until robot 2 and a peer have
-// both left for the same later slot at the same cell.
+// both left for the same later slot at the same cell: its plan fields, and
+// every entry of its table, or the table would outrank robot 2's plan (P6).
 TEST(TeamHarnessReplay, PlanSplitHealsByAlternation) {
   Params p;
   p.n = 3;
@@ -263,7 +278,14 @@ TEST(TeamHarnessReplay, PlanSplitHealsByAlternation) {
   Plan v1;
   int renew_slot = -1, lift_slot = -1, lift_cell = -1;
   p.beacon_filter = [&](double, int, int to, Beacon& bc) {
-    if (to == 2 && renewed && !lifted && bc.plan.version >= 2) bc.plan = v1;
+    if (to != 2 || !renewed || lifted) return true;
+    if (bc.plan.version > v1.version) bc.plan = v1;
+    for (size_t k = 0; k < bc.plan_known_version.size(); ++k) {
+      if (bc.plan_known_version[k] <= v1.version) continue;
+      bc.plan_known_version[k] = v1.version;
+      bc.plan_known_cell[k] = v1.cell;
+      bc.plan_known_center[k] = v1.center;
+    }
     return true;
   };
   Sim sim(p);
@@ -287,8 +309,20 @@ TEST(TeamHarnessReplay, PlanSplitHealsByAlternation) {
       }
   };
   bool healed = false;
+  int p6_faults = 0;
   while (sim.now() < p.horizon) {
     sim.step();
+    // P6 here too: robot 2's table must not outrank its plan, which it would
+    // if the filter rewrote the plan fields and not the table.
+    for (int i = 0; i < p.n; ++i) {
+      const TeamCore& c = *sim.robot(i).core;
+      uint32_t top = 0;
+      for (int j = 0; j < p.n; ++j) top = std::max(top, c.knownPlan(j).version);
+      if (top != c.plan().version && p6_faults++ == 0)
+        ADD_FAILURE() << "P6 t=" << sim.now() - p.dt << " robot " << i
+                      << " table holds v" << top << " but the plan is v"
+                      << c.plan().version;
+    }
     if (renewed && !lifted) {
       const Booking& b2 = sim.robot(2).core->booking();
       for (int i = 0; i < 2 && !lifted; ++i) {

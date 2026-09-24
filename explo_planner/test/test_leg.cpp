@@ -93,6 +93,7 @@ TEST(Leg, NewKeyStartsANewLeg) {
   auto c = t.update(1.0, {1, 0}, leg(2, {10, 0}), picker(true));
   EXPECT_TRUE(c.publish);
   EXPECT_EQ(t.legs(), 2);
+  EXPECT_EQ(t.starts(), 2);
 }
 
 TEST(Leg, WatchdogEscapesThenResumes) {
@@ -171,5 +172,7 @@ TEST(Leg, ResetForgetsTheLeg) {
   // not leave the old one half-armed.
   const auto c = t.update(5.0, {0, 0}, leg(1, {20, 0}), picker(true));
   EXPECT_TRUE(c.publish);
-  EXPECT_EQ(t.legs(), 2);
+  // One drive, two starts (§11.5).
+  EXPECT_EQ(t.legs(), 1);
+  EXPECT_EQ(t.starts(), 2);
 }
