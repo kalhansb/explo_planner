@@ -1938,7 +1938,7 @@ TARGETS="${TARGETS:-$PLANNER_SHARE/config/targets_flatforest.yaml}"
 # both are pure config, so editing them applies on the next run with no rebuild.
 RVIZ_CFG="$HERE/../explo_planner/config/explo_sim_2robot_lidar.rviz"
 URDF_IN="$HERE/../explo_planner/config/costar_husky_viz.urdf.in"
-for f in "$RVIZ_CFG" "$URDF_IN" "$HERE/sim_tf_publisher.py" "$HERE/sim_target_markers.py" \
+for f in "$RVIZ_CFG" "$URDF_IN" "$HERE/sim_tf_publisher.py" "$HERE/lidar_crop.py" "$HERE/sim_target_markers.py" \
          "$HERE/comms_gates.py"; do
   [ -f "$f" ] || { echo "ERROR missing $f"; exit 2; }
 done
@@ -1976,7 +1976,7 @@ stack_procs() {
   # Unset (the sequential default) falls through to the original behaviour
   # byte for byte, so this cannot regress a normal single-cell run.
   local matched
-  matched=$(ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
+  matched=$(ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|lidar_crop|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
     | grep -v grep | grep -v claude | grep -v run_explo_sim_rviz)
   [ -z "${IGN_PARTITION:-}" ] && { printf '%s\n' "$matched"; return 0; }
   printf '%s\n' "$matched" | while read -r p rest; do
@@ -2352,6 +2352,13 @@ done
 for r in $ROBOTS; do
   start tf_$r "$OUTDIR/tf_$r.log" python3 "$HERE/sim_tf_publisher.py" $r
 done
+# The Husky lidar renders to 100 m (VLP-16 datasheet). Mapping and nav read a
+# copy cropped at the generation-9 25 m far clip (returns beyond it -> +inf),
+# so exploration behaves as before; see lidar_crop.py.
+for r in $ROBOTS; do
+  start crop_$r "$OUTDIR/crop_$r.log" python3 "$HERE/lidar_crop.py" $r --max-range 25.0 \
+    --ros-args -p use_sim_time:=true
+done
 # robot_state_publisher exists here ONLY to give RViz a robot to draw: link
 # names are pre-prefixed with "<robot>/" so they match the TF frames above with
 # no frame_prefix/TF-Prefix indirection, and the wheel joints are fixed (nothing
@@ -2443,6 +2450,7 @@ for r in $ROBOTS; do
       voxel_resolution_m:=$VOXEL_RES \
       global_planning_map_size_m:=$PLAN_MAP_SIZE \
       global_planning_map_resolution:=$PLAN_MAP_RES \
+      lidar_points_topic:=/$r/velodyne_points_25m \
       ${FINE_LAUNCH_ARGS[@]+"${FINE_LAUNCH_ARGS[@]}"} \
       $( [ "$POSE_NOISE" = "1" ] && echo odom_topic:=/$r/odom_noisy )
 done
@@ -3158,6 +3166,7 @@ PYGEOM
   fi
   echo "planner_extra=${PLANNER_EXTRA:-}"
   echo "pose_noise=$POSE_NOISE drift_xy=${POSE_DRIFT_XY:-0.01} drift_yaw_deg=${POSE_DRIFT_YAW:-0.01} jitter_xy=${POSE_JITTER_XY:-0.01} jitter_yaw_deg=${POSE_JITTER_YAW:-0.1} jitter_tau=${POSE_JITTER_TAU:-0.5} seed=${POSE_NOISE_SEED:-1}"
+  echo "lidar_crop_m=25.0 lidar_mapping_topic=/<r>/velodyne_points_25m"
   echo "lidar_noise_stddev=$(grep -A3 '<noise>' /ws/src/hmr_sim/hmr_sim/models/COSTAR_HUSKY_SENSOR_CONFIG_LIDAR/model.sdf | sed -n 's/.*<stddev>\(.*\)<\/stddev>.*/\1/p' | head -1)"
   echo "fine_band=$FINE_BAND"
   echo "fine_ratio_log2=$FINE_K"
