@@ -1916,7 +1916,9 @@ for r in $ROBOTS; do
   # intent stream under COMMS=1, so the emulator can relay it per link; with
   # COMMS=0 both ends use the shared /exploration/team_beacon bus, where every
   # peer reads present, so such a run says nothing about gating.
-  EXTRA+=( -p arm:="$ARM" )
+  # Quoted as a YAML string: bare `off` parses as bool false and the node
+  # refuses to start (the string parameter cannot take a bool).
+  EXTRA+=( -p "arm:='$ARM'" )
   if [ "$COMMS" = "1" ]; then
     EXTRA+=( -p team_beacon_pub_topic:=exploration/team_beacon
              -p team_beacon_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/team_beacon')" )
