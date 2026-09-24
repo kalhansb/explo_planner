@@ -267,6 +267,66 @@ case("polls without readable stats are not counted as evidence", "UNRUN",
      lambda: outage_line("yes", False, 240, 0))
 
 
+# --- --map-suffix: the full-map arm moves the required relay ---------------
+# (DESIGN_gen34 section 12). Each case runs on fresh copies of the module lists
+# and restores them, since configure_suffixes mutates the globals.
+
+def with_suffixes(map_suffix, extra, fn):
+    saved = (list(cg.GATED_SUFFIXES), list(cg.LEAK_ONLY_SUFFIXES))
+    try:
+        err = cg.configure_suffixes(map_suffix, extra)
+        return fn(err)
+    finally:
+        cg.GATED_SUFFIXES[:] = saved[0]
+        cg.LEAK_ONLY_SUFFIXES[:] = saved[1]
+
+
+def relay_set(present):
+    rep = cg.Report("")
+    cg.gate_relay_set(["a", "b"], rep, present)
+    return verdict(rep)
+
+
+FULL = "scovox_node/scovox_full"
+BIN = "scovox_node/scovox_bin"
+INT = "exploration/intents"
+DELTA_PRESENT = {f"/{x}/rx/{y}/{s}" for x, y in (("a", "b"), ("b", "a"))
+                 for s in (BIN, INT)}
+FULL_PRESENT = {f"/{x}/rx/{y}/{s}" for x, y in (("a", "b"), ("b", "a"))
+                for s in (FULL, INT)}
+
+case("default map suffix: the delta relays pass", "PASS", "4 expected relay",
+     lambda: with_suffixes(BIN, "", lambda e: relay_set(DELTA_PRESENT)))
+
+case("full map suffix: the full relays pass", "PASS", "4 expected relay",
+     lambda: with_suffixes(FULL, "", lambda e: relay_set(FULL_PRESENT)))
+
+case("full map suffix: delta relays alone fail", "FAIL", "scovox_full",
+     lambda: with_suffixes(FULL, "", lambda e: relay_set(DELTA_PRESENT)))
+
+case("full map suffix keeps the delta stream leakage-checked", "PASS", BIN,
+     lambda: with_suffixes(FULL, "", lambda e: (
+         ("PASS", " ".join(cg.LEAK_ONLY_SUFFIXES))
+         if BIN in cg.LEAK_ONLY_SUFFIXES and BIN not in cg.GATED_SUFFIXES
+         else ("FAIL", f"gated={cg.GATED_SUFFIXES} "
+                       f"leak_only={cg.LEAK_ONLY_SUFFIXES}"))))
+
+case("default map suffix adds nothing leak-only", "PASS", "none",
+     lambda: with_suffixes(BIN, "", lambda e: (
+         ("PASS", "none") if not cg.LEAK_ONLY_SUFFIXES
+         else ("FAIL", f"leak_only={cg.LEAK_ONLY_SUFFIXES}"))))
+
+case("an empty map suffix is refused", "FAIL", "must not be empty",
+     lambda: with_suffixes(" / ", "", lambda e: (
+         ("FAIL", e) if e else ("PASS", "accepted"))))
+
+case("gated-extra still applies with the full suffix", "PASS", "team_beacon",
+     lambda: with_suffixes(FULL, "exploration/team_beacon", lambda e: (
+         ("PASS", " ".join(cg.GATED_SUFFIXES))
+         if "exploration/team_beacon" in cg.GATED_SUFFIXES
+         else ("FAIL", f"gated={cg.GATED_SUFFIXES}"))))
+
+
 def main():
     bad = []
     for name, want, want_sub, fn in CASES:

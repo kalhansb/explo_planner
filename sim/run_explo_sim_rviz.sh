@@ -789,6 +789,45 @@ LINK_DOWN_CONFIRM="$(flt "${LINK_DOWN_CONFIRM:-0}")"
 # map delta for good, so size it for a full blackout (1 GiB, ~2.4x margin, up to
 # 2 GiB RAM). Overflow stays a hard gate. (notes: relay-queue-cap)
 RELAY_QUEUE_BYTES="${RELAY_QUEUE_BYTES:-1073741824}"
+# Full-map arm (DESIGN_gen34 section 12). > 0: every robot also publishes its
+# whole map every SHARE_FULL_PERIOD_S sim seconds on scovox_full, and that
+# stream, not the delta stream, crosses the radio, with the emulator keeping
+# only the newest unsent frame per link. 0 (default): deltas, as always.
+# Needs COMMS=1: without the emulator there is no link to measure.
+SHARE_FULL_PERIOD_S="${SHARE_FULL_PERIOD_S:-0}"
+case "$SHARE_FULL_PERIOD_S" in
+  ''|*[!0-9.]*|*.*.*|.)
+    echo "FATAL: SHARE_FULL_PERIOD_S='$SHARE_FULL_PERIOD_S' is not 0 or a plain" >&2
+    echo "       positive decimal number (seconds between full-map frames)." >&2
+    exit 2 ;;
+esac
+if awk -v v="$SHARE_FULL_PERIOD_S" 'BEGIN { exit !(v + 0 > 0) }'; then
+  MAP_STREAM=full
+  if [ "$COMMS" != "1" ]; then
+    echo "FATAL: SHARE_FULL_PERIOD_S=$SHARE_FULL_PERIOD_S needs COMMS=1. The" >&2
+    echo "       full-map arm measures what the radio carries; without the" >&2
+    echo "       emulator the peers would read each other directly." >&2
+    exit 2
+  fi
+else
+  MAP_STREAM=delta
+fi
+SHARE_FULL_PERIOD_S="$(flt "$SHARE_FULL_PERIOD_S")"
+# How the emulator puts a queued map message on the air (DESIGN_gen34 section
+# 12.12). admission (default): the whole message at the tier in force when it
+# is admitted, as every banked run before section 12. progressive: one
+# message on the air per link, sent at the current tier, delivered FIFO when
+# complete. The full-map experiment runs both of its arms progressive.
+TX_MODEL="${TX_MODEL:-admission}"
+case "$TX_MODEL" in
+  admission|progressive) ;;
+  *) echo "FATAL: TX_MODEL='$TX_MODEL' is not admission or progressive." >&2
+     exit 2 ;;
+esac
+if [ "$TX_MODEL" != admission ] && [ "$COMMS" != "1" ]; then
+  echo "FATAL: TX_MODEL=$TX_MODEL needs COMMS=1 (it configures the emulator)." >&2
+  exit 2
+fi
 # Planner ROI half-extent (m), sim only, square about the world origin. The
 # yaml's field-site ROI is largely empty here, so coverage could never
 # terminate; 50 fits the ground plane and the planning map below.
@@ -1268,11 +1307,13 @@ if [ "$COMMS" = "1" ]; then
       tree_attenuation_db:="$TREE_ATTEN" \
       max_range_m:="$MAX_RANGE" \
       reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES" \
+      map_stream:="$MAP_STREAM" \
+      transmission_model:="$TX_MODEL" \
       ${BEST_EFFORT_PRIORITY:+best_effort_priority:="$BEST_EFFORT_PRIORITY"}
   sleep 3
   log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
       "tree_attenuation_db=$TREE_ATTEN max_range_m=$MAX_RANGE" \
-      "relay_queue=${RELAY_QUEUE_BYTES}B" \
+      "relay_queue=${RELAY_QUEUE_BYTES}B map_stream=$MAP_STREAM tx_model=$TX_MODEL" \
       "best_effort_priority=${BEST_EFFORT_PRIORITY:-params-file}) ahead of the mappers"
   # Per-run connectivity trace: link_states is kept nowhere else and every radio
   # metric derives from link_states.csv. Started here, before the mappers, so it
@@ -1290,7 +1331,15 @@ fi
 # (notes: nav-dscovox-team-map-wiring)
 PEER_BIN_PATTERN="/{peer}/scovox_node/scovox_bin"
 [ "$COMMS" = "1" ] && PEER_BIN_PATTERN="/{self}/rx/{peer}/scovox_node/scovox_bin"
-log "peer_bin_topic_pattern=$PEER_BIN_PATTERN (COMMS=$COMMS)"
+# Full-map arm: peers' whole-map frames off the relay; self still reads its own
+# deltas. (DESIGN_gen34 section 12)
+[ "$MAP_STREAM" = "full" ] && PEER_BIN_PATTERN="/{self}/rx/{peer}/scovox_node/scovox_full"
+log "peer_bin_topic_pattern=$PEER_BIN_PATTERN (COMMS=$COMMS map_stream=$MAP_STREAM)"
+FULL_NAV_ARGS=()
+if [ "$MAP_STREAM" = "full" ]; then
+  FULL_NAV_ARGS=( share_full_map_period_s:=$SHARE_FULL_PERIOD_S
+                  skip_unchanged_voxels:=true )
+fi
 # One launch per robot over the roster; peers is a comma-separated list, so each
 # dscovox_node fuses every other robot's binary and each planner reads a team
 # map, not a pairwise one. (notes: nav-launch-per-robot-roster)
@@ -1301,7 +1350,8 @@ for r in $ROBOTS; do
       peer_bin_topic_pattern:="$PEER_BIN_PATTERN" \
       voxel_resolution_m:=$VOXEL_RES \
       global_planning_map_size_m:=$PLAN_MAP_SIZE \
-      global_planning_map_resolution:=$PLAN_MAP_RES
+      global_planning_map_resolution:=$PLAN_MAP_RES \
+      ${FULL_NAV_ARGS[@]+"${FULL_NAV_ARGS[@]}"}
 done
 for r in $ROBOTS; do
   wait_for 180 "$r planning_map" -- \
@@ -1360,7 +1410,7 @@ if [ "$COMMS" = "1" ]; then
     # bytes do not. (notes: bag-sent-and-received-intents)
     for p in $(peers_of "$r"); do
       COMMS_BAG_TOPICS+=( "/$r/rx/$p/exploration/intents"
-                          "/$r/rx/$p/scovox_node/scovox_bin" )
+                          "/$r/rx/$p/scovox_node/scovox_$([ "$MAP_STREAM" = full ] && echo full || echo bin)" )
       if [ "$TEAM_WORLD" = "1" ]; then
         COMMS_BAG_TOPICS+=( "/$r/rx/$p/$TEAM_XCHG_TOPIC" )
       fi
@@ -1382,6 +1432,7 @@ if [ "$RECORD" != "0" ]; then
   BAG_TOPICS=( /clock /tf_static )
   for r in $ROBOTS; do
     BAG_TOPICS+=( /$r/odom_ground_truth /$r/scovox_node/scovox_bin )
+    [ "$MAP_STREAM" = "full" ] && BAG_TOPICS+=( /$r/scovox_node/scovox_full )
   done
   BAG_TOPICS+=( /exploration/intents )
   if [ "$RECORD" = "1" ]; then
@@ -1640,6 +1691,12 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "separation_weight=$SEPARATION_WEIGHT"
   echo "separation_radius_m=$SEPARATION_RADIUS_M"
   echo "separation_max_age_sec=$SEPARATION_MAX_AGE_SEC"
+  # The map stream on the radio (DESIGN_gen34 section 12). A manifest without
+  # these lines predates the full-map arm and ran deltas.
+  echo "share_full_period_s=$SHARE_FULL_PERIOD_S"
+  echo "map_stream=$MAP_STREAM"
+  # Absent: a manifest from before section 12.12, which ran admission.
+  echo "transmission_model=$TX_MODEL"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -1756,6 +1813,17 @@ MANIFEST="$OUTDIR/run_manifest.txt"
       echo "sha256_$_navnode=$(sha256sum -b "$_navbin" 2>/dev/null | cut -c1-16)"
     else
       echo "sha256_$_navnode=missing"
+    fi
+  done
+  # The mappers and the radio emulator too, so a stale install of either
+  # shows in the manifest (DESIGN_gen34 section 12 changed both).
+  for _bin in scovox_mapping/scovox_mapping_node scovox_mapping/dscovox_mapping_node \
+              hmr_sim/hmr_comms_sim_node; do
+    _path="$WS/install/${_bin%%/*}/lib/$_bin"
+    if [ -e "$_path" ]; then
+      echo "sha256_${_bin##*/}=$(sha256sum -b "$_path" 2>/dev/null | cut -c1-16)"
+    else
+      echo "sha256_${_bin##*/}=missing"
     fi
   done
   # The node loads shared_params.yaml from the install tree, so hash that copy.
@@ -2072,8 +2140,12 @@ if [ "$COMMS" = "1" ]; then
   # here. The TeamWorld relay is required only when TEAM_WORLD=1, since
   # team_world_hz defaults to 0.0. (notes: comms-gates-capture-status)
   GATE_EXTRA=()
+  if [ "$MAP_STREAM" = "full" ]; then
+    GATE_EXTRA+=( --map-suffix scovox_node/scovox_full )
+    log "gates: the map relay is scovox_full (full-map arm)"
+  fi
   if [ "$TEAM_WORLD" = "1" ]; then
-    GATE_EXTRA=( --gated-extra "$TEAM_XCHG_TOPIC" )
+    GATE_EXTRA+=( --gated-extra "$TEAM_XCHG_TOPIC" )
     log "gates: also requiring the $TEAM_XCHG_TOPIC relay"
   fi
   python3 "$HERE/comms_gates.py" check --robots "$ROBOT_CSV" \

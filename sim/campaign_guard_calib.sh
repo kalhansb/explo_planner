@@ -775,6 +775,7 @@ alloc_peer_pos_max_age_sec=none
 separation_weight=0
 separation_radius_m=20
 separation_max_age_sec=10
+share_full_period_s=0.0
 link_gate=0
 link_gate_effective=0
 done_seek_enabled=false
@@ -800,8 +801,12 @@ rg() {
   else
     rg_manifest "$_arm" > "$_cell/run_manifest.txt"
   fi
+  # RG_EXTRA, when set, is one more manifest line (a key the fixture lacks).
+  [ -n "${RG_EXTRA:-}" ] && echo "$RG_EXTRA" >> "$_cell/run_manifest.txt"
+  # RG_ENV, when set, is the campaign's one --env token (the full-map cases).
   _out=$(MIN_FREE_MB=999999999999 timeout 60 "$CS" --root "$_root" --tag rg \
            --duration 3000 --scenario flatforest_dense_2robot_lidar.yaml \
+           ${RG_ENV:+--env "$RG_ENV"} \
            --arms "$_arm" --seeds 1 2>&1)
   _rc=$?
   if echo "$_out" | grep -q "ABORT: rg_${_arm}_seed1 is complete but its manifest says"; then
@@ -912,6 +917,44 @@ rg ABORT "separation_radius_m=nan agrees with 20 under a bare +0" \
 # acquire one, and this is the case that would fail if the trim were dropped.
 rg SKIP  "separation_radius_m= 20.0 (padded) still resumes"   "$RG_ARM" separation_radius_m " 20.0 "
 
+# The map stream (DESIGN_gen34 section 12). Absent is the one key read as a
+# value, 0, since every manifest before the full-map arm ran deltas; a present
+# value compares as usual, and a full-map campaign still aborts on an old cell.
+# (notes: guardcal-share-full-absent)
+rg SKIP  "share_full_period_s absent predates the arm: deltas" "$RG_ARM" share_full_period_s "<none>"
+rg SKIP  "share_full_period_s=0 agrees with the delta default" "$RG_ARM" share_full_period_s 0
+rg ABORT "a full-map cell (0.5) under a delta campaign"       "$RG_ARM" share_full_period_s 0.5
+rg ABORT "share_full_period_s= (truncated line) is not absent" "$RG_ARM" share_full_period_s ""
+rg ABORT "share_full_period_s=off is not a number"            "$RG_ARM" share_full_period_s off
+RG_ENV="SHARE_FULL_PERIOD_S=0.5"
+rg SKIP  "a full-map cell at 0.5 resumes a 0.5 campaign"      "$RG_ARM" share_full_period_s 0.5
+rg SKIP  "0.50 agrees with a requested 0.5"                   "$RG_ARM" share_full_period_s 0.50
+rg ABORT "an old cell (absent) under a full-map campaign"     "$RG_ARM" share_full_period_s "<none>"
+rg ABORT "a delta cell (0.0) under a full-map campaign"       "$RG_ARM" share_full_period_s 0.0
+rg ABORT "a full-map cell at 1.0 under a 0.5 campaign"        "$RG_ARM" share_full_period_s 1.0
+unset RG_ENV
+# Absent reads as 0 only for a manifest from before the arm: the new runner
+# writes map_stream beside it, so absence there is a damaged manifest.
+RG_EXTRA="map_stream=delta"
+rg ABORT "share_full_period_s absent beside map_stream"       "$RG_ARM" share_full_period_s "<none>"
+unset RG_EXTRA
+# transmission_model (section 12.12): absent is admission, same rule.
+rg SKIP  "transmission_model absent predates it: admission"   "$RG_ARM" transmission_model "<none>"
+rg SKIP  "transmission_model=admission agrees with default"   "$RG_ARM" transmission_model admission
+rg ABORT "a progressive cell under an admission campaign"     "$RG_ARM" transmission_model progressive
+RG_EXTRA="map_stream=delta"
+rg ABORT "transmission_model absent beside map_stream"        "$RG_ARM" transmission_model "<none>"
+unset RG_EXTRA
+RG_ENV="TX_MODEL=progressive"
+rg SKIP  "a progressive cell resumes a progressive campaign"  "$RG_ARM" transmission_model progressive
+rg ABORT "an old cell (absent) under a progressive campaign"  "$RG_ARM" transmission_model "<none>"
+rg ABORT "an admission cell under a progressive campaign"     "$RG_ARM" transmission_model admission
+RG_ENV="TX_MODEL=bogus"
+rg "REFUSED(rc=2)" "TX_MODEL=bogus fails up front"            "$RG_ARM"
+RG_ENV="SHARE_FULL_PERIOD_S=junk"
+rg "REFUSED(rc=2)" "SHARE_FULL_PERIOD_S=junk fails up front"  "$RG_ARM"
+unset RG_ENV
+
 # --- the verdict itself, which the resume guard used to read one bit of ------
 # A banked SUSPECT, verdict-less or unknown-verdict cell still skips but says so
 # (SKIP-DIRTY), not with the certified SKIP line. Still skipping and saying why
@@ -994,7 +1037,9 @@ unset _spec _ek _vn _ld _gd
 # is running exactly as intended.
 for _spec in SEPARATION_WEIGHT:SEPARATION_WEIGHT_REQ \
              SEPARATION_RADIUS_M:SEPARATION_RADIUS_REQ \
-             SEPARATION_MAX_AGE_SEC:SEPARATION_MAX_AGE_REQ; do
+             SEPARATION_MAX_AGE_SEC:SEPARATION_MAX_AGE_REQ \
+             SHARE_FULL_PERIOD_S:SHARE_FULL_PERIOD_REQ \
+             TX_MODEL:TX_MODEL_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\${$_ek:-\(.*\)}\"$/\1/p" "$LAUNCHER" | head -1)

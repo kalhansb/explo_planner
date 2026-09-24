@@ -52,6 +52,13 @@ DEFAULT_ALLOW = ["rosbag", "rviz", "transform_listener", "_ros2cli"]
 # COMMS=1 run carries: gate_relay_set fails on a missing relay, so conditional
 # streams go in via --gated-extra. (notes: gates-gated-suffixes)
 GATED_SUFFIXES = ["scovox_node/scovox_bin", "exploration/intents"]
+DEFAULT_MAP_SUFFIX = GATED_SUFFIXES[0]
+
+# Raw streams checked for leakage but NOT required as relays. The full-map arm
+# (DESIGN_gen34 section 12, --map-suffix scovox_node/scovox_full) moves the
+# radio to the full-map stream; the delta stream still exists and only the
+# robot's own merger may read it. (notes: gates-map-suffix)
+LEAK_ONLY_SUFFIXES = []
 
 
 def run(cmd, timeout=15):
@@ -175,6 +182,21 @@ class Report:
 # Gate 1 — leakage
 # ---------------------------------------------------------------------------
 
+def configure_suffixes(map_suffix, gated_extra):
+    """Set the gated and leak-only suffix lists from the CLI. Returns an error
+    string, or None. Mutates the module globals in place; see main()."""
+    map_suffix = map_suffix.strip().strip("/")
+    if not map_suffix:
+        return "--map-suffix must not be empty"
+    if map_suffix != DEFAULT_MAP_SUFFIX:
+        GATED_SUFFIXES[GATED_SUFFIXES.index(DEFAULT_MAP_SUFFIX)] = map_suffix
+        LEAK_ONLY_SUFFIXES.append(DEFAULT_MAP_SUFFIX)
+    for s in (x.strip().strip("/") for x in gated_extra.split(",")):
+        if s and s not in GATED_SUFFIXES:
+            GATED_SUFFIXES.append(s)
+    return None
+
+
 def gate_leakage(robots, allow, rep):
     """No node outside the emulator may subscribe to another robot's raw stream.
 
@@ -185,7 +207,7 @@ def gate_leakage(robots, allow, rep):
     """
     checked = 0
     for r in robots:
-        for suffix in GATED_SUFFIXES:
+        for suffix in GATED_SUFFIXES + LEAK_ONLY_SUFFIXES:
             topic = f"/{r}/{suffix}"
             out, err = run_checked(["ros2", "topic", "info", "-v", topic])
             if err or not out:
@@ -649,6 +671,10 @@ def main():
     # Extra gated suffixes for streams only some runs carry (e.g. TeamWorld, off
     # unless team_world_hz > 0, or gen 34's team beacon). The caller that turns
     # a stream on is the one that passes it here. (notes: gates-gated-extra)
+    ap.add_argument("--map-suffix", default=DEFAULT_MAP_SUFFIX,
+                    help="the map stream that must cross the emulator; "
+                         "scovox_node/scovox_full for the full-map arm. "
+                         "The default stream then stays leakage-checked only")
     ap.add_argument("--gated-extra", default="",
                     help="comma-separated extra topic suffixes to treat as "
                          "must-cross-the-emulator (e.g. "
@@ -668,9 +694,9 @@ def main():
     # the module global, and threading the list through them instead would leave
     # two call sites that could be updated apart. Every gate must see the same
     # set or a topic could be required to exist and not checked for leaks.
-    for s in (x.strip().strip("/") for x in args.gated_extra.split(",")):
-        if s and s not in GATED_SUFFIXES:
-            GATED_SUFFIXES.append(s)
+    err = configure_suffixes(args.map_suffix, args.gated_extra)
+    if err:
+        ap.error(err)
     rep = Report(args.report)
 
     # Read the graph ONCE, here, and hand it to the gates that need it.

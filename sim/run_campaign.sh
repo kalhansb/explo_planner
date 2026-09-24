@@ -302,6 +302,28 @@ CELL_SIZE_REQ=$(env_val CELL_SIZE_M 10.0)
 SEPARATION_WEIGHT_REQ=$(env_val SEPARATION_WEIGHT 0)
 SEPARATION_RADIUS_REQ=$(env_val SEPARATION_RADIUS_M 20)
 SEPARATION_MAX_AGE_REQ=$(env_val SEPARATION_MAX_AGE_SEC 10)
+# The map stream (DESIGN_gen34 section 12): 0 = deltas, > 0 = the full-map arm.
+# Default duplicated from the runner.
+SHARE_FULL_PERIOD_REQ=$(env_val SHARE_FULL_PERIOD_S 0)
+# The emulator's transmission model (section 12.12), default duplicated from
+# the runner.
+TX_MODEL_REQ=$(env_val TX_MODEL admission)
+# Checked here too, so a bad value fails once rather than per cell after a
+# bring-up each; the runner's own checks stay authoritative.
+case "$SHARE_FULL_PERIOD_REQ" in
+  ''|*[!0-9.]*|*.*.*|.)
+    log "ABORT: SHARE_FULL_PERIOD_S='$SHARE_FULL_PERIOD_REQ' is not 0 or a plain positive number."
+    exit 2 ;;
+esac
+case "$TX_MODEL_REQ" in
+  admission|progressive) ;;
+  *) log "ABORT: TX_MODEL='$TX_MODEL_REQ' is not admission or progressive."; exit 2 ;;
+esac
+if [ "$COMMS_ON" = "0" ] && { [ "$TX_MODEL_REQ" != admission ] || \
+     awk -v v="$SHARE_FULL_PERIOD_REQ" 'BEGIN { exit !(v + 0 > 0) }'; }; then
+  log "ABORT: SHARE_FULL_PERIOD_S and TX_MODEL configure the emulator; --comms 0 has none."
+  exit 2
+fi
 
 IFS=',' read -ra CELL_LIST <<< "$CELLS"
 if [ "$COMMS_ON" = "0" ]; then
@@ -366,10 +388,18 @@ for cell in "${CELL_LIST[@]}"; do
       "pursuit_predictor=$PURSUIT_PREDICTOR_REQ" \
       "link_gate=$LINK_GATE_REQ" \
       "link_gate_effective=$LINK_GATE_EFFECTIVE_REQ" \
+      "transmission_model=$TX_MODEL_REQ" \
       "done_seek_enabled=false"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+      # Absent is admission for a manifest from before section 12, one that
+      # has no map_stream line either; any other absence is a mismatch.
+      # (notes: resume-share-full-absent-is-delta)
+      if [ "$k" = "transmission_model" ] && [ -z "$have" ] && \
+         ! grep -q '^transmission_model=\|^map_stream=' "$out/run_manifest.txt" 2>/dev/null; then
+        have=admission
+      fi
       if [ "${have:-<absent>}" != "$want" ]; then
         log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
         log "       while this campaign runs $k=$want. Same name, different"
@@ -392,11 +422,22 @@ for cell in "${CELL_LIST[@]}"; do
       "separation_weight=$SEPARATION_WEIGHT_REQ" \
       "separation_radius_m=$SEPARATION_RADIUS_REQ" \
       "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ" \
+      "share_full_period_s=$SHARE_FULL_PERIOD_REQ" \
       "reconnect_midrun_silence_sec=$MIDRUN_SILENCE_REQ" \
       "team_world_hz=$TEAM_WORLD_HZ_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
+      # The one numeric key where absent is not a mismatch: every manifest
+      # written before the full-map arm ran deltas, which is
+      # share_full_period_s=0. Only a manifest with neither this line nor
+      # map_stream is read as 0 (the new runner writes both); a present value
+      # compares as usual, and a campaign running > 0 still aborts on an old
+      # cell. (notes: resume-share-full-absent-is-delta)
+      if [ "$k" = "share_full_period_s" ] && [ -z "$have" ] && \
+         ! grep -q '^share_full_period_s=\|^map_stream=' "$out/run_manifest.txt" 2>/dev/null; then
+        have=0
+      fi
       same=0
       if [ "$want" = "none" ] || [ "${have:-<absent>}" = "none" ]; then
         if [ "${have:-<absent>}" = "$want" ]; then same=1; fi
@@ -507,6 +548,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u PURSUIT_PREDICTOR \
       -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
       -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
+      -u SHARE_FULL_PERIOD_S -u TX_MODEL \
       -u DONE_GRACE_S -u HANG_HB -u POLL_S \
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \
