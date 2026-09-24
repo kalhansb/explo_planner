@@ -269,9 +269,10 @@ TEST(ProximityGuard, GarbageConfigSanitised) {
 
 // 20. Gen 34 (Q65): an exempt peer cannot force a hold, even inside the disc;
 //     the exemption is replaced wholesale, so clearing it restores the hold.
+//     Inside parked_keep_dist_m (1.5) the exemption does not apply.
 TEST(ProximityGuard, ExemptPeerCannotHold) {
   ProximityGuard g(cfg(), "zulu");
-  g.onPeerPose("atlas", v(1.0f, 0.0f), at(100.0));
+  g.onPeerPose("atlas", v(1.6f, 0.0f), at(100.0));
   g.onPeerPose("rama", v(2.0f, 0.0f), at(100.0));
   g.setExempt({"atlas"});
   auto d = g.evaluate(v(0, 0), at(100.0), false);
@@ -284,4 +285,9 @@ TEST(ProximityGuard, ExemptPeerCannotHold) {
   EXPECT_EQ(d.note, "exempt");
   g.setExempt({});
   EXPECT_TRUE(g.evaluate(v(0, 0), at(100.0), false).hold);
+  g.setExempt({"atlas", "rama"});
+  g.onPeerPose("atlas", v(1.4f, 0.0f), at(101.0));
+  d = g.evaluate(v(0, 0), at(101.0), false);
+  EXPECT_TRUE(d.hold);
+  EXPECT_EQ(d.peer_id, "atlas");
 }

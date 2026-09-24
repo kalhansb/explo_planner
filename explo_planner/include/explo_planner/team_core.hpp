@@ -197,8 +197,8 @@ class TeamOracle {
   /// Robot 0's plan solve (RendezvousScheduler::solve over the allocator, or
   /// the team's centroid cell when there is no tour yet, marked provisional).
   virtual PlanSolve solvePlan(const std::vector<TeamRobotView>& team) = 0;
-  /// Path length in metres from `from` to the plan cell (the allocator's
-  /// cell-to-cell cost), straight line when there is no cell world.
+  /// Travel distance in metres from `from` to the plan cell (the node gives
+  /// the straight line to its centre).
   virtual double pathDistance(const Vec2& from, int cell, const Vec2& center) = 0;
   /// A robot may stand here: the planning map shows it free (true when there
   /// is no map).

@@ -118,8 +118,11 @@ ProximityGuard::Decision ProximityGuard::evaluate(
     const bool escaped =
         p.escape_active && (now - p.escape_until).seconds() < 0.0;
 
-    // setExempt: the caller has cleared this peer (both in Meet).
+    // setExempt: the caller has cleared this peer (both in Meet). Like parked,
+    // not inside parked_keep_dist_m: ring spots are fixed by id, so two
+    // attendees can cross on the way (gen-34 pilot: 0.96 m).
     const bool exempt =
+        dist >= cfg_.parked_keep_dist_m &&
         std::find(exempt_.begin(), exempt_.end(), p.id) != exempt_.end();
 
     if (fresh && !parked && !escaped && !exempt && dist < trigger) {

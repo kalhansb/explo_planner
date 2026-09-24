@@ -109,7 +109,8 @@ public:
   void armEscape(const std::string& peer_id, const rclcpp::Time& now);
 
   /// Peers that cannot force a hold until the next call (gen 34, Q65: both
-  /// robots are in Meet, driving to their own ring spots). Replaces the whole
+  /// robots are in Meet, driving to their own ring spots), except inside
+  /// parked_keep_dist_m, where they hold as usual. Replaces the whole
   /// set each call. Empty by default, so callers that never set it (gen 33)
   /// are unaffected. An exempt peer still names itself in a no-hold decision,
   /// with note "exempt".

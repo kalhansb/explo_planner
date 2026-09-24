@@ -5993,20 +5993,14 @@ gen34::PlanSolve ExploPlannerNode::oracleSolvePlan(
   return out;
 }
 
-// Metres to the plan cell: the allocator's cell-to-cell cost, never less than
-// the straight line; the straight line without a cell world.
-double ExploPlannerNode::oraclePathDistance(const gen34::Vec2& from, int cell,
+// Metres to the plan cell's centre in a straight line. Not the allocator's
+// cell-to-cell cost: its edges count unknown as blocked, so it detours round
+// everything unexplored while the navigator drives straight through, and the
+// lead came out 2-3x the trip (gen-34 pilot: a 332 s lead for a 105 s trip).
+// Driven paths ran 1.0-1.5x the straight line; depart_safety covers that.
+double ExploPlannerNode::oraclePathDistance(const gen34::Vec2& from, int /*cell*/,
                                             const gen34::Vec2& center) const {
-  const double straight = std::hypot(center.x - from.x, center.y - from.y);
-  if (!cell_world_.configured() || !cell_world_.grid().valid(cell))
-    return straight;
-  const int from_cell = cell_world_.grid().idAt(static_cast<float>(from.x),
-                                                static_cast<float>(from.y));
-  if (from_cell < 0) return straight;
-  const double path_m =
-      static_cast<double>(GlobalAllocator::costMm(cell_world_, from_cell,
-                                                  cell)) / 1000.0;
-  return std::max(straight, path_m);
+  return std::hypot(center.x - from.x, center.y - from.y);
 }
 
 // Known free on the planning map; anywhere without one.
