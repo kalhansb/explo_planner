@@ -76,7 +76,9 @@ BOUNDS = {
 }
 
 # Beacon receipt is stamped at the node's next drain, the link trace at 5 Hz.
-LINK_SLACK_SEC = 1.5
+# A PLAN solve holds the drain back: 1.9-2.7 s over the gen-34 control and
+# ladder, and two contacts at 1.9 s failed a 1.5 s slack.
+LINK_SLACK_SEC = 3.0
 # A wait ends on the first node tick at or past its bound.
 WAIT_SLACK_SEC = 1.0
 FLIP_WINDOW_SEC = 60.0
