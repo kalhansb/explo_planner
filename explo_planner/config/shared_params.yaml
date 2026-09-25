@@ -104,7 +104,7 @@
     nav_max_timeout_sec: 180.0
 
     # No-progress watchdog (runs in parallel with the budget). If the robot
-    # hasn't accumulated >= progress_min_distance_m of travel within
+    # hasn't moved >= progress_min_distance_m (straight line) within
     # progress_window_sec, the goal fails immediately — wedged-robot case.
     progress_window_sec: 15.0
     progress_min_distance_m: 0.2

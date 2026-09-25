@@ -614,7 +614,7 @@ private:
   // Per-navigate-cycle state for the smart timeout.
   double nav_budget_sec_ = 0.0;
   rclcpp::Time progress_check_time_;
-  float progress_check_dist_ = 0.0f;
+  Eigen::Vector3f progress_check_pos_ = Eigen::Vector3f::Zero();
 
   // Post-arrival rotation deadline. Armed the first tick the robot is inside
   // goal_xy_tol_ but still outside goal_yaw_tol_; disarmed by transitionTo()
@@ -4190,7 +4190,7 @@ void ExploPlannerNode::doPlan() {
   // Both anchors mark NAVIGATE entry; reuse the timestamp transitionTo()
   // just stamped rather than re-reading the clock.
   progress_check_time_ = state_enter_time_;
-  progress_check_dist_ = cumulative_distance_;
+  progress_check_pos_ = latest_pos_;
   RCLCPP_DEBUG(get_logger(),
       "Step %d: nav budget %.1fs for %.2f m goal", step_,
       nav_budget_sec_, dist);
@@ -4327,9 +4327,12 @@ void ExploPlannerNode::doNavigate() {
   // 2) No-progress watchdog.
   double window_elapsed = (now - progress_check_time_).seconds();
   if (window_elapsed > progress_window_sec_) {
-    float delta = cumulative_distance_ - progress_check_dist_;
+    // Straight-line xy displacement, not odometer: a robot rocking in place
+    // piles up odometer and never fails (gen-34 ladder: 164 s wedged, net
+    // 0.38 m). Same test as the team layer's legs (leg.cpp).
+    float delta = (latest_pos_ - progress_check_pos_).head<2>().norm();
     if (delta < progress_min_distance_m_) {
-      // The test here is a DISTANCE, not a time: metres travelled inside the
+      // The test here is a DISTANCE, not a time: metres moved inside the
       // progress window against progress_min_distance_m. test_name carries the
       // units so no consumer has to infer them from `reason` and then get them
       // wrong.
@@ -4339,7 +4342,7 @@ void ExploPlannerNode::doNavigate() {
       return;
     }
     progress_check_time_ = now;
-    progress_check_dist_ = cumulative_distance_;
+    progress_check_pos_ = latest_pos_;
   }
 
   // Keep-alive re-send (throttled; see republishGoal).
@@ -4799,7 +4802,7 @@ void ExploPlannerNode::doProximityHold() {
   state_enter_time_ =
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
   progress_check_time_ = now;
-  progress_check_dist_ = cumulative_distance_;
+  progress_check_pos_ = latest_pos_;
   publishGoal(current_goal_);
 }
 
