@@ -838,7 +838,9 @@ ROI_HALF="$(flt "${ROI_HALF:-50.0}")"
 # the flood starts at its cell. Not the 20 m rolling planning_map.
 # (notes: global-planning-map-size)
 PLAN_MAP_SIZE="$(flt "${PLAN_MAP_SIZE:-$(awk "BEGIN{print 3*$ROI_HALF}")}")"
-PLAN_MAP_RES="$(flt "${PLAN_MAP_RES:-0.40}")"
+# Cell size (m) of that map; must equal the local planning_map's 0.20. At 0.40
+# the global path ran through gaps between oak halos that the local map seals.
+PLAN_MAP_RES="$(flt "${PLAN_MAP_RES:-0.20}")"
 # Reachability flood radius (m); must be set here: the yaml's auto cap, sized
 # for polar candidates, rejects distant frontiers. 10x ROI_HALF means unbounded;
 # never clamp it to the grid diagonal. 0 is the auto sentinel.

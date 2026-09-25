@@ -1558,7 +1558,7 @@ at all (addFrontierCandidates clips to the ROI and nothing else), and
 FRONTIER_ONLY=1 removes the polar set entirely — so under the auto cap every
 frontier more than 10 m of walked distance away comes back kInfCost and is
 rejected as unreachable. The escape hatch does not save it either: it only
-trips below 10 reached cells, and a 10 m flood at 0.4 m/cell reaches ~1900.
+trips below 10 reached cells, and a 10 m flood at 0.2 m/cell reaches ~7800.
 Exploration would degenerate to 10 m hops, or stall outright once no frontier
 remains inside the disc — and it would look like a legitimate result.
 
