@@ -14,7 +14,7 @@
 #   ./run_campaign.sh --root DIR --duration 3000 \
 #                     --scenario flatforest_dense_2robot_lidar.yaml \
 #                     --cells "off:1,off:2,pursuit:1" \
-#                     [--tx 30.0] [--record 0] [--tag phase3]
+#                     [--tx 30.0] [--radio v1] [--record 0] [--tag phase3]
 #   ./run_campaign.sh --root DIR --duration 3000 --scenario ... \
 #                     --arms "off,hybrid" --seeds "1,2,3"   # cross product
 #   The arms are the planner's four ARM names (off, pursuit, rendezvous,
@@ -32,6 +32,12 @@ DURATION=""
 # experimental variable (see the --comms note below) — so unlike DURATION this
 # one genuinely has a correct default and keeps it.
 TX="30.0"
+TX_SET=0
+# Radio stack (DESIGN_radio_v2 §12): v1 = hmr_comms_sim_node, every banked
+# campaign; neutral | pessimistic = hmr_radio with that §2.14 profile, which
+# fixes every radio value, so --tx is refused with it. First-class like --comms:
+# it is the radio regime, and --env would override every cell's record of it.
+RADIO_ON="v1"
 # Bag recording off by default: the analyses read the event JSONL and the
 # planner CSV, never the bags. (notes: campaign-record-off-default)
 REC="0"
@@ -67,7 +73,8 @@ while [ $# -gt 0 ]; do
     --arms)     ARMS="$2"; shift 2;;
     --seeds)    SEEDS="$2"; shift 2;;
     --duration) DURATION="$2"; shift 2;;
-    --tx)       TX="$2"; shift 2;;
+    --tx)       TX="$2"; TX_SET=1; shift 2;;
+    --radio)    RADIO_ON="$2"; shift 2;;
     --record)   REC="$2"; shift 2;;
     --tag)      TAG="$2"; shift 2;;
     --scenario) SCENARIO="$2"; shift 2;;
@@ -145,6 +152,37 @@ if env_has COMMS; then
   echo "       --env is expanded last, so the passenger wins over the flag and" >&2
   echo "       every record of the campaign would name the wrong arm." >&2
   exit 2
+fi
+case "$RADIO_ON" in
+  v1) ;;
+  neutral|pessimistic)
+    if [ "$COMMS_ON" != "1" ]; then
+      echo "FATAL: --radio $RADIO_ON selects the emulator; --comms 0 has none." >&2
+      exit 2
+    fi
+    if [ "$TX_SET" = "1" ]; then
+      echo "FATAL: --tx is a v1 radio dial; --radio $RADIO_ON takes every radio" >&2
+      echo "       value from its profile (a variant is a new profile yaml)." >&2
+      exit 2
+    fi ;;
+  *) echo "FATAL: --radio must be v1, neutral or pessimistic (got '$RADIO_ON')" >&2
+     exit 2;;
+esac
+for _blocked in RADIO TX_POWER; do
+  if env_has "$_blocked"; then
+    echo "FATAL: set $_blocked with --radio / --tx, not --env: --env is expanded" >&2
+    echo "       last, so it would override every cell's record of the regime." >&2
+    exit 2
+  fi
+done
+if [ "$RADIO_ON" != "v1" ]; then
+  for _blocked in TREE_ATTEN MAX_RANGE; do
+    if env_has "$_blocked"; then
+      echo "FATAL: $_blocked is a v1 radio dial; --radio $RADIO_ON takes every" >&2
+      echo "       radio value from its profile." >&2
+      exit 2
+    fi
+  done
 fi
 # Each is set per cell or defines the arm, and --env is expanded last, so any of
 # them in --env would override every cell while OUTDIR names, index and manifest
@@ -274,7 +312,7 @@ unset _nstrip
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY RUN: every validation passed, nothing launched."
-  echo "  tag=$TAG comms=$COMMS_ON tx=$TX duration=${DURATION}s record=$REC"
+  echo "  tag=$TAG comms=$COMMS_ON radio=$RADIO_ON tx=$([ "$RADIO_ON" = v1 ] && echo "$TX" || echo profile) duration=${DURATION}s record=$REC"
   echo "  scenario=$SCENARIO mission_return=$MISSION_RETURN_FLAG"
   echo "  done_criterion=$DONE_CRITERION done_unknown=$DONE_UNKNOWN"
   echo "  env='$EXTRA_ENV'"
@@ -326,11 +364,14 @@ if [ "$COMMS_ON" = "0" ] && { [ "$TX_MODEL_REQ" != admission ] || \
 fi
 
 IFS=',' read -ra CELL_LIST <<< "$CELLS"
+# Word-split on purpose in the cell's env line: empty under a v2 profile.
+TX_ASSIGN="TX_POWER=$TX"
+[ "$RADIO_ON" = v1 ] || TX_ASSIGN=""
 if [ "$COMMS_ON" = "0" ]; then
   log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (IDEAL COMMS, no emulator;" \
       "duration=${DURATION}s record=$REC)"
 else
-  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (tx=$TX duration=${DURATION}s record=$REC scenario=$SCENARIO)"
+  log "$TAG: ${#CELL_LIST[@]} cells -> $ROOT (radio=$RADIO_ON tx=${TX_ASSIGN:+$TX}${TX_ASSIGN:-profile} duration=${DURATION}s record=$REC scenario=$SCENARIO)"
 fi
 
 n_ok=0; n_fail=0; n_skip=0; consec_fail=0
@@ -389,6 +430,7 @@ for cell in "${CELL_LIST[@]}"; do
       "link_gate=$LINK_GATE_REQ" \
       "link_gate_effective=$LINK_GATE_EFFECTIVE_REQ" \
       "transmission_model=$TX_MODEL_REQ" \
+      "radio=$RADIO_ON" \
       "done_seek_enabled=false"
     do
       k="${kv%%=*}"; want="${kv#*=}"
@@ -399,6 +441,10 @@ for cell in "${CELL_LIST[@]}"; do
       if [ "$k" = "transmission_model" ] && [ -z "$have" ] && \
          ! grep -q '^transmission_model=\|^map_stream=' "$out/run_manifest.txt" 2>/dev/null; then
         have=admission
+      fi
+      # Absent is v1: every manifest from before hmr_radio.
+      if [ "$k" = "radio" ] && [ -z "$have" ]; then
+        have=v1
       fi
       if [ "${have:-<absent>}" != "$want" ]; then
         log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
@@ -427,6 +473,10 @@ for cell in "${CELL_LIST[@]}"; do
       "team_world_hz=$TEAM_WORLD_HZ_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
+      # v1's three dials do not exist under a v2 profile; radio= above holds it.
+      case "$k" in
+        tx_power_dbm|tree_attenuation_db|max_range_m) [ "$RADIO_ON" = v1 ] || continue;;
+      esac
       have=$(sed -n "s/^$k=//p" "$out/run_manifest.txt" 2>/dev/null | head -1)
       # The one numeric key where absent is not a mismatch: every manifest
       # written before the full-map arm ran deltas, which is
@@ -552,7 +602,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u DONE_GRACE_S -u HANG_HB -u POLL_S \
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \
-      OUTDIR="$out" COMMS="$COMMS_ON" TX_POWER="$TX" EXPECT_OUTAGE="$cell_expect" \
+      OUTDIR="$out" COMMS="$COMMS_ON" RADIO="$RADIO_ON" $TX_ASSIGN EXPECT_OUTAGE="$cell_expect" \
       ARM="$arm" \
       MISSION_RETURN="$MISSION_RETURN_FLAG" \
       EXPLOIT=0 RVIZ=0 RECORD="$REC" SEED="$seed" \

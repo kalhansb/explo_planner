@@ -732,6 +732,30 @@ unset _rzv_needed
 # link realisation. Paired-seed designs vary it while holding everything else
 # fixed; it is inert with COMMS=0.
 SEED="${SEED:-42}"
+# Radio stack (DESIGN_radio_v2 §12). v1 (default): hmr_sim's hmr_comms_sim_node,
+# every banked run. neutral | pessimistic: hmr_radio's node with that §2.14
+# profile, under the same node name, so every consumer is unchanged. A profile
+# fixes every radio value, so an explicit TX_POWER / TREE_ATTEN / MAX_RANGE is
+# refused with it rather than silently ignored; a variant is a new profile yaml.
+RADIO="${RADIO:-v1}"
+case "$RADIO" in
+  v1) ;;
+  neutral|pessimistic)
+    if [ "$COMMS" != "1" ]; then
+      echo "FATAL: RADIO=$RADIO needs COMMS=1 (it selects the emulator)." >&2
+      exit 2
+    fi
+    for _v in TX_POWER TREE_ATTEN MAX_RANGE; do
+      if [ -n "${!_v+x}" ]; then
+        echo "FATAL: $_v is a v1 radio dial; RADIO=$RADIO takes every radio" >&2
+        echo "       value from its profile." >&2
+        exit 2
+      fi
+    done
+    unset _v ;;
+  *) echo "FATAL: RADIO='$RADIO' is not v1, neutral or pessimistic." >&2
+     exit 2 ;;
+esac
 # Radio TX power (dBm). Default matches comms_sim_params.yaml; exposed so it
 # lands in the manifest and can be swept without editing the installed yaml.
 # (notes: radio-tx-power)
@@ -1029,7 +1053,7 @@ stack_procs() {
   # unset matches machine-wide, safe for one cell only.
   # (notes: teardown-stack-procs-partition-scope)
   local matched
-  matched=$(ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
+  matched=$(ps -eo pid,cmd | grep -E "ign gazebo|explo_planner_node|target_scheduler_node|dscovox_node|scovox_node|scovox_mapping_node|dscovox_mapping_node|hmr_comms_sim_node|hmr_radio_node|simple_nav|robot_state_publisher|sim_tf_publisher|sim_target_markers|rosbag2|parameter_bridge|ros_gz|rviz2" \
     | grep -v grep | grep -v claude | grep -v run_explo_sim_rviz)
   [ -z "${IGN_PARTITION:-}" ] && { printf '%s\n' "$matched"; return 0; }
   printf '%s\n' "$matched" | while read -r p rest; do
@@ -1301,7 +1325,7 @@ done
 # once a source topic exists, so anything published earlier (the first map
 # snapshot) is lost uncounted. The /rx/ check waits for the mappers.
 # (notes: comms-emulator-before-mappers)
-if [ "$COMMS" = "1" ]; then
+if [ "$COMMS" = "1" ] && [ "$RADIO" = "v1" ]; then
   start comms "$OUTDIR/comms.log" \
     ros2 launch hmr_sim comms_sim.launch.py \
       scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
@@ -1312,8 +1336,21 @@ if [ "$COMMS" = "1" ]; then
       map_stream:="$MAP_STREAM" \
       transmission_model:="$TX_MODEL" \
       ${BEST_EFFORT_PRIORITY:+best_effort_priority:="$BEST_EFFORT_PRIORITY"}
+elif [ "$COMMS" = "1" ]; then
+  # The launch file refuses a radio world whose recorded SDF hash differs from
+  # the world's, so a stale obstacle list fails here, not in the numbers.
+  start comms "$OUTDIR/comms.log" \
+    ros2 launch hmr_radio radio_sim.launch.py \
+      scenario:="$SCENARIO" seed:="$SEED" use_sim_time:=true \
+      radio_profile:="$RADIO" \
+      reliable_queue_max_bytes:="$RELAY_QUEUE_BYTES" \
+      map_stream:="$MAP_STREAM" \
+      transmission_model:="$TX_MODEL" \
+      ${BEST_EFFORT_PRIORITY:+best_effort_priority:="$BEST_EFFORT_PRIORITY"}
+fi
+if [ "$COMMS" = "1" ]; then
   sleep 3
-  log "comms emulator started (seed=$SEED tx_power_dbm=$TX_POWER" \
+  log "comms emulator started (radio=$RADIO seed=$SEED tx_power_dbm=$TX_POWER" \
       "tree_attenuation_db=$TREE_ATTEN max_range_m=$MAX_RANGE" \
       "relay_queue=${RELAY_QUEUE_BYTES}B map_stream=$MAP_STREAM tx_model=$TX_MODEL" \
       "best_effort_priority=${BEST_EFFORT_PRIORITY:-params-file}) ahead of the mappers"
@@ -1324,6 +1361,13 @@ if [ "$COMMS" = "1" ]; then
   start linklog "$OUTDIR/link_logger.log" \
     python3 "$HERE/link_logger.py" --out "$OUTDIR/link_states.csv" \
       --ros-args -p use_sim_time:=true
+  # v2: where each link's loss comes from, and the effective radio parameters
+  # (radio_regime.json) as the node published them.
+  if [ "$RADIO" != "v1" ]; then
+    start radiobd "$OUTDIR/link_breakdown_logger.log" \
+      python3 "$WS/install/hmr_radio/lib/hmr_radio/link_breakdown_logger.py" \
+        --out "$OUTDIR/link_breakdown.csv" --ros-args -p use_sim_time:=true
+  fi
 fi
 
 # --- 3. nav + lidar mapping, mergers cross-wired ----------------------------
@@ -1656,9 +1700,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "mission_start_hold_sec=$START_HOLD"
   echo "comms=$COMMS"
   echo "seed=$SEED"
-  echo "tx_power_dbm=$TX_POWER"
-  echo "tree_attenuation_db=$TREE_ATTEN"
-  echo "max_range_m=$MAX_RANGE"
+  echo "radio=$RADIO"
+  # v1's three dials. Under a v2 profile they do not exist: tx_power_dbm is
+  # written below from the node's effective parameters, and the other two are
+  # absent (no corridor attenuation, no horizon).
+  if [ "$RADIO" = "v1" ]; then
+    echo "tx_power_dbm=$TX_POWER"
+    echo "tree_attenuation_db=$TREE_ATTEN"
+    echo "max_range_m=$MAX_RANGE"
+  fi
   # The arm's label for the outage gate, recorded because it is a claim about
   # what this run was FOR, not something recoverable from tx_power_dbm alone.
   echo "expect_outage=$EXPECT_OUTAGE"
@@ -1767,6 +1817,35 @@ MANIFEST="$OUTDIR/run_manifest.txt"
     echo "comms_trees_loaded=$(sed -n 's/.*Loaded \([0-9]\+\) tree positions.*/\1/p' \
       "$OUTDIR/comms.log" 2>/dev/null | head -1)"
   fi
+  # v2: the node's effective radio parameters and the regime hash over all of
+  # them, from its "radio effective" line. radio_regime=missing means the node
+  # never logged it, and the cell carries no record of its radio.
+  if [ "$COMMS" = "1" ] && [ "$RADIO" != "v1" ]; then
+    /usr/bin/python3 - "$OUTDIR/comms.log" <<'PY'
+import json, re, sys
+eff = None
+try:
+    for line in open(sys.argv[1], errors="replace"):
+        m = re.search(r"radio effective: (\{.*\})", line)
+        if m:
+            eff = json.loads(m.group(1))
+            break
+except (OSError, ValueError):
+    eff = None
+if eff is None:
+    print("radio_regime=missing")
+    sys.exit(0)
+print("radio_regime=" + eff.get("radio_regime", "missing"))
+print("tx_power_dbm=" + eff.get("tx_power_dbm", ""))
+for k in ("radio_stack", "radio_profile"):
+    print(f"{k}={eff.get(k, '')}")
+for k in ("p0_db", "gamma_itu_db_m", "gamma_explicit_db_m", "gamma_bg_db_m",
+          "veg_max_atten_db", "fade_sigma_db", "world_sha256"):
+    print(f"radio_{k}={eff.get(k, '')}")
+h = sorted({v for k, v in eff.items() if k.startswith("antenna_height_m.")})
+print("antenna_height_m=" + ",".join(h))
+PY
+  fi
   echo
   echo "# --- provenance (dirty = uncommitted changes present) ---"
   for repo in "$WS/.." "$WS/src/explo_planner" "$WS/src/hmr_sim" \
@@ -1820,7 +1899,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # The mappers and the radio emulator too, so a stale install of either
   # shows in the manifest (DESIGN_gen34 section 12 changed both).
   for _bin in scovox_mapping/scovox_mapping_node scovox_mapping/dscovox_mapping_node \
-              hmr_sim/hmr_comms_sim_node; do
+              hmr_sim/hmr_comms_sim_node hmr_radio/hmr_radio_node; do
     _path="$WS/install/${_bin%%/*}/lib/$_bin"
     if [ -e "$_path" ]; then
       echo "sha256_${_bin##*/}=$(sha256sum -b "$_path" 2>/dev/null | cut -c1-16)"
