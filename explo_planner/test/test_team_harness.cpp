@@ -16,6 +16,8 @@
 //      its slot.
 //   P6 gossip bound (§11.1): after every tick, the highest version in a
 //      robot's plan table is its own plan's.
+//   P7 prompt release: a fully met booking is released within 30 s while
+//      robot 0 has been all-connected on every tick since the full meeting.
 // Replays:
 //   cell 12: a finished robot at the cell, its peer stuck out of reach, goes
 //      home after two missed slots.
@@ -96,6 +98,10 @@ Verdict runMission(const Params& p) {
       }
     }
   };
+  // P7, per robot: the full_met_time of the booking watched (-1: none), and
+  // whether robot 0 has been all-connected on every tick since.
+  std::vector<double> met_since(p.n, -1.0);
+  std::vector<bool> met_conn(p.n, false);
   while (sim.now() < p.horizon) {
     sim.step();
     const double now = sim.now() - p.dt;   // the tick just run
@@ -115,6 +121,20 @@ Verdict runMission(const Params& p) {
         s << "P3 t=" << now << " robot " << i << " " << activityName(o.activity)
           << " past its bound " << o.wait_bound;
         fault(s.str());
+      }
+      const Booking& B = c.booking();
+      if (B.held && B.full_met) {
+        if (met_since[i] < 0.0) { met_since[i] = B.full_met_time; met_conn[i] = true; }
+        met_conn[i] = met_conn[i] && sim.robot(0).core->allConnected();
+        if (met_conn[i] && now - met_since[i] > 30.0) {
+          std::ostringstream s;
+          s << "P7 t=" << now << " robot " << i << " full_met slot " << B.slot << " held "
+            << now - met_since[i] << " s with robot 0 all-connected";
+          fault(s.str());
+          met_conn[i] = false;   // one fault per booking
+        }
+      } else {
+        met_since[i] = -1.0;
       }
     }
     if (sim.allDone()) { v.done = true; break; }

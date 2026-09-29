@@ -600,6 +600,21 @@ void TeamCore::bookingPass() {
   // pairs caught up.
   if (booking_.held && !booking_.full_met && plan_.renewed_at_slot >= booking_.slot)
     clearBooking("renewed");
+  // Q55: a slot is met when every pair is listed, so robot 0 renews a slot a
+  // peer's beacon shows fully met whether or not robot 0 still holds it: its
+  // own booking of it may have ended as an encounter, or be a later slot. A
+  // slot robot 0 holds renews from the booking below instead, where the
+  // proposer stays at its spot (§11.1).
+  if (self == 0 && !team_finished_) {
+    for (int j = 1; j < cfg_.n; ++j) {
+      const int k = peers_[j].b.meeting_slot;
+      if (k > plan_.renewed_at_slot && renewed_for_slot_ != k &&
+          !(booking_.held && booking_.slot == k) && fullMet(k)) {
+        renewed_for_slot_ = k;
+        proposePlan("renewed", k);
+      }
+    }
+  }
   if (!booking_.held && plan_.valid() && !team_finished_ && apart && !home_done_ &&
       !(in_.finished && missed_streak_ >= cfg_.finished_missed_slots)) {
     book();
@@ -727,7 +742,8 @@ void TeamCore::bookingPass() {
     }
   }
   if (B.full_met) {
-    bool renewed = team_finished_ || plan_.renewed_at_slot == B.slot;
+    // A renewal at a later slot ends this one too, as for an unmet booking.
+    bool renewed = team_finished_ || plan_.renewed_at_slot >= B.slot;
     // §11.1: a renewal relayed by a third robot counts.
     for (int j = 0; j < cfg_.n && renewed; ++j)
       if (j != self) renewed = known_[j].version >= plan_.version;

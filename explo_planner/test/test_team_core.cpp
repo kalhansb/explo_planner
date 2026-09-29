@@ -1262,6 +1262,164 @@ TEST(TeamCoreBooking, BackstopCapsTheWaitForAnUnseenRenewal) {
   EXPECT_EQ(countEvents(r.b[0], "booking", "backstop"), 0);
 }
 
+// g35smoke_pessimistic_n2 hybrid seed 1, slot 0. Robot 1 has the long lead and
+// departs; robot 0 has not yet when the two come into contact. Robot 1 lists
+// robot 0 for slot 0, which at N = 2 is the full meeting, and robot 0's
+// booking ends as an encounter. Robot 0 must renew slot 0 all the same, or
+// robot 1 holds at the cell for the whole patience and the cell is never
+// refreshed.
+TEST(TeamCoreBooking, RobotZeroRenewsASlotItsEncounterEndedWhenAPeerMetIt) {
+  Rig r(2, Arm::kHybrid);
+  r.b[0].in.pose = {0, 0};      // lead 42 s to (10,10)
+  r.b[1].in.pose = {10, 60};    // lead 150 s
+  r.run(4);
+  r.allLinks(false);
+  ASSERT_TRUE(r.until([&] { return r.core(1).booking().departed; }, 200));
+  ASSERT_FALSE(r.core(0).booking().departed);
+  r.allLinks(true);
+  ASSERT_TRUE(r.until([&] { return countEvents(r.b[0], "booking", "encounter") == 1 &&
+                                   r.core(1).booking().full_met; }, 10));
+  const double met_at = r.core(1).booking().full_met_time;
+  EXPECT_TRUE(r.until([&] { return !r.core(1).booking().held; }, 10));
+  EXPECT_LT(r.now - met_at, 10.0);
+  EXPECT_EQ(countEvents(r.b[0], "plan", "renewed"), 1);
+  EXPECT_EQ(r.core(0).plan().renewed_at_slot, 0);
+  EXPECT_EQ(r.core(1).plan().version, 2u);
+  EXPECT_EQ(countEvents(r.b[1], "booking", "met"), 1);
+  EXPECT_EQ(countOf(r.core(1), "booking_renewal_unseen"), 0);
+  // Slot 0 is proved met: apart again, neither robot books it, and the
+  // renewal is issued once.
+  r.allLinks(false);
+  r.run(20);
+  EXPECT_NE(r.core(0).booking().held ? r.core(0).booking().slot : -1, 0);
+  EXPECT_NE(r.core(1).booking().held ? r.core(1).booking().slot : -1, 0);
+  EXPECT_EQ(countEvents(r.b[0], "plan", "renewed"), 1);
+}
+
+// The same at N = 3: two departed peers list robot 0 and each other; robot 0,
+// not yet departed, ends its booking as an encounter and must still renew.
+TEST(TeamCoreBooking, RobotZeroRenewsForTwoDepartedPeersAfterItsEncounter) {
+  Rig r(3, Arm::kRendezvous);
+  r.b[0].in.pose = {0, 0};      // lead 42 s
+  r.b[1].in.pose = {10, 60};    // lead 150 s
+  r.b[2].in.pose = {60, 10};    // lead 150 s
+  r.run(4);
+  r.allLinks(false);
+  ASSERT_TRUE(r.until([&] { return r.core(1).booking().departed &&
+                                   r.core(2).booking().departed; }, 200));
+  ASSERT_FALSE(r.core(0).booking().departed);
+  r.allLinks(true);
+  ASSERT_TRUE(r.until([&] { return countEvents(r.b[0], "booking", "encounter") == 1 &&
+                                   r.core(1).booking().full_met &&
+                                   r.core(2).booking().full_met; }, 10));
+  const double met_at = std::max(r.core(1).booking().full_met_time,
+                                 r.core(2).booking().full_met_time);
+  EXPECT_TRUE(r.until([&] { return !r.core(1).booking().held &&
+                                   !r.core(2).booking().held; }, 10));
+  EXPECT_LT(r.now - met_at, 10.0);
+  EXPECT_EQ(countEvents(r.b[0], "plan", "renewed"), 1);
+  EXPECT_EQ(r.core(0).plan().renewed_at_slot, 0);
+  for (int i = 1; i < 3; ++i) {
+    EXPECT_EQ(countEvents(r.b[i], "booking", "met"), 1) << i;
+    EXPECT_EQ(countOf(r.core(i), "booking_renewal_unseen"), 0) << i;
+    EXPECT_EQ(r.core(i).plan().version, 2u) << i;
+  }
+}
+
+// Robot 0 holds a later slot than the peer that meets it: it booked slot 1
+// from a stale far position of robot 1, robot 1 booked slot 0 from where it
+// really was. Robot 1 lists robot 0 for slot 0 before slot 1's interval opens,
+// so robot 0's own booking shows nothing; robot 0 renews slot 0 from the
+// listing and keeps its slot 1 booking.
+TEST(TeamCoreBooking, RobotZeroRenewsAPeersSlotWhileHoldingALaterOne) {
+  Rig r(2, Arm::kRendezvous, [](TeamConfig& c) { c.book_apart_sec = 15.0; });
+  r.b[0].in.pose = {0, 0};
+  r.b[1].in.pose = {10, 200};   // lead 570 s: slot 0 out of reach from here
+  r.run(4);
+  r.allLinks(false);
+  r.b[1].in.pose = {7, 10};     // but robot 1 is at the cell when it books
+  r.b[0].in.finished = true;
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().held && r.core(1).booking().held; }, 30));
+  ASSERT_EQ(r.core(0).booking().slot, 1);
+  ASSERT_EQ(r.core(1).booking().slot, 0);
+  ASSERT_TRUE(r.core(0).booking().departed);
+  r.b[0].in.pose = r.core(0).booking().spot;
+  ASSERT_TRUE(r.until([&] { return r.core(1).booking().departed; }, 300));
+  ASSERT_LT(r.now, 300.0);
+  r.allLinks(true);
+  ASSERT_TRUE(r.until([&] { return r.core(1).booking().full_met; }, 10));
+  ASSERT_LT(r.now, 302.0);
+  EXPECT_EQ(r.core(0).booking().met_mask, 0u);   // slot 1's interval not open
+  const double met_at = r.core(1).booking().full_met_time;
+  EXPECT_TRUE(r.until([&] { return !r.core(1).booking().held; }, 10));
+  EXPECT_LT(r.now - met_at, 10.0);
+  EXPECT_LT(r.now, 302.0);
+  EXPECT_EQ(r.core(0).plan().renewed_at_slot, 0);
+  EXPECT_EQ(countOf(r.core(1), "booking_renewal_unseen"), 0);
+  EXPECT_EQ(countEvents(r.b[1], "booking", "met"), 1);
+  EXPECT_TRUE(r.core(0).booking().held);
+  EXPECT_EQ(r.core(0).booking().slot, 1);
+}
+
+// Two slots met at once: robot 0 holds slot 0, robot 1 (finished, booked from
+// a stale far position of robot 0) holds slot 1, and they exchange after slot
+// 0's time. Robot 0 renews slot 0 from its own booking and slot 1 from robot
+// 1's listing. Both must leave: a fully met booking is released by a renewal
+// at its slot or any later one.
+TEST(TeamCoreBooking, ARenewalAtALaterSlotReleasesAMetBookingToo) {
+  Rig r(2, Arm::kRendezvous, [](TeamConfig& c) { c.book_apart_sec = 15.0; });
+  r.b[0].in.pose = {10, 200};   // robot 1 last hears robot 0 far away
+  r.b[1].in.pose = {20, 0};
+  r.run(4);
+  r.allLinks(false);
+  r.b[0].in.pose = {7, 10};     // but robot 0 is at the cell when it books
+  r.b[1].in.finished = true;
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().held && r.core(1).booking().held; }, 30));
+  ASSERT_EQ(r.core(0).booking().slot, 0);
+  ASSERT_EQ(r.core(1).booking().slot, 1);
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed; }, 300));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.b[1].in.pose = r.core(1).booking().spot;
+  while (r.now < 305) r.step();   // past slot 0's time: both slots' intervals are open
+  r.allLinks(true);
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().full_met && r.core(1).booking().full_met; }, 10));
+  const double met_at = r.now;
+  EXPECT_TRUE(r.until([&] { return !r.core(0).booking().held && !r.core(1).booking().held; }, 15));
+  EXPECT_LT(r.now - met_at, 15.0);
+  EXPECT_EQ(r.core(0).plan().renewed_at_slot, 1);
+  EXPECT_EQ(countEvents(r.b[0], "plan", "renewed"), 2);
+  EXPECT_EQ(countOf(r.core(0), "booking_renewal_unseen"), 0);
+  EXPECT_EQ(countOf(r.core(1), "booking_renewal_unseen"), 0);
+}
+
+// Robot 0 holds the slot, and robot 1's listing reaches it a tick before its
+// own exchange is done. The renewal must come from robot 0's booking, which is
+// fully met by the time the plan moves, so robot 0 stays at its spot (§11.1).
+// Renewing from the listing first would retarget it to the new cell.
+TEST(TeamCoreBooking, AProposerListedFirstStaysAtItsSpot) {
+  Rig r = splitPair();
+  ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed &&
+                                   r.core(1).booking().departed; }, 400));
+  r.b[0].in.pose = r.core(0).booking().spot;
+  r.b[1].in.pose = r.core(1).booking().spot;
+  r.b[0].in.sent_seq = 40;
+  r.b[1].in.sent_seq = 60;
+  r.b[0].oracle.solve.cell = 5;   // the renewal moves the meeting
+  r.b[0].oracle.solve.center = {16, 10};
+  r.allLinks(true);
+  r.run(4);
+  ASSERT_TRUE(r.core(0).booking().arrived);
+  r.b[0].in.rcvd_seq[1] = 60;     // robot 1's exchange ends a tick before robot 0's
+  r.step();
+  r.b[1].in.rcvd_seq[0] = 40;
+  ASSERT_TRUE(r.until([&] { return !r.core(0).booking().held &&
+                                   !r.core(1).booking().held; }, 30));
+  EXPECT_EQ(r.core(0).plan().cell, 5);
+  EXPECT_EQ(r.core(0).plan().renewed_at_slot, 0);
+  EXPECT_EQ(countEvents(r.b[0], "booking", "retargeted"), 0);
+  EXPECT_EQ(countEvents(r.b[0], "booking", "met"), 1);
+}
+
 TEST(TeamCoreBooking, LostPairAtTheCellHigherIdMovesLowerHolds) {
   Rig r = splitPair();
   ASSERT_TRUE(r.until([&] { return r.core(0).booking().departed &&
