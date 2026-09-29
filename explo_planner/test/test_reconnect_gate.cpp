@@ -164,10 +164,12 @@ TEST(KnowledgeGate, AnyMissingPeerLackingTheCellCounts) {
 namespace {
 
 /// n EXPLORING cells laid in from cell 24 back towards the origin, furthest
-/// from robot 0 at cell 0. All are first-hand, so under the no-comms mask the
-/// peer may take none of them. (notes: gate-fixture-world-with-work)
+/// from robot 0 at cell 0, every other cell COVERED. All are first-hand, so
+/// under the no-comms mask the peer may take none of them.
+/// (notes: gate-fixture-world-with-work)
 CellWorld worldWithWork(int n) {
   CellWorld w = world5(0);
+  for (int id = 0; id < w.size(); ++id) w.commitSelf(id, CellStatus::COVERED);
   for (int id = 24; id > 0 && n > 0; --id, --n)
     w.commitSelf(id, CellStatus::EXPLORING);
   return w;
@@ -211,7 +213,7 @@ TEST(ValueGate, KnowledgeAloneDoesNotDispatch) {
   // not dispatch. With both makespans zero, C_re equals the leg at both
   // distances, one-for-one. (notes: gate-knowledge-and-value-are-and)
   CellWorld w = world5(0);
-  w.commitSelf(6, CellStatus::COVERED);
+  for (int id = 0; id < w.size(); ++id) w.commitSelf(id, CellStatus::COVERED);
 
   for (const int peer_cell : {4, 24}) {
     const GateVerdict v = evaluateReconnectGate(
@@ -231,7 +233,7 @@ TEST(ValueGate, KnowledgeAloneDoesNotDispatch) {
 /// the specified `<` does not.
 TEST(ValueGate, AnExactTieDoesNotDispatch) {
   CellWorld w = world5(0);
-  w.commitSelf(12, CellStatus::COVERED);
+  for (int id = 0; id < w.size(); ++id) w.commitSelf(id, CellStatus::COVERED);
 
   const GateVerdict v =
       evaluateReconnectGate(w, pair2(12, 12), missing1(1, 12), alloc0());

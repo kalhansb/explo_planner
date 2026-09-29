@@ -281,7 +281,9 @@ int CellWorld::applyObservation(const std::vector<CellObservation>& obs) {
   for (size_t i = 0; i < cells_.size(); ++i) {
     if (obs[i].total_columns <= 0) continue;  // unmeasured: leave it alone
     cells_[i].obs = obs[i];
-    const CellStatus s = classify(cells_[i].status, obs[i]);
+    const CellStatus s = cells_[i].written_off
+                             ? cells_[i].status
+                             : classify(cells_[i].status, obs[i]);
     if (commitSelf(static_cast<int>(i), s)) ++changed;
     // Whatever the status now is, this robot holds it.
     markKnownBy(static_cast<int>(i), self_id_);
@@ -289,9 +291,10 @@ int CellWorld::applyObservation(const std::vector<CellObservation>& obs) {
   return changed;
 }
 
-bool CellWorld::commitSelf(int id, CellStatus s) {
+bool CellWorld::commitSelf(int id, CellStatus s, bool write_off) {
   if (!grid_.valid(id)) return false;
   Cell& c = cells_[static_cast<size_t>(id)];
+  if (write_off) c.written_off = true;
   if (c.status == s) return false;
   c.status = s;
   // Rule 1: update_id counts FIRST-HAND committed changes, and only this path

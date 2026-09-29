@@ -118,8 +118,8 @@ public:
   };
 
   /// Solve over world's statuses, known_by masks and distances; robots in any
-  /// order (sorted by id inside). Candidates are EXPLORING and
-  /// EXPLORING_BY_OTHERS cells, both, so robots solve the same problem.
+  /// order (sorted by id inside). Candidates are UNSEEN, EXPLORING and
+  /// EXPLORING_BY_OTHERS cells, so robots solve the same problem.
   /// (notes: alloc-solve-candidates)
   static Allocation solve(const CellWorld& world,
                           const std::vector<AllocRobot>& robots,
@@ -137,8 +137,8 @@ public:
                                const std::vector<int>& tour);
 };
 
-/// Should a focus cell that keeps yielding no admissible candidate be demoted
-/// to COVERED? skips: ticks it was the focus but the goal came from elsewhere;
+/// Should a focus cell that keeps making no progress be demoted to COVERED?
+/// skips: appearances as focus without a drop in its unknown fraction;
 /// k: the threshold. status must be read after a fresh census.
 /// (notes: alloc-stale-focus-demotion)
 bool shouldDemoteStaleFocus(int skips, int k, CellStatus status);

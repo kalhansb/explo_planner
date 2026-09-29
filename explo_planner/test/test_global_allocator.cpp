@@ -37,6 +37,13 @@ CellWorld world5(int self = 0) {
 /// update_id / known_by rules the node would.
 void setSelf(CellWorld& w, int id, CellStatus s) { w.commitSelf(id, s); }
 
+/// Every still-UNSEEN cell COVERED, so the cells a test set are the whole
+/// candidate set: UNSEEN cells are allocator work since gen 35.
+void coverUnseen(CellWorld& w) {
+  for (int id = 0; id < w.size(); ++id)
+    if (w.status(id) == CellStatus::UNSEEN) setSelf(w, id, CellStatus::COVERED);
+}
+
 std::vector<AllocRobot> pair2(int cell_a, int cell_b) {
   return {AllocRobot{0, cell_a, true, false},
           AllocRobot{1, cell_b, true, false}};
@@ -100,10 +107,25 @@ TEST(GlobalAllocatorCrossPerspective, ByOthersCellsAreCandidates) {
   setSelf(peer, 18, CellStatus::EXPLORING);
   w.mergeWire(1, peer.toWire());
   ASSERT_EQ(w.status(18), CellStatus::EXPLORING_BY_OTHERS);
+  coverUnseen(w);
 
   const Allocation alloc = GlobalAllocator::solve(w, pair2(0, 24), {});
   const std::vector<int> got = allAssigned(alloc);
   EXPECT_EQ(got, (std::vector<int>{6, 18}));
+}
+
+/// Never-seen ground is work to divide (gen 35). Without UNSEEN in the set the
+/// tour front was always the nearest EXPLORING cell and lad5 runs ended with
+/// 10-22 of 100 cells never seen. COVERED stays out. (notes:
+/// alloc-solve-candidates)
+TEST(GlobalAllocatorCandidates, UnseenIsACandidateCoveredIsNot) {
+  CellWorld w = world5(0);
+  setSelf(w, 6, CellStatus::EXPLORING);
+  for (int id = 10; id < 25; ++id) setSelf(w, id, CellStatus::COVERED);
+
+  const Allocation alloc = GlobalAllocator::solve(w, pair2(0, 4), {});
+  EXPECT_EQ(allAssigned(alloc),
+            (std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
 }
 
 /// The caller's vector order is not part of the problem. Two robots that list
@@ -137,6 +159,7 @@ TEST(GlobalAllocatorDeterminism, VehicleOrderDoesNotChangeTheAnswer) {
 TEST(GlobalAllocatorDeterminism, ExactTieBreaksToTheLowerRobotId) {
   CellWorld w = world5(0);
   setSelf(w, 12, CellStatus::EXPLORING);      // centre of the 5x5
+  coverUnseen(w);
 
   // Cells 2 and 22 are the same graph distance from 12 (two rows either way).
   const auto robots = pair2(2, 22);
@@ -190,6 +213,7 @@ TEST(GlobalAllocatorCost, UnreachableFallsBackToCentroidDistance) {
 TEST(GlobalAllocatorMask, OutOfCommsRobotOnlyGetsCellsItKnows) {
   CellWorld w = world5(0);
   for (int id : {6, 18}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
   // Robot 1 knows about 6 but has never heard of 18.
   w.markKnownBy(6, 1);
 
@@ -211,6 +235,7 @@ TEST(GlobalAllocatorMask, OutOfCommsRobotOnlyGetsCellsItKnows) {
 TEST(GlobalAllocatorMask, WithoutTheMaskTheSameFixtureAllocatesFreely) {
   CellWorld w = world5(0);
   for (int id : {6, 18}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
   w.markKnownBy(6, 1);
 
   std::vector<AllocRobot> robots = pair2(0, 24);
@@ -228,6 +253,7 @@ TEST(GlobalAllocatorMask, WithoutTheMaskTheSameFixtureAllocatesFreely) {
 TEST(GlobalAllocatorMask, StarvedCandidatesAreReportedNotDiscarded) {
   CellWorld w = world5(0);
   setSelf(w, 18, CellStatus::EXPLORING);   // known_by == {0}: this robot only
+  coverUnseen(w);
 
   GlobalAllocator::Config cfg;
   cfg.comms_mask = true;
@@ -254,6 +280,7 @@ TEST(GlobalAllocatorMask, StarvedCandidatesAreReportedNotDiscarded) {
 TEST(GlobalAllocatorVehicles, FinishedRobotIsRemovedAndItsCellsReturn) {
   CellWorld w = world5(0);
   for (int id : {20, 21, 22}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
 
   std::vector<AllocRobot> robots = pair2(0, 24);
   const Allocation live = GlobalAllocator::solve(w, robots, {});
@@ -273,6 +300,7 @@ TEST(GlobalAllocatorVehicles, FinishedRobotIsRemovedAndItsCellsReturn) {
 TEST(GlobalAllocatorVehicles, OffFrontierRobotIsRemovedAndItsCellsReturn) {
   CellWorld w = world5(0);
   for (int id : {20, 21, 22}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
 
   std::vector<AllocRobot> robots = pair2(0, 24);
   const Allocation live = GlobalAllocator::solve(w, robots, {});
@@ -294,6 +322,7 @@ TEST(GlobalAllocatorVehicles, OffFrontierRobotIsRemovedAndItsCellsReturn) {
 TEST(GlobalAllocatorVehicles, UnlocatableRobotIsDroppedNotDefaulted) {
   CellWorld w = world5(0);
   for (int id : {6, 7}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
 
   std::vector<AllocRobot> robots = pair2(0, -1);
   const Allocation alloc = GlobalAllocator::solve(w, robots, {});
@@ -323,6 +352,7 @@ TEST(GlobalAllocatorBalance, EachRobotTakesItsOwnSide) {
   CellWorld w = world5(0);
   for (int id : {0, 1, 5, 6}) setSelf(w, id, CellStatus::EXPLORING);
   for (int id : {18, 19, 23, 24}) setSelf(w, id, CellStatus::EXPLORING);
+  coverUnseen(w);
 
   const auto robots = pair2(0, 24);
   const Allocation alloc = GlobalAllocator::solve(w, robots, {});
@@ -350,6 +380,7 @@ TEST(GlobalAllocatorFocus, FocusIsTheFirstCellOfOwnTour) {
 TEST(GlobalAllocatorFocus, NothingToExploreIsSolvedNotRefused) {
   CellWorld w = world5(0);
   setSelf(w, 6, CellStatus::COVERED);
+  coverUnseen(w);
 
   const auto robots = pair2(0, 24);
   const Allocation alloc = GlobalAllocator::solve(w, robots, {});
@@ -530,6 +561,8 @@ TEST(AllocHash, CandidateSetMovesTheDigest) {
   CellWorld a = world5(0), b = world5(0);
   for (int id : {2, 6, 10}) setSelf(a, id, CellStatus::EXPLORING);
   for (int id : {2, 6, 11}) setSelf(b, id, CellStatus::EXPLORING);
+  coverUnseen(a);
+  coverUnseen(b);
   GlobalAllocator::Config c;
   EXPECT_NE(GlobalAllocator::solve(a, pair2(0, 24), c).alloc_hash,
             GlobalAllocator::solve(b, pair2(0, 24), c).alloc_hash);

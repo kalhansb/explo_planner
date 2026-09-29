@@ -663,7 +663,10 @@ is chosen is indistinguishable in every field above from one that works.
 
 ```text
 How many solves IN A ROW that held the current focus cell as focus have
-produced no admissible candidate from its neighbourhood.
+found its unknown fraction no lower than at its previous appearance as
+focus. Until gen 35 (2026-09-29) it counted solves whose pick came from
+outside the focus neighbourhood instead; values from gen 34 and earlier
+cells mean that.
 
 NOT consecutive ticks, which is what this said through v7 — the node's
 counter is indexed by cell id and is only touched on a tick where that

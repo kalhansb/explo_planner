@@ -576,6 +576,30 @@ TEST(CellWorldApply, UnmeasuredCellsAreLeftAlone) {
   for (int i = 0; i < 9; ++i) EXPECT_EQ(w.status(i), CellStatus::COVERED);
 }
 
+/// The staleness rule's write-off must survive this robot's own census. The
+/// merge guard already stops peers lowering a first-hand COVERED; without the
+/// pin, hysteresis re-promoted a stuck cell (unknown fraction above
+/// exploring_min_unknown by definition) on the very next tick. Cell 1 is the
+/// control: the same demotion without write_off, on the same evidence, flips
+/// back. (notes: cell-written-off)
+TEST(CellWorldApply, AWrittenOffCellIsNotReclassified) {
+  CellWorld w = makeWorld();
+  std::vector<CellWorld::CellObservation> o(9, obs(100, 50));
+  ASSERT_EQ(w.applyObservation(o), 9);
+  ASSERT_EQ(w.status(0), CellStatus::EXPLORING);
+  EXPECT_TRUE(w.commitSelf(0, CellStatus::COVERED, true));
+  EXPECT_TRUE(w.commitSelf(1, CellStatus::COVERED));
+
+  std::vector<CellWorld::CellObservation> o2(9, obs(100, 55));
+  EXPECT_EQ(w.applyObservation(o2), 1);
+  EXPECT_EQ(w.status(0), CellStatus::COVERED);
+  EXPECT_EQ(w.status(1), CellStatus::EXPLORING);
+  EXPECT_TRUE(w.cell(0).written_off);
+  EXPECT_FALSE(w.cell(1).written_off);
+  // The census still stores the evidence it no longer acts on.
+  EXPECT_EQ(w.cell(0).obs.observed_columns, 55);
+}
+
 TEST(CellWorldApply, RejectsAWronglySizedObservation) {
   CellWorld w = makeWorld();
   std::vector<CellWorld::CellObservation> o(8, obs(100, 100));

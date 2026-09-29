@@ -11,7 +11,7 @@ Sections follow the order of the source file and are grouped by the function (or
 - [makeCellGrid](#makecellgrid) — 1
 - [Config — declarations](#config--declarations) — 3
 - [CellObservation — declarations](#cellobservation--declarations) — 1
-- [CellWorld — declarations](#cellworld--declarations) — 10
+- [CellWorld — declarations](#cellworld--declarations) — 11
 - [censusFromMap](#censusfrommap) — 1
 
 ## Status
@@ -193,6 +193,29 @@ bumped its update_id and reset its known_by to {self}.
 
 An entry with total_columns == 0 is "not measured this tick" and leaves
 the cell alone; it is not evidence that the cell became unseen.
+```
+
+### cell-written-off
+
+**A written-off cell stays COVERED** — attached to `bool       written_off = false;` (added 2026-09-29, gen 35)
+
+```text
+Set only by commitSelf(..., write_off = true), which the allocator's
+staleness rule calls when it demotes a focus cell that stopped making
+progress. From then on applyObservation still stores the cell's obs (the
+census event and the diagnostics keep reading it) but skips classify(),
+so the status stays the COVERED it was written off as.
+
+Without the pin the write-off was not a write-off. The merge guard stops
+PEERS lowering a first-hand COVERED, but this robot's own census ran
+classify() on the next tick, and the hysteresis sends COVERED back to
+EXPLORING whenever the unknown fraction is above exploring_min_unknown.
+A stuck cell sits there by definition, so the demotion undid itself
+within one census period and the robot went back to the same cell.
+
+The flag is local. It is not on the wire and not in sharedHash(): peers
+see an ordinary COVERED, and a peer that adopts it as COVERED_BY_OTHERS
+already cannot lower it with its own evidence (relayed-raise-only).
 ```
 
 ### cell-codec-beside-machine

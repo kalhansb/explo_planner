@@ -182,12 +182,20 @@ Solve. `world` supplies the cell statuses, the known_by masks and the
 distances; `robots` is the vehicle set in any order (it is sorted
 internally by id, so the caller's order cannot affect the result).
 
-Candidate cells are those with status EXPLORING or EXPLORING_BY_OTHERS.
-Both, per §3.4: restricting to first-hand EXPLORING would have the two
-robots solving provably different problems immediately after every
-exchange, which destroys the solve-same premise this whole design rests
-on. A cell one robot covered itself and one it learned about are the same
-work to divide.
+Candidate cells are those with status UNSEEN, EXPLORING or
+EXPLORING_BY_OTHERS. Both EXPLORING flavours, per §3.4: restricting to
+first-hand EXPLORING would have the two robots solving provably different
+problems immediately after every exchange, which destroys the solve-same
+premise this whole design rests on. A cell one robot covered itself and
+one it learned about are the same work to divide.
+
+UNSEEN since gen 35 (2026-09-29). Without it the tour front was always
+the nearest EXPLORING cell, never-seen ground was reached only by frontier
+utility, and lad5 runs ended with 10-22 of 100 cells still UNSEEN. With
+it the candidate set is every cell not yet COVERED, which is also the
+steadier set across robots: an UNSEEN/EXPLORING disagreement no longer
+changes it. At 100 candidates the solve takes ~37 ms (N=2), well inside
+the PLAN budget.
 ```
 
 ### alloc-costmm-fallback
@@ -230,7 +238,7 @@ cells the allocator would not, which is invisible in every log.
 
 ```text
 The staleness rule's decision (§3.4): should a focus cell that keeps
-producing no admissible candidate be written off as COVERED?
+making no progress be written off as COVERED?
 
 A free function, and not simply an `if` in doPlan, because of what the
 answer costs when it is wrong. A demotion is a FIRST-HAND COVERED, and the
@@ -239,8 +247,8 @@ so a spurious demotion writes that ground off for the whole team, for the
 rest of the run, with no path back. That is a decision worth being able to
 test at its boundary rather than one to read out of a 900-line function.
 
-`skips` counts consecutive planning ticks on which this cell was the focus
-and the goal came from somewhere else. `k` is the threshold. `status` must
+`skips` counts consecutive appearances as focus in which the cell's
+unknown fraction did not drop. `k` is the threshold. `status` must
 be the status read AFTER a fresh census: the whole point of the re-measure
 is that a cell which has quietly been cleared must not be demoted, and
 passing the pre-census status would silently remove that protection while

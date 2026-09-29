@@ -7737,12 +7737,12 @@ failed would make the allocator look innocent by omission.
 **What the focus staleness counter counts** — attached to `const int focus = alloc_ev.focus_cell;`
 
 ```text
-Staleness (§3.4). A focus cell that keeps yielding no admissible
-candidate is re-measured from the map and, if it still claims to be
-worth exploring, demoted to COVERED — mTARE's not-connected -> COVERED
-demotion, and the only thing that stops a phantom EXPLORING cell from
-being re-assigned forever and from dragging the rendezvous minimax
-toward ground nobody can clear.
+Staleness (§3.4). A focus cell that keeps making no progress is
+re-measured from the map and, if it still claims to be worth exploring,
+demoted to COVERED — mTARE's not-connected -> COVERED demotion, and the
+only thing that stops a phantom EXPLORING cell from being re-assigned
+forever and from dragging the rendezvous minimax toward ground nobody can
+clear.
 
 WHAT THE COUNTER ACTUALLY COUNTS, because it is not "k consecutive
 ticks" and said so until 2026-09-18: `alloc_focus_skips_` is indexed BY
@@ -7750,8 +7750,23 @@ CELL ID and is only touched on a tick where that cell is the focus. So
 it counts k consecutive APPEARANCES AS FOCUS that failed, not k
 consecutive ticks — the focus cell moves as the allocator re-solves, and
 a cell's count survives however many ticks pass with some other cell in
-the chair. There is no decay. A cell that misses once, drops out of the
-focus for two hundred ticks, and comes back to miss again is at 2.
+the chair. There is no decay. A cell that fails once, drops out of the
+focus for two hundred ticks, and comes back to fail again is at 2.
+
+WHAT FAILED MEANS, since gen 35 (2026-09-29): the cell's own unknown
+fraction (`cell(focus).obs`, the last census) did not drop below its
+value at the cell's previous appearance as focus, stored per cell in
+`alloc_focus_unknown_`. A drop resets the count; the pick's rank plays no
+part. Until gen 35 a rank-0 pick reset it and any other pick advanced
+it. That rule could not see the census-freeze loop: the rank-0 band
+always wins the sort, so a robot circling frontiers it can reach but
+never clear picks rank 0 on every tick. In lad5 that was 6923 of 6926
+allocations, focus_skips never reached k, and zero demotions fired while
+the slow cells sat on one unchanging cell for 1000+ s. A lad5 replay of
+the progress rule, with the ROI unknown fraction standing in for the
+cell's (it under-fires), fired at k=3 in 29/42 slow robot-runs and
+2/88 fast ones. The first appearance always counts as progress (the
+stored value starts at +inf), so k=3 means three failures after it.
 
 That is deliberately NOT patched into a strict tick run, because the
 demotion's real guard is not the counter at all: `shouldDemoteStaleFocus`
@@ -7776,14 +7791,24 @@ the number, up on an out-of-focus pick and back to zero on a rank-0 one.
 
 ```text
 A first-hand COVERED, which the merge guard will not let any peer
-lower again — so this is a one-way write-off of ground on behalf
-of the whole team, and it is logged on every fire for precisely
-that reason. What keeps it honest is the three conditions above:
-it must be the focus cell, it must have failed k times in a row as
-focus (see the counter's note — that is not k consecutive ticks),
-and the map must still read it as unexplored after a fresh
-measurement taken this tick. The last of those is the one doing
-the work.
+lower again, committed with write_off so this robot's own census
+cannot lower it either (cell_world_notes: cell-written-off) — so this
+is a one-way write-off of ground on behalf of the whole team, and it
+is logged on every fire for precisely that reason. Until gen 35 the
+own-census half was missing, and the hysteresis re-promoted any
+written-off cell whose unknown fraction was above
+exploring_min_unknown on the next census. What keeps it honest is
+the three conditions above: it must be the focus cell, it must have
+failed k times in a row as focus (see the counter's note — that is
+not k consecutive ticks), and the map must still read it as
+unexplored after a fresh measurement taken this tick. The last of
+those is the one doing the work.
+
+UNSEEN focus cells are candidates since gen 35 but are never written
+off: shouldDemoteStaleFocus accepts only EXPLORING statuses, so an
+UNSEEN front with no progress advances the count and then has it
+reset without a demotion. A cell no one has seen four columns of has
+nothing to write off.
 ```
 
 ### rejection-profile-placement

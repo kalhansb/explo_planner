@@ -201,6 +201,9 @@ public:
     uint32_t   update_id = 0;
     /// Last observation applied, for diagnostics and the census event.
     CellObservation obs;
+    /// Written off by the staleness rule: the census still records obs but
+    /// no longer reclassifies the cell. (notes: cell-written-off)
+    bool       written_off = false;
   };
 
   CellWorld() = default;
@@ -232,8 +235,9 @@ public:
 
   /// Commit a status arrived at first-hand: on a CHANGE, bump update_id and
   /// reset known_by to {self} (rule 2). Returns true if it changed anything.
-  /// This is the ONLY path that touches update_id.
-  bool commitSelf(int id, CellStatus s);
+  /// This is the ONLY path that touches update_id. write_off pins the cell
+  /// against later reclassification by applyObservation.
+  bool commitSelf(int id, CellStatus s, bool write_off = false);
 
   /// Record that robot `id` is known to have seen this cell in its CURRENT
   /// status. Merging uses this; it never bumps update_id.

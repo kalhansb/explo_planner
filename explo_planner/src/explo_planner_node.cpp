@@ -352,11 +352,15 @@ private:
   // (notes: global-alloc-off-by-default)
   bool       global_alloc_enable_ = false;
   GlobalAllocator::Config alloc_cfg_;
-  /// Consecutive planning ticks each cell has been the focus without yielding
-  /// an admissible candidate. Sized with the grid at configure time. The
-  /// staleness rule (§3.4) reads it; nothing else does.
+  /// Consecutive appearances as focus in which each cell's unknown fraction
+  /// did not drop. Sized with the grid at configure time. The staleness rule
+  /// (§3.4) reads it; nothing else does.
   std::vector<int> alloc_focus_skips_;
-  /// How many consecutive skips demote a phantom EXPLORING cell to COVERED.
+  /// Each cell's unknown fraction at its last appearance as focus; +inf until
+  /// it has one, so a first appearance always counts as progress.
+  std::vector<double> alloc_focus_unknown_;
+  /// How many appearances without progress write an EXPLORING cell off as
+  /// COVERED.
   int        alloc_focus_skip_k_ = 3;
   /// Max age, in mission-elapsed seconds, of a latched peer position in the
   /// allocator solve; <= 0 = unbounded (the pre-TTL behaviour). Applied at the
@@ -2045,12 +2049,14 @@ ExploPlannerNode::ExploPlannerNode()
     if (alloc_focus_skip_k_ < 1) {
       RCLCPP_WARN(get_logger(),
           "global_alloc_focus_skip_k=%d is below 1; a cell would be demoted "
-          "the first tick it produced no candidate, which every cell does on "
-          "the tick it is first assigned. Clamping to 1.",
+          "on its first appearance as focus, before it could show any "
+          "progress. Clamping to 1.",
           alloc_focus_skip_k_);
       alloc_focus_skip_k_ = 1;
     }
     alloc_focus_skips_.assign(static_cast<size_t>(cell_world_.size()), 0);
+    alloc_focus_unknown_.assign(static_cast<size_t>(cell_world_.size()),
+                                std::numeric_limits<double>::infinity());
   }
   if (exp_log_) {
     exp_log_->addParamBool("global_alloc_enable", global_alloc_enable_);
@@ -3707,7 +3713,8 @@ void ExploPlannerNode::doPlan() {
     alloc_ev.edge_hash         = alloc.edge_hash;
     for (int cid = 0; cid < cell_world_.size(); ++cid) {
       const CellStatus s = cell_world_.status(cid);
-      if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
+      if (s == CellStatus::UNSEEN || s == CellStatus::EXPLORING ||
+          s == CellStatus::EXPLORING_BY_OTHERS)
         ++alloc_ev.candidates;
     }
     alloc_ev.unassigned        = static_cast<int>(alloc.unassigned.size());
@@ -3951,16 +3958,20 @@ void ExploPlannerNode::doPlan() {
   if (alloc_ran) {
     alloc_ev.picked_rank = found ? alloc_rank[selected_idx] : -1;
 
-    // alloc_focus_skips_ is per cell id and counts failed appearances as focus,
-    // not consecutive ticks; no decay. !found neither advances nor resets it; a
-    // rank-0 pick resets it, any other pick increments it.
+    // alloc_focus_skips_ is per cell id and counts appearances as focus in
+    // which the cell's unknown fraction did not drop, whatever the pick's
+    // rank; no decay. !found neither advances nor resets it.
     // (notes: alloc-focus-staleness-counter)
     const int focus = alloc_ev.focus_cell;
     if (focus >= 0 && focus < static_cast<int>(alloc_focus_skips_.size())) {
-      if (found && alloc_ev.picked_rank == 0) {
-        alloc_focus_skips_[focus] = 0;
-      } else if (found) {
-        ++alloc_focus_skips_[focus];
+      if (found) {
+        const double u = cell_world_.cell(focus).obs.unknownFraction();
+        if (u < alloc_focus_unknown_[focus]) {
+          alloc_focus_skips_[focus] = 0;
+        } else {
+          ++alloc_focus_skips_[focus];
+        }
+        alloc_focus_unknown_[focus] = u;
       }
       alloc_ev.focus_skips = alloc_focus_skips_[focus];
 
@@ -3976,17 +3987,17 @@ void ExploPlannerNode::doPlan() {
         if (shouldDemoteStaleFocus(alloc_focus_skips_[focus],
                                    alloc_focus_skip_k_,
                                    cell_world_.status(focus))) {
-          // A first-hand COVERED that no peer can lower again, so it is logged
-          // on every fire. Requires the focus cell, k failed appearances as
-          // focus, and a fresh census still reading it unexplored.
+          // A written-off first-hand COVERED that neither a peer nor this
+          // robot's own census can lower again, so it is logged on every fire.
+          // Requires the focus cell, k appearances as focus without progress,
+          // and a fresh census still reading it unexplored.
           // (notes: alloc-focus-demotion-one-way)
-          cell_world_.commitSelf(focus, CellStatus::COVERED);
+          cell_world_.commitSelf(focus, CellStatus::COVERED, true);
           alloc_ev.demoted = std::to_string(focus);
           RCLCPP_WARN(get_logger(),
-              "Global allocator: focus cell %d produced no admissible "
-              "candidate on %d consecutive solves that held it as focus, and "
-              "still reads unexplored after a fresh census — demoting it to "
-              "COVERED.",
+              "Global allocator: focus cell %d made no progress on %d "
+              "consecutive solves that held it as focus, and still reads "
+              "unexplored after a fresh census — writing it off as COVERED.",
               focus, alloc_focus_skips_[focus]);
         }
         alloc_focus_skips_[focus] = 0;

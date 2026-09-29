@@ -566,8 +566,8 @@ struct AllocationEvent {
   /// least one frontier candidate fell outside the focus neighbourhood. False
   /// means the filter was a no-op this tick and `picked_rank` proves nothing.
   bool reordered = false;
-  /// Solves in a row, holding this cell as focus, with no admissible candidate
-  /// from its neighbourhood. Kept per cell id and not decayed by ticks, so it
+  /// Solves in a row, holding this cell as focus, in which its unknown
+  /// fraction did not drop. Kept per cell id and not decayed by ticks, so it
   /// bounds nothing about elapsed time. (notes: explog-alloc-focus-skips)
   int focus_skips = 0;
   std::string demoted;

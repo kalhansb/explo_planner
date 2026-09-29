@@ -4341,6 +4341,10 @@ the work is always the part of the map furthest from robot 0 at cell 0.
 Every one is first-hand, so under the no-comms mask the peer may take NONE
 of them and the whole tour falls to me — which is what makes C_no the cost
 of staying apart rather than an artefact of where the peer happens to be.
+
+Every other cell is COVERED, not left UNSEEN: since gen 35 (2026-09-29)
+UNSEEN cells are allocator candidates, so an UNSEEN background would be
+work of its own and `n` would stop being the lever.
 ```
 
 ### gate-value-lever-is-work
@@ -4362,8 +4366,9 @@ not less. Work is the clean one.
 
 ```text
 The two gates are AND, not OR. Here there is genuinely something to share
-(a COVERED cell the peer has never heard of) and genuinely nothing to gain
-by sharing it (no work left to divide). Also pins the leg's arithmetic:
+(COVERED cells the peer has never heard of) and genuinely nothing to gain
+by sharing it (no work left to divide: every cell is COVERED, since an
+UNSEEN cell is allocator work from gen 35). Also pins the leg's arithmetic:
 with both makespans zero, C_re IS the leg, at two different distances, so
 the drive enters the cost one-for-one and not scaled or dropped.
 ```

@@ -110,7 +110,8 @@ Allocation GlobalAllocator::solve(const CellWorld& world,
   std::vector<int> cand;
   for (int id = 0; id < world.size(); ++id) {
     const CellStatus s = world.status(id);
-    if (s == CellStatus::EXPLORING || s == CellStatus::EXPLORING_BY_OTHERS)
+    if (s == CellStatus::UNSEEN || s == CellStatus::EXPLORING ||
+        s == CellStatus::EXPLORING_BY_OTHERS)
       cand.push_back(id);
   }
 
