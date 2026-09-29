@@ -3960,12 +3960,13 @@ void ExploPlannerNode::doPlan() {
 
     // alloc_focus_skips_ is per cell id and counts appearances as focus in
     // which the cell's unknown fraction did not drop, whatever the pick's
-    // rank; no decay. !found neither advances nor resets it.
+    // rank; no decay. !found neither advances nor resets it, and nor does a
+    // cell the census has not measured yet (u = -1).
     // (notes: alloc-focus-staleness-counter)
     const int focus = alloc_ev.focus_cell;
     if (focus >= 0 && focus < static_cast<int>(alloc_focus_skips_.size())) {
-      if (found) {
-        const double u = cell_world_.cell(focus).obs.unknownFraction();
+      const double u = cell_world_.cell(focus).obs.unknownFraction();
+      if (found && u >= 0.0) {
         if (u < alloc_focus_unknown_[focus]) {
           alloc_focus_skips_[focus] = 0;
         } else {

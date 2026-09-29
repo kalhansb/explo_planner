@@ -7768,6 +7768,15 @@ cell's (it under-fires), fired at k=3 in 29/42 slow robot-runs and
 2/88 fast ones. The first appearance always counts as progress (the
 stored value starts at +inf), so k=3 means three failures after it.
 
+An appearance whose cell the census has not measured yet (total_columns
+0, so unknownFraction() returns the -1 sentinel) neither advances nor
+resets the count and is not stored. Only cells inside the map's extent
+are measured (19 of 100 at the start of a run), and comparing the
+sentinel as a number made the first real measurement, say -1 -> 0.7,
+read as "no drop": one spurious failure that wrote a stuck cell off an
+appearance early. Found two minutes into the first gen-35 smoke (binary
+a308ccc95e27154d), which was stopped before it banked anything.
+
 That is deliberately NOT patched into a strict tick run, because the
 demotion's real guard is not the counter at all: `shouldDemoteStaleFocus`
 fires only if a census taken THIS TICK still reads the cell unexplored.
