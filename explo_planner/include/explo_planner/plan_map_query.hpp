@@ -27,8 +27,9 @@ struct Roi2D {
   float max_y;
 };
 
-/// Sentinel for planMapCellAt(): no data — empty/degenerate grid or `pos` out
-/// of bounds. Distinct from the real cell range (-1 unknown, 0..100 occupancy).
+/// Sentinel for planMapCellAt(): no data — empty/degenerate grid (including
+/// `data` not matching `width * height`) or `pos` out of bounds. Distinct
+/// from the real cell range (-1 unknown, 0..100 occupancy).
 inline constexpr int8_t kCellNoData = -2;
 
 /// Raw occupancy value at world XY (-1 unknown, 0..100 cost), or kCellNoData
@@ -50,8 +51,8 @@ bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& grid,
                     const Eigen::Vector3f& pos);
 
 /// Fraction of cells in `roi` (clipped to the grid) whose value is -1
-/// (unknown). Returns -1.0 if the grid is degenerate or the ROI doesn't
-/// overlap it.
+/// (unknown). Returns -1.0 if the grid is degenerate (including `data` not
+/// matching `width * height`) or the ROI doesn't overlap it.
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& grid,
                             const Roi2D& roi);
 

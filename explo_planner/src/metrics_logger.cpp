@@ -2,9 +2,28 @@
 
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace explo_planner {
+
+namespace {
+
+// sim_time_sec is this->now().seconds(), which with the shipped
+// use_sim_time: false is a wall-clock epoch (~1.76e9). At the stream's default
+// 6 significant digits every row of a run prints as "1.75891e+09" — ~1000 s of
+// effective resolution, i.e. one identical timestamp for the whole experiment.
+// Format it here instead of touching the stream's precision, which would then
+// apply to every float column after it.
+std::string epochSeconds(double t) {
+  std::ostringstream ss;
+  ss << std::fixed << std::setprecision(3) << t;
+  return ss.str();
+}
+
+}  // namespace
 
 MetricsLogger::MetricsLogger(const std::string& csv_path)
     : file_(csv_path, std::ios::out | std::ios::trunc) {
@@ -41,7 +60,7 @@ void MetricsLogger::writeHeader() {
 void MetricsLogger::logStep(const StepMetrics& m) {
   if (!header_written_) writeHeader();
   file_ << m.step << ","
-        << m.sim_time_sec << ","
+        << epochSeconds(m.sim_time_sec) << ","
         << m.total_observed_voxels << ","
         << m.frontier_voxels << ","
         << m.distance_traveled << ","

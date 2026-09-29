@@ -69,10 +69,11 @@ force that independent finish even in a multi-robot run.
 
 The anchor needs no configuration — it is recorded automatically from incoming
 peer intents. The barrier waits for `rendezvous_expected_peers` teammates (the
-multi-robot launch sets this from the team size). By default the wait is
-unbounded (STAY until all connected); set `rendezvous_max_wait_sec > 0` as a
-field escape hatch so a robot whose teammate died doesn't hold the anchor
-forever. `max_steps` still ends a run directly, independent of the barrier.
+multi-robot launch sets this from the team size). The shipped
+`rendezvous_max_wait_sec` of 600 s is the field escape hatch: a robot whose
+teammate died gives up the anchor after 10 min instead of holding it forever.
+Set it `<= 0` for an unbounded wait (STAY until all connected). `max_steps`
+still ends a run directly, independent of the barrier.
 
 ### Coordinated proximity stop (multi-robot, default on)
 

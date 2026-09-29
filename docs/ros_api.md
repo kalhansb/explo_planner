@@ -322,7 +322,7 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 |---|---|---|---|
 | `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, drive to the last-connected anchor and wait. |
 | `rendezvous_expected_peers` | int | `0` | Teammates to wait for. **`0` leaves the feature inert** — the multi-robot launch sets team size − 1; set it by hand on hardware. |
-| `rendezvous_max_wait_sec` | double | `0.0` | Barrier give-up (s); `0` = wait forever. |
+| `rendezvous_max_wait_sec` | double | `600.0` | Barrier give-up (s); `<= 0` = wait forever (the C++ fallback is `0.0`). |
 
 **Proximity stop (coordinated yield)** — best-effort coordination, *not* a
 certified safety stop. Right of way: the lexicographically smaller
@@ -549,7 +549,7 @@ one planner per robot PC by hand — this is also the only launch that sets
 | `max_steps` | `100` | Per-robot budget. |
 | `coordination_enabled` | `true` | MinPos deconfliction. |
 | `rendezvous_enabled` | `true` | Anchor-return reconnection. |
-| `rendezvous_max_wait_sec` | `0.0` | Barrier give-up. |
+| `rendezvous_max_wait_sec` | `600.0` | Barrier give-up. |
 | `proximity_stop_enabled` | `true` | Coordinated yield. |
 | `params_file` | `''` | Overlay layered over the shared file — [`config/exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml) on hardware, whose `/<robot>/explo_planner` blocks match these namespaced nodes. See [real_robot_tuning.md](real_robot_tuning.md). |
 

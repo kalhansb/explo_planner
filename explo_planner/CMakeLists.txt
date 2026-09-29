@@ -148,6 +148,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plan_map_query test/test_plan_map_query.cpp)
   target_link_libraries(test_plan_map_query explo_planner_lib)
 
+  ament_add_gtest(test_metrics_logger test/test_metrics_logger.cpp)
+  target_link_libraries(test_metrics_logger explo_planner_lib)
+
   ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
   target_link_libraries(test_failed_goal_blacklist explo_planner_lib)
 

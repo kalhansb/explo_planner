@@ -426,11 +426,11 @@ from the team size anyway. The single-robot launch matches neither, so a
 robot running alone keeps it at 0 — which is right: a robot that has never
 heard a peer has no anchor and simply finishes.
 
-`rendezvous_max_wait_sec` inherits 0.0, which means **wait forever**. A robot
-that exhausts its goals after losing comms drives back to where it last heard
-its teammate and holds there until the team is complete. Correct for a
-controlled trial; a field hazard if the team may not reconvene. Set a finite
-give-up if that is a possibility.
+`rendezvous_max_wait_sec` inherits 600.0: a robot that exhausts its goals
+after losing comms drives back to where it last heard its teammate, holds
+there, and gives up after 10 min if the team never completes. Set it `<= 0`
+to wait forever — correct for a controlled trial that must reconvene, a
+field hazard if the team may not.
 
 ### Calibrated from the validation run
 

@@ -549,9 +549,11 @@ private:
   // Cache key for the UNBOUNDED exploitation flood of cost_grid_ (see
   // doExploitPlan). That flood is O(grid) and EXPLOIT_PLAN re-enters at the
   // full tick rate whenever no vantage is selectable, so it is rebuilt only
-  // when its inputs change. exploit_flood_map_ is an identity handle for the
-  // latched map object — compared, never dereferenced. Invalidated by doPlan's
-  // radius-bounded flood, which overwrites the same grid.
+  // when its inputs change. Invalidated by the planning_map callback on
+  // every new map (pointer identity alone can miss a replacement that reuses
+  // a freed map's address) and by doPlan's radius-bounded flood, which
+  // overwrites the same grid. exploit_flood_map_ is an identity handle for
+  // the latched map object — compared, never dereferenced.
   bool exploit_flood_valid_ = false;
   const void* exploit_flood_map_ = nullptr;
   Eigen::Vector3f exploit_flood_pos_ = Eigen::Vector3f::Zero();
@@ -1170,6 +1172,9 @@ ExploPlannerNode::ExploPlannerNode()
         [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
           latest_plan_map_ = msg;
           have_plan_map_ = true;
+          // A new map object can reuse a freed map's address, so the flood
+          // cache's pointer-identity check alone cannot detect replacement.
+          exploit_flood_valid_ = false;
         });
   }
 

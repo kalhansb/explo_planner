@@ -10,7 +10,8 @@ namespace explo_planner {
 
 int8_t planMapCellAt(const nav_msgs::msg::OccupancyGrid& m,
                      const Eigen::Vector3f& pos) {
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
+  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0 ||
+      m.data.size() != static_cast<size_t>(m.info.width) * m.info.height)
     return kCellNoData;
   int gx = static_cast<int>(std::floor(
       (pos.x() - m.info.origin.position.x) / m.info.resolution));
@@ -37,7 +38,8 @@ bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& m,
 
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
                             const Roi2D& roi) {
-  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0)
+  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0 ||
+      m.data.size() != static_cast<size_t>(m.info.width) * m.info.height)
     return -1.0;
 
   // Convert ROI world bounds to grid indices, clipped to the map.

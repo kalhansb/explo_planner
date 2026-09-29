@@ -64,6 +64,18 @@ TEST(PlanMapQuery, DegenerateGridIsNoData) {
   EXPECT_TRUE(isCellOccupied(zero_res, Eigen::Vector3f::Zero()));
 }
 
+// A grid whose data[] doesn't match width*height (truncated message) is
+// treated as degenerate: sentinel out, never an out-of-range index.
+TEST(PlanMapQuery, TruncatedDataIsNoData) {
+  auto g = makeGrid(10, 10, 1.0f);
+  g.data.resize(10);       // claims 100 cells, carries 10
+  g.data.shrink_to_fit();  // so a pre-fix read is truly out-of-allocation
+  EXPECT_EQ(planMapCellAt(g, cellCenter(g, 5, 5)), kCellNoData);
+  EXPECT_FALSE(isCellFree(g, cellCenter(g, 5, 5)));
+  EXPECT_TRUE(isCellOccupied(g, cellCenter(g, 5, 5)));
+  EXPECT_EQ(unknownFractionInRoi(g, {0.0f, 10.0f, 0.0f, 10.0f}), -1.0);
+}
+
 // isCellFree: only known-free (0..49) passes; unknown/occupied/OOB fail.
 TEST(PlanMapQuery, IsCellFreeClassification) {
   auto g = makeGrid(5, 5, 1.0f);
