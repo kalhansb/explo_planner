@@ -3998,13 +3998,17 @@ void ExploPlannerNode::doPlan() {
           RCLCPP_WARN(get_logger(),
               "Global allocator: focus cell %d made no progress on %d "
               "consecutive solves that held it as focus, and still reads "
-              "unexplored after a fresh census — writing it off as COVERED.",
+              "unexplored after a fresh census — writing it off as COVERED "
+              "and re-planning.",
               focus, alloc_focus_skips_[focus]);
         }
         alloc_focus_skips_[focus] = 0;
       }
     }
     if (exp_log_) exp_log_->logAllocation(expCtx(), alloc_ev);
+    // The pick was made for a tour that still held the written-off cell, so
+    // it is not driven: stay in PLAN and re-solve next tick without it.
+    if (!alloc_ev.demoted.empty()) return;
   }
 
   // ---- Rejection profile of THIS attempt ------------------------------

@@ -7791,7 +7791,8 @@ Two ways a tick declines to answer, and they are different:
     unlucky about somebody else's failure. Neither advances nor resets.
   - some other cell was the focus. Not this cell's tick; untouched.
 Only a tick that selected a goal and had THIS cell in the chair moves
-the number, up on an out-of-focus pick and back to zero on a rank-0 one.
+the number, up when the cell's unknown fraction did not drop and back to
+zero when it did.
 ```
 
 ### alloc-focus-demotion-one-way
@@ -7818,6 +7819,17 @@ off: shouldDemoteStaleFocus accepts only EXPLORING statuses, so an
 UNSEEN front with no progress advances the count and then has it
 reset without a demotion. A cell no one has seen four columns of has
 nothing to write off.
+
+A tick that writes a cell off does not drive its pick (gen 37,
+2026-09-29). The pick was chosen from a tour that still held the cell,
+its rank-0 band being that cell's neighbourhood, so it is one more trip
+to ground the robot has just given up on. In the gen-35/36 smokes every
+write-off (13 of 13) was followed by that trip, 17-82 s long, and the
+longest (82 s, g36smoke n2 hybrid, cell 75) cleared nothing. doPlan
+returns after logging the allocation and the robot stays in PLAN, as on
+a tick with no map; the next tick re-solves with the cell COVERED, so
+the focus moves. Each fire writes off a different cell, so a run of
+re-plans is bounded by the cells a fresh census still reads unexplored.
 ```
 
 ### rejection-profile-placement
