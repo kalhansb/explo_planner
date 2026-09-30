@@ -75,6 +75,7 @@
 #include "explo_planner/cost_grid.hpp"
 #include "explo_planner/coordination.hpp"
 #include "explo_planner/plan_map_query.hpp"
+#include "explo_planner/grid_frontier.hpp"
 #include "explo_planner/planner_util.hpp"
 #include "explo_planner/failed_goal_blacklist.hpp"
 #include "explo_planner/fleet_identity.hpp"
@@ -567,6 +568,17 @@ private:
   bool  frontier_band_set_ = false;
   float frontier_z_lo_off_ = 0.0f;
   float frontier_z_hi_off_ = 0.0f;
+  // "3d" (default): 3D frontier centroids scored by the FOV EIG ray cast.
+  // "2d_frontier" / "2d_raycast": frontiers of the 2D planning_map, scored by
+  // frontier length / by unknown grid area in view, with the cell census on
+  // the same grid. The fused 3D map still feeds coverage termination and the
+  // step metrics in every mode.
+  std::string planner_mode_{"3d"};
+  bool  planner_2d_ = false;
+  // Smallest 8-connected 2D frontier component kept; smaller ones are speckle.
+  int   grid_frontier_min_cells_ = 3;
+  // The sensor model the 2d_raycast gain casts with (fov_* params).
+  FovConfig fov_cfg_2d_;
 
   // --- Exploitation ---
   // Phase 2 (DESIGN_gen34.md Q66). Read so a launch file that sets it is
@@ -1318,6 +1330,30 @@ ExploPlannerNode::ExploPlannerNode()
         frontier_z_lo_off_, frontier_z_hi_off_, roi_min_z_, roi_max_z_);
   }
 
+  // Exploration mode; see the member doc. Refused rather than defaulted: a cell
+  // that silently ran 3d would carry a 2d arm's name.
+  planner_mode_ = dp("planner_mode", std::string("3d"));
+  if (planner_mode_ != "3d" && planner_mode_ != "2d_frontier" &&
+      planner_mode_ != "2d_raycast") {
+    RCLCPP_FATAL(get_logger(),
+        "planner_mode='%s' is not 3d, 2d_frontier or 2d_raycast.",
+        planner_mode_.c_str());
+    throw std::runtime_error("unknown planner_mode '" + planner_mode_ + "'");
+  }
+  planner_2d_ = planner_mode_ != "3d";
+  grid_frontier_min_cells_ =
+      std::max(1, static_cast<int>(dp("grid_frontier_min_cells", 3)));
+  if (planner_2d_) {
+    RCLCPP_INFO(get_logger(),
+        "planner_mode=%s: candidates are planning_map frontiers (components of "
+        ">= %d cells, %.1f m bins), scored by %s; the cell census reads the "
+        "same grid.",
+        planner_mode_.c_str(), grid_frontier_min_cells_,
+        frontier_cluster_radius_m_,
+        planner_mode_ == "2d_frontier" ? "frontier length"
+                                       : "unknown grid area in view");
+  }
+
   // FOV evaluation. Defaults are the VLP-16 the robots carry, matching the SDF;
   // they are what a launch that skips shared_params.yaml gets.
   // (notes: fov-default-vlp16-model)
@@ -1358,6 +1394,7 @@ ExploPlannerNode::ExploPlannerNode()
   fcfg.roi_max_y = ccfg.roi_max_y;
   fcfg.roi_min_z = roi_min_z_;
   fcfg.roi_max_z = roi_max_z_;
+  fov_cfg_2d_ = fcfg;
 
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
@@ -1646,6 +1683,8 @@ ExploPlannerNode::ExploPlannerNode()
     // different endpoints under one column name.
     exp_log_->addParamStr("done_criterion", done_criterion_);
     exp_log_->addParamStr("done_action", done_action_);
+    exp_log_->addParamStr("planner_mode", planner_mode_);
+    exp_log_->addParamNum("grid_frontier_min_cells", grid_frontier_min_cells_);
     exp_log_->addParamNum("mission_home_tol_m", mission_home_tol_m_);
     exp_log_->addParamNum("mission_return_max_sec", mission_return_max_sec_);
     // Failed-goal blacklist and no-progress knobs, logged because the analysis
@@ -1731,6 +1770,12 @@ ExploPlannerNode::ExploPlannerNode()
     // (notes: cellworld-status-thresholds-hysteresis)
     ccw.covered_max_unknown   = dp("cell_covered_max_unknown", 0.15);
     ccw.exploring_min_unknown = dp("cell_exploring_min_unknown", 0.35);
+    // The 2D census reads the planning_map, which saturates where the 3D
+    // column measure has a floor, so it has its own calibration.
+    if (planner_2d_) {
+      ccw.covered_max_unknown   = dp("cell_covered_max_unknown_2d", 0.15);
+      ccw.exploring_min_unknown = dp("cell_exploring_min_unknown_2d", 0.35);
+    }
     ccw.covered_max_frontier_frac =
         dp("cell_covered_max_frontier_frac", 0.90);
     ccw.min_observed_columns  = dp("cell_min_observed_columns", 4);
@@ -3469,11 +3514,34 @@ void ExploPlannerNode::doPlan() {
   // with a 3D occupancy check. Flat mode passes nullptr: only the 2D
   // planning_map filter, when enabled, checks occupancy.
   // (notes: plan-candidate-generation)
+  // The 2D modes read no 3D map here: the polar ring stays flat.
   const MapCache* terrain_map =
-      terrain_relative_z_ ? map_cache_.get() : nullptr;
+      terrain_relative_z_ && !planner_2d_ ? map_cache_.get() : nullptr;
   auto candidates =
       candidate_gen_->generate(robot_pos, robot_yaw, terrain_map);
   size_t n_radial = candidates.size();
+  if (planner_2d_) {
+    // planning_map frontiers, yawed from the robot toward them like the 3D
+    // ones, at the robot's own z (UGV arrival ignores z). The score is the
+    // 2d_frontier gain, the frontier length in metres; 2d_raycast replaces it
+    // below.
+    if (latest_plan_map_) {
+      const float res = latest_plan_map_->info.resolution;
+      for (const GridFrontier& f : findGridFrontiers(
+               *latest_plan_map_,
+               {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_},
+               frontier_cluster_radius_m_, grid_frontier_min_cells_)) {
+        CandidateViewpoint vp;
+        vp.position = Eigen::Vector3f(f.position.x(), f.position.y(),
+                                      robot_pos.z());
+        vp.yaw = std::atan2(f.position.y() - robot_pos.y(),
+                            f.position.x() - robot_pos.x());
+        vp.score = static_cast<float>(f.cells) * res;
+        vp.is_frontier = true;
+        candidates.push_back(vp);
+      }
+    }
+  }
   // Frontier search band. Defaults to the effective ROI band (unchanged
   // behaviour); frontier_z_lo_/hi_ narrow it, and can only ever narrow it.
   float f_lo = eff_roi_min_z_, f_hi = eff_roi_max_z_;
@@ -3491,8 +3559,10 @@ void ExploPlannerNode::doPlan() {
           f_lo, f_hi);
     }
   }
-  auto frontiers = map_cache_->findFrontierCentroids(
-      f_lo, f_hi, frontier_cluster_radius_m_);
+  auto frontiers = planner_2d_
+      ? std::vector<Eigen::Vector3f>()
+      : map_cache_->findFrontierCentroids(f_lo, f_hi,
+                                          frontier_cluster_radius_m_);
   candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos,
                                         terrain_map);
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
@@ -3547,7 +3617,20 @@ void ExploPlannerNode::doPlan() {
   {
     const bool use_traj = trajectory_scoring_
                           && cost_grid_ && !skip_reachability;
-    if (use_traj) {
+    if (planner_2d_) {
+      // 2d_frontier keeps the lengths set above (polar candidates score 0);
+      // 2d_raycast scores every candidate by the unknown area in view.
+      if (planner_mode_ == "2d_raycast" && latest_plan_map_) {
+        const float res = latest_plan_map_->info.resolution;
+        for (auto& c : candidates) {
+          c.score = res * res * static_cast<float>(gridVisibleUnknown(
+              *latest_plan_map_,
+              {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_}, c.position,
+              c.yaw, fov_cfg_2d_.hfov, fov_cfg_2d_.h_rays,
+              fov_cfg_2d_.min_range, fov_cfg_2d_.max_range));
+        }
+      }
+    } else if (use_traj) {
       if (!scoreTrajectory(candidates)) {
         RCLCPP_WARN(get_logger(),
             "Trajectory scoring failed, retrying next tick.");
@@ -3981,7 +4064,12 @@ void ExploPlannerNode::doPlan() {
         // rate limiter, so the cell's observation can be a full
         // cell_census_period_s old, and demoting on stale evidence is exactly
         // how a cell that HAS been cleared gets written off.
-        if (map_cache_) {
+        if (planner_2d_) {
+          if (latest_plan_map_) {
+            cell_world_.applyObservation(
+                censusFromPlanMap(*latest_plan_map_, cell_world_.grid()));
+          }
+        } else if (map_cache_) {
           cell_world_.applyObservation(
               censusFromMap(*map_cache_, cell_world_.grid()));
         }
@@ -5491,9 +5579,13 @@ void ExploPlannerNode::updateCellWorld(double roi_unknown_fraction,
     return;
   last_cell_census_sec_ = t;
 
-  const int changed =
-      cell_world_.applyObservation(censusFromMap(*map_cache_,
-                                                 cell_world_.grid()));
+  // The 2D modes census the planning_map; before one arrives the empty
+  // observation leaves every cell as it is.
+  const int changed = cell_world_.applyObservation(
+      !planner_2d_ ? censusFromMap(*map_cache_, cell_world_.grid())
+      : latest_plan_map_
+          ? censusFromPlanMap(*latest_plan_map_, cell_world_.grid())
+          : std::vector<CellWorld::CellObservation>());
 
   // Edges are rebuilt every census from the plan map as it fills. With no plan
   // map every edge is enabled; an all-disabled graph would rank nothing.

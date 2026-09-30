@@ -185,6 +185,15 @@
     # one centroid per bin is emitted as a long-range candidate. Larger ->
     # fewer, coarser frontier targets.
     frontier_cluster_radius_m: 5.0
+    # Exploration mode. "3d": 3D frontier centroids scored by the FOV EIG ray
+    # cast. "2d_frontier" / "2d_raycast": frontiers of the 2D planning_map
+    # (needs use_planning_map), binned by frontier_cluster_radius_m and scored
+    # by frontier length / by unknown grid area in view within fov_max_range;
+    # the cell census then reads the same grid (cell_*_2d thresholds). Coverage
+    # termination and the step metrics stay on the fused 3D map in every mode.
+    planner_mode: "3d"
+    # Smallest 8-connected planning_map frontier component kept (2d modes).
+    grid_frontier_min_cells: 3
     # Inset (m) of the frontier search band from the ROI z band, bottom and top;
     # it only narrows. At 0/0 the frontier set is the permanent FOV-wedge
     # surface and coverage termination is unreachable.
@@ -296,6 +305,11 @@
     cell_covered_max_unknown: 0.55
     cell_exploring_min_unknown: 0.62
     cell_covered_max_frontier_frac: 0.95
+    # The same pair for the 2d planner modes, whose census reads the
+    # planning_map. That grid saturates (seen cells read 0 unknown), so the
+    # library defaults hold there.
+    cell_covered_max_unknown_2d: 0.15
+    cell_exploring_min_unknown_2d: 0.35
 
     # Reconnect master switch; false = the control arm. reconnect_mode picks the
     # manoeuvre. Inert unless coordination_enabled and rendezvous_expected_peers

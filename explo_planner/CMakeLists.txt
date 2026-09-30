@@ -60,6 +60,7 @@ add_library(explo_planner_lib
   src/coordination.cpp
   src/proximity_guard.cpp
   src/plan_map_query.cpp
+  src/grid_frontier.cpp
   src/failed_goal_blacklist.cpp
   src/planner_util.cpp
   src/fleet_identity.cpp
@@ -195,6 +196,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_plan_map_query test/test_plan_map_query.cpp)
   target_link_libraries(test_plan_map_query explo_planner_lib)
+
+  ament_add_gtest(test_grid_frontier test/test_grid_frontier.cpp)
+  target_link_libraries(test_grid_frontier explo_planner_lib)
 
   ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
   target_link_libraries(test_failed_goal_blacklist explo_planner_lib)
