@@ -954,6 +954,17 @@ rg "REFUSED(rc=2)" "TX_MODEL=bogus fails up front"            "$RG_ARM"
 RG_ENV="SHARE_FULL_PERIOD_S=junk"
 rg "REFUSED(rc=2)" "SHARE_FULL_PERIOD_S=junk fails up front"  "$RG_ARM"
 unset RG_ENV
+# planner_mode: absent is 3d, every manifest from before the 2D modes.
+rg SKIP  "planner_mode absent predates it: 3d"                "$RG_ARM" planner_mode "<none>"
+rg SKIP  "planner_mode=3d agrees with the default"            "$RG_ARM" planner_mode 3d
+rg ABORT "a 2d_frontier cell under a 3d campaign"             "$RG_ARM" planner_mode 2d_frontier
+RG_ENV="PLANNER_MODE=2d_raycast"
+rg SKIP  "a 2d_raycast cell resumes a 2d_raycast campaign"    "$RG_ARM" planner_mode 2d_raycast
+rg ABORT "an old cell (absent) under a 2d_raycast campaign"   "$RG_ARM" planner_mode "<none>"
+rg ABORT "a 2d_frontier cell under a 2d_raycast campaign"     "$RG_ARM" planner_mode 2d_frontier
+RG_ENV="PLANNER_MODE=2d"
+rg "REFUSED(rc=2)" "PLANNER_MODE=2d fails up front"           "$RG_ARM"
+unset RG_ENV
 
 # --- the verdict itself, which the resume guard used to read one bit of ------
 # A banked SUSPECT, verdict-less or unknown-verdict cell still skips but says so
@@ -1039,7 +1050,8 @@ for _spec in SEPARATION_WEIGHT:SEPARATION_WEIGHT_REQ \
              SEPARATION_RADIUS_M:SEPARATION_RADIUS_REQ \
              SEPARATION_MAX_AGE_SEC:SEPARATION_MAX_AGE_REQ \
              SHARE_FULL_PERIOD_S:SHARE_FULL_PERIOD_REQ \
-             TX_MODEL:TX_MODEL_REQ; do
+             TX_MODEL:TX_MODEL_REQ \
+             PLANNER_MODE:PLANNER_MODE_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\${$_ek:-\(.*\)}\"$/\1/p" "$LAUNCHER" | head -1)

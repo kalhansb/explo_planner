@@ -852,6 +852,18 @@ if [ "$TX_MODEL" != admission ] && [ "$COMMS" != "1" ]; then
   echo "FATAL: TX_MODEL=$TX_MODEL needs COMMS=1 (it configures the emulator)." >&2
   exit 2
 fi
+# The planner's exploration mode (explo_planner planner_mode). 3d (default):
+# 3D frontier centroids scored by the FOV EIG ray cast. 2d_frontier /
+# 2d_raycast: planning_map frontiers scored by frontier length / by unknown
+# area in view, with the cell census on that grid under the yaml's cell_*_2d
+# pair, not CELL_COVERED_U / CELL_EXPLORING_U. Every mode stops on the same
+# done latch.
+PLANNER_MODE="${PLANNER_MODE:-3d}"
+case "$PLANNER_MODE" in
+  3d|2d_frontier|2d_raycast) ;;
+  *) echo "FATAL: PLANNER_MODE='$PLANNER_MODE' is not 3d, 2d_frontier or 2d_raycast." >&2
+     exit 2 ;;
+esac
 # Planner ROI half-extent (m), sim only, square about the world origin. The
 # yaml's field-site ROI is largely empty here, so coverage could never
 # terminate; 50 fits the ground plane and the planning map below.
@@ -1749,6 +1761,10 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "map_stream=$MAP_STREAM"
   # Absent: a manifest from before section 12.12, which ran admission.
   echo "transmission_model=$TX_MODEL"
+  # Absent: a manifest from before the 2D modes, which ran 3d. A 2D cell's
+  # cell_covered_max_unknown / cell_exploring_min_unknown above are not the
+  # ones its census used; its events.jsonl params carry the effective pair.
+  echo "planner_mode=$PLANNER_MODE"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -2161,6 +2177,7 @@ for r in $ROBOTS; do
       -p roi_min_x:=-$ROI_HALF -p roi_max_x:=$ROI_HALF \
       -p roi_min_y:=-$ROI_HALF -p roi_max_y:=$ROI_HALF \
       -p use_planning_map:=true \
+      -p planner_mode:=$PLANNER_MODE \
       -p planning_map_topic:=/$r/dscovox_node/global_planning_map \
       -p done_coverage_source:=scovox \
       -p cost_grid_radius_cap_m:=$COST_CAP \

@@ -346,6 +346,8 @@ SHARE_FULL_PERIOD_REQ=$(env_val SHARE_FULL_PERIOD_S 0)
 # The emulator's transmission model (section 12.12), default duplicated from
 # the runner.
 TX_MODEL_REQ=$(env_val TX_MODEL admission)
+# The planner's exploration mode, default duplicated from the runner.
+PLANNER_MODE_REQ=$(env_val PLANNER_MODE 3d)
 # Checked here too, so a bad value fails once rather than per cell after a
 # bring-up each; the runner's own checks stay authoritative.
 case "$SHARE_FULL_PERIOD_REQ" in
@@ -356,6 +358,10 @@ esac
 case "$TX_MODEL_REQ" in
   admission|progressive) ;;
   *) log "ABORT: TX_MODEL='$TX_MODEL_REQ' is not admission or progressive."; exit 2 ;;
+esac
+case "$PLANNER_MODE_REQ" in
+  3d|2d_frontier|2d_raycast) ;;
+  *) log "ABORT: PLANNER_MODE='$PLANNER_MODE_REQ' is not 3d, 2d_frontier or 2d_raycast."; exit 2 ;;
 esac
 if [ "$COMMS_ON" = "0" ] && { [ "$TX_MODEL_REQ" != admission ] || \
      awk -v v="$SHARE_FULL_PERIOD_REQ" 'BEGIN { exit !(v + 0 > 0) }'; }; then
@@ -430,6 +436,7 @@ for cell in "${CELL_LIST[@]}"; do
       "link_gate=$LINK_GATE_REQ" \
       "link_gate_effective=$LINK_GATE_EFFECTIVE_REQ" \
       "transmission_model=$TX_MODEL_REQ" \
+      "planner_mode=$PLANNER_MODE_REQ" \
       "radio=$RADIO_ON" \
       "done_seek_enabled=false"
     do
@@ -445,6 +452,10 @@ for cell in "${CELL_LIST[@]}"; do
       # Absent is v1: every manifest from before hmr_radio.
       if [ "$k" = "radio" ] && [ -z "$have" ]; then
         have=v1
+      fi
+      # Absent is 3d: every manifest from before the 2D planner modes.
+      if [ "$k" = "planner_mode" ] && [ -z "$have" ]; then
+        have=3d
       fi
       if [ "${have:-<absent>}" != "$want" ]; then
         log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
@@ -598,7 +609,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u PURSUIT_PREDICTOR \
       -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
       -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
-      -u SHARE_FULL_PERIOD_S -u TX_MODEL \
+      -u SHARE_FULL_PERIOD_S -u TX_MODEL -u PLANNER_MODE \
       -u DONE_GRACE_S -u HANG_HB -u POLL_S \
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \
