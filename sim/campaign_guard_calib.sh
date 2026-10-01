@@ -965,6 +965,18 @@ rg ABORT "a 2d_frontier cell under a 2d_raycast campaign"     "$RG_ARM" planner_
 RG_ENV="PLANNER_MODE=2d"
 rg "REFUSED(rc=2)" "PLANNER_MODE=2d fails up front"           "$RG_ARM"
 unset RG_ENV
+# done_coverage_source: absent is scovox, every manifest from before it was
+# recorded.
+rg SKIP  "done_coverage_source absent predates it: scovox"    "$RG_ARM" done_coverage_source "<none>"
+rg SKIP  "done_coverage_source=scovox agrees with the default" "$RG_ARM" done_coverage_source scovox
+rg ABORT "a planning_map cell under a scovox campaign"        "$RG_ARM" done_coverage_source planning_map
+RG_ENV="DONE_SOURCE=planning_map"
+rg SKIP  "a planning_map cell resumes a planning_map campaign" "$RG_ARM" done_coverage_source planning_map
+rg ABORT "an old cell (absent) under a planning_map campaign" "$RG_ARM" done_coverage_source "<none>"
+rg ABORT "a scovox cell under a planning_map campaign"        "$RG_ARM" done_coverage_source scovox
+RG_ENV="DONE_SOURCE=auto"
+rg "REFUSED(rc=2)" "DONE_SOURCE=auto fails up front"          "$RG_ARM"
+unset RG_ENV
 
 # --- the verdict itself, which the resume guard used to read one bit of ------
 # A banked SUSPECT, verdict-less or unknown-verdict cell still skips but says so
@@ -1051,7 +1063,8 @@ for _spec in SEPARATION_WEIGHT:SEPARATION_WEIGHT_REQ \
              SEPARATION_MAX_AGE_SEC:SEPARATION_MAX_AGE_REQ \
              SHARE_FULL_PERIOD_S:SHARE_FULL_PERIOD_REQ \
              TX_MODEL:TX_MODEL_REQ \
-             PLANNER_MODE:PLANNER_MODE_REQ; do
+             PLANNER_MODE:PLANNER_MODE_REQ \
+             DONE_SOURCE:DONE_SOURCE_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\${$_ek:-\(.*\)}\"$/\1/p" "$LAUNCHER" | head -1)

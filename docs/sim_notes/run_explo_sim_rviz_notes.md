@@ -2453,15 +2453,17 @@ fallback. There is no fallback destination any more, in any arm.
 
 ### done-coverage-source-scovox
 
-**Coverage source pinned to scovox** — attached to `log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}` (line 2689)
+**Coverage source is DONE_SOURCE, never auto** — attached to `DONE_SOURCE="${DONE_SOURCE:-scovox}"` (line 976)
 
 ```text
-done_coverage_source is pinned to scovox, NOT left on "auto". auto switches to
-the 2D planning_map the instant one is received, so enabling the planning map
-would have silently swapped the termination metric from 2.5D column coverage
-of the ROI to 2D cell coverage — a different number against the same
-done_unknown_fraction threshold, changing when every run ends and invalidating
-any comparison with runs recorded before this change.
+done_coverage_source comes from DONE_SOURCE (default scovox), NOT "auto". auto
+switches to the 2D planning_map the instant one is received, so enabling the
+planning map would have silently swapped the termination metric from 2.5D
+column coverage of the ROI to 2D cell coverage — a different number against the
+same done_unknown_fraction threshold, changing when every run ends and
+invalidating any comparison with runs recorded before this change.
+DONE_SOURCE=planning_map chooses the 2D grid on purpose. Its floor is not the
+scovox floor, so it always travels with its own DONE_UNKNOWN.
 ```
 
 ## 6a. run manifest

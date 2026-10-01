@@ -967,6 +967,18 @@ case "$DONE_CRITERION" in
   *) echo "DONE_CRITERION must be 'latch' or 'streak', got '$DONE_CRITERION'" >&2
      exit 2 ;;
 esac
+# Which map the done latch measures (explo_planner done_coverage_source).
+# scovox (default): the 3D column fraction. planning_map: the 2D fused
+# planning_map grid, a different quantity with its own floor, so it needs its
+# own DONE_UNKNOWN. Never auto: auto switches to the planning_map when one
+# arrives, changing the metric against the same threshold.
+# (notes: done-coverage-source-scovox)
+DONE_SOURCE="${DONE_SOURCE:-scovox}"
+case "$DONE_SOURCE" in
+  scovox|planning_map) ;;
+  *) echo "FATAL: DONE_SOURCE='$DONE_SOURCE' is not scovox or planning_map." >&2
+     exit 2 ;;
+esac
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
 # Own DDS domain, not 0: other ROS work on this box uses 0, and a second /clock
 # there corrupts every use_sim_time node. Children inherit it; export the same
@@ -1606,10 +1618,7 @@ log "exploit_dwell_sync_enabled=$DWELL_SYNC_ARG (DWELL_SYNC=$DWELL_SYNC)"
 log "reconnect_mode=$MODE_ARG reconnect_enabled=$RECONNECT_ENABLED (RECONNECT_MODE=$RECONNECT_MODE)"
 log "reconnect gates: confirm=${RECONNECT_CONFIRM}s barrier_max_wait=${RDV_MAX_WAIT}s"
 log "roi x,y = [-$ROI_HALF, $ROI_HALF] (sim override; yaml carries the field site's ROI)"
-# done_coverage_source is pinned to scovox, not auto: auto switches to the 2D
-# planning_map when one arrives, changing the termination metric against the
-# same done_unknown_fraction. (notes: done-coverage-source-scovox)
-log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=scovox"
+log "planning_map = /<r>/dscovox_node/global_planning_map (FUSED team map, ${PLAN_MAP_SIZE}m @ ${PLAN_MAP_RES}m/cell), done_coverage_source=$DONE_SOURCE"
 
 # --- 6a. run manifest -------------------------------------------------------
 # Everything that distinguishes this run, written into the run directory. Git
@@ -1806,7 +1815,7 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "voxel_resolution_m=$VOXEL_RES"
   echo "done_unknown_fraction=$DONE_UNKNOWN"
   echo "done_criterion=$DONE_CRITERION"
-  echo "done_coverage_source=scovox"
+  echo "done_coverage_source=$DONE_SOURCE"
   echo "prox_hold_m=$PROX_HOLD_M"
   echo "prox_resume_m=$PROX_RESUME_M"
   echo "targets=$TARGETS"
@@ -2179,7 +2188,7 @@ for r in $ROBOTS; do
       -p use_planning_map:=true \
       -p planner_mode:=$PLANNER_MODE \
       -p planning_map_topic:=/$r/dscovox_node/global_planning_map \
-      -p done_coverage_source:=scovox \
+      -p done_coverage_source:=$DONE_SOURCE \
       -p cost_grid_radius_cap_m:=$COST_CAP \
       -p candidate_min_goal_dist_m:=$MIN_GOAL_DIST \
       -p utility_cost_exponent:=$UTIL_GAMMA \
