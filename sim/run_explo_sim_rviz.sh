@@ -143,8 +143,9 @@ PROX_RESUME_M="$(flt "${PROX_RESUME_M:-2.5}")"
 DWELL_SYNC="${DWELL_SYNC:-1}"
 # --- Planner generation (DESIGN_gen34.md §8.9) ------------------------------
 # explo_planner_node is generation 34 (the gen-33 node is backed up, unbuilt,
-# in ../backup/gen33/). ARM is its one team knob (off | pursuit | rendezvous |
-# hybrid, default hybrid). Every arm runs mtare_off's exploration stack (cell
+# in ../backup/gen33/). ARM is its per-cell team knob (off | pursuit |
+# rendezvous | hybrid, default hybrid); the meeting interval, RDV_INTERVAL, is
+# set per campaign. Every arm runs mtare_off's exploration stack (cell
 # world, the team exchange, the global allocator, no gen-33 manoeuvre), so the
 # arm is the only difference between cells. Refused: RECONNECT_MODE (gen 33's
 # arm token), EXPLOIT=1 (phase 2), DONE_SEEK=1, MISSION_RETURN=0 (gen 34
@@ -353,14 +354,13 @@ HOLD_ESCALATE_ARG=$([ "$HOLD_ESCALATE" = "1" ] && echo true || echo false)
 HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
 # ---------------------------------------------------------------------------
 # The rendezvous treatment knobs, passed explicitly even at their defaults so
-# every manifest records them. RDV_DEPART_DELAY is inert, still passed so the
-# param rows keep their schema. (notes: rdv-countdown-knobs)
+# every manifest records them. Gen 34 declares none of the rendezvous_* params,
+# so RDV_DEPART_DELAY, RDV_MAX_LATE, RDV_SETTLE, RDV_APPT_WAIT and
+# RDV_LATCHED_HOLD are inert, still passed so the param rows keep their schema;
+# the notes below give their gen-33 meanings. (notes: rdv-countdown-knobs)
 # RDV_MAX_LATE: the most lateness a robot may accept when picking its lattice
-# rung at arming, clamped at zero. RDV_INTERVAL minus this bounds hybrid's chase
-# window; 0 = on time or the next rung. (notes: rdv-max-late)
-# RDV_INTERVAL: spacing of the meeting timetable, the shortest gap between legal
-# meeting instants and the floor on the derived interval. It moves the lattice
-# only, not the proposal period. (notes: rdv-interval-lattice)
+# rung at arming, clamped at zero; 0 = on time or the next rung.
+# (notes: rdv-max-late)
 #   RDV_SETTLE        seconds to hold at the cell AFTER the team is whole again,
 #                     so the map merge completes before anyone leaves. Not a
 #                     safety margin on the barrier — a separate, later hold.
@@ -370,9 +370,15 @@ HOLD_ESCALATE_WAIT="$(flt "${HOLD_ESCALATE_WAIT:-300}")"
 #                     value turns the rendezvous arm into something else; it
 #                     exists so that can be MEASURED, not so it can be tuned in.
 # RDV_LATCHED_HOLD: cap on a finished robot's wait at the agreed cell, clocked
-# from max(arrival, t_meet). Must cover one rolled rung: RDV_INTERVAL +
-# RDV_MAX_LATE + 60 s. Re-derive if either moves; nothing checks it.
-# (notes: rdv-latched-hold)
+# from max(arrival, t_meet). (notes: rdv-latched-hold)
+# RDV_INTERVAL is live: it is also passed as meeting_interval_sec, the spacing
+# of the gen-34 meeting timetable (slot k at t0 + k*interval, t0 = the first
+# proposal + interval, both fixed by plan version 1; DESIGN_gen34 Q54). 300 is
+# the node's compiled default. Keep it above the 120 s meeting window: at or
+# under it a missed slot closes only as the next one starts, so the next one
+# can never be booked (Q29). The window, the 120 s chase departure margin, the
+# 120 s patience and the 600 s backstop do not scale with it, and
+# gen34_check.py accepts only the levels it lists.
 # START_HOLD: pre-mission hold (s) in every arm, so the team agrees its
 # rendezvous place while co-located; 0 disables. It does not contain the
 # provisional-to-final rendezvous upgrade. (notes: start-hold-pre-mission)
@@ -1641,13 +1647,17 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   # Per-robot JSONL event stream: the run's primary record. The manifest names
   # it so a reader knows to look for it (and knows it is missing if it is).
   echo "experiment_log=<robot>.events.jsonl"
-  # Which planner ran, and its team knob. The gen-33 manoeuvre lines below
+  # Which planner ran, and its team knobs. The gen-33 manoeuvre lines below
   # (reconnect_*, rendezvous_*, pursuit_*, midrun, done_seek, hold_escalate,
   # link_gate*, team_world_hz, reconnect_gate, rendezvous_schedule,
   # pursuit_predictor) name knobs the binary never reads; arm is the arm.
   echo "node=$NODE"
   echo "planner_exe=$PLANNER_EXE"
   echo "arm=${ARM:-none}"
+  # The meeting interval the node ran (RDV_INTERVAL, set per campaign). A
+  # manifest without this line predates the -p, and its node ran the compiled
+  # 300.
+  echo "meeting_interval_sec=$RDV_INTERVAL"
   echo "team_exchange_topic=$TEAM_XCHG_TOPIC"
   echo "best_effort_priority=${BEST_EFFORT_PRIORITY:-params-file}"
   echo "reconnect_mode_requested=$RECONNECT_MODE"
@@ -2177,6 +2187,7 @@ for r in $ROBOTS; do
       -p rendezvous_depart_delay_sec:=$RDV_DEPART_DELAY \
       -p rendezvous_max_lateness_sec:=$RDV_MAX_LATE \
       -p rendezvous_interval_sec:=$RDV_INTERVAL \
+      -p meeting_interval_sec:=$RDV_INTERVAL \
       -p rendezvous_settle_sec:=$RDV_SETTLE \
       -p rendezvous_appointment_wait_sec:=$RDV_APPT_WAIT \
       -p rendezvous_latched_hold_sec:=$RDV_LATCHED_HOLD \

@@ -265,7 +265,7 @@ TEAM_WORLD_HZ_REQ="$(env_val TEAM_WORLD_HZ 1.0)"
 # by nothing but stays in both lists on purpose. (notes: ambient-knob-warning)
 for _amb in LINK_GATE MIDRUN_SILENCE \
             CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
-            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR \
+            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR RDV_INTERVAL \
             STOP_ON_DONE DONE_GRACE_S HANG_HB GATES_STRICT POLL_S \
             CLOCK_EVERY_S CLOCK_DEADMAN_S CLOCK_FAIL_MAX MAP_AGREE_MAX_PCT \
             GZ_GUI; do
@@ -350,6 +350,9 @@ TX_MODEL_REQ=$(env_val TX_MODEL admission)
 PLANNER_MODE_REQ=$(env_val PLANNER_MODE 3d)
 # The map the done latch measures, default duplicated from the runner.
 DONE_SOURCE_REQ=$(env_val DONE_SOURCE scovox)
+# The meeting interval (meeting_interval_sec), default duplicated from the
+# runner.
+RDV_INTERVAL_REQ=$(env_val RDV_INTERVAL 300)
 # Checked here too, so a bad value fails once rather than per cell after a
 # bring-up each; the runner's own checks stay authoritative.
 case "$SHARE_FULL_PERIOD_REQ" in
@@ -493,7 +496,8 @@ for cell in "${CELL_LIST[@]}"; do
       "separation_max_age_sec=$SEPARATION_MAX_AGE_REQ" \
       "share_full_period_s=$SHARE_FULL_PERIOD_REQ" \
       "reconnect_midrun_silence_sec=$MIDRUN_SILENCE_REQ" \
-      "team_world_hz=$TEAM_WORLD_HZ_REQ"
+      "team_world_hz=$TEAM_WORLD_HZ_REQ" \
+      "meeting_interval_sec=$RDV_INTERVAL_REQ"
     do
       k="${kv%%=*}"; want="${kv#*=}"
       # v1's three dials do not exist under a v2 profile; radio= above holds it.
@@ -510,6 +514,13 @@ for cell in "${CELL_LIST[@]}"; do
       if [ "$k" = "share_full_period_s" ] && [ -z "$have" ] && \
          ! grep -q '^share_full_period_s=\|^map_stream=' "$out/run_manifest.txt" 2>/dev/null; then
         have=0
+      fi
+      # Absent is 300: no runner passed meeting_interval_sec before this line
+      # was written, so the node ran its compiled 300. A present but empty
+      # line is a damaged manifest and still aborts.
+      if [ "$k" = "meeting_interval_sec" ] && [ -z "$have" ] && \
+         ! grep -q '^meeting_interval_sec=' "$out/run_manifest.txt" 2>/dev/null; then
+        have=300
       fi
       same=0
       if [ "$want" = "none" ] || [ "${have:-<absent>}" = "none" ]; then
@@ -622,6 +633,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
       -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
       -u SHARE_FULL_PERIOD_S -u TX_MODEL -u PLANNER_MODE -u DONE_SOURCE \
+      -u RDV_INTERVAL \
       -u DONE_GRACE_S -u HANG_HB -u POLL_S \
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \

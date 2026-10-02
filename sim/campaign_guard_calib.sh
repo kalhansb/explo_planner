@@ -781,6 +781,7 @@ link_gate_effective=0
 done_seek_enabled=false
 reconnect_midrun_silence_sec=90
 team_world_hz=1.0
+meeting_interval_sec=300.0
 EOF
   echo "arm=$1"
 }
@@ -977,6 +978,17 @@ rg ABORT "a scovox cell under a planning_map campaign"        "$RG_ARM" done_cov
 RG_ENV="DONE_SOURCE=auto"
 rg "REFUSED(rc=2)" "DONE_SOURCE=auto fails up front"          "$RG_ARM"
 unset RG_ENV
+# meeting_interval_sec: absent is 300, every manifest from before the runner
+# passed it; a present but empty line is not absent.
+rg SKIP  "meeting_interval_sec absent predates it: 300"       "$RG_ARM" meeting_interval_sec "<none>"
+rg SKIP  "meeting_interval_sec=300 agrees with 300.0"         "$RG_ARM" meeting_interval_sec 300
+rg ABORT "a 150 s cell under a 300 s campaign"                "$RG_ARM" meeting_interval_sec 150.0
+rg ABORT "meeting_interval_sec= (truncated line) is not absent" "$RG_ARM" meeting_interval_sec ""
+RG_ENV="RDV_INTERVAL=150"
+rg SKIP  "a 150 s cell resumes a 150 s campaign"              "$RG_ARM" meeting_interval_sec 150.0
+rg ABORT "an old cell (absent) under a 150 s campaign"        "$RG_ARM" meeting_interval_sec "<none>"
+rg ABORT "a 300 s cell under a 150 s campaign"                "$RG_ARM" meeting_interval_sec 300.0
+unset RG_ENV
 
 # --- the verdict itself, which the resume guard used to read one bit of ------
 # A banked SUSPECT, verdict-less or unknown-verdict cell still skips but says so
@@ -1037,10 +1049,10 @@ echo
 echo "=== the resume guard's copies of the launcher defaults must still be true ==="
 # The resume guard keeps copies of launcher defaults to predict each manifest; a
 # stale copy aborts correct resumes or skips cells from the wrong regime. Read
-# TREE_ATTEN, MAX_RANGE and CELL_SIZE_M back.
+# TREE_ATTEN, MAX_RANGE, CELL_SIZE_M and RDV_INTERVAL back.
 # (notes: guardcal-resume-default-readback)
 for _spec in TREE_ATTEN:TREE_ATTEN_REQ MAX_RANGE:MAX_RANGE_REQ \
-             CELL_SIZE_M:CELL_SIZE_REQ; do
+             CELL_SIZE_M:CELL_SIZE_REQ RDV_INTERVAL:RDV_INTERVAL_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\$(flt \"\${$_ek:-\(.*\)}\")\"\$/\1/p" "$LAUNCHER" | head -1)

@@ -577,6 +577,27 @@ case("stamped starvation latch differs",
 case("a bound not stamped",
      lambda f: f.params.pop("chase_limit_sec"), 3,
      r"\[bounds\] atlas: chase_limit_sec not stamped")
+# The meeting interval's copy is the level the manifest names; absent is 300.
+case("a 300 s manifest line (clean)",
+     lambda f: f.manifest.update(meeting_interval_sec="300.0"), 0)
+case("a 150 s cell at its own level (clean)",
+     lambda f: [f.manifest.update(meeting_interval_sec="150.0"),
+                f.params.update(meeting_interval_sec=150.0)], 0)
+case("a 150 s manifest over a 300 s run",
+     lambda f: f.manifest.update(meeting_interval_sec="150.0"), 1,
+     r"\[bounds\] atlas: meeting_interval_sec=300, the checker's bound is "
+     r"150")
+case("a 150 s run with no manifest line is checked at 300",
+     lambda f: f.params.update(meeting_interval_sec=150.0), 1,
+     r"\[bounds\] atlas: meeting_interval_sec=150, the checker's bound is "
+     r"300")
+case("a level the checker does not list",
+     lambda f: [f.manifest.update(meeting_interval_sec="120.0"),
+                f.params.update(meeting_interval_sec=120.0)], 1,
+     r"\[bounds\] manifest meeting_interval_sec='120.0' is not one of")
+case("a truncated manifest line is not absent",
+     lambda f: f.manifest.update(meeting_interval_sec=""), 1,
+     r"\[bounds\] manifest meeting_interval_sec='' is not one of")
 
 print("refusals")
 case("schema 12", lambda f: setattr(f, "schema", 12), 2,
@@ -672,6 +693,11 @@ for k, v in G.BOUNDS.items():
         f"node {have}, checker {v}")
     stamped = re.search(r'addParamNum\(\s*"' + re.escape(k) + '"', node)
     pin(f"bound {k} is stamped in run_start", bool(stamped))
+
+pin("the meeting interval levels hold the node default",
+    G.BOUNDS["meeting_interval_sec"] in G.MEETING_INTERVAL_LEVELS,
+    f"levels {G.MEETING_INTERVAL_LEVELS}, bound "
+    f"{G.BOUNDS['meeting_interval_sec']}")
 
 core = open(CORE_SRC).read()
 mm = re.search(r"counterNames\(\)\s*\{.*?=\s*\{(.*?)\};", core, re.S)

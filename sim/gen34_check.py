@@ -9,7 +9,8 @@ claim of contact is checked against the link trace, which no robot writes
 Per cell:
   bounds     the stamped bounds equal this checker's own copies (§9.4: the
              detector holds its own copy of every bound and checks the run
-             against it, never reads it from the run)
+             against it, never reads it from the run); the meeting interval
+             has one copy per level, and the manifest names the level
   contact    every exchange done or done_late, booking pair_met, chase
              contact and all-connected tick has a live link in link_states.csv
              inside the presence window before it (two windows for a pair the
@@ -74,6 +75,11 @@ BOUNDS = {
     "tick_event_period_sec": 2.0,
     "plan_starve_finish_sec": 300.0,
 }
+# The meeting interval is the one bound run at more than one level. The
+# manifest's meeting_interval_sec picks the copy; absent is a cell from before
+# the runner passed it, whose node ran the compiled BOUNDS value. A level not
+# listed here is a fail, not a new bound.
+MEETING_INTERVAL_LEVELS = (300.0, 150.0)
 
 # Beacon receipt is stamped at the node's next drain, the link trace at 5 Hz.
 # A PLAN solve holds the drain back: 1.9-2.7 s over the gen-34 control and
@@ -276,6 +282,15 @@ def check_cell(path):
     rid = {name: k for k, name in enumerate(robots)}
     comms = man.get("comms") == "1"
     end_reason = man.get("run_end_reason")
+    bounds = dict(BOUNDS)
+    level = man.get("meeting_interval_sec")
+    if level is not None:
+        if num(level) in MEETING_INTERVAL_LEVELS:
+            bounds["meeting_interval_sec"] = num(level)
+        else:
+            c.fail("bounds", f"manifest meeting_interval_sec={level!r} is not "
+                             f"one of the checker's levels "
+                             f"{', '.join(f'{v:g}' for v in MEETING_INTERVAL_LEVELS)}")
 
     # Events per robot.
     events = {}
@@ -299,7 +314,7 @@ def check_cell(path):
         if params.get("arm") != c.arm:
             c.fail("bounds", f"{r}: run_start arm={params.get('arm')!r} but "
                              f"the manifest says {c.arm!r}")
-        for k, want in BOUNDS.items():
+        for k, want in bounds.items():
             have = num(params.get(k))
             if have is None:
                 c.unres("bounds", f"{r}: {k} not stamped in run_start")
