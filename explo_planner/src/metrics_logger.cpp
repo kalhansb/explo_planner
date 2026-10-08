@@ -53,7 +53,9 @@ void MetricsLogger::writeHeader() {
         << "coord_active_peers,rejected_by_minpos,rejected_by_unreachable,"
         << "phase,target_id,vantage_index,n_vantages_valid,"
         << "vantage_los_clear,dwell_sec,"
-        << "prox_hold_count,prox_hold_total_sec\n";
+        << "prox_hold_count,prox_hold_total_sec,"
+        << "goal_outcome,nav_elapsed_sec,goal_path_length_m,"
+        << "nav2_aborts,nav2_recoveries,nav2_error_code\n";
   header_written_ = true;
 }
 
@@ -84,7 +86,13 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.vantage_los_clear << ","
         << m.dwell_sec << ","
         << m.prox_hold_count << ","
-        << m.prox_hold_total_sec << "\n";
+        << m.prox_hold_total_sec << ","
+        << m.goal_outcome << ","
+        << m.nav_elapsed_sec << ","
+        << m.goal_path_length_m << ","
+        << m.nav2_aborts << ","
+        << m.nav2_recoveries << ","
+        << m.nav2_error_code << "\n";
   file_.flush();
 }
 

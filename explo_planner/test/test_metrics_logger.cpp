@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -91,7 +92,7 @@ TEST(MetricsLogger, HeaderAndRowHaveSameColumnCount) {
   EXPECT_EQ(splitCsv(lines[0]).size(), splitCsv(lines[1]).size());
   // Pin the width too: a field added to StepMetrics but wired into NEITHER
   // writeHeader nor logStep is invisible to the comparison above.
-  EXPECT_EQ(splitCsv(lines[0]).size(), 26u)
+  EXPECT_EQ(splitCsv(lines[0]).size(), 32u)
       << "column count changed — update writeHeader, logStep, and the "
          "expected list in ColumnOrderMatchesHeaderNames together";
 }
@@ -131,6 +132,12 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
   m.dwell_sec               = 24;
   m.prox_hold_count         = 25;
   m.prox_hold_total_sec     = 26;
+  m.goal_outcome            = "nav2-aborted";
+  m.nav_elapsed_sec         = 28;
+  m.goal_path_length_m      = 29;
+  m.nav2_aborts             = 30;
+  m.nav2_recoveries         = 31;
+  m.nav2_error_code         = 32;
 
   TempDir dir;
   auto csv = dir.file("m.csv");
@@ -168,7 +175,15 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
       {"dwell_sec", 24},
       {"prox_hold_count", 25},
       {"prox_hold_total_sec", 26},
+      {"goal_outcome", 0},  // string column
+      {"nav_elapsed_sec", 28},
+      {"goal_path_length_m", 29},
+      {"nav2_aborts", 30},
+      {"nav2_recoveries", 31},
+      {"nav2_error_code", 32},
   };
+  const std::vector<std::pair<std::string, std::string>> text_columns = {
+      {"phase", "exploit"}, {"goal_outcome", "nav2-aborted"}};
 
   auto names  = splitCsv(lines[0]);
   auto values = splitCsv(lines[1]);
@@ -176,8 +191,11 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
   ASSERT_EQ(values.size(), expected.size());
   for (size_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(names[i], expected[i].first) << "header column " << i;
-    if (expected[i].first == "phase") {
-      EXPECT_EQ(values[i], "exploit") << "value for column " << i;
+    const auto text = std::find_if(
+        text_columns.begin(), text_columns.end(),
+        [&](const auto& c) { return c.first == expected[i].first; });
+    if (text != text_columns.end()) {
+      EXPECT_EQ(values[i], text->second) << "value for column " << i;
       continue;
     }
     // Millisecond tolerance: enough to catch a swapped or shifted column,
@@ -224,9 +242,9 @@ TEST(MetricsLogger, EpochTimeKeepsMillisecondResolution) {
   EXPECT_NEAR(std::stod(t1_text) - std::stod(t0_text), kDt, 2e-3);
 }
 
-// An explore-phase step leaves every exploitation and proximity column at the
-// defaults metrics_logger.hpp documents, so a CSV row always attributes itself
-// to a phase.
+// An explore-phase step leaves every exploitation, proximity and goal-outcome
+// column at the defaults metrics_logger.hpp documents, so a CSV row always
+// attributes itself to a phase and an empty goal_outcome means "no goal ended".
 TEST(MetricsLogger, ExploreRowCarriesDocumentedDefaults) {
   TempDir dir;
   auto csv = dir.file("m.csv");
@@ -246,6 +264,12 @@ TEST(MetricsLogger, ExploreRowCarriesDocumentedDefaults) {
   EXPECT_EQ(valueOf(names, values, "dwell_sec"), "0");
   EXPECT_EQ(valueOf(names, values, "prox_hold_count"), "0");
   EXPECT_EQ(valueOf(names, values, "prox_hold_total_sec"), "0");
+  EXPECT_EQ(valueOf(names, values, "goal_outcome"), "");
+  EXPECT_EQ(valueOf(names, values, "nav_elapsed_sec"), "0");
+  EXPECT_EQ(valueOf(names, values, "goal_path_length_m"), "0");
+  EXPECT_EQ(valueOf(names, values, "nav2_aborts"), "0");
+  EXPECT_EQ(valueOf(names, values, "nav2_recoveries"), "0");
+  EXPECT_EQ(valueOf(names, values, "nav2_error_code"), "-1");
 }
 
 // The header is written once, on the first row — not per row.

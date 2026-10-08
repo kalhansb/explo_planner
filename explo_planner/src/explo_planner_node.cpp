@@ -27,10 +27,14 @@
 /// vantages are covered and the queue empties, it reverts to EXPLORE. With no
 /// targets (or exploitation_enabled=false) behaviour is pure exploration.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <algorithm>
@@ -42,6 +46,8 @@
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <action_msgs/msg/goal_status.hpp>
+#include <action_msgs/msg/goal_status_array.hpp>
 #include <action_msgs/srv/cancel_goal.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -62,6 +68,7 @@
 
 #include "explo_planner/map_cache.hpp"
 #include "explo_planner/candidate_generator.hpp"
+#include "explo_planner/candidate_snap.hpp"
 #include "explo_planner/fov_evaluator.hpp"
 #include "explo_planner/scoring.hpp"
 #include "explo_planner/metrics_logger.hpp"
@@ -72,6 +79,7 @@
 #include "explo_planner/failed_goal_blacklist.hpp"
 #include "explo_planner/proximity_guard.hpp"
 #include "explo_planner/target_queue.hpp"
+#include "explo_planner/traversability_accumulator.hpp"
 #include "explo_planner/vantage_planner.hpp"
 
 namespace explo_planner {
@@ -104,6 +112,79 @@ enum class State {
 // Top-level behaviour mode. NAVIGATE / INTEGRATE / LOG_STEP are shared between
 // modes and branch on this to route correctly.
 enum class Phase { EXPLORE, EXPLOIT };
+
+// action_msgs/GoalStatus label for the logs; -1 = no status seen.
+static const char* navStatusName(int status) {
+  switch (status) {
+    case action_msgs::msg::GoalStatus::STATUS_ACCEPTED:  return "ACCEPTED";
+    case action_msgs::msg::GoalStatus::STATUS_EXECUTING: return "EXECUTING";
+    case action_msgs::msg::GoalStatus::STATUS_CANCELING: return "CANCELING";
+    case action_msgs::msg::GoalStatus::STATUS_SUCCEEDED: return "SUCCEEDED";
+    case action_msgs::msg::GoalStatus::STATUS_CANCELED:  return "CANCELED";
+    case action_msgs::msg::GoalStatus::STATUS_ABORTED:   return "ABORTED";
+    case -1:                                             return "no status";
+    default:                                             return "UNKNOWN";
+  }
+}
+
+// NavigateToPose's result carries error_code / error_msg from Jazzy on and is
+// empty on Humble. Detected at compile time so one source builds on both;
+// -1 / "" when the distro has no such field.
+template <typename R, typename = void>
+struct HasNavErrorCode : std::false_type {};
+template <typename R>
+struct HasNavErrorCode<R, std::void_t<decltype(std::declval<const R&>().error_code)>>
+    : std::true_type {};
+template <typename R, typename = void>
+struct HasNavErrorMsg : std::false_type {};
+template <typename R>
+struct HasNavErrorMsg<R, std::void_t<decltype(std::declval<const R&>().error_msg)>>
+    : std::true_type {};
+template <typename R>
+int navResultErrorCode(const R& r) {
+  if constexpr (HasNavErrorCode<R>::value) {
+    return static_cast<int>(r.error_code);
+  } else {
+    return -1;
+  }
+}
+template <typename R>
+std::string navResultErrorMsg(const R& r) {
+  if constexpr (HasNavErrorMsg<R>::value) {
+    return r.error_msg;
+  } else {
+    return {};
+  }
+}
+constexpr bool kNavResultHasErrorCode =
+    HasNavErrorCode<nav2_msgs::action::NavigateToPose::Result>::value;
+// nav2_abort_final_after_recovery: an ABORT is final when nav2 ran at least
+// kNav2RecoveriesHere recovery behaviours (costmap clears count too) within
+// kNav2RecoverySpotM of where it aborts. 1 m holds a robot that is wedged,
+// backs up 0.3 m and drives into the same bush again. 2, not 1: a lone
+// context clear (nav2 retrying FollowPath / ComputePathToPose once) on a
+// healthy pass does not count; one recovery round does (the default tree's
+// first round alone is two costmap clears).
+constexpr float kNav2RecoverySpotM = 1.0f;
+constexpr int kNav2RecoveriesHere = 2;
+
+// State label for diagnostics only.
+static const char* stateName(State s) {
+  switch (s) {
+    case State::WAIT_FOR_MAP:   return "WAIT_FOR_MAP";
+    case State::PLAN:           return "PLAN";
+    case State::NAVIGATE:       return "NAVIGATE";
+    case State::INTEGRATE:      return "INTEGRATE";
+    case State::LOG_STEP:       return "LOG_STEP";
+    case State::DONE:           return "DONE";
+    case State::EXPLOIT_PLAN:   return "EXPLOIT_PLAN";
+    case State::EXPLOIT_DWELL:  return "EXPLOIT_DWELL";
+    case State::RETURN_NAV:     return "RETURN_NAV";
+    case State::RETURN_SYNC:    return "RETURN_SYNC";
+    case State::PROXIMITY_HOLD: return "PROXIMITY_HOLD";
+  }
+  return "?";
+}
 
 // ==================================================================
 // ExploPlannerNode — EIG-only NBV exploration planner.
@@ -140,6 +221,8 @@ private:
   void doNavigate();
   void doIntegrate();
   void doLogStep();
+  // Builds and writes one CSV row (doLogStep, and the last row on DONE).
+  StepMetrics writeStepRow();
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
   // exploration exhaustion, between DONE and returning home;
@@ -219,8 +302,30 @@ private:
   bool isCellFree(const Eigen::Vector3f& pos) const;
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
 
+  // Planning-map plumbing. onPlanMapWindow integrates one rolling window into
+  // plan_map_accum_ (planning_map_mode "accumulate"); refreshAccumulatedPlanMap
+  // (every tick) turns the accumulator into a new latest_plan_map_ snapshot at
+  // most every planning_map_accum_refresh_sec; setPlanMap is the one place
+  // latest_plan_map_ changes. ensureCostGridBuilt rebuilds cost_grid_'s layers
+  // only when the planning map changed since the last build.
+  void onPlanMapWindow(const nav_msgs::msg::OccupancyGrid& msg);
+  void refreshAccumulatedPlanMap();
+  void setPlanMap(nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+  void ensureCostGridBuilt();
+
   // NAVIGATE helpers
   void failGoal(const char* reason, double elapsed);
+  // No-progress watchdog window: restart it at `t` from the current position,
+  // and the net XY displacement since that restart.
+  void resetProgressWindow(const rclcpp::Time& t);
+  float progressNetM() const;
+  // Start watching nav2 for the goal just published (exploration, exploit or
+  // home): its nav2 counters reset, and only nav2 goals accepted from here on
+  // count against it. `path_len_m` is what its nav budget was sized for.
+  void startNavEpisode(float path_len_m);
+  // One "Goal end [...]" line for every way a goal ends, and the matching
+  // CSV columns staged for the next row. Call before leaving the driving state.
+  void logGoalEnd(const char* outcome, bool warn);
   void heartbeatTick();
 
   // Coordinated proximity stop. checkProximityHold runs each tick while a nav
@@ -246,6 +351,30 @@ private:
   void updatePoseFromTF();
   void trackDistance();
   static geometry_msgs::msg::Quaternion yawToQuat(float yaw);
+
+  // Field diagnostics. The planner commands nav2 through goal_pose alone, so
+  // these are what surface the failures it cannot otherwise see: nav2 results
+  // and feedback (onNavStatus / onNavFeedback / requestNavResult), stale or
+  // failing TF, a stale fused map, the robot leaving the ROI, and a PLAN that
+  // never selects. Logging only, with one exception: onNavStatus and
+  // onNavFeedback count nav2 aborts and recoveries of the planner's goal, and
+  // doNavigate / doReturnNav give the goal up when onNavStatus decides nav2
+  // has (nav2_abort_limit, nav2_abort_final_after_recovery).
+  void onNavStatus(const action_msgs::msg::GoalStatusArray::SharedPtr& msg);
+  void onNavFeedback(
+      const nav2_msgs::action::NavigateToPose::Impl::FeedbackMessage::SharedPtr&
+          msg);
+  // Ask nav2 why goal `id` ended (Jazzy's result error_code); the answer is
+  // logged and, when `episode` is still the current one, kept for logGoalEnd.
+  void requestNavResult(const std::array<uint8_t, 16>& id, uint64_t episode);
+  void checkDiagnostics();
+  // Age of the pose in latest_pos_ (TF data stamp, or lookup time for an
+  // all-static chain); -1 before the first pose.
+  double poseAgeSec() const;
+  // One-line fused-map status for the no-map warnings.
+  std::string mapStatusStr() const;
+  // Brake-goal staleness warning shared by abandonNavGoal/enterProximityHold.
+  void warnIfBrakePoseStale(const char* why);
   void publishGoal(const CandidateViewpoint& vp);
   void republishGoal(const CandidateViewpoint& vp);
   void publishCandidateViz(const std::vector<CandidateViewpoint>& candidates);
@@ -374,12 +503,10 @@ private:
   bool   proximity_stop_enabled_ = true;
   double proximity_max_hold_sec_ = 0.0;
   std::string proximity_nav_cancel_action_;
-  // ROI bounds — used to constrain candidate generation, the FOV raycast and
-  // the clip applied when ingesting the fused map topic into map_cache_.
-  float roi_min_x_ = -15.0f;
-  float roi_max_x_ =  15.0f;
-  float roi_min_y_ = -15.0f;
-  float roi_max_y_ =  15.0f;
+  // ROI — used to constrain candidate generation, the FOV raycast and the
+  // clip applied when ingesting the fused map topic into map_cache_. XY bounds
+  // are in the ROI frame (roi_yaw_deg / roi_origin_x / roi_origin_y).
+  Roi2D roi_xy_{-15.0f, 15.0f, -15.0f, 15.0f};
   float roi_min_z_ =  -0.5f;
   float roi_max_z_ =   2.0f;
   // Terrain-relative (3D) mode. When true:
@@ -526,6 +653,38 @@ private:
   Eigen::Vector3f latest_pos_ = Eigen::Vector3f::Zero();
   float latest_yaw_ = 0.0f;
   nav_msgs::msg::OccupancyGrid::SharedPtr latest_plan_map_;
+  // Bumped by setPlanMap() on every latest_plan_map_ change. Cache key for the
+  // CostGrid layers and both floods — a counter, not the map pointer, because
+  // a freed snapshot's address is routinely reused by the next one.
+  uint64_t plan_map_gen_ = 0;
+  // planning_map cells >= this are obstacles (isCellFree / isCellOccupied /
+  // CostGrid). 50 = the nav2 inflated/lethal band of a costmap; on
+  // traversability_mapping's 0..100 score it is "steep, stepped or rough".
+  int8_t plan_map_obstacle_threshold_ = 50;
+  // Path-cost shaping applied to every CostGrid build (see CostModel).
+  CostModel cost_model_;
+  // Moves frontier candidates off bad planning-map cells before scoring.
+  std::unique_ptr<CandidateSnapper> snapper_;
+  // Blocked cells within this radius of the robot are passable for its own
+  // floods (planning_map_robot_clear_m; see CostGrid::floodFrom).
+  float robot_clear_m_ = 0.0f;
+  // planning_map_mode "accumulate": stitches the rolling window topic into one
+  // ROI-sized grid (see TraversabilityAccumulator); null in "direct" mode.
+  std::unique_ptr<TraversabilityAccumulator> plan_map_accum_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr accum_map_pub_;
+  double plan_map_accum_refresh_sec_ = 1.0;
+  uint64_t plan_map_accum_snap_version_ = 0;
+  std::chrono::steady_clock::time_point plan_map_accum_snap_time_{};
+  std::chrono::steady_clock::time_point plan_map_last_window_time_{};
+  size_t plan_map_windows_ok_ = 0;
+  size_t plan_map_windows_rejected_ = 0;
+  const char* plan_map_last_reject_ = "none";
+  // CostGrid layer cache (ensureCostGridBuilt) and doPlan's flood cache.
+  bool     cost_grid_built_ = false;
+  uint64_t cost_grid_gen_   = 0;
+  bool plan_flood_valid_ = false;
+  Eigen::Vector3f plan_flood_pos_ = Eigen::Vector3f::Zero();
+  size_t plan_flood_reached_ = 0;
   CandidateViewpoint current_goal_;
   rclcpp::Time state_enter_time_;
   float cumulative_distance_ = 0.0f;
@@ -535,10 +694,11 @@ private:
   // Recently-failed goals (TTL + radius blacklist).
   FailedGoalBlacklist failed_goals_;
 
-  // Per-navigate-cycle state for the smart timeout.
+  // Per-navigate-cycle state for the smart timeout. The no-progress window
+  // measures net XY displacement from progress_check_pos_, not summed travel.
   double nav_budget_sec_ = 0.0;
   rclcpp::Time progress_check_time_;
-  float progress_check_dist_ = 0.0f;
+  Eigen::Vector3f progress_check_pos_ = Eigen::Vector3f::Zero();
 
   // Post-arrival rotation deadline. Armed the first tick the robot is inside
   // goal_xy_tol_ but still outside goal_yaw_tol_; disarmed by transitionTo()
@@ -549,13 +709,10 @@ private:
   // Cache key for the UNBOUNDED exploitation flood of cost_grid_ (see
   // doExploitPlan). That flood is O(grid) and EXPLOIT_PLAN re-enters at the
   // full tick rate whenever no vantage is selectable, so it is rebuilt only
-  // when its inputs change. Invalidated by the planning_map callback on
-  // every new map (pointer identity alone can miss a replacement that reuses
-  // a freed map's address) and by doPlan's radius-bounded flood, which
-  // overwrites the same grid. exploit_flood_map_ is an identity handle for
-  // the latched map object — compared, never dereferenced.
+  // when its inputs change (planning-map generation, robot pose). Invalidated
+  // by doPlan's radius-bounded flood, which overwrites the same grid.
   bool exploit_flood_valid_ = false;
-  const void* exploit_flood_map_ = nullptr;
+  uint64_t exploit_flood_gen_ = 0;
   Eigen::Vector3f exploit_flood_pos_ = Eigen::Vector3f::Zero();
   size_t exploit_flood_reached_ = 0;
 
@@ -609,6 +766,9 @@ private:
   float pending_mean_path_cost_       = 0.0f;
   float pending_selected_info_gain_   = 0.0f;
   float pending_selected_path_cost_   = 0.0f;
+  // Metres along the selected goal's path (= path cost unless the CostModel
+  // is shaped; the straight line without a cost grid). Sizes the nav budget.
+  float pending_selected_path_len_    = 0.0f;
   float pending_plan_ms_              = 0.0f;
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
@@ -636,6 +796,9 @@ private:
   rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_sub_;
   scovox_msgs::msg::ScovoxMap::SharedPtr latest_scovox_map_;
   scovox_msgs::msg::ScovoxMap::SharedPtr ingested_scovox_map_;
+  // Bumped each time a new message is ingested: an identity that survives the
+  // old message being freed (cf. plan_map_gen_).
+  uint64_t ingested_scovox_gen_ = 0;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   // Last goal actually put on the wire, for republishGoal()'s change
@@ -674,6 +837,85 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr prox_state_pub_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
+
+  // --- Field diagnostics state (see onNavStatus et al.) ---
+  // Thresholds (params): TF age / outage before warning (<= 0 disables), and
+  // goal distance beyond which a goal is likely off nav2's costmap (0 = off).
+  double tf_stale_warn_sec_ = 1.0;
+  double far_goal_warn_m_   = 50.0;
+  // Every rclcpp::Time below is compared against now(), so it must carry the
+  // node clock's type (a default-constructed Time is SYSTEM_TIME and the
+  // subtraction would throw).
+  rclcpp::Time pose_stamp_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time tf_fail_since_{0, 0, RCL_ROS_TIME};
+  bool         tf_failing_ = false;
+  std::string  tf_last_error_;
+  bool roi_known_  = false;
+  bool roi_inside_ = false;
+  // Fused-map freshness: receipt time + robot position at receipt.
+  rclcpp::Time    last_map_rx_time_{0, 0, RCL_ROS_TIME};
+  Eigen::Vector3f pos_at_last_map_ = Eigen::Vector3f::Zero();
+  bool            map_rx_pos_valid_ = false;
+  // Coverage streak: step + map identity (source, generation) of the last
+  // increment, to flag increments that are PLAN retries on the same map rather
+  // than new steps. A generation, not the map's address: a freed snapshot's
+  // address is routinely reused by the next one.
+  int         last_streak_step_ = -1;
+  std::string last_streak_src_;
+  uint64_t    last_streak_gen_  = 0;
+  // nav2 NavigateToPose status watch: last status per goal id (pruned to the
+  // latest array), first-array priming, publisher check, and the last cancel
+  // this planner requested (so its own cancels read as expected).
+  std::string nav_status_action_;
+  rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr
+      nav_status_sub_;
+  std::map<std::array<uint8_t, 16>, int8_t> nav_goal_status_;
+  bool         nav_status_primed_ = false;
+  bool         have_first_goal_pub_ = false;
+  bool         nav_status_pub_checked_ = false;
+  rclcpp::Time first_goal_pub_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_nav_cancel_time_{0, 0, RCL_ROS_TIME};
+  std::string  last_nav_cancel_why_;
+  // Newest nav2 goal acceptance stamp seen on the status topic (nav2's clock).
+  rclcpp::Time nav_newest_stamp_{0, 0, RCL_ROS_TIME};
+  // nav2 feedback (<action>/_action/feedback) for the goal nav2 is executing,
+  // and the result service (<action>/_action/get_result) for abort codes.
+  rclcpp::Subscription<nav2_msgs::action::NavigateToPose::Impl::FeedbackMessage>::
+      SharedPtr nav_feedback_sub_;
+  rclcpp::Client<nav2_msgs::action::NavigateToPose::Impl::GetResultService>::
+      SharedPtr nav_result_client_;
+  std::array<uint8_t, 16> nav_fb_goal_id_{};
+  bool         nav_fb_have_ = false;
+  int          nav_fb_recoveries_ = 0;   // nav2's count for nav_fb_goal_id_
+  float        nav_fb_dist_remaining_ = 0.0f;
+  rclcpp::Time nav_fb_rx_time_{0, 0, RCL_ROS_TIME};
+  // Give a goal up after this many nav2 aborts in a row from the same spot;
+  // 0 = log aborts only.
+  int          nav2_abort_limit_ = 2;
+  // ...or after one, where nav2 already ran its recoveries.
+  bool         nav2_abort_final_after_recovery_ = true;
+  // nav2's view of the current planner goal ("episode", see startNavEpisode).
+  uint64_t     nav_ep_id_ = 0;
+  rclcpp::Time nav_ep_start_{0, 0, RCL_ROS_TIME};        // planner clock
+  rclcpp::Time nav_ep_stamp_floor_{0, 0, RCL_ROS_TIME};  // nav2 clock
+  float        nav_ep_path_len_m_ = 0.0f;
+  AbortStreak  nav_ep_abort_streak_;
+  RecoveryLog  nav_ep_recovery_log_;           // where nav2 ran recoveries
+  bool         nav_ep_nav2_gave_up_ = false;  // set in onNavStatus
+  int          nav_ep_aborts_ = 0;
+  int          nav_ep_recoveries_ = 0;
+  int          nav_ep_last_status_ = -1;
+  int          nav_ep_error_code_ = -1;
+  std::string  nav_ep_error_msg_;
+  // The last goal end, staged by logGoalEnd for the next CSV row.
+  std::string  pending_goal_outcome_;
+  float        pending_nav_elapsed_sec_ = 0.0f;
+  float        pending_nav_path_len_m_ = 0.0f;
+  int          pending_nav2_aborts_ = 0;
+  int          pending_nav2_recoveries_ = 0;
+  int          pending_nav2_error_code_ = -1;
+  uint64_t     pending_nav_ep_id_ = 0;  // episode of the staged numbers
+  rclcpp::TimerBase::SharedPtr clock_check_timer_;
 };
 
 // ==================================================================
@@ -747,6 +989,12 @@ ExploPlannerNode::ExploPlannerNode()
   // this cannot reject real motion; it filters localization discontinuities so
   // they don't inflate distance_traveled or spoof the no-progress watchdog.
   max_pose_jump_m_ = static_cast<float>(dp("max_pose_jump_m", 1.0));
+  // Diagnostics only: warn when the map->base TF is older than this (s), or
+  // has failed to look up for this long while a pose is held. <= 0 disables.
+  tf_stale_warn_sec_ = dp("tf_stale_warn_sec", 1.0);
+  // Diagnostics only: warn when a published goal is farther than this (m)
+  // from the robot — likely off a nav2 costmap. 0 disables.
+  far_goal_warn_m_ = dp("far_goal_warn_m", 50.0);
 
   // Failed-goal blacklist. When a navigate cycle times out before reaching
   // the goal, the goal position is parked here for `failed_goal_ttl_sec`
@@ -816,6 +1064,13 @@ ExploPlannerNode::ExploPlannerNode()
   ccfg.roi_max_x  = static_cast<float>(dp("roi_max_x",  15.0));
   ccfg.roi_min_y  = static_cast<float>(dp("roi_min_y", -15.0));
   ccfg.roi_max_y  = static_cast<float>(dp("roi_max_y",  15.0));
+  // Rotated / offset ROI. The four bounds above are measured in the ROI frame:
+  // the map frame yawed by roi_yaw_deg about map (roi_origin_x, roi_origin_y).
+  // Defaults (0, 0, 0) make the ROI frame the map frame — the legacy
+  // axis-aligned box, bit for bit.
+  ccfg.roi_yaw      = static_cast<float>(dp("roi_yaw_deg", 0.0) * M_PI / 180.0);
+  ccfg.roi_origin_x = static_cast<float>(dp("roi_origin_x", 0.0));
+  ccfg.roi_origin_y = static_cast<float>(dp("roi_origin_y", 0.0));
 
   // Vertical ROI band. In dscovox mode this is the z-slab the fused map is
   // clipped to on ingest, and it bounds the FOV raycast, frontier
@@ -887,11 +1142,52 @@ ExploPlannerNode::ExploPlannerNode()
   fcfg.roi_max_x = ccfg.roi_max_x;
   fcfg.roi_min_y = ccfg.roi_min_y;
   fcfg.roi_max_y = ccfg.roi_max_y;
+  fcfg.roi_yaw      = ccfg.roi_yaw;
+  fcfg.roi_origin_x = ccfg.roi_origin_x;
+  fcfg.roi_origin_y = ccfg.roi_origin_y;
   fcfg.roi_min_z = roi_min_z_;
   fcfg.roi_max_z = roi_max_z_;
 
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
+
+  // Planning-map path cost + goal placement (all inert at their defaults, and
+  // without use_planning_map). See CostModel and CandidateSnapper.
+  //   planning_map_obstacle_threshold: cells >= this are obstacles.
+  //   planning_map_trav_weight: step cost x (1 + w * value / 100) on passable
+  //     cells, so the Dijkstra path cost prefers smooth ground over rough.
+  //   planning_map_unknown_value: the value an unseen (-1) cell is weighted
+  //     as under trav_weight (0 = as cheap as open ground).
+  //   planning_map_clearance_m / _penalty: passable cells this close to an
+  //     obstacle are a clearance zone — never a goal, and their step cost is
+  //     multiplied by the penalty.
+  //   candidate_snap_radius_m: frontier candidates on an obstacle, in the
+  //     clearance zone or unreachable move to the nearest good cell within
+  //     this radius before scoring (0 = reject them as before).
+  //   planning_map_robot_clear_m: blocked cells this close to the robot do
+  //     not wall in its path search (its own body seen by the LiDAR).
+  {
+    const int thr = dp("planning_map_obstacle_threshold", 50);
+    plan_map_obstacle_threshold_ =
+        static_cast<int8_t>(std::clamp(thr, 1, 101));
+    if (thr != plan_map_obstacle_threshold_) {
+      RCLCPP_WARN(get_logger(),
+          "planning_map_obstacle_threshold=%d out of [1, 101]; using %d.",
+          thr, plan_map_obstacle_threshold_);
+    }
+    cost_model_.trav_weight = static_cast<float>(
+        std::max(0.0, dp("planning_map_trav_weight", 0.0)));
+    cost_model_.unknown_value = static_cast<float>(
+        std::clamp(dp("planning_map_unknown_value", 0.0), 0.0, 99.0));
+    cost_model_.clearance_m = static_cast<float>(
+        std::max(0.0, dp("planning_map_clearance_m", 0.0)));
+    cost_model_.clearance_penalty = static_cast<float>(
+        std::max(1.0, dp("planning_map_clearance_penalty", 1.0)));
+    snapper_ = std::make_unique<CandidateSnapper>(static_cast<float>(
+        std::max(0.0, dp("candidate_snap_radius_m", 0.0))));
+    robot_clear_m_ = static_cast<float>(
+        std::max(0.0, dp("planning_map_robot_clear_m", 0.0)));
+  }
 
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
   // info_gain for each candidate is the sum of score_fn evaluated at sampled
@@ -1133,12 +1429,102 @@ ExploPlannerNode::ExploPlannerNode()
   // scovox_node) to restore 2D free-cell + reachability filtering as a hard
   // startup precondition.
   use_planning_map_ = dp("use_planning_map", false);
+  // How planning_map_topic is consumed:
+  //   "direct"     — each message IS the planning map (a map covering the
+  //                  whole ROI, e.g. dscovox's planning_map).
+  //   "accumulate" — each message is a robot-centred rolling window (e.g.
+  //                  traversability_mapping's /occupancy_map_local, or a nav2
+  //                  rolling costmap). Windows are stitched into one grid over
+  //                  the ROI bounding box + planning_map_accum_margin_m, at
+  //                  planning_map_accum_resolution (coarsened to stay within
+  //                  planning_map_accum_max_cells), re-snapshotted as the
+  //                  planning map at most every planning_map_accum_refresh_sec
+  //                  and republished on ~/traversability_map. Used raw, a
+  //                  window makes every cell beyond ~10 m "off the map", i.e.
+  //                  blocked, and every far frontier unreachable.
+  const std::string plan_map_mode =
+      dp("planning_map_mode", std::string("direct"));
+  const double accum_res = dp("planning_map_accum_resolution", 0.2);
+  const double accum_margin = dp("planning_map_accum_margin_m", 5.0);
+  const int accum_max_cells = dp("planning_map_accum_max_cells", 4000000);
+  plan_map_accum_refresh_sec_ = dp("planning_map_accum_refresh_sec", 1.0);
+  if (plan_map_mode != "direct" && plan_map_mode != "accumulate") {
+    RCLCPP_ERROR(get_logger(),
+        "planning_map_mode='%s' is not 'direct' or 'accumulate'; using "
+        "'direct'.", plan_map_mode.c_str());
+  }
+  const bool accumulate = use_planning_map_ && plan_map_mode == "accumulate";
 
-  // Cache ROI bounds for the fused-map ingest clip (loadLatestMap()).
-  roi_min_x_ = ccfg.roi_min_x;
-  roi_max_x_ = ccfg.roi_max_x;
-  roi_min_y_ = ccfg.roi_min_y;
-  roi_max_y_ = ccfg.roi_max_y;
+  // Cache the ROI for the fused-map ingest clip (loadLatestMap()), the
+  // coverage measures and inRoi().
+  roi_xy_ = ccfg.roiXY();
+  {
+    const Roi2D bb = roi_xy_.mapAabb();
+    RCLCPP_INFO(get_logger(),
+        "ROI: [%.2f, %.2f] x [%.2f, %.2f] m in a frame yawed %.2f deg about "
+        "map (%.2f, %.2f); map-frame extent x [%.2f, %.2f] y [%.2f, %.2f]",
+        roi_xy_.min_x, roi_xy_.max_x, roi_xy_.min_y, roi_xy_.max_y,
+        roi_xy_.yaw * 180.0 / M_PI, roi_xy_.origin_x, roi_xy_.origin_y,
+        bb.min_x, bb.max_x, bb.min_y, bb.max_y);
+
+    if (accumulate) {
+      AccumulatorConfig acfg;
+      const double margin = std::max(0.0, accum_margin);
+      // An unconfigured ROI is +-1e9: fall back to a 400 x 400 m box about
+      // the map origin rather than coarsening a planet-sized box into
+      // kilometre cells.
+      constexpr double kUnboundedRoi = 1e6;
+      constexpr float kFallbackHalf = 200.0f;
+      if (std::abs(bb.min_x) > kUnboundedRoi ||
+          std::abs(bb.max_x) > kUnboundedRoi ||
+          std::abs(bb.min_y) > kUnboundedRoi ||
+          std::abs(bb.max_y) > kUnboundedRoi) {
+        RCLCPP_WARN(get_logger(),
+            "planning_map_mode=accumulate with an unbounded ROI: accumulating "
+            "over [-%.0f, %.0f]^2 m about the map origin. Set candidate_roi_* "
+            "to the area of operations.", kFallbackHalf, kFallbackHalf);
+        acfg.min_x = -kFallbackHalf;
+        acfg.max_x =  kFallbackHalf;
+        acfg.min_y = -kFallbackHalf;
+        acfg.max_y =  kFallbackHalf;
+      } else {
+        acfg.min_x = static_cast<float>(bb.min_x - margin);
+        acfg.max_x = static_cast<float>(bb.max_x + margin);
+        acfg.min_y = static_cast<float>(bb.min_y - margin);
+        acfg.max_y = static_cast<float>(bb.max_y + margin);
+      }
+      acfg.resolution = static_cast<float>(accum_res > 0.0 ? accum_res : 0.2);
+      acfg.max_cells = static_cast<size_t>(std::max(1, accum_max_cells));
+      plan_map_accum_ = std::make_unique<TraversabilityAccumulator>(acfg);
+      const double mb = plan_map_accum_->cellCount() / (1024.0 * 1024.0);
+      RCLCPP_INFO(get_logger(),
+          "planning_map accumulate: %dx%d cells at %.2f m over x [%.1f, %.1f] "
+          "y [%.1f, %.1f] (grid %.1f MB; CostGrid ~%.0f MB, Dijkstra queue "
+          "~%.0f MB transient per flood)",
+          plan_map_accum_->width(), plan_map_accum_->height(),
+          plan_map_accum_->resolution(), acfg.min_x,
+          plan_map_accum_->originX() +
+              plan_map_accum_->width() * plan_map_accum_->resolution(),
+          acfg.min_y,
+          plan_map_accum_->originY() +
+              plan_map_accum_->height() * plan_map_accum_->resolution(),
+          mb, 13.0 * mb, 24.0 * mb);
+      if (plan_map_accum_->coarsened()) {
+        if (plan_map_accum_->resolution() > 1.0f) {
+          RCLCPP_ERROR(get_logger(),
+              "planning_map accumulate: coarsened from %.2f m to %.2f m to "
+              "stay within planning_map_accum_max_cells=%d — far too coarse "
+              "to steer around bushes. Shrink the ROI or raise the cap.",
+              acfg.resolution, plan_map_accum_->resolution(), accum_max_cells);
+        } else {
+          RCLCPP_WARN(get_logger(),
+              "planning_map accumulate: coarsened from %.2f m to %.2f m to "
+              "stay within planning_map_accum_max_cells=%d.",
+              acfg.resolution, plan_map_accum_->resolution(), accum_max_cells);
+        }
+      }
+    }
+  }
 
   // The dscovox mapping node fuses every robot's voxels (multi-robot
   // consensus) and publishes the WHOLE fused map as a ScovoxMap topic. We
@@ -1165,21 +1551,88 @@ ExploPlannerNode::ExploPlannerNode()
   // every planning_map use site (all guarded on latest_plan_map_) takes its
   // map-less path — the planner cannot consult a 2D map even if one is being
   // published on the topic.
-  if (use_planning_map_) {
+  if (use_planning_map_ && plan_map_accum_) {
     plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
         planning_map_topic,
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
         [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-          latest_plan_map_ = msg;
-          have_plan_map_ = true;
-          // A new map object can reuse a freed map's address, so the flood
-          // cache's pointer-identity check alone cannot detect replacement.
-          exploit_flood_valid_ = false;
+          onPlanMapWindow(*msg);
+        });
+    accum_map_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+        "~/traversability_map",
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+  } else if (use_planning_map_) {
+    plan_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        planning_map_topic,
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+        [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+          // Consumed in map_frame_ without reframing, like the fused map.
+          if (!msg->header.frame_id.empty() &&
+              msg->header.frame_id != map_frame_) {
+            RCLCPP_WARN_ONCE(get_logger(),
+                "planning_map frame_id '%s' != planner map_frame '%s' — used "
+                "without reframing, so free/occupied lookups are misplaced.",
+                msg->header.frame_id.c_str(), map_frame_.c_str());
+          }
+          setPlanMap(msg);
         });
   }
 
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
+
+  // nav2 watch. The planner drives nav2 through goal_pose, not as an action
+  // client, so it reads nav2's view from the action's own topics: the status
+  // array (SUCCEEDED / ABORTED / CANCELED), the feedback (distance remaining,
+  // recoveries) and, on Jazzy, the result's error code via the get_result
+  // service. An ABORT (no path, goal off the costmap, controller failure) is
+  // otherwise invisible until the nav budget / no-progress watchdog fires —
+  // and the keep-alive re-send restarts nav2 every goal_republish_sec, so its
+  // giving up never sticks. nav2_abort_limit aborts in a row from the same
+  // spot fail the goal, and so does one abort where nav2 already ran its
+  // recoveries (nav2_abort_final_after_recovery); limit 0 = log only. ""
+  // disables the whole watch.
+  nav_status_action_ = dp("nav_status_action",
+                          std::string("/" + robot_name_ + "/navigate_to_pose"));
+  {
+    const int lim = dp("nav2_abort_limit", 2);
+    nav2_abort_limit_ = std::max(0, lim);
+  }
+  nav2_abort_final_after_recovery_ =
+      dp("nav2_abort_final_after_recovery", true);
+  if (!nav_status_action_.empty()) {
+    using NavToPose = nav2_msgs::action::NavigateToPose;
+    // rcl_action's status profile: KeepLast(1), reliable, transient_local.
+    nav_status_sub_ = create_subscription<action_msgs::msg::GoalStatusArray>(
+        nav_status_action_ + "/_action/status",
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+        [this](action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+          onNavStatus(msg);
+        });
+    // bt_navigator publishes feedback every BT tick (~100 Hz). Best effort,
+    // depth 1: only the latest matters, and a dropped one costs nothing (the
+    // recovery count is cumulative per goal).
+    nav_feedback_sub_ = create_subscription<NavToPose::Impl::FeedbackMessage>(
+        nav_status_action_ + "/_action/feedback",
+        rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
+        [this](NavToPose::Impl::FeedbackMessage::SharedPtr msg) {
+          onNavFeedback(msg);
+        });
+    if (kNavResultHasErrorCode) {
+      nav_result_client_ = create_client<NavToPose::Impl::GetResultService>(
+          nav_status_action_ + "/_action/get_result");
+    }
+    const std::string on_abort = nav2_abort_limit_ > 0
+        ? "a goal fails after " + std::to_string(nav2_abort_limit_) +
+              " nav2 aborts in a row" +
+              (nav2_abort_final_after_recovery_
+                   ? ", or after 1 where nav2 already ran its recoveries"
+                   : "")
+        : std::string("aborts are logged only (nav2_abort_limit 0)");
+    RCLCPP_INFO(get_logger(), "Watching nav2 on %s (status, feedback%s); %s.",
+        nav_status_action_.c_str(),
+        kNavResultHasErrorCode ? ", abort error codes" : "", on_abort.c_str());
+  }
 
   viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "~/candidates", 10);
@@ -1344,6 +1797,20 @@ ExploPlannerNode::ExploPlannerNode()
       this, get_clock(), std::chrono::milliseconds(100),
       [this] { tick(); });
 
+  // One-shot WALL timer: with use_sim_time and no /clock the tick timer above
+  // never fires and the node sits silent — nothing else can report it.
+  clock_check_timer_ = create_wall_timer(std::chrono::seconds(10), [this] {
+    clock_check_timer_->cancel();
+    bool sim = false;
+    get_parameter("use_sim_time", sim);
+    if (sim && this->now().nanoseconds() == 0) {
+      RCLCPP_WARN(get_logger(),
+          "use_sim_time=true but no /clock received after 10 s — the state "
+          "machine runs on sim time and will NOT tick. Play the bag with "
+          "--clock / start the sim, or set use_sim_time:=false on hardware.");
+    }
+  });
+
   // --- Coord heartbeat. Re-publishes the active claim while NAVIGATE-ing
   //     so peers don't lose it through TTL. Period = 1 / coord_heartbeat_hz.
   if (coord_enabled_ && coord_heartbeat_hz_ > 0.0) {
@@ -1360,6 +1827,18 @@ ExploPlannerNode::ExploPlannerNode()
       max_steps_, map_frame_.c_str(), base_frame_.c_str(),
       use_planning_map_ ? planning_map_topic.c_str() : "(disabled)",
       goal_topic.c_str());
+  if (use_planning_map_) {
+    RCLCPP_INFO(get_logger(),
+        "planning_map: mode=%s obstacle>=%d trav_weight=%.2f unknown=%.0f "
+        "clearance=%.2f m (x%.1f) snap_radius=%.2f m robot_clear=%.2f m "
+        "flood_cap=%.1f m",
+        plan_map_accum_ ? "accumulate" : "direct",
+        static_cast<int>(plan_map_obstacle_threshold_),
+        cost_model_.trav_weight, cost_model_.unknown_value,
+        cost_model_.clearance_m,
+        cost_model_.clearance_penalty, snapper_->radius(), robot_clear_m_,
+        cost_grid_radius_cap_m_);
+  }
   if (terrain_relative_z_) {
     RCLCPP_INFO(get_logger(),
         "Terrain-relative z ON: map z-band [%+.1f, %+.1f] m about the robot, "
@@ -1389,6 +1868,20 @@ void ExploPlannerNode::onScovoxMap(
         "without reframing and would be misplaced.",
         msg->header.frame_id.c_str(), map_frame_.c_str());
   }
+  // Diagnostics: a header stamp far from our clock means the mapper and the
+  // planner disagree on time (use_sim_time on one side only, a bag clock, or
+  // unsynced hosts) — every stamp-based check downstream is then meaningless.
+  const auto now = this->now();
+  const rclcpp::Time stamp(msg->header.stamp, RCL_ROS_TIME);
+  if (stamp.nanoseconds() != 0 && std::abs((now - stamp).seconds()) > 10.0) {
+    RCLCPP_WARN_ONCE(get_logger(),
+        "Fused map header stamp differs from this node's clock by %.1f s — "
+        "clock mismatch between mapper and planner (use_sim_time set on only "
+        "one side, bag clock, or unsynced hosts).", (now - stamp).seconds());
+  }
+  last_map_rx_time_ = now;
+  pos_at_last_map_  = latest_pos_;
+  map_rx_pos_valid_ = have_pose_;
   // Cache only. The grid is rebuilt from this (ROI-clipped) in loadLatestMap(),
   // mirroring the old per-cycle GetRegion fetch and avoiding a full grid rebuild
   // on every incoming message while the robot is NAVIGATE-ing.
@@ -1429,9 +1922,7 @@ bool ExploPlannerNode::loadLatestMap() {
     // observation volume that is also what FovEvaluator clips rays to
     // (doPlan re-syncs the evaluator from eff_roi_*_z_ each tick).
     if (!map_cache_->updateFromScovoxMap(
-            *latest_scovox_map_,
-            Eigen::Vector3f(roi_min_x_, roi_min_y_, band_lo),
-            Eigen::Vector3f(roi_max_x_, roi_max_y_, band_hi))) {
+            *latest_scovox_map_, roi_xy_, band_lo, band_hi)) {
       // Unusable resolution on the wire (see MapCache::updateFromScovoxMap).
       // The previous grid is intact, so keep planning on it; do NOT latch
       // ingested_scovox_map_, so a later good publish still triggers a rebuild.
@@ -1442,6 +1933,8 @@ bool ExploPlannerNode::loadLatestMap() {
           latest_scovox_map_->resolution, map_cache_->voxelCount());
       return map_cache_->voxelCount() > 0;
     }
+    // Both pointers own their message, so neither address can be reused here.
+    if (ingested_scovox_map_ != latest_scovox_map_) ++ingested_scovox_gen_;
     ingested_scovox_map_ = latest_scovox_map_;
     eff_roi_min_z_ = band_lo;
     eff_roi_max_z_ = band_hi;
@@ -1543,6 +2036,11 @@ bool ExploPlannerNode::scoreTrajectory(
 void ExploPlannerNode::tick() {
   updatePoseFromTF();
   trackDistance();
+  checkDiagnostics();
+  // Accumulate mode: publish a new planning-map snapshot when due. Before the
+  // dispatch so WAIT_FOR_MAP sees the first one and every state plans on the
+  // same map within a tick.
+  refreshAccumulatedPlanMap();
 
   // A configured-but-silent peer pose topic (typo'd name, localiser down) is
   // indistinguishable from "peer far away" to the guard — keep saying so
@@ -1606,11 +2104,33 @@ void ExploPlannerNode::tick() {
           // Name the missing precondition so a stuck startup (wrong topic /
           // namespace / QoS, dead mapper, no TF) is diagnosable instead of a
           // silent indefinite wait.
+          // Publisher counts + TF state make a namespace / frame mismatch
+          // obvious (0 publishers = wrong topic; TF error = wrong frames).
+          char plan_buf[320] = "disabled";
+          if (plan_map_sub_ && plan_map_accum_) {
+            std::snprintf(plan_buf, sizeof(plan_buf),
+                "'%s' %zu publisher(s), accumulate: %zu windows integrated, "
+                "%zu rejected (last: %s), %zu known cells",
+                plan_map_sub_->get_topic_name(),
+                plan_map_sub_->get_publisher_count(), plan_map_windows_ok_,
+                plan_map_windows_rejected_, plan_map_last_reject_,
+                plan_map_accum_->knownCells());
+          } else if (plan_map_sub_) {
+            std::snprintf(plan_buf, sizeof(plan_buf), "'%s' %zu publisher(s)",
+                plan_map_sub_->get_topic_name(),
+                plan_map_sub_->get_publisher_count());
+          }
+          const std::string map_str = mapStatusStr();
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
               "Waiting to start: map=%d pose=%d planning_map=%d (0 = not yet "
-              "received; planning_map %s).",
+              "received; planning_map %s). Fused map: %s. planning_map: %s. "
+              "TF %s -> %s: %s.",
               have_map_, have_pose_, have_plan_map_,
-              use_planning_map_ ? "required" : "disabled");
+              use_planning_map_ ? "required" : "disabled", map_str.c_str(),
+              plan_buf, map_frame_.c_str(), base_frame_.c_str(),
+              have_pose_ ? "ok"
+                         : (tf_last_error_.empty() ? "no lookup result yet"
+                                                   : tf_last_error_.c_str()));
         }
       }
       break;
@@ -1712,6 +2232,10 @@ void ExploPlannerNode::transitionTo(State s) {
   // DONE too). Without it the first finisher goes invisible one claim TTL
   // after finishing.
   if (s == State::DONE) publishPresenceIntent();
+  // A goal that ended since the last row (the drive home, typically: its
+  // ends go to RETURN_SYNC, not LOG_STEP) would otherwise never reach the
+  // CSV. One last row carries it.
+  if (s == State::DONE && !pending_goal_outcome_.empty()) writeStepRow();
   // The dwell-sync barrier is per-DWELL: its wait clock starts at entry (the
   // moment the robot is physically staged on the vantage) and neither latch may
   // survive into the next capture — a timed-out barrier would otherwise disable
@@ -1779,7 +2303,8 @@ void ExploPlannerNode::doPlan() {
   // fresh consensus data.
   if (!loadLatestMap()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "No fused map received yet on the dscovox topic; retrying next tick.");
+        "No usable fused map (%s); retrying next tick.",
+        mapStatusStr().c_str());
     return;
   }
 
@@ -1791,11 +2316,26 @@ void ExploPlannerNode::doPlan() {
     const char* cov_src = "";
     double unk = coverageUnknownFraction(&cov_src);
     if (unk >= 0.0 && unk < done_unknown_fraction_) {
-      ++coverage_done_streak_;
-      RCLCPP_INFO(get_logger(),
-          "Step %d: ROI unknown fraction %.3f < %.3f (source=%s, streak %d/%d)",
-          step_, unk, done_unknown_fraction_, cov_src,
-          coverage_done_streak_, done_min_consecutive_steps_);
+      // Count distinct measurements, not PLAN ticks: a PLAN that rejects
+      // every candidate retries next tick at the same step on the same map and
+      // would re-count one measurement, reaching done_min_consecutive_steps in
+      // a fraction of a second. A retry holds the streak instead.
+      const uint64_t cov_gen = std::string(cov_src) == "planning_map"
+          ? plan_map_gen_ : ingested_scovox_gen_;
+      const bool retry = coverage_done_streak_ > 0 &&
+                         last_streak_step_ == step_ &&
+                         last_streak_src_ == cov_src &&
+                         last_streak_gen_ == cov_gen;
+      if (!retry) {
+        ++coverage_done_streak_;
+        last_streak_step_ = step_;
+        last_streak_src_  = cov_src;
+        last_streak_gen_  = cov_gen;
+        RCLCPP_INFO(get_logger(),
+            "Step %d: ROI unknown fraction %.3f < %.3f (source=%s, streak %d/%d)",
+            step_, unk, done_unknown_fraction_, cov_src,
+            coverage_done_streak_, done_min_consecutive_steps_);
+      }
       if (coverage_done_streak_ >= done_min_consecutive_steps_) {
         RCLCPP_INFO(get_logger(),
             "Exploration complete: ROI saturated "
@@ -1808,6 +2348,8 @@ void ExploPlannerNode::doPlan() {
       }
     } else {
       coverage_done_streak_ = 0;
+      last_streak_step_ = -1;
+      last_streak_src_.clear();
       if (unk < 0.0) {
         // -1 = the selected source cannot measure: done_coverage_source
         // "planning_map" with no planning_map published, or a degenerate ROI
@@ -1860,29 +2402,50 @@ void ExploPlannerNode::doPlan() {
       n_radial, candidates.size() - n_radial, candidates.size());
 
   if (candidates.empty()) {
-    RCLCPP_WARN(get_logger(), "No valid candidates. Retrying next tick.");
+    // Throttled: PLAN retries at the tick rate. Robot outside the ROI or an
+    // occupied/unmapped neighbourhood are the usual causes.
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "No valid candidates (robot (%.2f, %.2f) %s the ROI, %zu frontier "
+        "centroids, polar %s). Retrying next tick.",
+        robot_pos.x(), robot_pos.y(), inRoi(robot_pos) ? "inside" : "OUTSIDE",
+        frontiers.size(),
+        candidate_gen_->config().enable_polar ? "on" : "off");
     return;
   }
 
-  // Build the bounded cost grid from the latched planning_map. ~5 ms once
-  // per PLAN tick at the auto bound, then O(1) per-candidate lookups.
+  // Build the bounded cost grid from the latched planning_map, then O(1)
+  // per-candidate lookups. Both the layers and the flood are cached: a PLAN
+  // that rejects every candidate retries at the full tick rate, and on an
+  // accumulated ROI-sized map with a long flood cap each rebuild + flood is
+  // O(ROI cells) — redo them only when the map changed (at most every
+  // planning_map_accum_refresh_sec) or the robot moved.
   bool skip_reachability = false;
+  int n_snapped = 0;
+  int n_snap_nospot = 0;
   if (latest_plan_map_) {
-    cost_grid_->build(*latest_plan_map_);
-    cost_grid_->floodFrom(robot_pos,
-                          static_cast<float>(cost_grid_radius_cap_m_));
-    // cost_grid_ is shared with the exploitation planner, and this flood is
-    // RADIUS-BOUNDED while that one is unbounded — invalidate its cache so it
-    // does not reuse a truncated flood as if it were the full one.
-    exploit_flood_valid_ = false;
-    size_t reached = cost_grid_->reachedCellCount();
+    ensureCostGridBuilt();
+    constexpr float kPlanFloodRefreshM = 0.25f;
+    if (!plan_flood_valid_ ||
+        (robot_pos - plan_flood_pos_).head<2>().norm() > kPlanFloodRefreshM) {
+      cost_grid_->floodFrom(robot_pos,
+                            static_cast<float>(cost_grid_radius_cap_m_),
+                            robot_clear_m_);
+      plan_flood_valid_ = true;
+      plan_flood_pos_ = robot_pos;
+      plan_flood_reached_ = cost_grid_->reachedCellCount();
+      // cost_grid_ is shared with the exploitation planner, and this flood is
+      // RADIUS-BOUNDED while that one is unbounded — invalidate its cache so
+      // it does not reuse a truncated flood as if it were the full one.
+      exploit_flood_valid_ = false;
+    }
+    size_t reached = plan_flood_reached_;
     // If the flood barely escaped the source (e.g. robot is surrounded
     // by inflated cells in a dense forest), the reachability filter would
     // reject every candidate. Fall back to no-reachability filtering for
     // this tick so the planner can still make progress.
     constexpr size_t kMinReachedForFilter = 10;
     if (reached < kMinReachedForFilter) {
-      RCLCPP_WARN(get_logger(),
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
           "CostGrid: flood reached only %zu cells (robot=%.2f,%.2f "
           "robotCost=%.2f map %dx%d origin=%.1f,%.1f). "
           "Skipping reachability filter this tick.",
@@ -1893,14 +2456,44 @@ void ExploPlannerNode::doPlan() {
           latest_plan_map_->info.origin.position.y);
       skip_reachability = true;
     }
+
+    // Goal placement: a frontier centroid on an obstacle (a bush), inside
+    // the clearance zone or in a pocket the flood cannot reach moves to the
+    // nearest good cell within candidate_snap_radius_m, BEFORE scoring, so
+    // the FOV gain is that of the viewpoint actually sent. Frontier
+    // candidates may stand on unknown ground (they border unexplored space by
+    // construction); anything else must be known free. Candidates with no
+    // spot stay put and fall to the filters below.
+    if (snapper_->radius() > 0.0f) {
+      const auto in_roi = [this](float x, float y) {
+        return roi_xy_.contains(x, y);
+      };
+      for (auto& c : candidates) {
+        Eigen::Vector2f to;
+        const auto out = snapper_->snap(*cost_grid_, c.position,
+                                        /*allow_unknown=*/c.is_frontier,
+                                        /*require_reachable=*/!skip_reachability,
+                                        in_roi, to);
+        if (out == CandidateSnapper::Outcome::kSnapped) {
+          candidate_gen_->relocate(c, to.x(), to.y(), terrain_map);
+          ++n_snapped;
+        } else if (out == CandidateSnapper::Outcome::kNoSpot) {
+          ++n_snap_nospot;
+        }
+      }
+    }
   } else {
     // Best-effort mode: no planning_map this tick -> fall back to straight-line
     // distances and skip the reachability filter (there is no grid to flood).
     // The candidate free/occupied filter below is likewise skipped when absent.
     skip_reachability = true;
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "No planning_map available — using straight-line distances and "
-        "skipping reachability filtering this tick.");
+    // With use_planning_map off this is the configured mode, already stated
+    // once at startup; warning every PLAN tick buried the real warnings.
+    if (use_planning_map_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "No planning_map available — using straight-line distances and "
+          "skipping reachability filtering this tick.");
+    }
   }
 
   // Evaluate candidates -> populates per-candidate FOV info gain.
@@ -1968,6 +2561,19 @@ void ExploPlannerNode::doPlan() {
     }
   }
 
+  // A NaN utility sorts last but can still be selected when nothing else
+  // passes, and says the map or scorer produced garbage — surface it.
+  {
+    const auto n_nan = std::count_if(candidates.begin(), candidates.end(),
+        [](const CandidateViewpoint& c) { return std::isnan(c.score); });
+    if (n_nan > 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+          "Step %d: %ld/%zu candidates have NaN utility (non-finite info gain "
+          "or position) — check the fused map / terrain z for NaNs.",
+          step_, static_cast<long>(n_nan), candidates.size());
+    }
+  }
+
   // Sort the selection order by utility descending. The cost-grid
   // reachability filter runs after the sort as one of the candidate filters
   // in the walk below.
@@ -1986,6 +2592,7 @@ void ExploPlannerNode::doPlan() {
       });
 
   int rejected_map = 0;
+  int rejected_clearance = 0;
   int rejected_blacklist = 0;
   int rejected_unreachable = 0;
   int rejected_minpos = 0;
@@ -2016,6 +2623,15 @@ void ExploPlannerNode::doPlan() {
         if (isCellOccupied(vp.position)) { ++rejected_map; continue; }
       } else {
         if (!isCellFree(vp.position)) { ++rejected_map; continue; }
+      }
+      // 1b. Not inside the clearance zone around an obstacle (on when
+      //     planning_map_clearance_m > 0): a goal brushing a bush is one the
+      //     navigator ends up pushing into. The snap above has already moved
+      //     what it could out of the zone.
+      if (cost_model_.clearance_m > 0.0f &&
+          cost_grid_->inClearanceZone(vp.position)) {
+        ++rejected_clearance;
+        continue;
       }
     }
     // 2. Cost-grid reachability — catches free pockets sealed off by
@@ -2053,12 +2669,14 @@ void ExploPlannerNode::doPlan() {
     break;
   }
   if (!found) {
-    RCLCPP_WARN(get_logger(),
-        "Step %d: all %zu candidates rejected (close=%d map=%d unreach=%d "
-        "blk=%d minpos=%d). Retrying next tick.",
+    // Throttled: this retries at the tick rate (the counters say why).
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Step %d: all %zu candidates rejected (close=%d map=%d clear=%d "
+        "unreach=%d blk=%d minpos=%d; snapped=%d nospot=%d). Retrying next "
+        "tick.",
         step_, candidates.size(), rejected_too_close,
-        rejected_map, rejected_unreachable,
-        rejected_blacklist, rejected_minpos);
+        rejected_map, rejected_clearance, rejected_unreachable,
+        rejected_blacklist, rejected_minpos, n_snapped, n_snap_nospot);
     return;  // stay in PLAN, retry next tick
   }
 
@@ -2074,6 +2692,9 @@ void ExploPlannerNode::doPlan() {
           : 0.0f;
   pending_selected_info_gain_ = info_gain[selected_idx];
   pending_selected_path_cost_ = path_cost[selected_idx];
+  pending_selected_path_len_ = (skip_reachability || !cost_grid_)
+      ? path_cost[selected_idx]
+      : cost_grid_->pathLengthTo(current_goal_.position);
   pending_rejected_by_minpos_      = rejected_minpos;
   pending_rejected_by_unreachable_ = rejected_unreachable;
 
@@ -2084,14 +2705,15 @@ void ExploPlannerNode::doPlan() {
 
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
-      "info=%.2f cost=%.2f [%zu cand, close=%d map=%d unreach=%d blk=%d "
-      "minpos=%d, peers=%zu, %.1fms]",
+      "info=%.2f cost=%.2f path=%.1fm [%zu cand, close=%d map=%d clear=%d "
+      "unreach=%d blk=%d minpos=%d, snapped=%d nospot=%d, peers=%zu, %.1fms]",
       step_, current_goal_.position.x(), current_goal_.position.y(),
       current_goal_.yaw, current_goal_.score,
       pending_selected_info_gain_, pending_selected_path_cost_,
-      candidates.size(), rejected_too_close, rejected_map,
-      rejected_unreachable, rejected_blacklist, rejected_minpos,
-      coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
+      pending_selected_path_len_,
+      candidates.size(), rejected_too_close, rejected_map, rejected_clearance,
+      rejected_unreachable, rejected_blacklist, rejected_minpos, n_snapped,
+      n_snap_nospot, coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
 
   publishGoal(current_goal_);
   publishCandidateViz(candidates);
@@ -2112,23 +2734,24 @@ void ExploPlannerNode::doPlan() {
   transitionTo(State::NAVIGATE);
 
   // Initialise smart-timeout state for this NAVIGATE cycle. Budget the DRIVEN
-  // distance, not the straight line: the selected candidate's Dijkstra path
-  // cost was already computed a few lines above, and a goal 5 m away in a
-  // straight line that needs a 15 m detour around an obstacle used to get a
-  // 5 m budget, time out, and be blacklisted for being "unreachable" when it
-  // was merely far. With no cost grid path_cost IS the straight line, so this
+  // distance, not the straight line: a goal 5 m away in a straight line that
+  // needs a 15 m detour around an obstacle used to get a 5 m budget, time out,
+  // and be blacklisted for being "unreachable" when it was merely far. Metres,
+  // not the shaped path cost: a speed only converts metres to seconds, and
+  // the cost's weighting of rough ground (up to ~4.5x) is a preference, not
+  // extra distance. With no cost grid the length IS the straight line, so this
   // is a no-op in the default use_planning_map=false configuration.
   float dx = current_goal_.position.x() - robot_pos.x();
   float dy = current_goal_.position.y() - robot_pos.y();
   float dist = std::sqrt(dx * dx + dy * dy);
-  if (std::isfinite(pending_selected_path_cost_))
-    dist = std::max(dist, pending_selected_path_cost_);
+  if (std::isfinite(pending_selected_path_len_))
+    dist = std::max(dist, pending_selected_path_len_);
   nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
                                  nav_min_timeout_sec_, nav_max_timeout_sec_);
-  // Both anchors mark NAVIGATE entry; reuse the timestamp transitionTo()
+  // The window starts at NAVIGATE entry; reuse the timestamp transitionTo()
   // just stamped rather than re-reading the clock.
-  progress_check_time_ = state_enter_time_;
-  progress_check_dist_ = cumulative_distance_;
+  resetProgressWindow(state_enter_time_);
+  startNavEpisode(dist);
   RCLCPP_DEBUG(get_logger(),
       "Step %d: nav budget %.1fs for %.2f m goal", step_,
       nav_budget_sec_, dist);
@@ -2141,7 +2764,7 @@ void ExploPlannerNode::doPlan() {
 double ExploPlannerNode::unknownFractionInRoi() const {
   if (!latest_plan_map_) return -1.0;
   return explo_planner::unknownFractionInRoi(
-      *latest_plan_map_, {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_});
+      *latest_plan_map_, roi_xy_);
 }
 
 double ExploPlannerNode::coverageUnknownFraction(const char** source) const {
@@ -2159,20 +2782,109 @@ double ExploPlannerNode::coverageUnknownFraction(const char** source) const {
   // and this reads 1.0 (never done) — set a per-area z band or
   // terrain_relative_z when the ground leaves the default band.
   *source = "scovox";
-  return map_cache_->unknownColumnFraction(roi_min_x_, roi_max_x_,
-                                           roi_min_y_, roi_max_y_);
+  return map_cache_->unknownColumnFraction(roi_xy_);
 }
 
 bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
   // No map: not free (matches the old kCellNoData -> v >= 0 failure).
   return latest_plan_map_ &&
-         explo_planner::isCellFree(*latest_plan_map_, pos);
+         explo_planner::isCellFree(*latest_plan_map_, pos,
+                                   plan_map_obstacle_threshold_);
 }
 
 bool ExploPlannerNode::isCellOccupied(const Eigen::Vector3f& pos) const {
   // No map: conservatively occupied (matches the old kCellNoData default).
   return !latest_plan_map_ ||
-         explo_planner::isCellOccupied(*latest_plan_map_, pos);
+         explo_planner::isCellOccupied(*latest_plan_map_, pos,
+                                       plan_map_obstacle_threshold_);
+}
+
+// ==================================================================
+// Planning map — direct / accumulated, and the CostGrid cache
+// ==================================================================
+
+void ExploPlannerNode::setPlanMap(nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+  latest_plan_map_ = std::move(msg);
+  have_plan_map_ = latest_plan_map_ != nullptr;
+  ++plan_map_gen_;
+}
+
+void ExploPlannerNode::onPlanMapWindow(
+    const nav_msgs::msg::OccupancyGrid& msg) {
+  // The accumulator stitches in map_frame_; a window in another frame would
+  // be written at the wrong place for good, so drop it (unlike direct mode,
+  // where a misframed map is at least replaced by the next one).
+  if (!msg.header.frame_id.empty() && msg.header.frame_id != map_frame_) {
+    ++plan_map_windows_rejected_;
+    plan_map_last_reject_ = "wrong frame";
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "planning_map window frame_id '%s' != map_frame '%s' — dropped (the "
+        "accumulator does not reframe).",
+        msg.header.frame_id.c_str(), map_frame_.c_str());
+    return;
+  }
+  using St = TraversabilityAccumulator::Status;
+  const St st = plan_map_accum_->integrate(msg);
+  plan_map_last_window_time_ = std::chrono::steady_clock::now();
+  if (st == St::kIntegrated || st == St::kNoKnownCells) {
+    ++plan_map_windows_ok_;
+    return;
+  }
+  ++plan_map_windows_rejected_;
+  plan_map_last_reject_ = TraversabilityAccumulator::statusName(st);
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+      "planning_map window rejected: %s (%ux%u @ %.3f m, origin %.1f, %.1f; "
+      "%zu rejected / %zu integrated so far).",
+      plan_map_last_reject_, msg.info.width, msg.info.height,
+      msg.info.resolution, msg.info.origin.position.x,
+      msg.info.origin.position.y, plan_map_windows_rejected_,
+      plan_map_windows_ok_);
+}
+
+void ExploPlannerNode::refreshAccumulatedPlanMap() {
+  if (!plan_map_accum_) return;
+  const auto now = std::chrono::steady_clock::now();
+  // The accumulated map outlives its source: if the window topic stops, the
+  // planner keeps steering on what it last saw. Say so.
+  if (plan_map_windows_ok_ > 0 &&
+      now - plan_map_last_window_time_ > std::chrono::seconds(5)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "planning_map: no window for %.0f s — planning on the stale "
+        "accumulated map.",
+        std::chrono::duration<double>(now - plan_map_last_window_time_)
+            .count());
+  }
+  // Snapshot only when the content changed, and at most once per refresh
+  // period: each snapshot is a full grid copy and invalidates the CostGrid
+  // layers + floods, so a window rate snapshot would re-flood at 5+ Hz.
+  // Steady clock: the period is a CPU budget, not a sim-time quantity.
+  const uint64_t v = plan_map_accum_->version();
+  if (v == 0 || v == plan_map_accum_snap_version_) return;
+  if (latest_plan_map_ &&
+      now - plan_map_accum_snap_time_ <
+          std::chrono::duration<double>(plan_map_accum_refresh_sec_)) {
+    return;
+  }
+  auto snap = std::make_shared<nav_msgs::msg::OccupancyGrid>();
+  plan_map_accum_->toMsg(*snap);
+  snap->header.frame_id = map_frame_;
+  snap->header.stamp = this->now();
+  plan_map_accum_snap_version_ = v;
+  plan_map_accum_snap_time_ = now;
+  setPlanMap(snap);
+  // Latched, so a late rviz gets the current grid; <= 1 Hz of one grid copy.
+  if (accum_map_pub_) accum_map_pub_->publish(*latest_plan_map_);
+}
+
+void ExploPlannerNode::ensureCostGridBuilt() {
+  if (cost_grid_built_ && cost_grid_gen_ == plan_map_gen_) return;
+  cost_grid_->build(*latest_plan_map_, plan_map_obstacle_threshold_,
+                    cost_model_);
+  cost_grid_built_ = true;
+  cost_grid_gen_ = plan_map_gen_;
+  // build() clears the flood both callers cache.
+  plan_flood_valid_ = false;
+  exploit_flood_valid_ = false;
 }
 
 // ==================================================================
@@ -2188,6 +2900,7 @@ void ExploPlannerNode::doNavigate() {
     RCLCPP_INFO(get_logger(),
         "Target appeared mid-hop -> releasing exploration goal, switching "
         "to EXPLOIT.");
+    logGoalEnd("target-switch", false);
     have_active_intent_ = false;
     target_queue_.activate();
     phase_ = Phase::EXPLOIT;
@@ -2213,6 +2926,7 @@ void ExploPlannerNode::doNavigate() {
         "aborting navigation and re-planning.",
         step_, current_goal_.position.x(),
         current_goal_.position.y());
+    logGoalEnd("goal-in-obstacle", true);
     have_active_intent_ = false;
     // PLAN usually re-goals on the next tick, but nothing guarantees it does —
     // and until it does nav2 is still driving INTO a now-mapped obstacle
@@ -2248,6 +2962,7 @@ void ExploPlannerNode::doNavigate() {
           "re-planning another angle.",
           current_vantage_index_, pending_exploit_target_id_,
           peer->robot_id.c_str());
+      logGoalEnd("yielded", false);
       // Release the claim WITH the hop. The winner does not need it — its
       // symmetric check computes the same total order whether it sees our claim
       // or none at all — but its dwell-sync barrier reads it: a kept claim is
@@ -2299,6 +3014,7 @@ void ExploPlannerNode::doNavigate() {
           RCLCPP_INFO(get_logger(),
               "Reached approach waypoint for target %d (dist=%.2f) -> "
               "re-planning vantages.", pending_exploit_target_id_, dist);
+          logGoalEnd("reached", false);
           transitionTo(State::EXPLOIT_PLAN);
           return;
         }
@@ -2309,6 +3025,7 @@ void ExploPlannerNode::doNavigate() {
             "Reached vantage %d of target %d (dist=%.2f) -> dwelling %.1fs.",
             current_vantage_index_, pending_exploit_target_id_, dist,
             exploit_dwell_sec_);
+        logGoalEnd("reached", false);
         transitionTo(State::EXPLOIT_DWELL);
         return;
       }
@@ -2317,6 +3034,7 @@ void ExploPlannerNode::doNavigate() {
       RCLCPP_INFO(get_logger(),
           "Goal reached: dist=%.2f yaw_err=%.1f deg", dist,
           yaw_err * 180.0f / static_cast<float>(M_PI));
+      logGoalEnd("reached", false);
       transitionTo(State::INTEGRATE);
       return;
     }
@@ -2332,6 +3050,12 @@ void ExploPlannerNode::doNavigate() {
     if (!rotate_deadline_armed_) {
       rotate_deadline_armed_ = true;
       rotate_start_time_ = now;
+    }
+    // nav2 gave the goal up (below) during the final turn: end it now rather
+    // than on the rotate deadline, under the outcome that says why.
+    if (nav_ep_nav2_gave_up_) {
+      failGoal("nav2-aborted", (now - state_enter_time_).seconds());
+      return;
     }
     if ((now - rotate_start_time_).seconds() > goal_rotate_timeout_sec_) {
       failGoal("budget-rotate", (now - state_enter_time_).seconds());
@@ -2349,22 +3073,34 @@ void ExploPlannerNode::doNavigate() {
   auto now = this->now();
   double elapsed = (now - state_enter_time_).seconds();
 
-  // 1) Distance-budgeted hard timeout.
+  // 1) nav2 gave the goal up for good (onNavStatus): nav2_abort_limit times
+  //    in a row without the robot getting anywhere in between (each
+  //    keep-alive re-send restarts it), or once right where it had already
+  //    run its recoveries. GOAL_OUTSIDE_MAP aborts within milliseconds, so
+  //    this ends such a goal in ~one goal_republish_sec instead of the whole
+  //    nav budget.
+  if (nav_ep_nav2_gave_up_) {
+    failGoal("nav2-aborted", elapsed);
+    return;
+  }
+
+  // 2) Distance-budgeted hard timeout: the backstop for everything nav2 does
+  //    not end itself (no nav2 status, or nav2 still trying).
   if (elapsed > nav_budget_sec_) {
     failGoal("budget", elapsed);
     return;
   }
 
-  // 2) No-progress watchdog.
+  // 3) No-progress watchdog on NET displacement over the window. Summed
+  //    per-tick travel let pose jitter on a parked robot (~1.5 m per 30 s on
+  //    the 2026-07-31 bag) satisfy it indefinitely.
   double window_elapsed = (now - progress_check_time_).seconds();
   if (window_elapsed > progress_window_sec_) {
-    float delta = cumulative_distance_ - progress_check_dist_;
-    if (delta < progress_min_distance_m_) {
+    if (progressNetM() < progress_min_distance_m_) {
       failGoal("no-progress", elapsed);
       return;
     }
-    progress_check_time_ = now;
-    progress_check_dist_ = cumulative_distance_;
+    resetProgressWindow(now);
   }
 
   // Keep-alive re-send (throttled; see republishGoal).
@@ -2372,22 +3108,112 @@ void ExploPlannerNode::doNavigate() {
 }
 
 // Park the current goal in the failed-goal blacklist with a tagged reason
-// and transition out of NAVIGATE. Centralised so both timeout paths
-// (budget exceeded / no progress) share the same logging + bookkeeping.
+// and transition out of NAVIGATE. Centralised so every failure path (nav2
+// aborts, budget exceeded, no progress, rotate timeout) shares the same
+// logging + bookkeeping.
 void ExploPlannerNode::failGoal(const char* reason, double elapsed) {
   failed_goals_.add(current_goal_.position, this->now().seconds());
   RCLCPP_WARN(get_logger(),
-      "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f). "
-      "Blacklisted; %zu active failed-goal entries.",
+      "Step %d: navigation failed [%s] after %.1fs at goal (%.2f, %.2f), "
+      "robot at (%.2f, %.2f) %.2f m short. Blacklisted; %zu active "
+      "failed-goal entries.",
       step_, reason, elapsed,
       current_goal_.position.x(), current_goal_.position.y(),
+      latest_pos_.x(), latest_pos_.y(),
+      (latest_pos_ - current_goal_.position).head<2>().norm(),
       failed_goals_.size());
+  logGoalEnd(reason, true);
   have_active_intent_ = false;  // release the claim on failure
-  // The nav budget / no-progress watchdogs give up on this goal; nav2 does not
-  // know that — the goal is still accepted and still driving (invariant: see
-  // abandonNavGoal), and INTEGRATE is one of the states presumed stationary.
+  // The planner gives up on this goal; nav2 may not know that — the goal can
+  // still be accepted and driving (invariant: see abandonNavGoal), and
+  // INTEGRATE is one of the states presumed stationary.
   abandonNavGoal(reason);
   transitionTo(State::INTEGRATE);
+}
+
+void ExploPlannerNode::resetProgressWindow(const rclcpp::Time& t) {
+  progress_check_time_ = t;
+  progress_check_pos_ = latest_pos_;
+}
+
+float ExploPlannerNode::progressNetM() const {
+  return (latest_pos_ - progress_check_pos_).head<2>().norm();
+}
+
+void ExploPlannerNode::startNavEpisode(float path_len_m) {
+  ++nav_ep_id_;
+  nav_ep_start_ = this->now();
+  // The goal was published just before this call and nav2 has not accepted it
+  // yet, so everything nav2 holds now predates it.
+  nav_ep_stamp_floor_ = nav_newest_stamp_;
+  nav_ep_path_len_m_ = path_len_m;
+  nav_ep_abort_streak_.reset();
+  nav_ep_recovery_log_.reset();
+  nav_ep_nav2_gave_up_ = false;
+  nav_ep_aborts_ = 0;
+  nav_ep_recoveries_ = 0;
+  nav_ep_last_status_ = -1;
+  nav_ep_error_code_ = -1;
+  nav_ep_error_msg_.clear();
+}
+
+// Fixed shape, so a run's goals tabulate from the log alone:
+//   Goal end [<outcome>] step <n> <kind> (<x>, <y>): <t>s of <budget>s budget,
+//   path <m> m, <m> m short; nav2 <status>, <n> abort(s), <n> recovery(ies)
+//   [, last error <code> <NAME> "<msg>"][, <m> m to go]
+// kind is explore / vantage / approach / home. The same outcome, time, path
+// and nav2 counts go into the next CSV row. Some ends write no row of their
+// own (goal-in-obstacle, target-switch, yielded and team-reconnected re-plan;
+// an approach waypoint reached goes on to the vantage; every drive home goes
+// to RETURN_SYNC), so outcomes since the last row are joined with '+' and the
+// numbers describe the last goal. Outcomes still pending when the run ends
+// get a last row on DONE.
+void ExploPlannerNode::logGoalEnd(const char* outcome, bool warn) {
+  const double elapsed = (this->now() - state_enter_time_).seconds();
+  const float short_m =
+      (latest_pos_ - current_goal_.position).head<2>().norm();
+  const char* kind = state_ == State::RETURN_NAV ? "home"
+      : phase_ == Phase::EXPLOIT ? (current_is_approach_ ? "approach"
+                                                         : "vantage")
+      : "explore";
+  std::string nav2 = "nav2 not watched";
+  if (nav_status_sub_) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "nav2 %s, %d abort(s), %d recovery(ies)",
+                  navStatusName(nav_ep_last_status_), nav_ep_aborts_,
+                  nav_ep_recoveries_);
+    nav2 = buf;
+    if (nav_ep_error_code_ >= 0) {
+      nav2 += ", last error " + std::to_string(nav_ep_error_code_) + " " +
+              nav2ErrorName(nav_ep_error_code_);
+      if (!nav_ep_error_msg_.empty()) nav2 += " \"" + nav_ep_error_msg_ + "\"";
+    }
+    if (nav_fb_have_ && nav_fb_rx_time_ >= nav_ep_start_) {
+      std::snprintf(buf, sizeof(buf), ", %.1f m to go", nav_fb_dist_remaining_);
+      nav2 += buf;
+    }
+  }
+  char line[256];
+  std::snprintf(line, sizeof(line),
+      "Goal end [%s] step %d %s (%.2f, %.2f): %.1fs of %.0fs budget, path "
+      "%.1f m, %.2f m short; ",
+      outcome, step_, kind, current_goal_.position.x(),
+      current_goal_.position.y(), elapsed, nav_budget_sec_, nav_ep_path_len_m_,
+      short_m);
+  if (warn) {
+    RCLCPP_WARN(get_logger(), "%s%s", line, nav2.c_str());
+  } else {
+    RCLCPP_INFO(get_logger(), "%s%s", line, nav2.c_str());
+  }
+
+  if (!pending_goal_outcome_.empty()) pending_goal_outcome_ += '+';
+  pending_goal_outcome_   += outcome;
+  pending_nav_elapsed_sec_ = static_cast<float>(elapsed);
+  pending_nav_path_len_m_  = nav_ep_path_len_m_;
+  pending_nav2_aborts_     = nav_ep_aborts_;
+  pending_nav2_recoveries_ = nav_ep_recoveries_;
+  pending_nav2_error_code_ = nav_ep_error_code_;
+  pending_nav_ep_id_       = nav_ep_id_;
 }
 
 // ==================================================================
@@ -2534,8 +3360,8 @@ void ExploPlannerNode::startReturnHome(const char* reason) {
   nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
                                  nav_min_timeout_sec_,
                                  return_nav_max_timeout_sec_);
-  progress_check_time_ = state_enter_time_;
-  progress_check_dist_ = cumulative_distance_;
+  resetProgressWindow(state_enter_time_);
+  startNavEpisode(dist);
 }
 
 // Drive toward home. If the whole team reconnects en route, the barrier
@@ -2552,6 +3378,7 @@ void ExploPlannerNode::doReturnNav() {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: team reconnected en route (%d/%d) -> re-planning against "
         "merged map.", active, rendezvous_expected_peers_);
+    logGoalEnd("team-reconnected", false);
     have_active_intent_ = false;
     // The re-plan must actually SEE the merged map: the streak that declared
     // exhaustion was measured pre-reconnection, and left at threshold it
@@ -2573,6 +3400,7 @@ void ExploPlannerNode::doReturnNav() {
   if (dist < goal_xy_tol_) {
     RCLCPP_INFO(get_logger(),
         "Rendezvous: reached home (dist=%.2f) -> waiting for team.", dist);
+    logGoalEnd("reached", false);
     // Same invariant as the watchdog exits: RETURN_SYNC is presumed
     // stationary, but nav2 may still be finishing the last <goal_xy_tol_ m
     // plus the in-place rotation — stop it so the wait clock does not run on
@@ -2584,13 +3412,25 @@ void ExploPlannerNode::doReturnNav() {
 
   const auto now = this->now();
   const double elapsed = (now - state_enter_time_).seconds();
-  // Distance-budgeted timeout / no-progress watchdog: if home can't be
-  // reached, wait for the team from here rather than looping on the drive
-  // (we're at least closer to comms than where exploration stranded us).
+  // nav2 aborts / distance-budgeted timeout / no-progress watchdog (same
+  // three as doNavigate): if home can't be reached, wait for the team from
+  // here rather than looping on the drive (we're at least closer to comms
+  // than where exploration stranded us).
+  if (nav_ep_nav2_gave_up_) {
+    RCLCPP_WARN(get_logger(),
+        "Rendezvous: nav2 gave the drive home up (%d abort(s) in a row from "
+        "here, dist=%.2f) -> waiting for team from current pose.",
+        nav_ep_abort_streak_.count(), dist);
+    logGoalEnd("nav2-aborted", true);
+    abandonNavGoal("rendezvous-home-nav2-aborted");
+    transitionTo(State::RETURN_SYNC);
+    return;
+  }
   if (elapsed > nav_budget_sec_) {
     RCLCPP_WARN(get_logger(),
         "Rendezvous: home unreachable within budget (%.1fs, dist=%.2f) "
         "-> waiting for team from current pose.", elapsed, dist);
+    logGoalEnd("budget", true);
     // RETURN_SYNC is presumed stationary (the guard doesn't run there) and
     // its wait clock starts now — stop the platform instead of letting nav2
     // keep driving the abandoned home goal under a "waiting" state.
@@ -2600,17 +3440,16 @@ void ExploPlannerNode::doReturnNav() {
   }
   const double window_elapsed = (now - progress_check_time_).seconds();
   if (window_elapsed > progress_window_sec_) {
-    const float delta = cumulative_distance_ - progress_check_dist_;
-    if (delta < progress_min_distance_m_) {
+    if (progressNetM() < progress_min_distance_m_) {
       RCLCPP_WARN(get_logger(),
           "Rendezvous: no progress toward home -> waiting for team from "
           "current pose.");
+      logGoalEnd("no-progress", true);
       abandonNavGoal("rendezvous-home-stuck");  // same invariant as above
       transitionTo(State::RETURN_SYNC);
       return;
     }
-    progress_check_time_ = now;
-    progress_check_dist_ = cumulative_distance_;
+    resetProgressWindow(now);
   }
   republishGoal(current_goal_);
 }
@@ -2779,6 +3618,8 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
   // checked async below purely to say out loud when it did not land.
   // current_goal_ is left untouched; the resume re-publishes it fresh.
   if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
+    last_nav_cancel_time_ = this->now();  // diagnostics: expected CANCELED
+    last_nav_cancel_why_  = "proximity hold";
     nav_cancel_client_->async_cancel_all_goals(
         [this](auto resp) {
           if (!resp ||
@@ -2803,6 +3644,7 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
   CandidateViewpoint brake;
   brake.position = latest_pos_;
   brake.yaw = latest_yaw_;
+  warnIfBrakePoseStale("proximity hold");
   publishGoal(brake);
 
   char buf[160];
@@ -2846,6 +3688,8 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
 // entered before the first pose, where it would command the frame origin.
 void ExploPlannerNode::abandonNavGoal(const char* why) {
   if (nav_cancel_client_ && nav_cancel_client_->action_server_is_ready()) {
+    last_nav_cancel_time_ = this->now();  // diagnostics: expected CANCELED
+    last_nav_cancel_why_  = why;
     // The reason is copied into the callback, not captured as a pointer: the
     // response lands ticks later and one caller forwards failGoal's `reason`
     // argument, so nothing here may assume the string outlives this call.
@@ -2873,10 +3717,14 @@ void ExploPlannerNode::abandonNavGoal(const char* why) {
   CandidateViewpoint brake;
   brake.position = latest_pos_;
   brake.yaw = latest_yaw_;
+  warnIfBrakePoseStale(why);
   publishGoal(brake);
 
   RCLCPP_INFO(get_logger(),
-      "Abandoning nav goal [%s]: cancelled + braking in place.", why);
+      "Abandoning nav goal [%s] in %s: cancelled + braking in place at "
+      "(%.2f, %.2f) (pose age %.2fs).",
+      why, stateName(state_), brake.position.x(), brake.position.y(),
+      poseAgeSec());
 }
 
 void ExploPlannerNode::doProximityHold() {
@@ -2924,8 +3772,10 @@ void ExploPlannerNode::doProximityHold() {
   transitionTo(prox_resume_state_);
   state_enter_time_ =
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
-  progress_check_time_ = now;
-  progress_check_dist_ = cumulative_distance_;
+  resetProgressWindow(now);
+  // The hold's brake goal is nav2's newest so far; only goals from the
+  // re-send below count against this goal again.
+  nav_ep_stamp_floor_ = nav_newest_stamp_;
   publishGoal(current_goal_);
 }
 
@@ -2951,7 +3801,7 @@ void ExploPlannerNode::doIntegrate() {
 // LOG_STEP state
 // ==================================================================
 
-void ExploPlannerNode::doLogStep() {
+StepMetrics ExploPlannerNode::writeStepRow() {
   StepMetrics m;
   m.step = step_;
   m.sim_time_sec = this->now().seconds();
@@ -2978,6 +3828,22 @@ void ExploPlannerNode::doLogStep() {
   // (holds only interrupt driving states), so these are always settled.
   m.prox_hold_count     = prox_hold_count_;
   m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
+
+  // How the goal behind this row ended (staged by logGoalEnd), then cleared
+  // so a row with no goal end in between reads "" rather than a stale one.
+  m.goal_outcome       = pending_goal_outcome_;
+  m.nav_elapsed_sec    = pending_nav_elapsed_sec_;
+  m.goal_path_length_m = pending_nav_path_len_m_;
+  m.nav2_aborts        = pending_nav2_aborts_;
+  m.nav2_recoveries    = pending_nav2_recoveries_;
+  m.nav2_error_code    = pending_nav2_error_code_;
+  pending_goal_outcome_.clear();
+  pending_nav_elapsed_sec_ = 0.0f;
+  pending_nav_path_len_m_  = 0.0f;
+  pending_nav2_aborts_     = 0;
+  pending_nav2_recoveries_ = 0;
+  pending_nav2_error_code_ = -1;
+  pending_nav_ep_id_       = 0;
 
   // Exploitation columns. Left at the "explore"/-1/0 defaults for exploration
   // rows; filled from the dwelled vantage for exploitation rows.
@@ -3006,7 +3872,11 @@ void ExploPlannerNode::doLogStep() {
       "Step %d logged: voxels=%d frontiers=%d dist=%.2f mean_eig=%.4f",
       step_, m.total_observed_voxels, m.frontier_voxels,
       m.distance_traveled, m.mean_eig);
+  return m;
+}
 
+void ExploPlannerNode::doLogStep() {
+  const StepMetrics m = writeStepRow();
   step_++;
   if (step_ >= max_steps_) {
     RCLCPP_INFO(get_logger(),
@@ -3112,8 +3982,7 @@ void ExploPlannerNode::onPeerExploitIntent(
 }
 
 bool ExploPlannerNode::inRoi(const Eigen::Vector3f& pos) const {
-  return pos.x() >= roi_min_x_ && pos.x() <= roi_max_x_ &&
-         pos.y() >= roi_min_y_ && pos.y() <= roi_max_y_;
+  return roi_xy_.contains(pos.x(), pos.y());
 }
 
 // Close the active target (success or partial) and route back to the queue or
@@ -3183,9 +4052,9 @@ void ExploPlannerNode::removeLiveRefinementRegions() {
 }
 
 // March from just outside the trunk outward along the line toward the robot and
-// return the point closest to the trunk that is in-ROI, a free planning_map cell,
-// reachable from the robot via the (already-flooded) cost grid, and not
-// blacklisted. This is the nearest spot we can actually drive to that makes
+// return the point closest to the trunk that is in-ROI, a free planning_map cell
+// outside the clearance zone, reachable from the robot via the (already-flooded)
+// cost grid, and not blacklisted. This is the nearest spot we can actually drive to that makes
 // progress toward a target whose vantage ring is still unmapped/unreachable;
 // driving there maps the surroundings so a vantage can pass on a later tick.
 // Returns false if no such point exists meaningfully nearer the trunk than the
@@ -3223,6 +4092,10 @@ bool ExploPlannerNode::computeApproachGoal(const Eigen::Vector3f& center,
     Eigen::Vector3f p(px, py, pz);
     if (!inRoi(p)) continue;
     if (latest_plan_map_ && !isCellFree(p)) continue;
+    // Not beside an obstacle: the same clearance zone exploration goals keep
+    // out of (planning_map_clearance_m).
+    if (latest_plan_map_ && cost_model_.clearance_m > 0.0f &&
+        cost_grid_->inClearanceZone(p)) continue;
     // Reachability only when a planning_map/cost grid exists; with no map,
     // accept the straight-line point (same fallback as the vantage loop).
     if (latest_plan_map_ && !cost_grid_->reachable(p)) continue;
@@ -3305,14 +4178,17 @@ void ExploPlannerNode::startExploitNavigate(const Eigen::Vector3f& robot_pos) {
 
   transitionTo(State::NAVIGATE);
 
-  // Initialise the smart-timeout state for this NAVIGATE cycle (same as doPlan).
+  // Initialise the smart-timeout state for this NAVIGATE cycle (same as doPlan,
+  // including the driven path length the caller staged).
   const float dx = current_goal_.position.x() - robot_pos.x();
   const float dy = current_goal_.position.y() - robot_pos.y();
-  const float dist = std::sqrt(dx * dx + dy * dy);
+  float dist = std::sqrt(dx * dx + dy * dy);
+  if (std::isfinite(pending_selected_path_len_))
+    dist = std::max(dist, pending_selected_path_len_);
   nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
                                  nav_min_timeout_sec_, nav_max_timeout_sec_);
-  progress_check_time_ = state_enter_time_;
-  progress_check_dist_ = cumulative_distance_;
+  resetProgressWindow(state_enter_time_);
+  startNavEpisode(dist);
 }
 
 bool ExploPlannerNode::vantageVetoedByPeers(uint32_t target_id,
@@ -3589,7 +4465,8 @@ void ExploPlannerNode::doExploitPlan() {
   // The LoS ray-march reads the fused grid; refresh it (cheap when unchanged).
   if (!loadLatestMap()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "EXPLOIT_PLAN: no fused map yet; retrying next tick.");
+        "EXPLOIT_PLAN: no usable fused map (%s); retrying next tick.",
+        mapStatusStr().c_str());
     return;
   }
 
@@ -3625,27 +4502,30 @@ void ExploPlannerNode::doExploitPlan() {
   // there is no obstacle layer to flood: have_cost stays false and every
   // vantage is ordered by straight-line distance with no reachability filter.
   //
-  // Cached on (map identity, source pose). "once per vantage" only held while
+  // Cached on (map generation, source pose). "once per vantage" only held while
   // a vantage was selectable: when none is, EXPLOIT_PLAN does NOT transition
   // and is therefore re-entered at the full 10 Hz tick rate until the target
   // times out — up to ~1200 whole-grid floods per target, all identical, on
   // the single-threaded executor that also has to service the map and TF
-  // callbacks. Rebuild only when the latched map object or the robot pose
-  // actually changed.
+  // callbacks. Rebuild only when the planning map or the robot pose actually
+  // changed.
   bool have_cost = false;
   if (latest_plan_map_) {
     constexpr float kFloodRefreshM = 0.5f;
+    ensureCostGridBuilt();  // clears exploit_flood_valid_ on a new map
     const bool stale =
         !exploit_flood_valid_ ||
-        exploit_flood_map_ != latest_plan_map_.get() ||
+        exploit_flood_gen_ != plan_map_gen_ ||
         (robot_pos - exploit_flood_pos_).head<2>().norm() > kFloodRefreshM;
     if (stale) {
-      cost_grid_->build(*latest_plan_map_);
-      cost_grid_->floodFrom(robot_pos, /*radius_cap_m (unbounded)=*/0.0f);
+      cost_grid_->floodFrom(robot_pos, /*radius_cap_m (unbounded)=*/0.0f,
+                            robot_clear_m_);
       exploit_flood_valid_   = true;
-      exploit_flood_map_     = latest_plan_map_.get();
+      exploit_flood_gen_     = plan_map_gen_;
       exploit_flood_pos_     = robot_pos;
       exploit_flood_reached_ = cost_grid_->reachedCellCount();
+      // Same grid as doPlan's bounded flood — that cache is now overwritten.
+      plan_flood_valid_ = false;
     }
     constexpr size_t kMinReachedForFilter = 10;
     have_cost = exploit_flood_reached_ >= kMinReachedForFilter;
@@ -3657,7 +4537,7 @@ void ExploPlannerNode::doExploitPlan() {
   int   best_idx  = -1;
   float best_cost = std::numeric_limits<float>::infinity();
   int   n_valid   = 0;
-  int rej_roi = 0, rej_map = 0, rej_unreach = 0, rej_los = 0,
+  int rej_roi = 0, rej_map = 0, rej_clear = 0, rej_unreach = 0, rej_los = 0,
       rej_visited = 0, rej_blk = 0, rej_minpos = 0, rej_noground = 0;
 
   for (size_t i = 0; i < vantages.size(); ++i) {
@@ -3673,6 +4553,13 @@ void ExploPlannerNode::doExploitPlan() {
     // Free-cell check only when a planning_map is present; without one
     // isCellFree() is conservatively false and would reject every vantage.
     if (latest_plan_map_ && !isCellFree(v.position)) { ++rej_map; continue; }
+    // Not beside an obstacle (planning_map_clearance_m), like exploration
+    // goals. Vantages are not snapped: the ring angle is the point of them.
+    if (latest_plan_map_ && cost_model_.clearance_m > 0.0f &&
+        cost_grid_->inClearanceZone(v.position)) {
+      ++rej_clear;
+      continue;
+    }
 
     float cost;
     if (have_cost) {
@@ -3730,9 +4617,9 @@ void ExploPlannerNode::doExploitPlan() {
     // once per window.
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Target %u: no selectable vantage (valid=%d noground=%d roi=%d map=%d "
-        "unreach=%d los=%d visited=%d blk=%d minpos=%d).",
-        tgt->id, n_valid, rej_noground, rej_roi, rej_map, rej_unreach, rej_los,
-        rej_visited, rej_blk, rej_minpos);
+        "clear=%d unreach=%d los=%d visited=%d blk=%d minpos=%d).",
+        tgt->id, n_valid, rej_noground, rej_roi, rej_map, rej_clear,
+        rej_unreach, rej_los, rej_visited, rej_blk, rej_minpos);
 
     // Quota-met and the per-target timeout are both handled unconditionally at
     // the top of this function, so neither can apply here. Drive *toward* the
@@ -3767,6 +4654,9 @@ void ExploPlannerNode::doExploitPlan() {
       pending_mean_path_cost_          = 0.0f;
       pending_selected_info_gain_      = 0.0f;
       pending_selected_path_cost_      = 0.0f;
+      pending_selected_path_len_ = have_cost
+          ? cost_grid_->pathLengthTo(approach)
+          : (approach - robot_pos).head<2>().norm();
       pending_rejected_by_minpos_      = rej_minpos;
       pending_rejected_by_unreachable_ = rej_unreach;
 
@@ -3820,6 +4710,9 @@ void ExploPlannerNode::doExploitPlan() {
   pending_mean_path_cost_          = best_cost;
   pending_selected_info_gain_      = 0.0f;
   pending_selected_path_cost_      = best_cost;
+  pending_selected_path_len_ = have_cost
+      ? cost_grid_->pathLengthTo(current_goal_.position)
+      : best_cost;
   pending_rejected_by_minpos_      = rej_minpos;
   pending_rejected_by_unreachable_ = rej_unreach;
 
@@ -4071,6 +4964,7 @@ void ExploPlannerNode::doExploitDwell() {
 // frame as the dscovox map.
 void ExploPlannerNode::updatePoseFromTF() {
   geometry_msgs::msg::TransformStamped tf;
+  const auto now = this->now();
   try {
     tf = tf_buffer_.lookupTransform(
         map_frame_, base_frame_, tf2::TimePointZero,
@@ -4079,7 +4973,54 @@ void ExploPlannerNode::updatePoseFromTF() {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "TF lookup %s -> %s failed: %s",
         map_frame_.c_str(), base_frame_.c_str(), e.what());
+    // Diagnostics: a failure keeps the LAST pose, so every consumer (arrival,
+    // watchdog, brake goals, candidates) silently runs on a frozen position.
+    tf_last_error_ = e.what();
+    if (!tf_failing_) {
+      tf_failing_ = true;
+      tf_fail_since_ = now;
+    }
+    const double down = (now - tf_fail_since_).seconds();
+    if (have_pose_ && tf_stale_warn_sec_ > 0.0 && down > tf_stale_warn_sec_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "TF %s -> %s failing for %.1fs: planning on a FROZEN pose from %.1fs "
+          "ago at (%.2f, %.2f) in %s. Check hmr_localisation (NDT map->odom) "
+          "and the odom->base publisher.",
+          map_frame_.c_str(), base_frame_.c_str(), down, poseAgeSec(),
+          latest_pos_.x(), latest_pos_.y(), stateName(state_));
+    }
     return;
+  }
+  if (tf_failing_) {
+    const double down = (now - tf_fail_since_).seconds();
+    if (have_pose_ && tf_stale_warn_sec_ > 0.0 && down > tf_stale_warn_sec_) {
+      RCLCPP_INFO(get_logger(), "TF %s -> %s recovered after a %.1fs outage.",
+          map_frame_.c_str(), base_frame_.c_str(), down);
+    }
+    tf_failing_ = false;
+  }
+  tf_last_error_.clear();
+  // TimePointZero returns the latest common time of the chain with no age
+  // check. A zero stamp = all-static chain (nothing to age); otherwise warn
+  // when localisation / odom stops publishing and the pose goes stale.
+  const rclcpp::Time stamp(tf.header.stamp, RCL_ROS_TIME);
+  if (stamp.nanoseconds() != 0) {
+    const double age = (now - stamp).seconds();
+    if (tf_stale_warn_sec_ > 0.0 && age > tf_stale_warn_sec_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "TF %s -> %s is %.1fs old (tf_stale_warn_sec=%.1f): the planner is "
+          "using a stale pose. Check the NDT map->odom and odom->base publish "
+          "rates (ros2 run tf2_ros tf2_monitor).",
+          map_frame_.c_str(), base_frame_.c_str(), age, tf_stale_warn_sec_);
+    } else if (tf_stale_warn_sec_ > 0.0 && age < -tf_stale_warn_sec_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "TF %s -> %s is stamped %.1fs in the FUTURE — clock mismatch between "
+          "localisation and this node (use_sim_time, unsynced hosts).",
+          map_frame_.c_str(), base_frame_.c_str(), -age);
+    }
+    pose_stamp_ = stamp;
+  } else {
+    pose_stamp_ = now;
   }
   latest_pos_ = Eigen::Vector3f(
       static_cast<float>(tf.transform.translation.x),
@@ -4102,16 +5043,361 @@ void ExploPlannerNode::trackDistance() {
     // no-progress watchdog. prev_pos_ is still advanced so the next tick
     // measures from the corrected pose. 0 disables the guard.
     if (max_pose_jump_m_ > 0.0f && step > max_pose_jump_m_) {
+      const Eigen::Vector3f d = latest_pos_ - prev_pos_;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-          "Pose jump of %.2f m in one tick exceeds max_pose_jump_m=%.2f — "
-          "treating as a localization discontinuity, not travel.",
-          step, max_pose_jump_m_);
+          "Pose jump of %.2f m in one tick (d=(%+.2f, %+.2f, %+.2f), (%.2f, "
+          "%.2f) -> (%.2f, %.2f), state %s) exceeds max_pose_jump_m=%.2f — "
+          "treating as a localization discontinuity (NDT relocalisation?), "
+          "not travel.",
+          step, d.x(), d.y(), d.z(), prev_pos_.x(), prev_pos_.y(),
+          latest_pos_.x(), latest_pos_.y(), stateName(state_),
+          max_pose_jump_m_);
+      // Carry the progress anchors with the jump: a relocalisation is not the
+      // robot getting anywhere.
+      progress_check_pos_ += d;
+      nav_ep_abort_streak_.shiftAnchor(d.x(), d.y());
+      nav_ep_recovery_log_.shiftAll(d.x(), d.y());
     } else {
       cumulative_distance_ += step;
     }
   }
   prev_pos_ = latest_pos_;
   first_pos_ = false;
+}
+
+// ==================================================================
+// Field diagnostics (logging only, except the nav2 abort and recovery counts
+// behind the nav2_abort_limit rule)
+// ==================================================================
+
+double ExploPlannerNode::poseAgeSec() const {
+  if (!have_pose_) return -1.0;
+  return (this->now() - pose_stamp_).seconds();
+}
+
+std::string ExploPlannerNode::mapStatusStr() const {
+  char buf[256];
+  if (!latest_scovox_map_) {
+    std::snprintf(buf, sizeof(buf),
+        "no ScovoxMap received on '%s' (%zu publisher(s))",
+        scovox_map_sub_->get_topic_name(),
+        scovox_map_sub_->get_publisher_count());
+  } else {
+    // Received but empty after the clip: the ROI / z-band misses the map
+    // (wrong roi_* / map frame, or terrain outside a flat band).
+    std::snprintf(buf, sizeof(buf),
+        "last ScovoxMap had %zu voxels (res %.3g), %zu inside the ROI x z-band "
+        "[%.2f, %.2f]",
+        latest_scovox_map_->voxels.size(),
+        static_cast<double>(latest_scovox_map_->resolution),
+        map_cache_->voxelCount(), eff_roi_min_z_, eff_roi_max_z_);
+  }
+  return buf;
+}
+
+void ExploPlannerNode::warnIfBrakePoseStale(const char* why) {
+  const double age = poseAgeSec();
+  if (tf_stale_warn_sec_ > 0.0 && age > tf_stale_warn_sec_) {
+    RCLCPP_WARN(get_logger(),
+        "Brake goal [%s] in %s uses a pose %.1fs old at (%.2f, %.2f): if the "
+        "robot moved since, nav2 drives it BACK there. See the TF warnings.",
+        why, stateName(state_), age, latest_pos_.x(), latest_pos_.y());
+  }
+}
+
+// nav2 NavigateToPose status, per goal id, logging transitions.
+// bt_navigator ABORTs the running goal whenever a new goal_pose preempts it —
+// i.e. on every keep-alive re-send — so only the NEWEST goal (by acceptance
+// stamp) is reported; older ABORTs are routine preemptions. The first array
+// (the latched snapshot, possibly from before this node started) only seeds
+// the table. A status of the planner's own goal (driving, the real goal on
+// the wire, accepted since startNavEpisode) is kept for logGoalEnd, and its
+// ABORTs feed the nav2_abort_limit / nav2_abort_final_after_recovery rule.
+void ExploPlannerNode::onNavStatus(
+    const action_msgs::msg::GoalStatusArray::SharedPtr& msg) {
+  using action_msgs::msg::GoalStatus;
+  rclcpp::Time newest(0, 0, RCL_ROS_TIME);
+  for (const auto& st : msg->status_list) {
+    const rclcpp::Time t(st.goal_info.stamp, RCL_ROS_TIME);
+    if (t > newest) newest = t;
+  }
+  if (newest > nav_newest_stamp_) nav_newest_stamp_ = newest;
+  const auto now = this->now();
+  const bool own_cancel = last_nav_cancel_time_.nanoseconds() != 0 &&
+                          (now - last_nav_cancel_time_).seconds() < 5.0;
+  const float dist =
+      (latest_pos_ - current_goal_.position).head<2>().norm();
+  const float yaw_err = std::remainder(latest_yaw_ - current_goal_.yaw,
+                                       2.0f * static_cast<float>(M_PI));
+  const bool driving =
+      state_ == State::NAVIGATE || state_ == State::RETURN_NAV;
+  // The last goal on the wire is the planner's real goal, not a brake.
+  const bool real_goal = have_last_goal_pub_ &&
+      (last_goal_pub_pos_ - current_goal_.position).squaredNorm() < 1e-6f;
+  // ...and nav2 accepted it after this planner goal started: an older goal
+  // (the previous goal's brake, say) is not this goal's business.
+  const bool ours = driving && real_goal && newest > nav_ep_stamp_floor_;
+
+  // Rebuilt from this array alone, so ids nav2 has dropped are pruned.
+  std::map<std::array<uint8_t, 16>, int8_t> seen;
+  for (const auto& st : msg->status_list) {
+    const auto& id = st.goal_info.goal_id.uuid;
+    seen[id] = st.status;
+    const auto it = nav_goal_status_.find(id);
+    if (!nav_status_primed_ ||
+        (it != nav_goal_status_.end() && it->second == st.status))
+      continue;
+    if (rclcpp::Time(st.goal_info.stamp, RCL_ROS_TIME) != newest) {
+      RCLCPP_DEBUG(get_logger(), "nav2: superseded goal -> status %d.",
+                   static_cast<int>(st.status));
+      continue;
+    }
+    if (ours) nav_ep_last_status_ = st.status;
+    switch (st.status) {
+      case GoalStatus::STATUS_SUCCEEDED: {
+        RCLCPP_INFO(get_logger(),
+            "nav2: goal SUCCEEDED (planner %s, %.2f m / %.2f rad from the "
+            "planner goal).", stateName(state_), dist, yaw_err);
+        // Only for the planner's real goal (not a brake): nav2 is done, the
+        // planner is not, and nothing re-drives until the keep-alive — the
+        // goal then fails on a timeout.
+        const bool yaw_off = state_ == State::NAVIGATE &&
+                             std::abs(yaw_err) >= goal_yaw_tol_;
+        if (driving && real_goal && (dist >= goal_xy_tol_ || yaw_off)) {
+          RCLCPP_WARN(get_logger(),
+              "nav2 reports SUCCEEDED but the planner has NOT arrived (%s): "
+              "dist %.2f m (goal_xy_tolerance %.2f), yaw err %.2f rad "
+              "(goal_yaw_tolerance %.2f). nav2's goal checker must be tighter "
+              "than the planner's tolerances, and TF %s -> %s must agree with "
+              "nav2's pose.",
+              stateName(state_), dist, goal_xy_tol_, yaw_err, goal_yaw_tol_,
+              map_frame_.c_str(), base_frame_.c_str());
+        }
+        break;
+      }
+      case GoalStatus::STATUS_ABORTED: {
+        // Ask why (Jazzy); the answer lands in its own log line.
+        requestNavResult(id, ours ? nav_ep_id_ : 0);
+        if (!ours) {
+          RCLCPP_WARN(get_logger(),
+              "nav2 ABORTED its newest goal, which is not the planner's "
+              "active goal (planner %s; a brake or an earlier goal).",
+              stateName(state_));
+          break;
+        }
+        ++nav_ep_aborts_;
+        // "Same spot" = within the watchdog's distance; 0.25 m when the
+        // watchdog is off (progress_min_distance_m 0 would make every abort
+        // a new streak and switch the limit off with it).
+        const float still_m = progress_min_distance_m_ > 0.0
+            ? static_cast<float>(progress_min_distance_m_) : 0.25f;
+        const int streak = nav_ep_abort_streak_.onAbort(
+            latest_pos_.x(), latest_pos_.y(), still_m);
+        // nav2 aborting after its own recovery rounds here is its considered
+        // answer: a re-send would run the same rounds from the same place
+        // (minutes on the default tree) and abort again.
+        const int recoveries_here = nav_ep_recovery_log_.countNear(
+            latest_pos_.x(), latest_pos_.y(), kNav2RecoverySpotM);
+        const Nav2GiveUp give_up = nav2GiveUp(
+            nav2_abort_limit_, streak, nav2_abort_final_after_recovery_,
+            recoveries_here, kNav2RecoveriesHere);
+        if (give_up != Nav2GiveUp::kRetry) nav_ep_nav2_gave_up_ = true;
+        std::string next;
+        if (nav2_abort_limit_ <= 0) {
+          next = "nav2_abort_limit 0: the planner waits for the nav budget / "
+                 "no-progress watchdog";
+        } else if (give_up == Nav2GiveUp::kAbortLimit) {
+          next = "giving the goal up";
+        } else if (give_up == Nav2GiveUp::kAfterRecovery) {
+          next = "giving the goal up: nav2 ran " +
+                 std::to_string(recoveries_here) + " recovery(ies) here first";
+        } else {
+          char buf[96];
+          std::snprintf(buf, sizeof(buf),
+              "the keep-alive re-sends it within %.0fs; gives up at %d",
+              goal_republish_sec_, nav2_abort_limit_);
+          next = buf;
+        }
+        RCLCPP_WARN(get_logger(),
+            "nav2 ABORTED the current goal (planner %s, goal (%.2f, %.2f), "
+            "robot (%.2f, %.2f), %.2f m to go): abort %d in a row from this "
+            "spot, %d for this goal — %s.",
+            stateName(state_), current_goal_.position.x(),
+            current_goal_.position.y(), latest_pos_.x(), latest_pos_.y(),
+            dist, streak, nav_ep_aborts_, next.c_str());
+        break;
+      }
+      case GoalStatus::STATUS_CANCELED:
+        if (own_cancel) {
+          RCLCPP_INFO(get_logger(), "nav2: goal CANCELED (planner-requested: %s).",
+              last_nav_cancel_why_.c_str());
+        } else {
+          RCLCPP_WARN(get_logger(),
+              "nav2 goal CANCELED without a planner cancel (planner %s, goal "
+              "(%.2f, %.2f), robot (%.2f, %.2f), %.2f m to go) — an operator or "
+              "another node stopped nav2; the planner still thinks it drives.",
+              stateName(state_), current_goal_.position.x(),
+              current_goal_.position.y(), latest_pos_.x(), latest_pos_.y(),
+              dist);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  nav_goal_status_.swap(seen);
+  nav_status_primed_ = true;
+}
+
+// nav2 feedback for the goal it is executing: distance remaining (for the
+// goal-end line) and the recovery count. bt_navigator restarts the count with
+// every goal, and the keep-alive re-send makes a new goal every
+// goal_republish_sec, so the count is followed per goal id: a new id's first
+// value is its baseline, and only increases after it are recoveries. Where
+// the robot stood for each feeds nav2_abort_final_after_recovery.
+void ExploPlannerNode::onNavFeedback(
+    const nav2_msgs::action::NavigateToPose::Impl::FeedbackMessage::SharedPtr&
+        msg) {
+  const auto& fb = msg->feedback;
+  const int rec = fb.number_of_recoveries;
+  const bool same_goal = nav_fb_have_ && msg->goal_id.uuid == nav_fb_goal_id_;
+  const int added =
+      newRecoveries(!nav_fb_have_, same_goal, nav_fb_recoveries_, rec);
+  nav_fb_have_ = true;
+  nav_fb_goal_id_ = msg->goal_id.uuid;
+  nav_fb_recoveries_ = rec;
+  nav_fb_dist_remaining_ = fb.distance_remaining;
+  nav_fb_rx_time_ = this->now();
+  if (added <= 0) return;
+  const bool driving =
+      state_ == State::NAVIGATE || state_ == State::RETURN_NAV;
+  const bool real_goal = have_last_goal_pub_ &&
+      (last_goal_pub_pos_ - current_goal_.position).squaredNorm() < 1e-6f;
+  if (!driving || !real_goal) return;
+  nav_ep_recoveries_ += added;
+  nav_ep_recovery_log_.add(latest_pos_.x(), latest_pos_.y(), added);
+  RCLCPP_WARN(get_logger(),
+      "nav2 ran a recovery on the current goal (%.2f, %.2f): %d for this "
+      "goal; %.1f m to go per nav2, robot at (%.2f, %.2f).",
+      current_goal_.position.x(), current_goal_.position.y(),
+      nav_ep_recoveries_, fb.distance_remaining, latest_pos_.x(),
+      latest_pos_.y());
+}
+
+// get_result on nav2's action server: answers at once for a finished goal.
+// Only Jazzy's result says why (error_code / error_msg); on Humble there is no
+// client and this returns immediately.
+void ExploPlannerNode::requestNavResult(const std::array<uint8_t, 16>& id,
+                                        uint64_t episode) {
+  using GetResult = nav2_msgs::action::NavigateToPose::Impl::GetResultService;
+  if (!nav_result_client_ || !nav_result_client_->service_is_ready()) return;
+  // One request in flight at most: an unanswered one (server gone) would
+  // otherwise sit in the client's pending table for the rest of the run.
+  nav_result_client_->prune_pending_requests();
+  auto req = std::make_shared<GetResult::Request>();
+  req->goal_id.uuid = id;
+  nav_result_client_->async_send_request(req,
+      [this, episode](rclcpp::Client<GetResult>::SharedFuture f) {
+        const auto resp = f.get();
+        if (!resp) return;
+        const int code = navResultErrorCode(resp->result);
+        if (code < 0) return;
+        const std::string text = navResultErrorMsg(resp->result);
+        if (episode != 0 && episode == nav_ep_id_) {
+          nav_ep_error_code_ = code;
+          nav_ep_error_msg_ = text;
+          // The goal can end (failGoal on the next tick) before this answer
+          // lands; its CSV row is still pending, so it gets the code too.
+          if (episode == pending_nav_ep_id_) pending_nav2_error_code_ = code;
+        }
+        RCLCPP_WARN(get_logger(),
+            "nav2 abort reason: error_code %d %s%s%s%s", code,
+            nav2ErrorName(code), text.empty() ? "" : " \"", text.c_str(),
+            text.empty() ? "" : "\"");
+      });
+}
+
+// Per-tick checks that need no state of their own beyond the diagnostics
+// members. Every message is throttled or one-shot.
+void ExploPlannerNode::checkDiagnostics() {
+  const auto now = this->now();
+
+  // nav2 status topic silent: wrong nav_status_action / namespace, or no
+  // bt_navigator. Checked once, ~10 s after the first goal went out.
+  if (nav_status_sub_ && have_first_goal_pub_ && !nav_status_pub_checked_ &&
+      (now - first_goal_pub_time_).seconds() > 10.0) {
+    nav_status_pub_checked_ = true;
+    if (nav_status_sub_->get_publisher_count() == 0) {
+      RCLCPP_WARN(get_logger(),
+          "No publisher on '%s' 10 s after the first goal — nav2 results are "
+          "invisible. Check nav_status_action / the robot namespace (goal "
+          "topic has %zu subscriber(s)).",
+          nav_status_sub_->get_topic_name(),
+          goal_pub_->get_subscription_count());
+    }
+  }
+
+  if (!have_pose_) return;
+
+  // ROI membership: candidates, frontiers and the map ingest are all
+  // ROI-clipped, so a robot outside it plans on nothing.
+  const bool inside = inRoi(latest_pos_);
+  if (!roi_known_) {
+    if (!inside) {
+      const Roi2D bb = roi_xy_.mapAabb();
+      RCLCPP_WARN(get_logger(),
+          "First pose (%.2f, %.2f) is OUTSIDE the ROI (map-frame extent x "
+          "[%.2f, %.2f] y [%.2f, %.2f]). Check roi_* / roi_origin_* / "
+          "roi_yaw_deg against this map frame (NDT map origin).",
+          latest_pos_.x(), latest_pos_.y(), bb.min_x, bb.max_x, bb.min_y,
+          bb.max_y);
+    }
+  } else if (inside != roi_inside_) {
+    if (!inside) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Robot left the ROI at (%.2f, %.2f) in %s — planning from outside "
+          "finds few or no candidates. Localisation jump, or a goal/approach "
+          "on the boundary?",
+          latest_pos_.x(), latest_pos_.y(), stateName(state_));
+    } else {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Robot back inside the ROI at (%.2f, %.2f).",
+          latest_pos_.x(), latest_pos_.y());
+    }
+  }
+  roi_known_  = true;
+  roi_inside_ = inside;
+
+  // Fused map gone quiet while the robot travels: the mapper died, the
+  // share link dropped, or the topic changed — planning on a stale map.
+  if (latest_scovox_map_) {
+    if (!map_rx_pos_valid_) {
+      pos_at_last_map_  = latest_pos_;
+      map_rx_pos_valid_ = true;
+    }
+    const double since = (now - last_map_rx_time_).seconds();
+    const float moved = (latest_pos_ - pos_at_last_map_).head<2>().norm();
+    if (since > 30.0 && moved > 5.0f) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "No new fused map on '%s' for %.0fs while the robot moved %.1f m — "
+          "planning on a STALE map (%zu publisher(s)). Check the mapper / map "
+          "share (ros2 topic hz).",
+          scovox_map_sub_->get_topic_name(), since, moved,
+          scovox_map_sub_->get_publisher_count());
+    }
+  }
+
+  // PLAN has no timeout of its own: every candidate rejected, tick after
+  // tick, leaves the robot idle indefinitely.
+  if (state_ == State::PLAN) {
+    const double in_plan = (now - state_enter_time_).seconds();
+    if (in_plan > 30.0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "Stuck in PLAN for %.0fs at step %d without selecting a goal — the "
+          "robot is idle. See the candidate-rejection / map lines above.",
+          in_plan, step_);
+    }
+  }
 }
 
 // Yaw-only (Z-axis) quaternion message. Shared by goal + candidate viz
@@ -4135,6 +5421,31 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   // choke on a non-zero z; markers/logs keep the 3D value either way.
   goal.pose.position.z = flatten_goal_z_ ? 0.0 : vp.position.z();
   goal.pose.orientation = yawToQuat(vp.yaw);
+  // Diagnostics (the goal is published regardless).
+  if (!vp.position.allFinite() || !std::isfinite(vp.yaw)) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Publishing a NON-FINITE goal (%.2f, %.2f) yaw=%.2f in %s — nav2 will "
+        "reject it. A NaN reached the goal path (fused map / terrain z / TF).",
+        vp.position.x(), vp.position.y(), vp.yaw, stateName(state_));
+  }
+  const float goal_dist = (vp.position - latest_pos_).head<2>().norm();
+  if (!use_planning_map_) {
+    RCLCPP_DEBUG(get_logger(),
+        "Goal (%.2f, %.2f) is %.2f m straight-line from the robot (no "
+        "planning_map: nav2 plans the real path).",
+        vp.position.x(), vp.position.y(), goal_dist);
+  }
+  if (far_goal_warn_m_ > 0.0 && goal_dist > far_goal_warn_m_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "Goal (%.2f, %.2f) is %.1f m from the robot (> far_goal_warn_m=%.0f): "
+        "likely beyond nav2's costmap, so the global planner may reject it "
+        "and ABORT. Check the global costmap size / rolling window.",
+        vp.position.x(), vp.position.y(), goal_dist, far_goal_warn_m_);
+  }
+  if (!have_first_goal_pub_) {
+    have_first_goal_pub_ = true;
+    first_goal_pub_time_ = goal.header.stamp;
+  }
   // No navigator listening: the goal goes nowhere and, with no action
   // feedback, the only symptom is every goal failing on the nav budget /
   // no-progress watchdog. Say so instead of letting it look like a slow robot.

@@ -46,6 +46,14 @@ bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg) {
 bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                                    const Eigen::Vector3f& roi_min,
                                    const Eigen::Vector3f& roi_max) {
+  return updateFromScovoxMap(
+      msg, Roi2D{roi_min.x(), roi_max.x(), roi_min.y(), roi_max.y()},
+      roi_min.z(), roi_max.z());
+}
+
+bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+                                   const Roi2D& roi_xy, float min_z,
+                                   float max_z) {
   // msg.resolution comes off the wire, so validate it here rather than trusting
   // it into the Grid constructor. `> 0.0f` is already false for NaN and for a
   // non-positive value (both fall back to the last known-good resolution), but
@@ -66,11 +74,9 @@ bool MapCache::updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
     // test against ±inf bounds (the unbounded overload).
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
       continue;
-    // Clip to the ROI AABB (inclusive). Against ±inf bounds (unbounded overload)
+    // Clip to the ROI (inclusive). Against ±inf bounds (unbounded overload)
     // every finite position passes, so this is free in the full-map case.
-    if (x < roi_min.x() || x > roi_max.x() ||
-        y < roi_min.y() || y > roi_max.y() ||
-        z < roi_min.z() || z > roi_max.z())
+    if (z < min_z || z > max_z || !roi_xy.contains(x, y))
       continue;
     // Drop non-finite Beta parameters too. p_occ is derived from them, and a
     // NaN a_occ/a_free silently produced a NaN p_occ that propagated into the
@@ -313,6 +319,52 @@ double MapCache::unknownColumnFraction(float min_x, float max_x,
   std::unordered_set<uint64_t> observed;
   grid_->forEachCell([&](const UnifiedVoxel&, const CoordT& c) {
     if (c.x < c_min.x || c.x > c_max.x || c.y < c_min.y || c.y > c_max.y)
+      return;
+    observed.insert(
+        (static_cast<uint64_t>(static_cast<uint32_t>(c.x)) << 32) |
+        static_cast<uint32_t>(c.y));
+  });
+
+  return 1.0 - static_cast<double>(observed.size()) /
+                   static_cast<double>(total);
+}
+
+double MapCache::unknownColumnFraction(const Roi2D& roi) const {
+  if (!roi.transformed())
+    return unknownColumnFraction(roi.min_x, roi.max_x, roi.min_y, roi.max_y);
+  if (!std::isfinite(roi.min_x) || !std::isfinite(roi.max_x) ||
+      !std::isfinite(roi.min_y) || !std::isfinite(roi.max_y) ||
+      !std::isfinite(roi.yaw) || !std::isfinite(roi.origin_x) ||
+      !std::isfinite(roi.origin_y) ||
+      !(roi.max_x > roi.min_x) || !(roi.max_y > roi.min_y))
+    return -1.0;
+
+  // A rotated box has no closed-form column count on the grid, so walk the
+  // columns of its map-frame bounding box and keep those whose centre is
+  // inside. Membership is by column index, so the observed set and the total
+  // use the same test.
+  const Roi2D box = roi.mapAabb();
+  const auto c_min = grid_->posToCoord(
+      static_cast<double>(box.min_x), static_cast<double>(box.min_y), 0.0);
+  const auto c_max = grid_->posToCoord(
+      static_cast<double>(box.max_x), static_cast<double>(box.max_y), 0.0);
+  const double res = resolution_;
+  auto inside = [&](int32_t cx, int32_t cy) {
+    return roi.contains(static_cast<float>((cx + 0.5) * res),
+                        static_cast<float>((cy + 0.5) * res));
+  };
+
+  int64_t total = 0;
+  for (int32_t cy = c_min.y; cy <= c_max.y; ++cy)
+    for (int32_t cx = c_min.x; cx <= c_max.x; ++cx)
+      if (inside(cx, cy)) ++total;
+  if (total <= 0) return -1.0;
+
+  // Same column packing as the box overload.
+  std::unordered_set<uint64_t> observed;
+  grid_->forEachCell([&](const UnifiedVoxel&, const CoordT& c) {
+    if (c.x < c_min.x || c.x > c_max.x || c.y < c_min.y || c.y > c_max.y ||
+        !inside(c.x, c.y))
       return;
     observed.insert(
         (static_cast<uint64_t>(static_cast<uint32_t>(c.x)) << 32) |

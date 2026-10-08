@@ -80,7 +80,7 @@ WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → D
                          │  ▲
                  PROXIMITY_HOLD           (yield while a peer drives past)
 exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
-rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive home, hold for the team)
 ```
 
 In exploration the cycle is:
@@ -220,15 +220,28 @@ The planner is optimistic about navigation and explicit about giving up.
 Each drive gets a **distance-scaled time budget**, `clamp(d / v̂ × k, 30 s,
 180 s)` with an assumed speed `v̂` of 0.15 m/s and a safety factor `k` of 3, so a
 2 m hop is allowed 40 s and a 15 m crossing 180 s. The budgeted distance is the
-*path* cost where one is available, not the straight line: a goal 5 m away that
-requires a 15 m detour should not be failed for being slow.
+planned *path's* length in metres where a planning map is available, not the
+straight line: a goal 5 m away that requires a 15 m detour should not be failed
+for being slow.
 
 Running in parallel is a **no-progress watchdog** that fails the goal
-immediately if the robot has travelled less than 0.2 m in the last 15 s — the
-wedged-robot case, which the time budget alone would take minutes to catch.
-Travelled distance is integrated from per-tick pose deltas, with single-tick
-jumps above 1 m rejected as localisation corrections rather than motion, so a
-relocalisation cannot spoof the watchdog or inflate the logged path length.
+immediately if, over the last 15 s, the robot has got less than 0.2 m (net,
+in a straight line) from where it was — the wedged-robot case, which the time
+budget alone would take minutes to catch. Net displacement rather than path
+walked, because pose jitter and rocking in place accumulate path on a robot
+that goes nowhere. Single-tick pose jumps above 1 m are rejected as
+localisation corrections rather than motion, so a relocalisation can neither
+spoof the watchdog nor inflate the logged path length.
+
+The planner also **watches the navigator** where it is Nav2: the
+`NavigateToPose` action's status, feedback and, on Jazzy, the error code of an
+abort. A goal Nav2 aborts twice in a row with the robot standing still (the
+keep-alive re-send gets one more try) is failed at once rather than left to
+the budget — typically a goal outside Nav2's costmap, or one it has no path
+to. One abort is enough when Nav2 had already run its recovery behaviours
+where the robot stands (a wedged robot): a re-send would only repeat them. Everything else Nav2 reports is logging: one line per goal end with the
+outcome, the time against the budget, the path length and Nav2's aborts,
+recoveries and last error.
 
 Arrival requires both position and heading to be within tolerance (0.4 m,
 0.4 rad), because a viewpoint's value depends on where the sensor points. The
@@ -301,18 +314,27 @@ it should do when it *finishes*. Stopping is wrong, because its teammate may
 still be exploring and their maps have not merged.
 
 Instead, a robot that exhausts its goals while a teammate is out of contact
-drives back to its **last-connected anchor** — the pose at which it last heard
-from a teammate, which by construction lies inside radio coverage — and waits
-there until the whole team is back in contact, broadcasting its presence
-throughout so that arriving teammates can count it. It then re-plans against the
-now-merged map: if the merge revealed new frontiers the team disperses again
-(MinPos splits them), and if not, everyone reaches the end together.
+drives back to the **mission start point** — the pose at which it started
+planning — and waits there until the whole team is back in contact,
+broadcasting its presence throughout so that arriving teammates can count it.
+The team launches inside one comms bubble, so every robot parked at its own
+start pose is in range of the others by construction: one deterministic meeting
+point. (An earlier design returned each robot to its *last-connected anchor*,
+the pose where it last heard a teammate; two robots that lost contact in
+different places then anchored in different places, and the barrier could hold
+both forever without ever putting them back in range.) It then re-plans against
+the now-merged map: if the merge revealed new frontiers the team disperses again
+(MinPos splits them), and if not, everyone reaches the end together. A robot
+that finishes with the team already present also drives home before stopping,
+so the mission ends with the team parked together where it launched.
 
 The barrier therefore enforces a useful invariant: **a robot can only finish
 when the whole team is present and the merged map is saturated**, so no robot
-quits while a teammate is still working. The wait is unbounded by default, with
-an optional timeout as a field escape hatch for a teammate that has genuinely
-died. The barrier takes priority over exploitation: an open tree target is stood
+quits while a teammate is still working. For field use both legs are bounded:
+the wait at home times out (600 s in the shipped configuration) for a teammate
+that has genuinely died — a robot that gives up still parks beaconing its
+presence, so a late teammate can find it — and a return drive that runs out of
+time or stops making progress waits where it is. The barrier takes priority over exploitation: an open tree target is stood
 down rather than serviced on the way home, because a robot detouring to inspect
 trees would leave its teammate waiting indefinitely.
 
@@ -341,7 +363,7 @@ states.
 Two release conditions prevent deadlock. A peer that has not moved for 10 s is
 treated as **parked** and no longer held against, because a stationary robot is
 an ordinary obstacle that the navigator's own costmap will route around, and
-holding against one deadlocks — a teammate waiting at its rendezvous anchor
+holding against one deadlocks — a teammate waiting at home for the rendezvous
 would otherwise stop the team forever. That release has a floor of 1.5 m,
 though: a peer parked closer than that keeps the hold, since "it stopped" is no
 licence to drive closer still. A final escape hatch resumes the drive after
@@ -529,9 +551,12 @@ map; distance travelled; the selected candidate's information gain, path cost
 and final utility, alongside the means over all candidates that cycle, so a
 selection can be attributed post hoc to either term; planning time; the number
 of active peers and the counts of candidates rejected by deconfliction and by
-unreachability; cumulative proximity-hold count and held seconds; and, for
+unreachability; cumulative proximity-hold count and held seconds; for
 exploitation rows, the target, the vantage index, how many vantages were valid,
-whether the sightline was clear, and the dwell time achieved.
+whether the sightline was clear, and the dwell time achieved; and, for the goal
+that ended since the previous row, how it ended, how long it took, the path
+length its budget was built from, and Nav2's aborts, recoveries and last error
+code on it.
 
 The columns are chosen so that behaviour is reconstructable without the logs:
 whether a robot was pulled off course by a teammate, whether a trunk closed
@@ -554,8 +579,9 @@ calibrated above.
 
 Obstacle avoidance is **delegated**. In the default configuration the planner
 performs no 2D reachability filtering at all; it discovers that a goal was
-unreachable only when the navigation budget expires, and recovers by
-blacklisting rather than by prediction.
+unreachable when Nav2 rejects it twice or, with no Nav2 to watch, when the
+navigation budget expires, and recovers by blacklisting rather than by
+prediction.
 
 The proximity stop is **coordination, not safety**. It depends on live peer
 data, on both planners running, and on the navigator honouring a cancel. In
@@ -583,7 +609,8 @@ offline, and the planner's own success criterion — three clear-sightline dwell
 | Occlusion threshold | p ≥ 0.7 | Ray stops at confidently occupied voxels |
 | Utility ε | 0.1 m | Division guard in `EIG / (ε + cost)` |
 | Nav budget | `clamp(d/0.15 × 3, 30, 180)` s | Distance-scaled drive timeout |
-| No-progress watchdog | 0.2 m in 15 s | Wedged-robot detection |
+| No-progress watchdog | 0.2 m net in 15 s | Wedged-robot detection |
+| Nav2 abort limit | 2 in a row, robot still; 1 after recoveries there | Gives up goals Nav2 rejects or cannot reach |
 | Arrival tolerance | 0.4 m, 0.4 rad | Must exceed the navigator's own checker |
 | Failed-goal blacklist | 2 m for 60 s | Prevents re-selecting failed goals |
 | Coverage termination | < 5 % unknown, 3 consecutive cycles | Saturation criterion |

@@ -4,6 +4,7 @@
 
 #include "explo_planner/scoring.hpp"
 #include "explo_planner/candidate_generator.hpp"
+#include "explo_planner/roi.hpp"
 #include <Eigen/Core>
 #include <vector>
 
@@ -20,7 +21,9 @@ struct FovConfig {
   int   v_rays     = 12;      ///< Vertical ray samples
   float occ_stop   = 0.7f;    ///< Stop ray at voxels above this p_occ
 
-  /// XYZ ROI bounds.  Rays are clipped at the ROI boundary so the
+  /// XYZ ROI bounds; x/y are in the ROI frame (map frame yawed by roi_yaw
+  /// about map (roi_origin_x, roi_origin_y), see Roi2D), z is map z.
+  /// Rays are clipped at the ROI boundary so the
   /// evaluator never scores voxels outside the region of interest. The z
   /// band must match the volume the local map_cache_ actually holds (in
   /// dscovox mode that is the GetRegion fetch band): otherwise rays leaving
@@ -32,6 +35,13 @@ struct FovConfig {
   float roi_max_y  =  1e9f;
   float roi_min_z  = -1e9f;
   float roi_max_z  =  1e9f;
+  float roi_yaw      = 0.0f;
+  float roi_origin_x = 0.0f;
+  float roi_origin_y = 0.0f;
+  Roi2D roiXY() const {
+    return {roi_min_x, roi_max_x, roi_min_y, roi_max_y,
+            roi_yaw, roi_origin_x, roi_origin_y};
+  }
 };
 
 struct EvalResult {

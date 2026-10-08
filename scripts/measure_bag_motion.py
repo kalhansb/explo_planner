@@ -9,7 +9,7 @@ and prints, next to each figure, the parameter it sizes:
 
   LINEAR mean                 -> nav_speed_estimate_mps
   YAWRATE p90 (180 deg turn)  -> goal_rotate_timeout_sec
-  longest standstill, min travel in any W-second window
+  longest standstill, min net displacement in any W-second window
                               -> progress_window_sec, progress_min_distance_m
   single-tick jumps per TF edge
                               -> max_pose_jump_m (and a doubled-publisher check)
@@ -196,22 +196,31 @@ def main():
           f"longest continuous standstill = {best:.1f} s")
     print(f"           -> progress_window_sec > longest standstill + one 180 deg turn")
 
-    cum, run = [(0.0, 0.0)], 0.0
+    # The watchdog compares NET displacement (window end vs start, a straight
+    # line); walked travel is printed next to it because jitter and rocking
+    # in place grow it on a robot that goes nowhere.
+    cum, run = [(0.0, 0.0, poses[0][1], poses[0][2])], 0.0
     for (ta, xa, ya, _), (tb, xb, yb, _) in zip(poses, poses[1:]):
         run += math.hypot(xb - xa, yb - ya)
-        cum.append((tb - t0, run))
-    print("WINDOW   min travel in any sliding window (the watchdog fires below this):")
+        cum.append((tb - t0, run, xb, yb))
+    print("WINDOW   net displacement in sliding windows (the watchdog fires below "
+          "progress_min_distance_m):")
     for W in windows:
-        worst, j = float('inf'), 0
-        for ti, ci in cum:
+        nets, walked, j = [], float('inf'), 0
+        for ti, ci, xi, yi in cum:
             while j < len(cum) and cum[j][0] < ti + W:
                 j += 1
             if j >= len(cum):
                 break
-            worst = min(worst, cum[j][1] - ci)
-        if worst < float('inf'):
-            print(f"           {W:>5.0f} s -> {worst:.2f} m")
-    print(f"           -> progress_min_distance_m <= about half the figure at your window")
+            nets.append(math.hypot(cum[j][2] - xi, cum[j][3] - yi))
+            walked = min(walked, cum[j][1] - ci)
+        if nets:
+            print(f"           {W:>5.0f} s -> net min {min(nets):.2f} m, p5 {pct(nets, 5):.2f} m, "
+                  f"{100 * sum(1 for n in nets if n < 0.25) / len(nets):.0f}% under 0.25 m;"
+                  f"  walked min {walked:.2f} m")
+    print(f"           -> progress_min_distance_m <= about half the net min at your window,")
+    print(f"              on a recording driven to goals throughout: operator stops")
+    print(f"              in a teleop recording pull the net min to 0")
 
     print("EDGES    single-tick translation jumps per dynamic TF edge in the chain:")
     for p, c in chain:

@@ -342,3 +342,72 @@ TEST(MapCacheIngest, NonFiniteWireResolutionIsRejectedAndKeepsThePreviousGrid) {
   // The wire field is a float, so the stored double is static_cast<double>(0.1f).
   EXPECT_NEAR(map.resolution(), 0.1, 1e-6);
 }
+
+// --- Rotated ROI -----------------------------------------------------------
+
+// An untransformed Roi2D is exactly the box overload.
+TEST(MapCacheColumnFraction, UntransformedRoiMatchesTheBoxOverload) {
+  MapCache map = makeMap({{0.15f, 0.25f, 0.5f}, {0.85f, 0.05f, 0.5f}});
+  EXPECT_DOUBLE_EQ(map.unknownColumnFraction(Roi2D{0.0f, kBoxMax, 0.0f, kBoxMax}),
+                   map.unknownColumnFraction(0.0f, kBoxMax, 0.0f, kBoxMax));
+}
+
+// A 90 deg ROI offset to (1, 0) with 1 m sides covers map [0, 1]^2 — the
+// same 10x10 columns (centres 0.05 m clear of every edge, so float noise in
+// cos(90 deg) cannot move one across) — so full coverage reads 0 and half
+// reads 0.5.
+TEST(MapCacheColumnFraction, RotatedRoiCountsItsOwnColumns) {
+  const Roi2D roi{0.0f, 1.0f, 0.0f, 1.0f,
+                  static_cast<float>(M_PI / 2.0), 1.0f, 0.0f};
+  std::vector<Eigen::Vector3f> all, half;
+  for (int i = 0; i < kCols; ++i)
+    for (int j = 0; j < kCols; ++j) {
+      all.emplace_back(center(i), center(j), 0.5f);
+      if (i < kCols / 2) half.emplace_back(center(i), center(j), 0.5f);
+    }
+  EXPECT_NEAR(makeMap(all).unknownColumnFraction(roi), 0.0, 1e-9);
+  EXPECT_NEAR(makeMap(half).unknownColumnFraction(roi), 0.5, 1e-9);
+  EXPECT_NEAR(MapCache(0.1).unknownColumnFraction(roi), 1.0, 1e-9);
+}
+
+// A column inside the ROI's bounding box but outside the rotated square does
+// not count as covered; one inside it does.
+TEST(MapCacheColumnFraction, RotatedRoiIgnoresBoundingBoxCorners) {
+  const Roi2D roi{0.0f, 1.0f, 0.0f, 1.0f, static_cast<float>(M_PI / 4.0)};
+  EXPECT_NEAR(makeMap({{0.65f, 0.15f, 0.5f}}).unknownColumnFraction(roi), 1.0,
+              1e-9);
+  EXPECT_LT(makeMap({{0.05f, 0.75f, 0.5f}}).unknownColumnFraction(roi), 1.0);
+}
+
+TEST(MapCacheColumnFraction, DegenerateRotatedRoiReturnsMinusOne) {
+  MapCache map = makeMap({{0.5f, 0.5f, 0.5f}});
+  EXPECT_DOUBLE_EQ(
+      map.unknownColumnFraction(Roi2D{1.0f, 0.0f, 0.0f, 1.0f, 0.3f}), -1.0);
+  EXPECT_DOUBLE_EQ(
+      map.unknownColumnFraction(Roi2D{0.0f, 1.0f, 0.0f, 1.0f, NAN}), -1.0);
+}
+
+// The ingest clip applies the rotated ROI: a voxel inside the bounding box
+// but outside the rotated square is dropped, one inside is kept, and the z
+// band still applies.
+TEST(MapCacheIngest, RotatedRoiClipsInItsOwnFrame) {
+  scovox_msgs::msg::ScovoxMap msg;
+  msg.resolution = 0.1f;
+  auto add = [&msg](float x, float y, float z) {
+    scovox_msgs::msg::ScovoxVoxel v;
+    v.position.x = x;
+    v.position.y = y;
+    v.position.z = z;
+    v.a_occ = 10.0f;
+    v.a_free = 1.0f;
+    msg.voxels.push_back(v);
+  };
+  add(0.05f, 0.75f, 0.5f);  // inside the diamond
+  add(0.65f, 0.15f, 0.5f);  // inside its bbox, outside the diamond
+  add(0.05f, 0.75f, 5.0f);  // inside the diamond, above the z band
+  const Roi2D roi{0.0f, 1.0f, 0.0f, 1.0f, static_cast<float>(M_PI / 4.0)};
+  MapCache map(0.1);
+  ASSERT_TRUE(map.updateFromScovoxMap(msg, roi, 0.0f, 1.0f));
+  EXPECT_EQ(map.voxelCount(), 1u);
+  EXPECT_TRUE(map.getVoxel({0.05f, 0.75f, 0.5f}).observed);
+}

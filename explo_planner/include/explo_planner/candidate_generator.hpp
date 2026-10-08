@@ -2,6 +2,7 @@
 /// @file candidate_generator.hpp
 /// @brief Polar-grid viewpoint candidate generation.
 
+#include "explo_planner/roi.hpp"
 #include <Eigen/Core>
 #include <vector>
 
@@ -39,15 +40,24 @@ struct CandidateConfig {
   float ground_search_below  = 4.0f;  ///< Ground search window below the reference z (m)
   float ground_search_above  = 1.0f;  ///< Ground search window above the reference z (m)
   float ground_stack_max_m   = 0.6f;  ///< Contiguous occupied-stack walk cap (vertical smear)
-  /// Hard XY bounding box on candidate positions (map frame, metres). The
-  /// generator drops any candidate (radial or frontier) whose centre falls
-  /// outside [roi_min_x, roi_max_x] x [roi_min_y, roi_max_y]. Set the dscovox
-  /// planning_map size + origin to match this box so the global planner is
-  /// constrained to the same area.
+  /// Hard XY box on candidate positions (metres). The generator drops any
+  /// candidate (radial or frontier) whose centre falls outside
+  /// [roi_min_x, roi_max_x] x [roi_min_y, roi_max_y] measured in the ROI frame
+  /// — the map frame yawed by roi_yaw (rad) about map (roi_origin_x,
+  /// roi_origin_y); see Roi2D. The defaults make the ROI frame the map frame.
+  /// Set the dscovox planning_map size + origin to cover this box so the
+  /// global planner is constrained to the same area.
   float roi_min_x   = -1e9f;
   float roi_max_x   =  1e9f;
   float roi_min_y   = -1e9f;
   float roi_max_y   =  1e9f;
+  float roi_yaw      = 0.0f;
+  float roi_origin_x = 0.0f;
+  float roi_origin_y = 0.0f;
+  Roi2D roiXY() const {
+    return {roi_min_x, roi_max_x, roi_min_y, roi_max_y,
+            roi_yaw, roi_origin_x, roi_origin_y};
+  }
   /// Vertical band a terrain-snapped candidate z is clamped into (map frame,
   /// metres, ABSOLUTE — the node pushes the effective robot-relative band each
   /// PLAN tick via setRoiZ). This is the band MapCache actually ingested, so a
@@ -85,6 +95,16 @@ public:
       const std::vector<Eigen::Vector3f>& frontier_centroids,
       const Eigen::Vector3f& robot_pos,
       const MapCache* map = nullptr) const;
+
+  /// Move a candidate to (x, y) — used by the planning-map snap
+  /// (CandidateSnapper) when its original cell is blocked, too close to an
+  /// obstacle, or unreachable. z is re-derived the way the candidate was
+  /// placed: terrain-relative mode (with a map) re-runs the ground search
+  /// around the candidate's current z, flat mode keeps the fixed z. A frontier
+  /// candidate moved more than 0.5 m is re-aimed at its original position (the
+  /// frontier it was generated to look at); other candidates keep their yaw.
+  void relocate(CandidateViewpoint& vp, float x, float y,
+                const MapCache* map = nullptr) const;
 
   /// Read-only access to the configuration (mirrors VantagePlanner::config()).
   /// The exploitation path needs the terrain-mode ground-search window and

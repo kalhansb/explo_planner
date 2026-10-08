@@ -74,7 +74,7 @@ WAIT_FOR_MAP → PLAN → NAVIGATE → INTEGRATE → LOG_STEP → PLAN … → D
                          │  ▲
                  PROXIMITY_HOLD           (yield while a peer drives past)
 exploit sub-loop:  EXPLOIT_PLAN → NAVIGATE → EXPLOIT_DWELL → LOG_STEP → …
-rendezvous:        RETURN_NAV → RETURN_SYNC  (drive to the anchor, hold for the team)
+rendezvous:        RETURN_NAV → RETURN_SYNC  (drive home, hold for the team)
 ```
 
 A `TreeTarget` on the targets topic pulls the planner from the exploration
@@ -175,16 +175,29 @@ launches (all cross-node topic defaults are built **absolute** from
   `exploitation_enabled`. QoS: reliable, `transient_local`, depth 50, so a
   planner that starts after targets were released still receives them.
 - `<planning_map_topic>` (`nav_msgs/OccupancyGrid`), default
-  `/<robot_name>/dscovox_node/planning_map` — optional 2D inflated grid for
-  candidate free-cell filtering, reachability and path costs. **Only
+  `/<robot_name>/dscovox_node/planning_map` — optional 2D grid for candidate
+  free-cell filtering, goal snapping, reachability and path costs. **Only
   subscribed when `use_planning_map: true`** (default off: straight-line
   costs, no 2D filtering, obstacle avoidance wholly delegated to the
-  navigator). QoS: reliable, `transient_local`, depth 1.
+  navigator). With `planning_map_mode: direct` each message is the map; with
+  `accumulate` each message is a robot-centred rolling window (e.g.
+  traversability_mapping's `/occupancy_map_local`) stitched into one grid over
+  the ROI. Accumulate mode drops windows whose `frame_id` is not `map_frame`
+  and rejects rotated, malformed or oversized ones (counted in the
+  WAIT_FOR_MAP log). QoS: reliable, `transient_local`, depth 1.
 - Each entry of `proximity_peer_pose_topics`
   (`geometry_msgs/PoseWithCovarianceStamped`) — a peer's localiser pose for
   the proximity guard, format `"<robot_name>:<topic>"`. Consumed in
   `map_frame` **without reframing** (warns once on mismatch). QoS: reliable,
   depth 5.
+- `<nav_status_action>/_action/status` (`action_msgs/GoalStatusArray`) and
+  `<nav_status_action>/_action/feedback`
+  (`nav2_msgs/action/NavigateToPose_FeedbackMessage`), default
+  `/<robot_name>/navigate_to_pose` — nav2's view of the goal: results,
+  recoveries and distance to go, for the log, the `Goal end` line, the CSV
+  and `nav2_abort_limit` / `nav2_abort_final_after_recovery`. Status QoS: reliable, `transient_local`, depth 1;
+  feedback: best effort, depth 1. Silent without nav2 (bag replay): nothing
+  then depends on them.
 
 #### Published topics
 
@@ -198,6 +211,10 @@ launches (all cross-node topic defaults are built **absolute** from
   `dwelled_mask`/`staged` during exploitation.
 - `~/candidates` (`visualization_msgs/MarkerArray`) — candidate viewpoints and
   scores for RViz; resolves to `/<ns>/explo_planner/candidates`.
+- `~/traversability_map` (`nav_msgs/OccupancyGrid`) — the accumulated planning
+  map, republished on every snapshot (at most every
+  `planning_map_accum_refresh_sec`); only with `planning_map_mode: accumulate`.
+  QoS: reliable, `transient_local`, depth 1.
 - `proximity_hold_state` (`std_msgs/String`) — `"clear"` or a hold reason;
   only when `proximity_stop_enabled`. Relative name: resolves under the node's
   namespace. QoS: reliable, `transient_local`, depth 1 (latched — `echo` shows
@@ -216,6 +233,10 @@ launches (all cross-node topic defaults are built **absolute** from
   *sent* through this client. The `goal_pose` topic remains the only command
   path, so any navigator that consumes `PoseStamped` works — only the
   proximity stop's cancel is Nav2-specific.
+- `<nav_status_action>/_action/get_result` (service, Jazzy builds only) —
+  asked once per nav2 ABORT for the result's `error_code` / `error_msg`, which
+  are logged (`nav2 abort reason: …`) and kept for the `Goal end` line and
+  the CSV. Humble's result is empty, so the client is not created there.
 
 #### Required tf transforms
 
@@ -245,6 +266,18 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `goal_topic` | string | *auto* | `/<robot_name>/goal_pose`. |
 | `use_planning_map` | bool | `false` | Master switch for the 2D grid (see subscribed topics). |
 | `planning_map_topic` | string | *auto* | `/<robot_name>/dscovox_node/planning_map`. |
+| `planning_map_mode` | string | `direct` | `direct`: each message is the planning map. `accumulate`: each message is a rolling window, stitched into one grid over the ROI bounding box (see subscribed topics). |
+| `planning_map_accum_resolution` | double | `0.2` | Accumulated grid cell (m). Finer windows are max-pooled into it. |
+| `planning_map_accum_margin_m` | double | `5.0` | Margin around the ROI bounding box. An unbounded ROI falls back to ±200 m about the map origin (warns). |
+| `planning_map_accum_max_cells` | int | `4000000` | Cell cap; the resolution is coarsened to fit (warns, errors above 1 m). |
+| `planning_map_accum_refresh_sec` | double | `1.0` | Minimum period between planning-map snapshots. Each one rebuilds the CostGrid layers and the next flood. |
+| `planning_map_obstacle_threshold` | int | `50` | Cells ≥ this are obstacles for the goal filter, the snap and the CostGrid. |
+| `planning_map_trav_weight` | double | `0` | Path cost: a passable cell holding v costs `step × (1 + w × v / 100)`. |
+| `planning_map_unknown_value` | double | `0` | The v an unseen (−1) cell counts as in the path cost, clamped to 0–99. `25` in the real-robot overlay. |
+| `planning_map_clearance_m` | double | `0` | Passable cells within this distance of an obstacle form a clearance zone: never a goal, and costed by the penalty below. |
+| `planning_map_clearance_penalty` | double | `1` | Step-cost multiplier inside the clearance zone (≥ 1). |
+| `candidate_snap_radius_m` | double | `0` (`2.0` in shared_params) | Frontier candidates on an obstacle, in the clearance zone, or unreachable move to the nearest good cell within this radius before scoring; with none they are rejected as before. Only with a planning map. |
+| `planning_map_robot_clear_m` | double | `0` | Blocked cells within this radius of the robot are passable for the robot's own path search (they stay obstacles for goals): a LiDAR that sees the robot's body otherwise walls a parked robot in, and the reachability filter switches off. `1.0` in the real-robot overlay. |
 
 **Navigation gates and watchdogs**
 
@@ -254,10 +287,15 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 | `goal_rotate_timeout_sec` | double | `15.0` | Deadline for the post-arrival in-place rotation. |
 | `goal_republish_sec` | double | `5.0` | Keep-alive re-send of an unchanged goal. Each re-send preempts Nav2's running goal via `GoalUpdated`, cutting recoveries short — never set it near the tick rate; `0` = publish-on-change only (best once bringup is reliable). |
 | `integrate_wait` | double | `2.0` | Dwell (s) in INTEGRATE after arrival so the map absorbs the new view. |
-| `nav_speed_estimate_mps` | double | `0.15` | Travel budget per NAVIGATE = `clamp(dist / speed × safety, min, max)`. |
+| `nav_speed_estimate_mps` | double | `0.15` | Travel budget per NAVIGATE = `clamp(dist / speed × safety, min, max)`; `dist` is the straight line, or the planned path's length in metres on the planning map if longer. |
 | `nav_safety_factor` | double | `3.0` | ⬑ |
 | `nav_min_timeout_sec` / `nav_max_timeout_sec` | double | `30` / `180` | ⬑ clamp bounds (s). |
-| `progress_window_sec` / `progress_min_distance_m` | double | `15` / `0.2` | No-progress watchdog: fail the goal if the robot travels less than this in this window. |
+| `progress_window_sec` / `progress_min_distance_m` | double | `15` / `0.2` | No-progress watchdog: fail the goal if, at the end of a window, the robot is less than this far (net, straight line) from where it stood at the window's start. |
+| `nav_status_action` | string | *auto* | `NavigateToPose` action watched for nav2's status, feedback and (Jazzy) abort reason: logged per goal and feeding `nav2_abort_limit`. *auto* → `/<robot_name>/navigate_to_pose`; `""` disables the watch. |
+| `nav2_abort_limit` | int | `2` | Fail the goal (`[nav2-aborted]`) after nav2 aborts it this many times in a row with the robot within `progress_min_distance_m` (0.25 m if that is 0) of the first abort. The keep-alive re-sends an aborted goal, so without it nav2 giving up never sticks. `0` = log only. |
+| `nav2_abort_final_after_recovery` | bool | `true` | Also fail the goal after ONE abort when nav2 had already run at least 2 recovery behaviours (costmap clears included, from its feedback) within 1 m of where it aborts: that abort ends nav2's own recovery rounds, and a re-send would repeat them from the same place. Instant refusals (no recoveries) keep the re-send. Needs `nav2_abort_limit` > 0. |
+| `far_goal_warn_m` | double | `50` | WARN when a published goal is farther than this from the robot (likely beyond nav2's costmap). `0` disables. |
+| `tf_stale_warn_sec` | double | `1.0` | WARN when the newest `map_frame → base_frame` transform is older than this; the planner keeps its last pose. `<= 0` disables. |
 | `max_pose_jump_m` | double | `1.0` | Single-tick pose delta above this is a relocalisation jump, not travel (excluded from distance and the watchdog). `0` disables. |
 | `failed_goal_radius_m` / `failed_goal_ttl_sec` | double | `2.0` / `60` | Blacklist disc and lifetime around a failed goal. |
 
@@ -274,15 +312,16 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `candidate_enable_polar` | bool | `true` | Adds `n_radial × n_rings × n_yaw` polar samples around the robot on top of frontier candidates. |
+| `candidate_enable_polar` | bool | `true` (`false` in shared_params) | Adds `n_radial × n_rings × n_yaw` polar samples around the robot on top of frontier candidates. |
 | `candidate_n_radial` / `candidate_n_rings` / `candidate_n_yaw` | int | `8` / `3` / `4` | ⬑ 96 samples at the defaults. |
 | `candidate_min_radius` / `candidate_max_radius` | double | `2.0` / `8.0` | Polar ring radii (m). |
 | `candidate_robot_z` | double | `0.3` | Sensor height (m) — absolute in flat mode, ignored for placement in terrain mode. |
 | `candidate_occ_thresh` | double | `0.7` | Occupancy above this blocks a candidate cell. |
 | `frontier_cluster_radius_m` | double | `5.0` | Frontier-centroid clustering bin edge (m). |
-| `roi_min_x/max_x/min_y/max_y` | double | AO box | Axis-aligned XY box (map frame) candidates must lie in; also the coverage-done measurement box. |
+| `roi_min_x/max_x/min_y/max_y` | double | AO box | XY box in the ROI frame that candidates must lie in; also the coverage-done measurement box. |
+| `roi_yaw_deg` / `roi_origin_x` / `roi_origin_y` | double | `0` / `0` / `0` (`25.75` / `-40.30` / `-31.54` in shared_params) | The ROI frame: the map frame yawed by `roi_yaw_deg` about map point (`roi_origin_x`, `roi_origin_y`). All zero = the map frame (an axis-aligned box). |
 | `roi_min_z` / `roi_max_z` | double | `-5.5` / `4.0` | Map ingest z-band. **Robot-relative** when `terrain_relative_z`, absolute otherwise. Any upstream share/ingest z-filters must be a superset. |
-| `cost_grid_radius_cap_m` | double | `0` | Bounded-Dijkstra flood radius. *auto* → `candidate_max_radius + 2`. |
+| `cost_grid_radius_cap_m` | double | `0` | Bounded-Dijkstra flood radius. *auto* → `candidate_max_radius + 2`. With an ROI-sized planning map set it to cover the ROI, or every candidate beyond 10 m reads unreachable. |
 | `trajectory_scoring` | bool | `false` | SSMI ablation: score poses sampled along the whole Dijkstra path, not just the endpoint. Expensive. |
 | `trajectory_sample_spacing_m` | double | `1.5` | ⬑ sample spacing. |
 
@@ -320,9 +359,10 @@ Topic-name parameters marked *auto* build their default from `robot_name`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `rendezvous_enabled` | bool | `true` | On goal exhaustion with teammates out of comms, drive to the last-connected anchor and wait. |
+| `rendezvous_enabled` | bool | `true` | On exploration exhaustion, drive back to the mission start point (the pose where planning started) and wait there until the team is back in comms; with the team already present, drive home and finish there. |
 | `rendezvous_expected_peers` | int | `0` | Teammates to wait for. **`0` leaves the feature inert** — the multi-robot launch sets team size − 1; set it by hand on hardware. |
-| `rendezvous_max_wait_sec` | double | `600.0` | Barrier give-up (s); `<= 0` = wait forever (the C++ fallback is `0.0`). |
+| `rendezvous_max_wait_sec` | double | `600.0` | Barrier give-up (s); `<= 0` = wait forever. The bare C++ fallback is `0.0`; `shared_params.yaml` and the multi-robot launch ship `600.0`. |
+| `return_nav_max_timeout_sec` | double | `600.0` | Ceiling on the drive home (s). On expiry or no progress the robot waits for the team where it is. |
 
 **Proximity stop (coordinated yield)** — best-effort coordination, *not* a
 certified safety stop. Right of way: the lexicographically smaller
@@ -548,10 +588,25 @@ one planner per robot PC by hand — this is also the only launch that sets
 | `output_dir` / `config_id` / `world` | `/tmp` / `c1` / `flatforest` | Compose the per-robot CSV name `exp7_<planner>_<world>_<config_id>_<robot>.csv`. |
 | `max_steps` | `100` | Per-robot budget. |
 | `coordination_enabled` | `true` | MinPos deconfliction. |
-| `rendezvous_enabled` | `true` | Anchor-return reconnection. |
+| `rendezvous_enabled` | `true` | Return-home reconnection. |
 | `rendezvous_max_wait_sec` | `600.0` | Barrier give-up. |
 | `proximity_stop_enabled` | `true` | Coordinated yield. |
 | `params_file` | `''` | Overlay layered over the shared file — [`config/exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml) on hardware, whose `/<robot>/explo_planner` blocks match these namespaced nodes. See [real_robot_tuning.md](real_robot_tuning.md). |
+
+### traversability_map.launch.py
+
+traversability_mapping's `traversability_filter` and `traversability_map`
+only (not its PRM/path planner): the planning-map source of the real-robot
+overlay. One instance per robot. See field_setup.md, "Traversability map".
+
+| Argument | Default | Description |
+|---|---|---|
+| `namespace` | `''` | Robot namespace. The nodes run in it, and every `*_topic` of the params file except `input_cloud_topic` gets a `/<namespace>` prefix, so the map lands on `/<namespace>/occupancy_map_local`. Empty = the params file's un-namespaced topics. |
+| `input_cloud_topic` | `/hesai/points_decimated` | LiDAR `PointCloud2`, taken as given. |
+| `base_frame` / `lidar_frame` | `''` | Frame overrides; empty = the params file (`base_link` / `hesai_lidar`). Frames are never prefixed: the robots share one TF tree. |
+| `use_sim_time` | `false` | `true` for bag replay. |
+| `params_file` | `''` | traversability_mapping params; empty = its shipped `config/traversability_mapping.yaml`. |
+| `sensor_range_limit` / `prediction_enable` | `''` | Overrides; empty = the params file. Floats keep their decimal point (`12.0`). |
 
 ---
 
@@ -562,15 +617,18 @@ to `output_csv`. Columns, in order:
 
 | Column | Meaning |
 |---|---|
-| `phase`, `target_id`, `vantage_index` | `explore`/`exploit`; active target and dwelled ring index (`-1` in explore). |
-| `n_vantages_valid`, `vantage_los_clear`, `dwell_sec` | Exploit diagnostics: selectable vantages this tick, clear-LoS flag, honest capture length (dwell-sync wait time is *not* counted). |
 | `step`, `sim_time_sec` | Step counter and node-clock time. |
 | `total_observed_voxels`, `frontier_voxels` | Map growth. |
-| `distance_traveled` | Integrated from tf, teleport-guarded (`max_pose_jump_m`). |
+| `distance_traveled` | Integrated from tf, teleport-guarded (`max_pose_jump_m`). Pose jitter still adds to it on a parked robot. |
 | `selected_score`, `plan_time_ms`, `mean_eig`, `mean_entropy`, `mean_variance` | Selection diagnostics. |
-| `mean_info_gain`, `mean_path_cost`, `selected_info_gain`, `selected_path_cost`, `selected_utility` | Utility decomposition (`U = gain / (0.1 + cost)`) for post-hoc attribution. |
+| `mean_info_gain`, `mean_path_cost`, `selected_info_gain`, `selected_path_cost`, `selected_utility` | Utility decomposition (`U = gain / (0.1 + cost)`) for post-hoc attribution. Path costs are costs, not metres, once a planning map shapes them. |
 | `coord_active_peers`, `rejected_by_minpos`, `rejected_by_unreachable` | Coordination diagnostics; `coord_active_peers` should read team size − 1 in a healthy run. |
+| `phase`, `target_id`, `vantage_index` | `explore`/`exploit`; active target and dwelled ring index (`-1` in explore). |
+| `n_vantages_valid`, `vantage_los_clear`, `dwell_sec` | Exploit diagnostics: selectable vantages this tick, clear-LoS flag, honest capture length (dwell-sync wait time is *not* counted). |
 | `prox_hold_count`, `prox_hold_total_sec` | Cumulative proximity holds (difference consecutive rows for per-step deltas). |
+| `goal_outcome` | How the goal that ended since the previous row ended: `reached`, `budget`, `budget-rotate`, `no-progress`, `nav2-aborted`, `goal-in-obstacle` (its cell turned into an obstacle), `target-switch`, `yielded` (a vantage a teammate picked at the same moment), `team-reconnected` (drive home cut short); empty when none did. Ends that write no row of their own — the last four, an approach waypoint reached, and every drive home — join the next row's with `+`, e.g. `goal-in-obstacle+budget`; the next five columns describe the last of them. Ends still pending when the run stops get one last row on DONE. |
+| `nav_elapsed_sec`, `goal_path_length_m` | Time the goal took, and the distance its budget was built from (planned path length in metres, or the straight line). |
+| `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | nav2's aborts of this goal, recoveries it ran on it, and the last abort's error code (Jazzy; `-1` = none or Humble). `0` / `0` / `-1` when nav2 is not watched. |
 
 ---
 
@@ -579,9 +637,10 @@ to `output_csv`. Columns, in order:
 **Bringing your own navigator.** The command interface is one topic:
 `PoseStamped` on `goal_topic`, goals in `map_frame`, yaw meaningful. The
 planner judges arrival itself from tf against `goal_xy_tolerance` /
-`goal_yaw_tolerance` — there is no action feedback, so a goal published while
-the navigator is down is lost silently (the `goal_republish_sec` keep-alive
-exists for exactly that). Your navigator's own arrival tolerance must be
+`goal_yaw_tolerance`. It reads Nav2's action status and feedback when they
+exist (`nav_status_action`), but nothing waits on them, so a goal published
+while the navigator is down is lost silently (the `goal_republish_sec`
+keep-alive exists for exactly that). Your navigator's own arrival tolerance must be
 tighter than the planner's. Only the proximity stop's cancel is Nav2-specific
 (`NavigateToPose` cancel-all); with a different navigator either disable
 `proximity_stop_enabled` or accept that holds brake by goal-republish alone.

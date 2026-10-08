@@ -320,3 +320,36 @@ TEST(CandidateGenerator, FlatModeIgnoresTheZBand) {
   ASSERT_EQ(out.size(), 1u);
   EXPECT_FLOAT_EQ(out[0].position.z(), 0.3f);
 }
+
+// A rotated ROI filters radial and frontier candidates in its own frame. The
+// strip runs along the map diagonal (yaw 45 deg), 1 m either side of it, so of
+// the 8 radial directions only the 45 deg one survives.
+TEST(CandidateGenerator, RotatedRoiFiltersInItsOwnFrame) {
+  CandidateConfig cfg;
+  cfg.n_radial = 8;
+  cfg.n_rings = 3;
+  cfg.n_yaw = 4;
+  cfg.roi_min_x = 0.0f;
+  cfg.roi_max_x = 20.0f;
+  cfg.roi_min_y = -1.0f;
+  cfg.roi_max_y = 1.0f;
+  cfg.roi_yaw = static_cast<float>(M_PI / 4.0);
+  CandidateGenerator gen(cfg);
+
+  auto candidates = gen.generate(Eigen::Vector3f(0, 0, 0), 0.0f);
+  ASSERT_EQ(candidates.size(), 3u * 4u);  // 3 rings x 4 yaws, one direction
+  for (const auto& c : candidates) {
+    EXPECT_NEAR(c.position.x(), c.position.y(), 1e-4f);
+    EXPECT_GT(c.position.x(), 0.0f);
+  }
+
+  std::vector<CandidateViewpoint> frontier;
+  gen.addFrontierCandidates(frontier,
+                            {{3.0f, 3.0f, 0.0f},    // on the diagonal: in
+                             {3.0f, -3.0f, 0.0f},   // inside the bbox: out
+                             {-3.0f, -3.0f, 0.0f}}, // behind the origin: out
+                            Eigen::Vector3f(0, 0, 0));
+  ASSERT_EQ(frontier.size(), 1u);
+  EXPECT_FLOAT_EQ(frontier[0].position.x(), 3.0f);
+  EXPECT_FLOAT_EQ(frontier[0].position.y(), 3.0f);
+}

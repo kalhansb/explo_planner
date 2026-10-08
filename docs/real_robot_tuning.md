@@ -17,15 +17,19 @@ turn with zero translation, which the watchdog counts as no progress.
 
 | Parameter | Shipped | Hardware | Basis |
 |---|---|---|---|
-| `progress_window_sec` | 15 | 30 | clears the longest healthy standstill with margin (§3.2) |
-| `progress_min_distance_m` | 0.2 | 0.25 | half the smallest travel seen in any 30 s window (§3.2) |
+| `progress_window_sec` | 15 | 120 | a backstop behind Nav2's own progress checker; the shortest window no healthy stretch of either bag trips (§3.2) |
+| `progress_min_distance_m` | 0.2 | 0.25 | far below the smallest net travel in any 120 s window (2.33 m); also the `nav2_abort_limit` "same spot" radius (§3.2) |
 | `goal_rotate_timeout_sec` | 15 | 25 | one 180° turn plus settling (§3.3) |
 | `nav_speed_estimate_mps` | 0.15 | 0.22 bunker, 0.20 curt | measured wall-clock mean, standstills included (§3.4) |
+| `nav_max_timeout_sec` | 180 | 600 | backstop only; Nav2 aborts and the watchdog stop bad goals sooner (§3.4) |
+| `exploit_target_timeout_sec` | 300 | 720 | stays one failed hop (600) + 120 s above the cap (§3.4) |
 | `base_frame` | `<robot>/base_link` | `base_link`, `base_link_curt` | the default frame exists on neither robot (§3.1) |
 
-The navigation budget's safety factor and caps were deliberately left alone.
-The watchdog is what catches a stuck robot, and a tighter budget would only
-abort slow hops that were about to succeed. The pose-jump threshold is also
+The navigation budget's safety factor and minimum were deliberately left
+alone, and its cap was raised rather than tightened. The watchdog is what
+catches a stuck robot and `nav2_abort_limit` what catches a goal Nav2 gives
+up on, so a tighter budget would only abort slow hops that were about to
+succeed. The pose-jump threshold is also
 unchanged but unvalidated, since neither recording contained a localisation
 correction (§3.5).
 
@@ -156,7 +160,11 @@ python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_10_57_06__kalhan_2
 | 180° turn at p90 | 13.0 s | 12.0 s |
 | stationary fraction | 18 % | 49 % |
 | longest standstill | 1.9 s | 22.6 s |
-| min travel in any 30 s window | 1.33 m | 0.51 m |
+| min walked travel in any 30 s window | 1.33 m | 0.51 m |
+| min net displacement in any 30 s window | 0.00 m | 0.00 m |
+| 30 s windows under 0.25 m net | 10 % | 9 % |
+| 60 / 90 / 120 s windows under 0.25 m net | 0 / 0 / 0 % | 6 / 2 / 0 % |
+| min net displacement in any 120 s window | 3.23 m | 2.33 m |
 
 **What the figures say.** CURT is the binding constraint on every timeout: it
 is stationary half the time and stands still for up to 22.6 s at a stretch on
@@ -214,21 +222,24 @@ reach the node (wrong block, or the single-robot launch without
 ### 3.2 `progress_window_sec`, `progress_min_distance_m`
 
 The no-progress watchdog
-([explo_planner_node.cpp:2305](../explo_planner/src/explo_planner_node.cpp#L2305)).
-On entering NAVIGATE the planner marks the current cumulative distance. Every
-`progress_window_sec` it checks how much path has been walked since the mark;
-if that is under `progress_min_distance_m` it fails the goal with
-`[no-progress]` and blacklists it (§3.6); otherwise it re-marks and starts the
-next window. The check is on the **total path walked**, not on distance
-closed to the goal, so a robot rotating in place or waiting for Nav2 to
-re-plan scores zero even when nothing is wrong.
+([explo_planner_node.cpp:3065](../explo_planner/src/explo_planner_node.cpp#L3065)).
+On entering NAVIGATE the planner records where the robot stands. Every
+`progress_window_sec` it measures the straight-line distance from there to
+where the robot is now; if that is under `progress_min_distance_m` it fails
+the goal with `[no-progress]` and blacklists it (§3.6); otherwise it records
+the new spot and starts the next window. The check is on **net
+displacement**, not on distance closed to the goal and not on path walked: a
+robot rocking in place or driving out and back scores near zero, and so does
+one rotating in place or waiting for Nav2 to re-plan, even when nothing is
+wrong. (Until 2026-10 it summed the walked path. Pose jitter added ~1.5 m of
+that per 30 s to a parked bunker, so the watchdog never fired on it.)
 
 It is deliberately not applied during the final in-place rotate at the goal,
 but the turn-to-face at the *start* of a hop happens inside the first window.
 
 | | shipped | hardware |
 |---|---|---|
-| `progress_window_sec` | 15.0 | **30.0** |
+| `progress_window_sec` | 15.0 | **120.0** |
 | `progress_min_distance_m` | 0.2 | **0.25** |
 
 **Why the shipped values are unsafe here.** CURT's longest healthy standstill
@@ -238,19 +249,37 @@ the planner walks off to a worse one.
 
 **How the hardware values were chosen.**
 
-- *Window*: longer than the longest healthy standstill plus one 180° turn.
-  22.6 s + 13 s ≈ 36 s in the worst case, but those two never coincided in
-  the recordings; 30 s clears the standstill with margin and leaves 17 s of
-  driving time after a full turn.
-- *Distance*: about half the smallest travel measured in any window of that
-  length (0.51 m over 30 s), so a genuinely wedged robot still fails within
-  one window while a slow or turning one never does.
+- *Window*: the watchdog is a backstop behind Nav2, so it is sized to never
+  fail a healthy robot rather than to react fast. With Nav2 watched, a goal
+  Nav2 rejects fails on `nav2_abort_limit` within seconds. A wedged robot is
+  noticed first by Nav2's own progress checker (0.5 m net within 10 s),
+  which runs its recoveries; the default tree aborts after six recovery
+  rounds, about 2.5 to 3 minutes, and the planner fails the goal on that
+  first abort, since Nav2 ran its recoveries right there
+  (`nav2_abort_final_after_recovery`). What
+  only the watchdog ends is a stall Nav2 does not report at all: Nav2 not
+  running or not watched, or Nav2 reporting SUCCEEDED short of the planner's
+  tolerance, so that every keep-alive re-send succeeds at once and the robot
+  stays parked. 120 s is the shortest window in which no stretch of either
+  recording falls under 0.25 m net, operator stops included (table above:
+  9 % of CURT's 30 s windows did, 6 % at 60 s, 2 % at 90 s). The check runs
+  once per window, so a stall is caught 120 to 240 s after it starts.
+  Earlier value: 30 s, sized to clear CURT's longest standstill (22.6 s),
+  when the watchdog was the first line against a stuck robot.
+- *Distance*: 0.25 m was set at about half the smallest walked travel in
+  any 30 s window (0.51 m), when the check still summed the walked path. At
+  120 s the smallest net figure in either recording is 2.33 m, so 0.25 m
+  is very lenient; it is kept because it is also the radius within which
+  two Nav2 aborts count as "the same spot" for `nav2_abort_limit`. The
+  validation run (§5) is its first real test.
 
 **Re-tuning.** From the script's `STILL` line and `WINDOW` table: pick the
-window first, then set the distance at roughly half the travel figure for
-that window. Raising the window costs nothing but reaction time on a truly
-stuck robot: it takes one full window to notice, then the Nav2 recovery on
-the next goal.
+window first, then set the distance at roughly half the `net min` figure for
+that window, read off a recording in which the robot was driven to goals
+throughout (a planner-driven run is best). Operator stops in a teleop
+recording pull that figure to 0, as in both 2026-07-31 bags. Raising the
+window costs nothing but reaction time on a truly stuck robot: it takes one
+to two full windows to notice, then the Nav2 recovery on the next goal.
 
 ### 3.3 `goal_rotate_timeout_sec`
 
@@ -286,19 +315,35 @@ budget = clamp( distance / nav_speed_estimate_mps × nav_safety_factor,
                 nav_min_timeout_sec, nav_max_timeout_sec )
 ```
 
-`distance` is the straight line to the goal, or the planned path length when
-a planning map is in use. A hop that outlives its budget fails with
-`[budget]`.
+`distance` is the straight line to the goal, or, when a planning map is in
+use, the planned path's length in metres if that is longer (not its cost,
+which roughness and clearance scale up). A hop that outlives its budget fails
+with `[budget]`. A goal Nav2 rejects does not wait for the budget:
+`nav2_abort_limit` (2) fails it as `[nav2-aborted]` after Nav2 aborts it
+twice in a row with the robot standing still, ~5 s apart. A goal Nav2 gives
+up on after running its recoveries where the robot stands fails at the first
+abort (`nav2_abort_final_after_recovery`).
 
 | | shipped | bunker | curt |
 |---|---|---|---|
 | `nav_speed_estimate_mps` | 0.15 | **0.22** | **0.20** |
 | `nav_safety_factor` | 3.0 | inherited | inherited |
 | `nav_min_timeout_sec` | 30.0 | inherited | inherited |
-| `nav_max_timeout_sec` | 180.0 | inherited | inherited |
+| `nav_max_timeout_sec` | 180.0 | **600.0** | **600.0** |
 
-With curt's values a 3 m hop gets 45 s, an 8 m hop 120 s, and anything past
-12 m the 180 s cap.
+With curt's values a 3 m hop gets 45 s, an 8 m hop 120 s, a 15 m hop 225 s,
+and only goals past 40 m (44 m on bunker) the 600 s cap. The budget still
+scales with distance; the cap is not a flat 10 minutes per goal.
+
+**Why the cap is 10 minutes.** With Nav2 watched, the budget is the last of
+three stops. A goal Nav2 rejects fails on `nav2_abort_limit` within seconds,
+and a robot that stops moving is ended by Nav2's own give-up or the watchdog
+(§3.2). The
+one case left for the budget is a robot that keeps moving but never arrives:
+Nav2's default behaviour tree replans at 1 Hz with no overall time limit, and
+its progress checker (0.5 m in 10 s) is satisfied by a robot circling an
+obstacle. A cap of a few minutes would fail long healthy hops; 10 minutes
+still bounds the circling case.
 
 **The speed is the wall-clock mean, not a moving speed.** The script's
 `LINEAR mean` is path over total time, standstills included. That is the
@@ -306,14 +351,16 @@ number the budget needs: CURT is stationary 49 % of the time, so a budget
 built from its speed while moving would abort healthy hops. The safety factor
 of 3 is then real headroom for detours, not a correction for waiting.
 
-**Do not tighten the budget to catch a stuck robot.** The watchdog (§3.2)
-does that job within one window. Shortening the budget only aborts slow hops
+**Do not tighten the budget to catch a stuck robot.** Nav2 and the
+watchdog (§3.2) do that job. Shortening the budget only aborts slow hops
 that were about to succeed. If `[budget]` fires on goals the robot was still
 visibly approaching, raise `nav_safety_factor` or the cap; leave the speed at
 the measurement.
 
-Raising the cap has one coupling: `exploit_target_timeout_sec` (300 s) keeps
-charging across failed hops and must stay above `nav_max_timeout_sec`.
+Raising the cap has one coupling: `exploit_target_timeout_sec` keeps
+charging across failed hops and must stay above `nav_max_timeout_sec`, or a
+tree closes PARTIAL after its first failed vantage approach. The overlay sets
+it to 720 s, one worst-case failed hop plus the shipped 120 s margin.
 
 ### 3.5 `max_pose_jump_m`
 
@@ -419,18 +466,20 @@ driving while the planner believes it has stopped.
 
 ### Team size — `rendezvous_expected_peers`, `rendezvous_max_wait_sec`
 
-Rendezvous is inert at the shipped `expected_peers: 0`
-([explo_planner_node.cpp:891](../explo_planner/src/explo_planner_node.cpp#L891)).
+Rendezvous is inert at the shipped `expected_peers: 0` (the
+`rendezvous_expected_peers` declaration in
+[explo_planner_node.cpp](../explo_planner/src/explo_planner_node.cpp)).
 The overlay's per-robot blocks set it to 1, and the two-robot launch sets it
 from the team size anyway. The single-robot launch matches neither, so a
-robot running alone keeps it at 0 — which is right: a robot that has never
-heard a peer has no anchor and simply finishes.
+robot running alone keeps it at 0 — which is right: with no teammate to
+wait for, it simply finishes where exploration ends.
 
-`rendezvous_max_wait_sec` inherits 600.0: a robot that exhausts its goals
-after losing comms drives back to where it last heard its teammate, holds
-there, and gives up after 10 min if the team never completes. Set it `<= 0`
-to wait forever — correct for a controlled trial that must reconvene, a
-field hazard if the team may not.
+`rendezvous_max_wait_sec` inherits 600 s from `shared_params.yaml`. A robot
+that exhausts its goals after losing comms drives back to its start point and
+holds there until the team is complete or the 600 s run out; a robot that gives
+up parks in `DONE` and keeps beaconing. Set `<= 0` to wait forever — right only
+for a controlled trial where someone is watching. The drive home is capped
+separately by `return_nav_max_timeout_sec` (600 s).
 
 ### Calibrated from the validation run
 
@@ -454,9 +503,23 @@ Step 12: navigation failed [no-progress] after 31.2s at goal (14.20, -3.10). Bla
 |-----|-----------------|-------------|
 | `[no-progress]` | driving or turning normally | raise `progress_window_sec`, or lower `progress_min_distance_m` (§3.2) |
 | `[no-progress]` | genuinely wedged | nothing — it worked; a shorter window only if it took too long to notice |
-| `[budget]` | still approaching the goal | raise `nav_safety_factor` or `nav_max_timeout_sec`; keep the speed (§3.4) |
+| `[budget]` | still approaching the goal | raise `nav_safety_factor` or `nav_max_timeout_sec` (and `exploit_target_timeout_sec` with it); keep the speed (§3.4) |
+| `[budget]` | circling or re-routing, never closing in | nothing — it worked; this is the case the cap is for (§3.4) |
 | `[budget-rotate]` | at the goal, still turning | raise `goal_rotate_timeout_sec` (§3.3); check the tolerances against Nav2 |
 | `[budget-rotate]` | at the goal, not moving | tolerances tighter than Nav2's goal checker (user manual §5) |
+| `[nav2-aborted]` with `0 recovery(ies)` | parked, Nav2 refused the goal twice | expected now and then; the `nav2 abort reason` line (Jazzy) names it. Many `GOAL_OUTSIDE_MAP` (204): Nav2's global costmap is smaller than the goals' reach (field setup, "Goals outside nav2's global costmap") |
+| `[nav2-aborted]` with recoveries | wedged; Nav2 tried its recoveries there and gave up once | nothing — it worked. Many on the same kind of ground: the planning map lets goals into it (field setup, "Traversability map") |
+
+Every goal, reached ones included, also ends with one line of fixed shape,
+with the same fields in the CSV (`goal_outcome`, `nav_elapsed_sec`,
+`goal_path_length_m`, `nav2_aborts`, `nav2_recoveries`, `nav2_error_code`):
+
+```
+Goal end [nav2-aborted] step 12 explore (14.20, -3.10): 6.1s of 120s budget, path 11.8 m, 11.40 m short; nav2 ABORTED, 2 abort(s), 0 recovery(ies), last error 204 GOAL_OUTSIDE_MAP
+```
+
+Tabulate those to see where the time went: the outcomes per goal kind, how
+much of each budget was used, and how often Nav2 needed recoveries.
 
 Warnings that mean a setting did not take:
 
@@ -508,7 +571,7 @@ Before the first run on a new platform:
 - [ ] `odom → base` edge has one publisher (script's `EDGES` section)
 - [ ] `base_frame` in the robot's block; `base=` in the startup line matches
 - [ ] `progress_window_sec` > longest standstill + one 180° turn
-- [ ] `progress_min_distance_m` ≈ half the min travel at that window
+- [ ] `progress_min_distance_m` ≈ half the `net min` at that window, from a recording driven to goals throughout
 - [ ] `goal_rotate_timeout_sec` > one 180° turn + 10 s
 - [ ] `nav_speed_estimate_mps` = wall-clock mean
 

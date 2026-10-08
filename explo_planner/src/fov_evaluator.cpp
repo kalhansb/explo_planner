@@ -37,6 +37,11 @@ namespace {
 //     in or entirely out according to the origin alone. Skipping the axis (the
 //     old behaviour) silently treated "entirely out" as "unconstrained".
 //
+// A rotated/offset ROI is handled by running the slab test in the ROI frame:
+// origin and direction are rotated into it (z untouched). Rotation preserves
+// length, so t is still metres along the world ray and the clipped endpoints
+// are taken on the original world ray.
+//
 // Returns false when nothing observable survives, in which case the ray must be
 // skipped rather than walked.
 bool clipRayToRoi(const Eigen::Vector3f& origin,
@@ -47,8 +52,11 @@ bool clipRayToRoi(const Eigen::Vector3f& origin,
   // world_dir is unit length, so t is a distance in metres along the ray.
   float t_enter = cfg.min_range;
   float t_exit  = cfg.max_range;
-  const float o[3] = {origin.x(), origin.y(), origin.z()};
-  const float d[3] = {world_dir.x(), world_dir.y(), world_dir.z()};
+  const Roi2D roi = cfg.roiXY();
+  const Eigen::Vector2f o_xy = roi.toLocal(origin.x(), origin.y());
+  const Eigen::Vector2f d_xy = roi.dirToLocal(world_dir.x(), world_dir.y());
+  const float o[3] = {o_xy.x(), o_xy.y(), origin.z()};
+  const float d[3] = {d_xy.x(), d_xy.y(), world_dir.z()};
   const float lo[3] = {cfg.roi_min_x, cfg.roi_min_y, cfg.roi_min_z};
   const float hi[3] = {cfg.roi_max_x, cfg.roi_max_y, cfg.roi_max_z};
   for (int i = 0; i < 3; ++i) {

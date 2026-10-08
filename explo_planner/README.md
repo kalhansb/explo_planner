@@ -38,8 +38,10 @@ Each PLAN cycle the node:
    Longer paths dilute a candidate's score; unreachable candidates get
    `U = −∞` and sort last.
 5. **Navigates** to the goal with a distance-scaled timeout, a no-progress
-   watchdog, and a TTL/radius blacklist of recently-failed goals to avoid
-   re-picking unreachable targets.
+   watchdog (net displacement), a give-up on goals Nav2 aborts twice from the
+   same spot, and a TTL/radius blacklist of recently-failed goals to avoid
+   re-picking unreachable targets. Each goal ends with one `Goal end` log
+   line and the same fields in the per-step CSV.
 6. **Terminates** when the unknown fraction in the ROI stays below a threshold
    for N consecutive cycles, or `max_steps` is reached.
 
@@ -49,16 +51,25 @@ SCovox view — there is no central merger.
 
 ### Rendezvous reconnection (multi-robot, default on)
 
-A robot that loses comms keeps exploring on its own rather than halting. When it
-exhausts its exploration goals (the coverage termination above) it does **not**
-stop while a teammate is still out of range: it drives back to its
-**last-connected anchor** — the pose where it last heard a teammate, which sits
-inside the router's coverage bubble — and **holds there until the whole team is
-back in comms**, then re-plans against the now-merged map. If new frontiers
-appeared it disperses again (MinPos splits them); if not, the whole team reaches
-`DONE` together. A robot can therefore only finish when the full team is present
-and the merged map is saturated, so nobody quits while a teammate is still
-exploring.
+The meeting point is the **mission start point** ("home"): each robot records
+the pose where it starts planning. The team launches inside one comms bubble, so
+robots parked at their own homes are in radio range of each other by
+construction.
+
+A robot that loses comms keeps exploring on its own; nothing happens mid-mission.
+When it exhausts exploration (coverage termination above, or `max_steps`) it
+counts the teammates it can hear:
+
+- **Team incomplete:** it drives home and **holds there until the whole team is
+  back in comms**, then re-plans against the now-merged map. If new frontiers
+  appeared it disperses again (MinPos splits them); if not, the team finishes
+  together. A reconnection on the way home releases it early.
+- **Team present:** it still drives home and goes `DONE` there, so the mission
+  ends with the team parked together where it launched.
+
+While returning, waiting and after `DONE` it keeps a 1 Hz presence intent on the
+bus so a later finisher can count it. Open tree targets are stood down for the
+return and resume after the barrier releases.
 
 This is `rendezvous_enabled` and it defaults **on**, but it only *activates*
 where it is meaningful: `coordination_enabled` must be on (the barrier waits on
@@ -67,13 +78,16 @@ and one-robot teams are therefore unaffected — it stays inert, and behaviour i
 bit-for-bit the finish-and-stop of before. Set `rendezvous_enabled:=false` to
 force that independent finish even in a multi-robot run.
 
-The anchor needs no configuration — it is recorded automatically from incoming
-peer intents. The barrier waits for `rendezvous_expected_peers` teammates (the
-multi-robot launch sets this from the team size). The shipped
-`rendezvous_max_wait_sec` of 600 s is the field escape hatch: a robot whose
-teammate died gives up the anchor after 10 min instead of holding it forever.
-Set it `<= 0` for an unbounded wait (STAY until all connected). `max_steps`
-still ends a run directly, independent of the barrier.
+Home needs no configuration. The barrier waits for `rendezvous_expected_peers`
+teammates (the multi-robot launch sets this from the team size; set it by hand
+on hardware). Both waits are bounded for the field: `rendezvous_max_wait_sec`
+(600 s in `shared_params.yaml` and the multi-robot launch; `<= 0` = wait
+forever, which is also the bare C++ default) caps the wait at home — a robot that
+gives up still parks in `DONE` beaconing its presence — and
+`return_nav_max_timeout_sec` (600 s) plus the no-progress watchdog cap the drive
+home; if home cannot be reached the robot waits where it is. Keep
+`done_action: "idle"` (shipped): with `"shutdown"` the first robot to finish
+disappears and its teammate waits for nothing.
 
 ### Coordinated proximity stop (multi-robot, default on)
 
@@ -98,7 +112,7 @@ closing at the peer's speed, which consumed the whole margin of the earlier 3 m
 default at field closing speeds. A peer that has stopped moving for
 `proximity_peer_static_sec` is treated as **parked** and released — a stationary
 robot is an ordinary costmap obstacle for the navigator, and holding against one
-would deadlock (e.g. a teammate waiting at its rendezvous anchor) — **unless it
+would deadlock (e.g. a teammate waiting at home for the rendezvous) — **unless it
 sits inside `proximity_parked_keep_dist_m`** (1.5 m): a peer parked closer than
 the panic line keeps the hold until it moves off or `proximity_max_hold_sec`
 (120 s) forces a loud resume. Stationary planner states (dwell, integrate, plan)
@@ -371,7 +385,8 @@ which is heavily commented. Common overrides:
 - `fov_*` — FOV geometry for information-gain ray-casting
 - `coordination_enabled` — turn multi-robot MinPos on/off
 - `rendezvous_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
-  — return-to-anchor-and-wait reconnection (see "Rendezvous reconnection")
+  / `return_nav_max_timeout_sec` — return-home-and-wait reconnection (see
+  "Rendezvous reconnection")
 - `exploitation_enabled` — turn the exploitation overlay on/off
 - `n_vantages` / `min_vantages_required` / `vantage_standoff_m` /
   `exploit_dwell_sec` — vantage geometry and dwell behaviour

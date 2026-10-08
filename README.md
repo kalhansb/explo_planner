@@ -9,8 +9,8 @@ drives to them through the navigation stack, and logs per-step metrics. When a
 tree target arrives it switches to **exploitation**: it circles the trunk at
 occlusion-free vantage points and dwells at each so the rosbag captures
 overlapping close-range views. Multiple robots deconflict their goals through a
-MinPos intent table, yield to each other when their paths cross, and return to
-a rendezvous anchor when comms drop.
+MinPos intent table, yield to each other when their paths cross, and, when exploration ends, return
+to their start point and wait there until the team is back in comms.
 
 ## Contents
 

@@ -18,6 +18,7 @@ std::vector<CandidateViewpoint> CandidateGenerator::generate(
   candidates.reserve(
       static_cast<size_t>(cfg_.n_rings * cfg_.n_radial * cfg_.n_yaw));
 
+  const Roi2D roi = cfg_.roiXY();
   const float dr = (cfg_.n_rings > 1)
       ? (cfg_.max_radius - cfg_.min_radius) / static_cast<float>(cfg_.n_rings - 1)
       : 0.0f;
@@ -36,8 +37,7 @@ std::vector<CandidateViewpoint> CandidateGenerator::generate(
           cfg_.robot_z);
 
       // Filter out-of-ROI candidates
-      if (pos.x() < cfg_.roi_min_x || pos.x() > cfg_.roi_max_x ||
-          pos.y() < cfg_.roi_min_y || pos.y() > cfg_.roi_max_y) continue;
+      if (!roi.contains(pos.x(), pos.y())) continue;
 
       const bool terrain = cfg_.terrain_relative && map;
       if (terrain) {
@@ -79,10 +79,10 @@ void CandidateGenerator::addFrontierCandidates(
     const Eigen::Vector3f& robot_pos,
     const MapCache* map) const {
   const bool terrain = cfg_.terrain_relative && map;
+  const Roi2D roi = cfg_.roiXY();
   for (const auto& fc : frontier_centroids) {
     // Filter out-of-ROI frontier centroids
-    if (fc.x() < cfg_.roi_min_x || fc.x() > cfg_.roi_max_x ||
-        fc.y() < cfg_.roi_min_y || fc.y() > cfg_.roi_max_y) continue;
+    if (!roi.contains(fc.x(), fc.y())) continue;
 
     // Yaw facing toward the frontier centroid from robot
     float dx = fc.x() - robot_pos.x();
@@ -101,6 +101,19 @@ void CandidateGenerator::addFrontierCandidates(
     vp.yaw = yaw;
     vp.is_frontier = true;
     candidates.push_back(vp);
+  }
+}
+
+void CandidateGenerator::relocate(CandidateViewpoint& vp, float x, float y,
+                                  const MapCache* map) const {
+  const Eigen::Vector3f orig = vp.position;
+  const float z = (cfg_.terrain_relative && map)
+      ? terrainZ(x, y, orig.z(), *map) : orig.z();
+  vp.position = Eigen::Vector3f(x, y, z);
+  if (vp.is_frontier) {
+    const float dx = orig.x() - x;
+    const float dy = orig.y() - y;
+    if (dx * dx + dy * dy > 0.25f) vp.yaw = std::atan2(dy, dx);
   }
 }
 

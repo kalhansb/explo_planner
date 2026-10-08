@@ -43,6 +43,43 @@
     # precondition in both phases.
     # planning_map_topic: "/<robot>/dscovox_node/planning_map"  # default
     use_planning_map: false
+    # How planning_map_topic is consumed. "direct": each message IS the map
+    # (it must cover the ROI). "accumulate": each message is a robot-centred
+    # rolling window — traversability_mapping's /occupancy_map_local, or a nav2
+    # rolling costmap — stitched into one grid over the ROI bounding box +
+    # margin, snapshotted as the planning map at most every refresh_sec and
+    # republished on ~/traversability_map. A raw 20 m window would make
+    # everything beyond ~10 m off-map, i.e. blocked. The grid is sized once
+    # (ROI ~101 x 66 m + 5 m margin at 0.2 m = ~211 k cells, 0.2 MB; the
+    # CostGrid built from it ~3 MB) and never grows; max_cells caps it by
+    # coarsening the resolution.
+    planning_map_mode: "direct"
+    planning_map_accum_resolution: 0.2
+    planning_map_accum_margin_m: 5.0
+    planning_map_accum_max_cells: 4000000
+    planning_map_accum_refresh_sec: 1.0
+    # Cells >= this are obstacles: goal filter, snap and CostGrid alike.
+    planning_map_obstacle_threshold: 50
+    # Path cost on the planning map (CostGrid). trav_weight: a passable cell
+    # with value v costs step * (1 + trav_weight * v / 100), so rough/steep
+    # ground counts as longer; unseen (-1) cells count as v = unknown_value
+    # (0..99). clearance_m: passable cells this close to an obstacle are
+    # never goals, and cost clearance_penalty x their step. All inert at
+    # these defaults (metric Dijkstra, no zone).
+    planning_map_trav_weight: 0.0
+    planning_map_unknown_value: 0.0
+    planning_map_clearance_m: 0.0
+    planning_map_clearance_penalty: 1.0
+    # Frontier candidates on an obstacle, in the clearance zone or unreachable
+    # move to the nearest good cell within this radius before scoring (0 =
+    # just reject them). Only acts with a planning map.
+    candidate_snap_radius_m: 2.0
+    # Blocked cells within this radius of the robot are passable for its own
+    # path search (the cells stay obstacles for goals). A LiDAR that sees the
+    # robot's own body draws an obstacle ring around it when parked, which
+    # otherwise walls the search in and turns the reachability filter off.
+    # 0 = off.
+    planning_map_robot_clear_m: 0.0
 
     # Navigation
     #
@@ -85,29 +122,40 @@
     # strictly the best setting for recoveries, once nav2 bringup is known
     # reliable enough not to need the keep-alive.
     goal_republish_sec: 5.0
+    # Diagnostics only: WARN when a published goal is farther than this (m)
+    # from the robot — likely beyond nav2's costmap, where the global planner
+    # rejects it. 0 disables.
+    far_goal_warn_m: 50.0
     integrate_wait: 2.0
 
     # Smart navigate timeout. Total budget per NAVIGATE cycle is computed
-    # at entry from straight-line distance to the goal:
+    # at entry from the distance to the goal: the planned path's length in
+    # metres on the planning map when there is one (a detour round a hedge
+    # counts), else the straight line:
     #   budget = clamp(dist / speed_est * safety, min, max)
     # so a 2 m hop gets ~8 s and an 8 m hop gets ~32 s. Tune speed_est down
     # if the controller is slower than expected (obstacle avoidance, tight
-    # corridors); tune safety up if you want more headroom.
+    # corridors); tune safety up if you want more headroom. The budget is
+    # the backstop: nav2_abort_limit fails a goal nav2 gives up on within
+    # seconds, and the watchdog below fails a robot that stops moving.
     nav_speed_estimate_mps: 0.15
     nav_safety_factor: 3.0
     nav_min_timeout_sec: 30.0
     nav_max_timeout_sec: 180.0
 
     # No-progress watchdog (runs in parallel with the budget). If the robot
-    # hasn't accumulated >= progress_min_distance_m of travel within
-    # progress_window_sec, the goal fails immediately — wedged-robot case.
+    # is not at least progress_min_distance_m (net, straight line) from
+    # where it stood when the window opened, at the end of each
+    # progress_window_sec, the goal fails immediately — the wedged-robot
+    # case, and a robot rocking in place (walked travel grows, net does not).
     #
     # HARDWARE: these values are TOO TIGHT for the Bunker Mini / CURT Mini
     # pair. CURT stands still for up to 22.6 s on a healthy run — longer
     # than this whole window — and a 180 deg in-place turn adds ~13 s of
     # zero translation on a skid-steer that cannot strafe. Layer
     # config/exploration_real_robot.yaml (params_file:= on either launch
-    # file) to get the measured 30.0 / 0.25 instead.
+    # file) to get 120.0 / 0.25 instead (a backstop behind nav2's own
+    # progress checker; see that file).
     progress_window_sec: 15.0
     progress_min_distance_m: 0.2
 
@@ -119,6 +167,11 @@
     # no-progress watchdog. At 10 Hz this can't reject real motion (a 1 m/s
     # robot moves 0.1 m/tick). Set 0 to disable and reproduce raw integration.
     max_pose_jump_m: 1.0
+    # Diagnostics only (no behaviour change): WARN when the map->base TF is
+    # older than this (s), or has failed to look up for this long while the
+    # planner keeps using its last pose. Zero-stamp (all-static) chains are
+    # not aged. <= 0 disables.
+    tf_stale_warn_sec: 1.0
 
     # Failed-goal blacklist. After a navigate timeout, the failed goal is
     # parked for failed_goal_ttl_sec; subsequent picks reject any candidate
@@ -128,10 +181,11 @@
     failed_goal_ttl_sec: 60.0
 
     # Coverage-based termination. Once the unknown fraction in the ROI drops
-    # below done_unknown_fraction for done_min_consecutive_steps PLAN cycles
-    # in a row, the planner declares the map saturated and transitions to
-    # DONE. Set done_unknown_fraction <= 0 to disable (then only max_steps
-    # stops the planner).
+    # below done_unknown_fraction for done_min_consecutive_steps measurements
+    # in a row (each on a new step or a new fused map; a PLAN retry on the same
+    # map is not counted again), the planner declares the map saturated and
+    # transitions to DONE. Set done_unknown_fraction <= 0 to disable (then
+    # only max_steps stops the planner).
     done_unknown_fraction: 0.05
     done_min_consecutive_steps: 3
     # Where that unknown fraction is measured:
@@ -173,7 +227,9 @@
     # an oscillation loop until the planner timeout fired.  Polar adds
     # n_radial*n_rings*n_yaw = 96 grid samples around the robot, giving
     # consistent fallback options.  Affects both A/B map types equally.
-    candidate_enable_polar: true
+    # Disabled for field runs (frontier-only); re-enable if the corner
+    # oscillation above reappears.
+    candidate_enable_polar: false
     candidate_n_radial: 8
     candidate_n_rings: 3
     candidate_min_radius: 2.0
@@ -188,28 +244,41 @@
     # fewer, coarser frontier targets.
     frontier_cluster_radius_m: 5.0
 
-    # Region of interest (XY bounding box, map frame, metres). The planner
-    # will not select candidates outside this box. KEEP IN SYNC with the
-    # dscovox planning_map size + origin in simple_nav_3d.launch.py so the
-    # global planner is constrained to the same area.
+    # Region of interest (XY rectangle, metres). The planner will not select
+    # candidates outside it, and it also bounds the fused-map ingest clip, the
+    # FOV raycast and the coverage-done measure. KEEP IN SYNC with the dscovox
+    # planning_map size + origin in simple_nav_3d.launch.py (when
+    # use_planning_map is on) so the global planner covers the same area.
     #
-    # FIELD (forest inspection AO, doc/experiment_script_forest_inspection.md
-    # §2): the plantation rows run at 24.82° to map x, so the 140x60 m AO is
-    # rotated. The planner ROI is axis-aligned and there is no roi_yaw yet
-    # (open item 2), so this is §2's prescribed fallback — the AO's axis-aligned
-    # bounding box. Out-of-AO cells must be painted lethal in the nav2 costmap,
-    # and note the coverage-done measure shares this box, so never-visited
-    # out-of-AO columns put a permanent floor under the unknown fraction:
-    # calibrate done_unknown_fraction above that floor at RS (open item 5).
+    # The four roi_min/max_x/y bounds are in the ROI FRAME: the map frame
+    # yawed by roi_yaw_deg about map point (roi_origin_x, roi_origin_y):
+    #   x' =  cos(yaw) (x - origin_x) + sin(yaw) (y - origin_y)
+    #   y' = -sin(yaw) (x - origin_x) + cos(yaw) (y - origin_y)
+    # roi_yaw_deg: 0 with origin (0, 0) makes the ROI frame the map frame
+    # (a plain axis-aligned box, the pre-rotation behaviour).
     #
-    # Phase 1 (SA-1 + SA-2, u in [-40, 60]) has a tighter bounding box —
-    # x [-51.4, 64.6], y [-38.7, 57.7] — set the four roi_* values below to
-    # that box to cut wasted candidates and lower the coverage floor if
-    # phase 2 is not run the same day.
-    roi_min_x: -51.3
-    roi_max_x: 100.9
-    roi_min_y: -38.7
-    roi_max_y:  74.5
+    # FIELD (hmr_localisation gt_map, map frame = NDT `map`): the "road frame"
+    # of hmr_localisation/scripts/analysis/gt_map_aligned_topdown.py —
+    # x' along the road (25.75 deg to map x, fitted to the point cloud's
+    # straight edges), y' = 0 on the far road edge, x' = 0 50 m west of the
+    # map origin along the road. The box is x' [0, 100] x y' [0, 25]: the
+    # tree block between the road and the building line. Map-frame corners
+    # (-40.30, -31.54), (49.77, 11.90), (38.91, 34.42), (-51.16, -9.02);
+    # the map origin (deployment point) is inside, at x' 50, y' 10.9.
+    # Picture: hmr_localisation/docs/explo_roi_box.png.
+    #
+    # NB this is NOT the forest-inspection "row frame" u/v of
+    # doc/experiment_script_forest_inspection.md §2 (24.82 deg, origin at the
+    # map origin, no offset) — 0.93 deg apart, ~1.6 m at 100 m. To run that
+    # script's AO instead: roi_yaw_deg 24.82, origin (0, 0),
+    # x [-40, 100], y [-24.16, 35.84].
+    roi_yaw_deg: 25.75
+    roi_origin_x: -40.30
+    roi_origin_y: -31.54
+    roi_min_x: 0.0
+    roi_max_x: 100.0
+    roi_min_y: 0.0
+    roi_max_y: 25.0
 
     # Vertical ROI band (map frame, metres): candidate goals are clamped to
     # z in [roi_min_z, roi_max_z]. Values here mirror the code defaults
@@ -439,6 +508,31 @@
     # NavigateToPose action used for the cancel. "" = auto =
     # /<robot_name>/navigate_to_pose (matches the goal_topic convention).
     proximity_nav_cancel_action: ""
+    # NavigateToPose action the planner watches: <action>/_action/status
+    # for results (ABORTED / CANCELED / SUCCEEDED before the planner's own
+    # arrival gate), _action/feedback for nav2's recovery count and distance
+    # to go, and, on Jazzy, _action/get_result for the reason of an ABORT
+    # (error_code / error_msg). All of it lands in the log and the "Goal end"
+    # line; ABORTs also feed nav2_abort_limit. Default (unset) =
+    # /<robot_name>/navigate_to_pose; "" disables the watch (and the limit).
+    #nav_status_action: "/atlas/navigate_to_pose"
+    # Fail the goal (failGoal "nav2-aborted", blacklisted like any failure)
+    # after nav2 ABORTs it this many times in a row with the robot still
+    # within progress_min_distance_m (0.25 m if that is 0) of where the
+    # first ABORT found it. The keep-alive (goal_republish_sec) re-sends an
+    # aborted goal, so without this nav2 giving up never sticks and the
+    # robot waits out the nav budget at a goal nav2 cannot plan to (off its
+    # costmap, no path). 2 = the re-send got one more try and failed the
+    # same way. 0 = log only.
+    nav2_abort_limit: 2
+    # ...or after ONE abort when nav2 had already run at least 2 recovery
+    # behaviours (costmap clears, spin, wait, back-up, from its feedback)
+    # within 1 m of where it aborts. That abort comes at the end of nav2's
+    # own recovery rounds (default tree: 6, ~2.5-3 min for a wedged robot),
+    # and a re-send would only run them again from the same place. An
+    # instant refusal (GOAL_OUTSIDE_MAP and the like, no recoveries) still
+    # gets the re-send. Needs nav2_abort_limit > 0.
+    nav2_abort_final_after_recovery: true
 
     # ----------------------------------------------------------------
     # Perceptive exploitation

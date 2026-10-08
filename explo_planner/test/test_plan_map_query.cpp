@@ -145,3 +145,21 @@ TEST(PlanMapQuery, UnknownFractionRoiClippingAndMiss) {
   auto empty = makeGrid(0, 0, 1.0f);
   EXPECT_EQ(unknownFractionInRoi(empty, {0.0f, 1.0f, 0.0f, 1.0f}), -1.0);
 }
+
+// A rotated ROI counts only the cells whose centre is inside it. The diamond
+// (yaw 45 deg, side 4 m, corner at (5, 1)) sits inside a 10x10 grid; marking
+// every cell OUTSIDE it unknown must leave the ROI fraction at 0.
+TEST(PlanMapQuery, UnknownFractionRotatedRoi) {
+  auto g = makeGrid(10, 10, 1.0f);
+  const Roi2D roi{0.0f, 4.0f, 0.0f, 4.0f, static_cast<float>(M_PI / 4.0),
+                  5.0f, 1.0f};
+  for (int gy = 0; gy < 10; ++gy)
+    for (int gx = 0; gx < 10; ++gx) {
+      const auto c = cellCenter(g, gx, gy);
+      if (!roi.contains(c.x(), c.y())) setCell(g, gx, gy, -1);
+    }
+  EXPECT_NEAR(unknownFractionInRoi(g, roi), 0.0, 1e-9);
+
+  for (auto& v : g.data) v = -1;
+  EXPECT_NEAR(unknownFractionInRoi(g, roi), 1.0, 1e-9);
+}

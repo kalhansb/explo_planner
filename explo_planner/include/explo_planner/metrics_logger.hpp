@@ -50,6 +50,19 @@ struct StepMetrics {
   // columns the only record of the yields was planner stdout.
   int    prox_hold_count          = 0;
   float  prox_hold_total_sec      = 0.0f;
+
+  // How the goal behind this row ended (the planner's "Goal end [...]" log
+  // line carries the same fields): outcome ("reached", "budget",
+  // "no-progress", "nav2-aborted", ...; "" when no goal ended since the last
+  // row), seconds spent driving it, metres along its planned path, and what
+  // nav2 reported for it (-1 error code = none received, always so on
+  // Humble, whose NavigateToPose result has no error code).
+  std::string goal_outcome;
+  float  nav_elapsed_sec          = 0.0f;
+  float  goal_path_length_m       = 0.0f;
+  int    nav2_aborts              = 0;
+  int    nav2_recoveries          = 0;
+  int    nav2_error_code          = -1;
 };
 
 class MetricsLogger {

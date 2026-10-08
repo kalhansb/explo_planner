@@ -89,8 +89,8 @@
     nav_max_timeout_sec: 45.0
 
     # --- No-progress watchdog: DISABLED for bag replay ---
-    # It compares cumulative_distance_ (total path length walked, NOT closing
-    # distance to the goal) against a threshold per window. Two reasons it is
+    # It compares the robot's net displacement over each window (NOT closing
+    # distance to the goal) against a threshold. Two reasons it is
     # meaningless here and actively harmful:
     #   1. Nothing consumes /goal_pose — the robot replays a fixed trajectory,
     #      so its motion is statistically independent of the goal. "No
@@ -99,8 +99,8 @@
     #   2. Bunker Mini (tracked) and CURT Mini (wheeled) are both skid-steer
     #      and CANNOT strafe, so they turn in place to face a goal. An in-place
     #      turn translates 0 m and is indistinguishable from being wedged.
-    # threshold 0.0 disables it cleanly: the check is `delta < threshold` and
-    # delta is a cumulative sum, so delta >= 0 always and it can never fire.
+    # threshold 0.0 disables it cleanly: the check is `net < threshold` and
+    # net is a distance, so net >= 0 always and it can never fire.
     # Re-enable (0.2 m / 30 s) only with a navigator actually driving.
     progress_min_distance_m: 0.0
     progress_window_sec: 30.0        # inert while the threshold is 0.0
@@ -146,7 +146,11 @@
     flatten_goal_z: false
 
     # ROI = the whole gt-map footprint (map spans x[-110,120] y[-95,111]),
-    # so no candidate is rejected just for leaving a toy box.
+    # so no candidate is rejected just for leaving a toy box. Axis-aligned in
+    # the map frame: reset the rotated field ROI from shared_params.yaml.
+    roi_yaw_deg: 0.0
+    roi_origin_x: 0.0
+    roi_origin_y: 0.0
     roi_min_x: -115.0
     roi_max_x:  125.0
     roi_min_y: -100.0

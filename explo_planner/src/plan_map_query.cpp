@@ -25,15 +25,15 @@ int8_t planMapCellAt(const nav_msgs::msg::OccupancyGrid& m,
 }
 
 bool isCellFree(const nav_msgs::msg::OccupancyGrid& m,
-                const Eigen::Vector3f& pos) {
+                const Eigen::Vector3f& pos, int8_t threshold) {
   int8_t v = planMapCellAt(m, pos);  // kCellNoData/unknown both fail v >= 0
-  return v >= 0 && v < 50;
+  return v >= 0 && v < threshold;
 }
 
 bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& m,
-                    const Eigen::Vector3f& pos) {
+                    const Eigen::Vector3f& pos, int8_t threshold) {
   int8_t v = planMapCellAt(m, pos);
-  return v == kCellNoData || v >= 50;
+  return v == kCellNoData || v >= threshold;
 }
 
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
@@ -42,7 +42,11 @@ double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
       m.data.size() != static_cast<size_t>(m.info.width) * m.info.height)
     return -1.0;
 
-  // Convert ROI world bounds to grid indices, clipped to the map.
+  // Convert ROI world bounds to grid indices, clipped to the map. A rotated
+  // ROI walks its map-frame bounding box and keeps only cells whose centre is
+  // inside the ROI.
+  const Roi2D box = roi.mapAabb();
+  const bool rotated = roi.transformed();
   auto to_gx = [&](float x) {
     return static_cast<int>(std::floor(
         (x - m.info.origin.position.x) / m.info.resolution));
@@ -51,15 +55,22 @@ double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
     return static_cast<int>(std::floor(
         (y - m.info.origin.position.y) / m.info.resolution));
   };
-  int gx0 = std::max(0, to_gx(roi.min_x));
-  int gx1 = std::min(static_cast<int>(m.info.width) - 1, to_gx(roi.max_x));
-  int gy0 = std::max(0, to_gy(roi.min_y));
-  int gy1 = std::min(static_cast<int>(m.info.height) - 1, to_gy(roi.max_y));
+  int gx0 = std::max(0, to_gx(box.min_x));
+  int gx1 = std::min(static_cast<int>(m.info.width) - 1, to_gx(box.max_x));
+  int gy0 = std::max(0, to_gy(box.min_y));
+  int gy1 = std::min(static_cast<int>(m.info.height) - 1, to_gy(box.max_y));
   if (gx0 > gx1 || gy0 > gy1) return -1.0;
 
   int total = 0, unknown = 0;
   for (int gy = gy0; gy <= gy1; ++gy) {
     for (int gx = gx0; gx <= gx1; ++gx) {
+      if (rotated &&
+          !roi.contains(
+              static_cast<float>(m.info.origin.position.x +
+                                 (gx + 0.5) * m.info.resolution),
+              static_cast<float>(m.info.origin.position.y +
+                                 (gy + 0.5) * m.info.resolution)))
+        continue;
       int8_t v = m.data[gy * m.info.width + gx];
       ++total;
       if (v < 0) ++unknown;

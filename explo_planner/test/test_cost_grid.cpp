@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <vector>
@@ -258,4 +259,210 @@ TEST(CostGrid, PositiveCapStillBoundsTheFlood) {
 
   EXPECT_TRUE(cg.reachable(cellCenter(grid, 2, 0)));    // 2 m out
   EXPECT_FALSE(cg.reachable(cellCenter(grid, 15, 15))); // way past the cap
+}
+
+// --- CostModel ---------------------------------------------------------------
+
+// A default (unshaped) model is the legacy metric flood.
+TEST(CostGridModel, DefaultModelIsMetric) {
+  auto grid = makeGrid(10, 1, 1.0f);
+  grid.data[5] = 40;  // graded but passable: ignored without trav_weight
+  CostGrid cg;
+  cg.build(grid, 50, CostModel{});
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 9, 0)), 9.0f, 1e-5f);
+  EXPECT_FALSE(cg.inClearanceZone(cellCenter(grid, 5, 0)));
+}
+
+// trav_weight: entering a cell holding v costs step * (1 + w * v / 100).
+TEST(CostGridModel, TraversabilityWeightScalesStep) {
+  auto grid = makeGrid(10, 1, 1.0f);
+  grid.data[5] = 40;
+  CostModel m;
+  m.trav_weight = 2.0f;
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  // 8 plain steps + one into the v=40 cell at 1 + 2*0.4 = 1.8.
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 9, 0)), 8.0f + 1.8f, 1e-4f);
+}
+
+// The flood detours around a rough strip when going round is cheaper.
+TEST(CostGridModel, TraversabilityWeightPrefersSmoothDetour) {
+  auto grid = makeGrid(9, 5, 1.0f);
+  // Rough (v=45, passable) column x=4 for y=0..3; y=4 left smooth.
+  for (int y = 0; y < 4; ++y) grid.data[y * 9 + 4] = 45;
+  CostModel m;
+  m.trav_weight = 10.0f;  // crossing the strip costs 5.5 per step
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  const float c = cg.costTo(cellCenter(grid, 8, 0));
+  EXPECT_LT(c, 8.0f + 4.5f);   // cheaper than crossing the strip
+  EXPECT_GT(c, 8.0f);          // but longer than the straight line
+  auto path = cg.extractPath(cellCenter(grid, 8, 0));
+  bool via_smooth = false;
+  for (const auto& p : path) {
+    if (std::floor(p.x()) == 4.0f) via_smooth = std::floor(p.y()) == 4.0f;
+  }
+  EXPECT_TRUE(via_smooth);
+}
+
+// Clearance zone: passable cells within clearance_m of an obstacle, flagged
+// and penalised but still passable.
+TEST(CostGridModel, ClearanceZoneMarksAndPenalises) {
+  auto grid = makeGrid(11, 11, 0.5f);
+  block(grid, 5, 5);
+  CostModel m;
+  m.clearance_m = 0.6f;  // orthogonal neighbours (0.5 m) in, diagonal (~0.7 m) out
+  m.clearance_penalty = 4.0f;
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  EXPECT_FALSE(cg.inClearanceZone(cellCenter(grid, 5, 5)));  // blocked itself
+  EXPECT_TRUE(cg.inClearanceZone(cellCenter(grid, 4, 5)));
+  EXPECT_TRUE(cg.inClearanceZone(cellCenter(grid, 5, 6)));
+  EXPECT_FALSE(cg.inClearanceZone(cellCenter(grid, 4, 6)));  // diagonal
+  EXPECT_FALSE(cg.inClearanceZone(cellCenter(grid, 3, 5)));  // 1.0 m away
+  EXPECT_FALSE(cg.inClearanceZone(cellCenter(grid, 0, 0)));
+
+  // Entering a zone cell costs penalty x step.
+  cg.floodFrom(cellCenter(grid, 3, 5), 0.0f);
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 4, 5)), 0.5f * 4.0f, 1e-4f);
+
+  // Starting inside the zone, the robot can still leave it.
+  cg.floodFrom(cellCenter(grid, 4, 5), 0.0f);
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 0, 0)));
+}
+
+// Clearance zone without a penalty: flagged for goal screening, cost metric.
+TEST(CostGridModel, ClearanceZoneWithoutPenaltyKeepsMetricCost) {
+  auto grid = makeGrid(11, 1, 1.0f);
+  block(grid, 5, 0);
+  CostModel m;
+  m.clearance_m = 1.0f;
+  EXPECT_FALSE(m.shaped());
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  EXPECT_TRUE(cg.inClearanceZone(cellCenter(grid, 4, 0)));
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 4, 0)), 4.0f, 1e-5f);
+}
+
+// Unknown cells are passable and flagged; the threshold is honoured.
+TEST(CostGridModel, UnknownAndThreshold) {
+  auto grid = makeGrid(5, 1, 1.0f);
+  grid.data[1] = -1;
+  grid.data[3] = 70;
+  CostGrid cg;
+  cg.build(grid, 80);  // 70 < 80: passable
+  EXPECT_TRUE(cg.unknownAt(1, 0));
+  EXPECT_FALSE(cg.blockedAt(3, 0));
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 4, 0)));
+  cg.build(grid, 50);  // 70 >= 50: blocked
+  EXPECT_TRUE(cg.blockedAt(3, 0));
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 4, 0)));
+}
+
+// A ring of obstacles around the robot (its own body seen by the LiDAR) walls
+// the flood in; source_clear_m lets the robot's own flood out through it.
+TEST(CostGridModel, SourceClearRadiusOpensRingAroundRobot) {
+  auto grid = makeGrid(21, 21, 0.2f);
+  for (int y = 7; y <= 13; ++y) {
+    for (int x = 7; x <= 13; ++x) {
+      const int d2 = (x - 10) * (x - 10) + (y - 10) * (y - 10);
+      if (d2 >= 4 && d2 <= 9) block(grid, x, y);  // 0.4-0.6 m ring
+    }
+  }
+  CostGrid cg;
+  cg.build(grid);
+  const auto robot = cellCenter(grid, 10, 10);
+  const auto outside = cellCenter(grid, 2, 10);
+  cg.floodFrom(robot, 0.0f);
+  EXPECT_FALSE(cg.reachable(outside));
+  EXPECT_LT(cg.reachedCellCount(), 10u);
+
+  cg.floodFrom(robot, 0.0f, /*source_clear_m=*/0.9f);  // 4 cells
+  EXPECT_TRUE(cg.reachable(outside));
+  // Straight out through the ring: 8 cells at 0.2 m, no detour.
+  EXPECT_NEAR(cg.costTo(outside), 8 * 0.2f, 1e-4f);
+  // Ring cells stay obstacles for goal checks.
+  EXPECT_TRUE(cg.blockedAt(10, 12));
+  // The count excludes the cleared 4-cell disc: 441 cells minus the
+  // 49 (dx^2 + dy^2 <= 16) in it.
+  EXPECT_EQ(cg.reachedCellCount(), 441u - 49u);
+
+  // A clear radius inside the ring changes nothing.
+  cg.floodFrom(robot, 0.0f, 0.3f);
+  EXPECT_FALSE(cg.reachable(outside));
+}
+
+// Unseen cells cost as if they held unknown_value; with the default 0 they
+// cost as open ground.
+TEST(CostGridModel, UnknownValueWeightsUnseenCells) {
+  auto grid = makeGrid(10, 1, 1.0f);
+  grid.data[5] = -1;
+  CostModel m;
+  m.trav_weight = 2.0f;
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 9, 0)), 9.0f, 1e-4f);
+
+  m.unknown_value = 25.0f;  // 1 + 2 * 0.25 = 1.5
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_NEAR(cg.costTo(cellCenter(grid, 9, 0)), 8.0f + 1.5f, 1e-4f);
+  EXPECT_TRUE(cg.unknownAt(5, 0));  // still passable, still flagged
+  EXPECT_FALSE(cg.blockedAt(5, 0));
+
+  m.unknown_value = 500.0f;  // clamped below the obstacle range
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_TRUE(cg.reachable(cellCenter(grid, 9, 0)));
+}
+
+// pathLengthTo() is the metres driven along the shaped path, not its cost.
+TEST(CostGridModel, PathLengthIsMetricUnderShapedModel) {
+  auto grid = makeGrid(9, 5, 0.5f);
+  for (int y = 0; y < 4; ++y) grid.data[y * 9 + 4] = 45;  // rough strip
+  CostModel m;
+  m.trav_weight = 10.0f;                                    // strip step x5.5
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  const auto goal = cellCenter(grid, 8, 0);
+  const auto path = cg.extractPath(goal);
+  ASSERT_GE(path.size(), 2u);
+  double walked = 0.0;
+  for (size_t i = 1; i < path.size(); ++i) walked += (path[i] - path[i - 1]).norm();
+  EXPECT_NEAR(cg.pathLengthTo(goal), walked, 1e-4);
+  EXPECT_GT(cg.pathLengthTo(goal), 8 * 0.5f);   // detours round the strip
+
+  // Every cell mildly rough: each step costs twice its length, and the
+  // length stays in metres.
+  std::fill(grid.data.begin(), grid.data.end(), 10);
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_NEAR(cg.pathLengthTo(goal), 8 * 0.5f, 1e-4);
+  EXPECT_NEAR(cg.costTo(goal), 2.0f * cg.pathLengthTo(goal), 1e-3f);
+
+  // Unshaped: the cost is the length.
+  cg.build(grid, 50, CostModel{});
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_FLOAT_EQ(cg.pathLengthTo(goal), cg.costTo(goal));
+  EXPECT_FLOAT_EQ(cg.pathLengthTo(cellCenter(grid, 0, 0)), 0.0f);
+}
+
+TEST(CostGridModel, PathLengthUnreachableIsInfinite) {
+  auto grid = makeGrid(5, 1, 1.0f);
+  block(grid, 2, 0);
+  CostModel m;
+  m.trav_weight = 1.0f;
+  CostGrid cg;
+  cg.build(grid, 50, m);
+  cg.floodFrom(cellCenter(grid, 0, 0), 0.0f);
+  EXPECT_FALSE(std::isfinite(cg.pathLengthTo(cellCenter(grid, 4, 0))));
+  EXPECT_FALSE(std::isfinite(cg.pathLengthTo(Eigen::Vector3f(-5.0f, 0.0f, 0.0f))));
 }

@@ -17,6 +17,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
+find_package(action_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
@@ -28,6 +29,7 @@ add_library(explo_planner_lib
   src/scoring.cpp
   src/map_cache.cpp
   src/candidate_generator.cpp
+  src/candidate_snap.cpp
   src/fov_evaluator.cpp
   src/metrics_logger.cpp
   src/cost_grid.cpp
@@ -39,6 +41,7 @@ add_library(explo_planner_lib
   src/target_queue.cpp
   src/vantage_planner.cpp
   src/tree_detector.cpp
+  src/traversability_accumulator.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -72,7 +75,7 @@ target_link_libraries(explo_planner_node
 ament_target_dependencies(explo_planner_node
   rclcpp geometry_msgs nav_msgs sensor_msgs
   visualization_msgs scovox_core scovox_msgs explo_planner_msgs
-  tf2 tf2_ros tf2_geometry_msgs rclcpp_action nav2_msgs std_msgs
+  tf2 tf2_ros tf2_geometry_msgs rclcpp_action action_msgs nav2_msgs std_msgs
 )
 
 # Time-based tree-target publisher: drives the exploitation targets topic from
@@ -127,6 +130,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_scoring test/test_scoring.cpp)
   target_link_libraries(test_scoring explo_planner_lib)
 
+  ament_add_gtest(test_metrics_logger test/test_metrics_logger.cpp)
+  target_link_libraries(test_metrics_logger explo_planner_lib)
+
   ament_add_gtest(test_candidate_generator test/test_candidate_generator.cpp)
   target_link_libraries(test_candidate_generator explo_planner_lib)
 
@@ -148,9 +154,6 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plan_map_query test/test_plan_map_query.cpp)
   target_link_libraries(test_plan_map_query explo_planner_lib)
 
-  ament_add_gtest(test_metrics_logger test/test_metrics_logger.cpp)
-  target_link_libraries(test_metrics_logger explo_planner_lib)
-
   ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
   target_link_libraries(test_failed_goal_blacklist explo_planner_lib)
 
@@ -165,6 +168,16 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_tree_detector test/test_tree_detector.cpp)
   target_link_libraries(test_tree_detector explo_planner_lib)
+
+  ament_add_gtest(test_roi test/test_roi.cpp)
+  target_link_libraries(test_roi explo_planner_lib)
+
+  ament_add_gtest(test_traversability_accumulator
+    test/test_traversability_accumulator.cpp)
+  target_link_libraries(test_traversability_accumulator explo_planner_lib)
+
+  ament_add_gtest(test_candidate_snap test/test_candidate_snap.cpp)
+  target_link_libraries(test_candidate_snap explo_planner_lib)
 endif()
 
 ament_package()

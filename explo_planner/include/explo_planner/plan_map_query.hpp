@@ -16,16 +16,9 @@
 #include <Eigen/Core>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 
-namespace explo_planner {
+#include "explo_planner/roi.hpp"
 
-/// Axis-aligned region of interest in world XY (metres). The 2D planning_map
-/// queries ignore Z.
-struct Roi2D {
-  float min_x;
-  float max_x;
-  float min_y;
-  float max_y;
-};
+namespace explo_planner {
 
 /// Sentinel for planMapCellAt(): no data — empty/degenerate grid (including
 /// `data` not matching `width * height`) or `pos` out of bounds. Distinct
@@ -38,21 +31,24 @@ int8_t planMapCellAt(const nav_msgs::msg::OccupancyGrid& grid,
                      const Eigen::Vector3f& pos);
 
 /// True iff the cell at `pos` is known-free. Out-of-bounds, unknown (-1) and
-/// occupied/inflated (>= 50) cells all fail. The map is already inflated by the
-/// body radius, so a single-cell check is enough.
+/// occupied/inflated (>= threshold, 50 by default) cells all fail. The map is
+/// already inflated by the body radius, so a single-cell check is enough.
 bool isCellFree(const nav_msgs::msg::OccupancyGrid& grid,
-                const Eigen::Vector3f& pos);
+                const Eigen::Vector3f& pos, int8_t threshold = 50);
 
-/// True iff the cell at `pos` is known-occupied/inflated (>= 50). Unlike
-/// isCellFree, unknown (-1) cells return false (lets frontier centroids pass
-/// through unknown territory); out-of-bounds (kCellNoData) is treated as
-/// occupied, the conservative default.
+/// True iff the cell at `pos` is known-occupied/inflated (>= threshold, 50 by
+/// default). Unlike isCellFree, unknown (-1) cells return false (lets frontier
+/// centroids pass through unknown territory); out-of-bounds (kCellNoData) is
+/// treated as occupied, the conservative default.
 bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& grid,
-                    const Eigen::Vector3f& pos);
+                    const Eigen::Vector3f& pos, int8_t threshold = 50);
 
 /// Fraction of cells in `roi` (clipped to the grid) whose value is -1
 /// (unknown). Returns -1.0 if the grid is degenerate (including `data` not
-/// matching `width * height`) or the ROI doesn't overlap it.
+/// matching `width * height`) or the ROI doesn't overlap it. An untransformed
+/// ROI counts every cell whose index range the box spans (legacy behaviour); a
+/// rotated/offset ROI counts the cells of its map-frame bounding box whose
+/// CENTRE lies inside the ROI.
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& grid,
                             const Roi2D& roi);
 

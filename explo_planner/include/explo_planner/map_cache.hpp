@@ -2,6 +2,7 @@
 /// @file map_cache.hpp
 /// @brief Read-only Bonxai grid rebuilt from ROS map messages.
 
+#include "explo_planner/roi.hpp"
 #include "explo_planner/scoring.hpp"
 #include <bonxai/bonxai.hpp>
 #include <Eigen/Core>
@@ -46,6 +47,12 @@ public:
   bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
                            const Eigen::Vector3f& roi_min,
                            const Eigen::Vector3f& roi_max);
+
+  /// As above, but the XY clip is a (possibly rotated/offset) Roi2D and the z
+  /// clip is the inclusive band [min_z, max_z]. The AABB overload is this with
+  /// an untransformed Roi2D.
+  bool updateFromScovoxMap(const scovox_msgs::msg::ScovoxMap& msg,
+                           const Roi2D& roi_xy, float min_z, float max_z);
 
   /// Rebuild grid from LogOdds PointCloud2 (x,y,z,occupancy_prob).
   void updateFromLogOddsCloud(const sensor_msgs::msg::PointCloud2& msg,
@@ -112,6 +119,12 @@ public:
   /// the caller's "cannot measure" convention.
   double unknownColumnFraction(float min_x, float max_x,
                                float min_y, float max_y) const;
+
+  /// As above over a Roi2D. An untransformed ROI is exactly the box overload.
+  /// A rotated/offset ROI counts the columns of its map-frame bounding box
+  /// whose CENTRE lies inside the ROI, and only those columns count as
+  /// observed. Returns -1.0 on a degenerate or non-finite ROI.
+  double unknownColumnFraction(const Roi2D& roi) const;
 
 private:
   double resolution_;

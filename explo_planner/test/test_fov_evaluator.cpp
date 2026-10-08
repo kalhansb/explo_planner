@@ -282,3 +282,41 @@ TEST(FovEvaluator, NearEndIsClippedAtTheRoiEntryFace) {
   EXPECT_GE(clipped.total_ray_voxels, 45);
   EXPECT_LE(clipped.total_ray_voxels, 55);
 }
+
+// The dead-zone case above, with the ROI rotated 30 deg and offset: a
+// candidate on the ROI's +x face firing out of it scores nothing, and firing
+// back in still scores. Guards the ROI-frame slab test.
+TEST(FovEvaluator, RotatedRoiClipsRaysInItsOwnFrame) {
+  const float yaw = static_cast<float>(M_PI / 6.0);
+  FovConfig cfg;
+  cfg.h_rays = 8;
+  cfg.v_rays = 1;
+  cfg.hfov = 3.0f;
+  cfg.vfov = 0.1f;
+  cfg.min_range = 0.3f;
+  cfg.max_range = 5.0f;
+  cfg.roi_min_x = -10.0f;
+  cfg.roi_max_x = 0.0f;    // candidate sits exactly on the +x face
+  cfg.roi_min_y = -10.0f;
+  cfg.roi_max_y = 10.0f;
+  cfg.roi_min_z = -1.0f;
+  cfg.roi_max_z = 1.0f;
+  cfg.roi_yaw = yaw;
+  cfg.roi_origin_x = 5.0f;
+  cfg.roi_origin_y = 5.0f;
+  FovEvaluator eval(cfg);
+
+  MapCache map(0.1);
+  CandidateViewpoint vp;
+  vp.position = Eigen::Vector3f(5.0f, 5.0f, 0.0f);  // the ROI origin
+
+  vp.yaw = yaw;  // along ROI +x, straight out
+  auto outward = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_EQ(outward.total_ray_voxels, 0);
+  EXPECT_FLOAT_EQ(outward.total_score, 0.0f);
+
+  vp.yaw = yaw + static_cast<float>(M_PI);
+  auto inward = eval.evaluate(vp, map, scoring::eig);
+  EXPECT_GT(inward.total_ray_voxels, 0);
+  EXPECT_GT(inward.total_score, 0.0f);
+}

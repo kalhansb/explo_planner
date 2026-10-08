@@ -44,6 +44,7 @@
 #   stationary fraction     18 %               49 %
 #   longest standstill      1.9 s              22.6 s
 #   min travel / 30 s win   1.33 m             0.51 m
+#   min net / 120 s win     3.23 m             2.33 m
 #
 # CURT is the binding constraint on every timeout: it is stationary half
 # the time and stands still for up to 22.6 s at a stretch.
@@ -103,18 +104,32 @@
     # shared_params.yaml ships 15.0 s / 0.2 m. That is unsafe on these two
     # platforms: CURT stands still for up to 22.6 s at a stretch on a
     # healthy run, which is LONGER than the whole 15 s window, and a 180
-    # deg in-place turn adds ~13 s of zero translation on top. The check is
-    # `cumulative_distance_ - mark < progress_min_distance_m`, i.e. total
-    # path walked, NOT closing distance — so a stationary-but-fine robot
-    # trips it, failGoal("no-progress") fires, and the goal the robot is
-    # standing on gets blacklisted under a failed_goal_radius_m disc for
-    # failed_goal_ttl_sec.
+    # deg in-place turn adds ~13 s of zero translation on top. At the end of
+    # each window the check compares the robot's NET displacement since the
+    # window opened (a straight line: rocking in place, or driving out and
+    # back, counts as nothing) with progress_min_distance_m. Below it,
+    # failGoal("no-progress") fires and the goal gets blacklisted under a
+    # failed_goal_radius_m disc for failed_goal_ttl_sec.
     #
-    # 30 s clears CURT's worst measured standstill (22.6 s) with margin,
-    # and 0.25 m sits at half its worst measured travel in any 30 s window
-    # (0.51 m) — so a genuinely wedged robot still trips it within one
-    # window, but a slow or turning one never does.
-    progress_window_sec: 30.0
+    # 120 s: a backstop behind nav2, not the first line. nav2 is watched,
+    # so a goal nav2 rejects fails in seconds (nav2_abort_limit), and
+    # nav2's own progress checker (0.5 m net within 10 s) notices a wedged
+    # robot long before this does and runs its recoveries. Default tree:
+    # 6 recovery rounds, ~2.5-3 min, then an ABORT, and that one abort
+    # fails the goal (nav2_abort_final_after_recovery). The watchdog is what
+    # ends a stall nav2 does not report at all: nav2 not running or not
+    # watched, or nav2 SUCCEEDED short of the planner's tolerance (every
+    # keep-alive re-send then succeeds at once and the robot stays parked).
+    # It checks once per window, so a stall is caught 120-240 s after it
+    # starts.
+    # Sized on the 2026-07-31 teleop bags (operator stops included): the
+    # share of sliding windows under 0.25 m net is 9 % (CURT) / 10 %
+    # (bunker) at 30 s, 6 % / 0 % at 60 s, 2 % / 0 % at 90 s and 0 % / 0 %
+    # at 120 s (net min 2.33 m / 3.23 m). 0.25 m is kept, far below those
+    # minima; it is also the "same spot" radius of nav2_abort_limit. On
+    # the first field run, read the "Goal end [no-progress]" lines: a
+    # healthy robot tripping it means the window is too short.
+    progress_window_sec: 120.0
     progress_min_distance_m: 0.25
 
     # A 180 deg in-place turn measures 12-13 s at the p90 yaw rate. The
@@ -123,16 +138,84 @@
     # one full turn plus a comfortable settle.
     goal_rotate_timeout_sec: 25.0
 
+    # Nav budget cap: 10 min. The budget is only the backstop here: nav2
+    # giving up fails a goal within seconds (nav2_abort_limit) and the
+    # watchdog above fails a robot that stops moving. What is left for the
+    # cap is a robot that keeps moving but never arrives (nav2 replanning
+    # round an obstacle with no overall limit of its own). The budget still
+    # scales with path length (speed 0.20-0.22 x safety 3): a 15 m goal gets
+    # ~3.5 min and only goals past ~40 m reach the cap.
+    nav_max_timeout_sec: 600.0
+    # Must stay ABOVE nav_max_timeout_sec: a failed hop keeps charging the
+    # per-tree timer, so a smaller value gives a tree up after its first
+    # failed vantage approach. 720 = one worst-case failed hop (600) + 120 s
+    # to re-select and reach another angle (shared_params.yaml).
+    exploit_target_timeout_sec: 720.0
+
     # INHERITED DELIBERATELY (do not "tighten" these for hardware):
-    #   nav_safety_factor 3.0 / nav_min_timeout_sec 30.0 /
-    #   nav_max_timeout_sec 180.0 — CURT is stationary 49 % of the time, so
-    #   wall-clock budgets must be ~2x the moving-time estimate before any
-    #   safety factor. The watchdog above is what catches a wedged robot;
-    #   the budget is not, and shortening it only aborts healthy slow hops.
+    #   nav_safety_factor 3.0 / nav_min_timeout_sec 30.0 — CURT is
+    #   stationary 49 % of the time, so wall-clock budgets must be ~2x the
+    #   moving-time estimate before any safety factor. The watchdog above is
+    #   what catches a wedged robot; the budget is not, and shortening it
+    #   only aborts healthy slow hops.
     #   max_pose_jump_m 1.0 — UNVALIDATED. map->odom is constant in both
     #   bags (max correction 0.000 m: odometry only, no loop closure), so
     #   this pipeline has never met a real SLAM discontinuity. Watch
     #   distance_traveled across the first NDT correction in the field.
+
+    # -------------------------------------------------------------------
+    # PLANNING MAP: traversability_mapping, accumulated over the ROI
+    # -------------------------------------------------------------------
+    # traversability_mapping (github.com/errorcodecritical/traversability_mapping)
+    # publishes /occupancy_map_local: a 20 x 20 m window at 0.1 m around the
+    # robot, frame map, 0..100 traversability (0 flat, 100 hard obstacle, -1
+    # unseen), the same grid nav2's global costmap is built from. The planner
+    # stitches the windows into one grid over the ROI ("accumulate") and uses
+    # it to keep goals out of bushes and to cost paths around them:
+    #   - cells >= 50 (steep / stepped / rough, and every hard obstacle) are
+    #     obstacles; frontier goals on them snap up to 2 m to the nearest
+    #     good cell (inherited candidate_snap_radius_m) or are dropped;
+    #   - goals never sit within 0.6 m of an obstacle (clearance zone):
+    #     frontier goals, tree vantages and approach points alike. An
+    #     AgileX Bunker is ~0.78 m wide: at 0.4 m its sides end at the bush
+    #     edge, and on the 2026-07-31 bag half the goals picked at 0.4 m had
+    #     an obstacle cell 0.4-1 m away;
+    #   - path cost is the Dijkstra cost over the grid: passable rough cells
+    #     cost up to ~1.5x (trav_weight 1.0, values below 50), unseen cells
+    #     1.25x (as if scored 25), the clearance zone 3x, so the
+    #     information-per-cost utility prefers frontiers reached over open,
+    #     already-seen ground. The nav time budget uses the path's length in
+    #     metres, not this cost.
+    # Each robot runs its own traversability_mapping in its namespace
+    # (traversability_map.launch.py namespace:=<robot>), so the per-robot
+    # blocks below set /<robot>/occupancy_map_local. The un-namespaced topic
+    # here is for a single-robot launch (node /explo_planner).
+    # The map becomes a hard startup precondition: the planner waits in
+    # WAIT_FOR_MAP (logging window counts) until the first window lands.
+    # Launch only traversability_filter + traversability_map
+    # (launch/traversability_map.launch.py) — the PRM/path nodes are not
+    # needed and carry their own CPU/memory costs — and feed them a ~5 Hz
+    # cloud on the Jetson: at 10 Hz each takes most of a desktop core
+    # (docs/field_setup.md, "Traversability map").
+    use_planning_map: true
+    planning_map_mode: "accumulate"
+    planning_map_topic: "/occupancy_map_local"
+    # Accumulated over the whole ROI, so frontiers far across it are in the
+    # flood. The default 0 (= candidate_max_radius + 2 m = 10 m) would make
+    # every one beyond 10 m unreachable. A full flood of the ~211 k-cell grid is
+    # ~20-40 ms; it runs at most once per map snapshot (1 s) or 0.25 m of motion.
+    cost_grid_radius_cap_m: 500.0
+    planning_map_clearance_m: 0.6
+    planning_map_clearance_penalty: 3.0
+    planning_map_trav_weight: 1.0
+    # Unseen (-1) cells are weighted as if scored 25/100: with 0 a path through
+    # unmapped scrub looked as cheap as one over mapped open ground.
+    planning_map_unknown_value: 25.0
+    # On the 2026-07-31 bag a parked bunker sat in a ring of 99-cells 0.4-0.8 m
+    # out (most likely its own body: traversability_mapping keeps returns
+    # from 0.5 m out) and the path search could not leave it — 6-7 PLANs per
+    # run lost the reachability filter. 1.0 m: none did.
+    planning_map_robot_clear_m: 1.0
 
 # =======================================================================
 # PER-ROBOT BLOCKS
@@ -162,6 +245,8 @@
     # node, so a robot running alone keeps rendezvous inert (0), as it should.
     rendezvous_expected_peers: 1
     targets_topic: "/exploration/targets/bunker"
+    # This robot's own traversability_mapping (namespace:=bunker).
+    planning_map_topic: "/bunker/occupancy_map_local"
 
 /curt/explo_planner:
   ros__parameters:
@@ -172,18 +257,24 @@
     output_csv: "/tmp/exploration_curt.csv"
     rendezvous_expected_peers: 1     # see bunker's block
     targets_topic: "/exploration/targets/curt"
+    # This robot's own traversability_mapping (namespace:=curt
+    # base_frame:=base_link_curt).
+    planning_map_topic: "/curt/occupancy_map_local"
 
 # =======================================================================
 # SET BEFORE THE FIRST RUN AT A NEW SITE — these cannot be measured from
 # the bags and are WRONG by default. Left as-is they fail quietly.
 # =======================================================================
-# 1. ROI BOX. shared_params.yaml ships roi_min/max_x -51.3..100.9 and
-#    roi_min/max_y -38.7..74.5 — the extent of a PREVIOUS site. Candidates
-#    outside the box are discarded, so a box that misses the real survey
-#    area starves the planner of candidates and it reports done with an
-#    unexplored site. Set the four keys to the actual survey extent in the
-#    map frame, with roi_min_z/roi_max_z (-5.5 / 4.0, terrain-relative)
-#    spanning ground-to-canopy.
+# 1. ROI BOX. shared_params.yaml ships a 100 x 25 m box rotated 25.75 deg
+#    (roi_yaw_deg / roi_origin_x / roi_origin_y + roi_min/max_x/y in the
+#    ROI frame) — the tree block of the hmr_localisation gt_map site.
+#    Candidates outside the box are discarded, so a box that misses the real
+#    survey area starves the planner of candidates and it reports done with
+#    an unexplored site. At a new site set the seven keys to the actual
+#    survey extent (roi_yaw_deg 0 + origin 0 for a plain map-frame box),
+#    with roi_min_z/roi_max_z (-5.5 / 4.0, terrain-relative) spanning
+#    ground-to-canopy. The node logs the ROI and its map-frame extent at
+#    startup.
 #
 # 2. proximity_peer_pose_topics. UNSET, and the node warns at startup that
 #    the proximity guard is then running on the 1 Hz intent heartbeat

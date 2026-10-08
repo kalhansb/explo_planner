@@ -123,12 +123,16 @@ the peer clears or parks.
 
 A robot that loses comms keeps exploring alone. When it exhausts its goals it
 does **not** stop while its teammate is still out of range: it drives back to
-its **last-connected anchor** — the pose where it last heard the teammate — and
-holds there until the team is back in comms, then re-plans against the merged
-map. Neither robot can finish while the other is still exploring.
+its **start point** — the pose where it started planning, inside the launch comms
+bubble — and holds there until the team is back in comms, then re-plans against
+the merged map. Neither robot can finish while the other is still exploring. A
+robot that finishes with its teammate in comms also drives home first, so the
+mission ends with both robots parked at the launch site.
 
-The anchor needs no configuration; it is recorded automatically from incoming
-peer intents. **`rendezvous_expected_peers` must be set to 1 by hand on a
+Home needs no configuration; it is recorded when planning starts. The wait at
+home gives up after `rendezvous_max_wait_sec` (600 s shipped) and the drive home
+after `return_nav_max_timeout_sec` (600 s); a robot that gives up parks in
+`DONE` and keeps beaconing so its teammate can still find it. **`rendezvous_expected_peers` must be set to 1 by hand on a
 hardware launch** (§5) — the shipped value is `0`, which leaves the whole
 feature inert.
 
@@ -386,10 +390,14 @@ targets anyway — it becomes a partial-coverage run; note it on the sheet.
 |------|---------|
 | `Step N: ROI unknown fraction …` | Exploration progress. The number should fall and then plateau. |
 | `Step N: navigation failed [no-progress] … Blacklisted; K active …` | Occasional is normal. **Three on the same spot is a panic-stop trigger.** |
+| `Goal end [reached] step N explore (x, y): 41.0s of 120s budget, path 8.3 m, …; nav2 SUCCEEDED, 0 abort(s), 1 recovery(ies)` | One per goal, whatever the outcome. Mostly `[reached]` is healthy; recoveries on most goals mean nav2 is struggling with the ground. |
+| `navigation failed [nav2-aborted]` + `nav2 abort reason: error_code 204 GOAL_OUTSIDE_MAP` | nav2 refused the goal twice; the planner dropped it and picks another. Occasional is normal; on every other goal, nav2's global costmap is too small for the goals (field setup). |
+| `nav2 ABORTED the current goal … giving the goal up: nav2 ran N recovery(ies) here first` | The robot was stuck; nav2 tried its recoveries and gave up, so the planner drops the goal at the first abort. |
 | `Proximity hold #N: yielding to 'bunker' at 4.2 m` | The pair got close and curt yielded. Expected where routes cross. |
 | `Target 1: vantage 1/3 selected at (…) cost=4.31 (3 valid, 0 clear-LoS dwelled)` | Exploitation working the ring. `valid=N` counts **down** as vantages are consumed. |
 | `Target 1 exploitation PARTIAL (1/3 clear-LoS vantages dwelled)` | The trunk closed without full coverage. Note it; do not abort. |
-| `Rendezvous: … team incomplete (0/1) -> returning to anchor` | Comms lost. The robot is driving back, not stuck. |
+| `Rendezvous: … team incomplete (0/1) -> returning home (x, y).` | Comms lost at the end of exploration. The robot is driving back to its start point, not stuck. |
+| `Rendezvous: waiting at home for team (0/1 present).` | Parked at the start point waiting for the teammate; releases on reconnection or after `rendezvous_max_wait_sec`. |
 
 ### Topics
 
@@ -425,6 +433,8 @@ Written to `output_csv` on each robot. Columns worth watching live:
 | `rejected_by_minpos` | Non-zero confirms deconfliction is actually firing. |
 | `phase`, `target_id`, `vantage_index` | The EXPLOIT windows the offline per-trunk metric is computed over. |
 | `prox_hold_count`, `prox_hold_total_sec` | Cumulative proximity holds — correlate against the trajectory afterwards. |
+| `goal_outcome`, `nav_elapsed_sec`, `goal_path_length_m` | How each goal ended, how long it took, and the route length its budget was built from. A run of `no-progress` / `nav2-aborted` means the robot is fighting the terrain. |
+| `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | nav2's side of the same goal (error code on Jazzy only). |
 
 ---
 
