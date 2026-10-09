@@ -45,8 +45,9 @@ matches. See `scovox/docs/field_setup.md` for the mapping side.
   robot's namespace and reads the namespaced traversability topics.
   `nav2_namespaced.launch.py namespace:=<robot> params_file:=<the robot's
   nav2 params>` does both, from an un-namespaced params file such as
-  bunker's, left unchanged. [nav2_config.md](nav2_config.md) lists what nav2
-  must match and what the launch changes.
+  bunker's, left unchanged (its header lists what it changes).
+  [nav2_config.md](nav2_config.md), written for whoever runs nav2, lists
+  what the planner needs from nav2 and how to change the planner's names.
 
 ## Setup (once)
 
@@ -236,7 +237,7 @@ un-namespaced, for a single-robot `/explo_planner`. nav2 reads two of them,
 the map (costmaps) and `traversability_filter`'s
 `/<robot>/pointcloud_2_laserscan` (collision monitor), so nav2 must read
 the namespaced topics. `nav2_namespaced.launch.py` rewrites an un-namespaced
-params file to them ([nav2_config.md](nav2_config.md)).
+params file to them (see its header).
 
 This starts only `traversability_filter` and `traversability_map`, with their
 shipped config. Do not use the package's own `traversability_mapping.launch.py`:
@@ -408,8 +409,27 @@ Levers:
   and inflation to match. With 50 lethal, the ring a parked robot sees around
   itself (step 6) becomes lethal to nav2 too. `footprint_clearing_enabled:
   true` on the static layer clears only the footprint, and the ring reaches
-  0.8 m, past a Bunker's ~0.39 m half-width. bunker's current values:
-  [nav2_config.md](nav2_config.md).
+  0.8 m, past a Bunker's ~0.39 m half-width.
+
+  bunker's own nav2 params (as supplied on 2026-10-09; nav2 is theirs to
+  tune, so take these up with whoever runs it):
+  - **Threshold.** Neither costmap sets `lethal_cost_threshold`, so only 100
+    is an obstacle to nav2, against the planner's 50. Going to 50 would wall
+    a parked Bunker in with the ring. A middle way is `trinary_costmap:
+    false`, a costmap-level parameter. 100 stays the only lethal value, and a
+    cell scored v costs v × 2.54 (50 → 127, 99 → 251, under the inscribed
+    253). navfn and MPPI then prefer the ground the planner prefers, and the
+    ring costs a lot but walls nothing in. MPPI's cost critic would weigh
+    rough ground too, so try it on a bag first.
+  - **Footprint.** `robot_radius: 0.2` is a 0.4 m disc against a Bunker's
+    ~1.0 × 0.78 m. The MPPI cost critic (`consider_footprint: false`) and
+    the collision monitor (its polygon is
+    `local_costmap/published_footprint`) both use that disc. Only the 0.8 m
+    inflation keeps the sides and corners off obstacles.
+  - **Distro.** The plugin names use `::`
+    (`nav2_navfn_planner::NavfnPlanner`). That needs nav2 on Jazzy or
+    later: Humble's `planner_server` fails with `Failed to create global
+    planner`. bunker's 2026-07-31 bag was recorded on Jazzy.
 - **Goals outside nav2's global costmap.** The package's 20 m rolling global
   costmap cannot hold a goal more than 10 m away: 3–4 of ~45 goals per bag
   replay. nav2 (Jazzy, default tree) rejects such a goal at once with
@@ -426,8 +446,12 @@ Levers:
   goals' reach. The robot's own nav2 on 2026-07-31 rejected two hand-sent goals
   only 3.1 m and 4.8 m away the same way, so its global costmap is not the
   package's 20 m window; check it with `ros2 param dump
-  /global_costmap/global_costmap` (bunker's current params: a 200 m window,
-  [nav2_config.md](nav2_config.md)). The planner's latched
+  /<robot>/global_costmap/global_costmap`. bunker's params (2026-10-09) set
+  a 200 × 200 m rolling window at 0.1 m. It holds goals up to 100 m away,
+  which is the whole shipped ROI (101 × 66 m) from almost anywhere in it.
+  Each map message covers only the 20 m window, but a rolling costmap keeps
+  earlier windows' cells until it rolls past them, so nav2 keeps the ground
+  it has seen. The planner's latched
   `~/traversability_map` covers the ROI + 5 m at a fixed origin and can
   replace it: a non-rolling global costmap (`rolling_window: false`) with a
   static layer on that topic (`map_subscribe_transient_local: true`) and

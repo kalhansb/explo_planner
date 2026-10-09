@@ -29,7 +29,8 @@ Everything else in params_file is used unchanged:
 - the tuning.
 
 Needs nav2_bringup, Jazzy or later. On Humble, navigation_launch.py starts
-no collision monitor. See docs/nav2_config.md.
+no collision monitor. docs/nav2_config.md lists what explo_planner needs
+from nav2.
 """
 import os
 import tempfile
@@ -80,7 +81,9 @@ def _setup(context):
     if not ns:
         raise RuntimeError("nav2_namespaced: namespace must name the robot "
                            "(e.g. bunker)")
-    params_file = LaunchConfiguration("params_file").perform(context)
+    # The shell leaves a ~ after params_file:= unexpanded.
+    params_file = os.path.expanduser(
+        LaunchConfiguration("params_file").perform(context))
     with open(params_file) as f:
         params = yaml.safe_load(f) or {}
     done = []

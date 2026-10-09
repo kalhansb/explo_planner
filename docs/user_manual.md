@@ -74,7 +74,7 @@ Five programs per robot, identical on both:
 | 1 | `lidar_localization` + EKF | hmr_localisation | NDT against the **shared** `gt_map_us050.pcd`. This is what puts both robots in one global `map` frame — no robot-to-robot pose estimation is needed. |
 | 2 | `scovox_mapping_node` (`mode: rolling`) | scovox | Per-robot voxel map; emits the LZ4 delta stream. |
 | 3 | `dscovox_mapping_node` | scovox | Fuses **both** robots' delta streams into this robot's global map. |
-| 4 | Nav2 with the GT costmap | — | Consumes `/<r>/goal_pose`, owns obstacle avoidance. Runs in the robot's namespace: `nav2_namespaced.launch.py`, see [nav2_config.md](nav2_config.md). |
+| 4 | Nav2 with the GT costmap | — | Consumes `/<r>/goal_pose`, owns obstacle avoidance. Runs in the robot's namespace (`nav2_namespaced.launch.py`). What the planner needs from it: [nav2_config.md](nav2_config.md). |
 | 5 | `explo_planner_node` | explo_planner | Viewpoint/vantage selection, coordination, metrics. |
 
 Only three things cross the mesh: each robot's `scovox_bin` delta stream,
@@ -301,7 +301,8 @@ ros2 launch explo_planner nav2_namespaced.launch.py namespace:=<r> \
 ```
 
 in place of `nav2_bringup navigation_launch.py`.
-[nav2_config.md](nav2_config.md) has what the launch changes and the checks.
+The launch file's header lists what it changes;
+[nav2_config.md](nav2_config.md) lists what the planner needs from nav2.
 
 **6. Segmentation** (bunker), **multispectral calibration panel capture**
 (curt), E-stop test, then **start all recordings**.
