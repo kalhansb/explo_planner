@@ -41,7 +41,10 @@ matches. See `scovox/docs/field_setup.md` for the mapping side.
   precondition for anything downstream meaning anything.
 - **A navigator** subscribed to the goal topic. Nav2 is the supported path:
   `bt_navigator` subscribes `goal_pose` and wraps each received pose in a
-  `NavigateToPose` action goal it sends itself.
+  `NavigateToPose` action goal it sends itself. Each robot's nav2 runs in the
+  robot's namespace and reads the namespaced traversability topics:
+  [nav2_config.md](nav2_config.md) lists what it must match, and the changes
+  bunker's current nav2 params need (they run un-namespaced).
 
 ## Setup (once)
 
@@ -227,7 +230,10 @@ ros2 launch explo_planner traversability_map.launch.py namespace:=curt \
 Each map lands on `/<robot>/occupancy_map_local`, which the overlay's
 per-robot blocks read. The nodes' other topics move under the namespace too;
 frames do not (one TF tree). Without `namespace` the topics stay
-un-namespaced, for a single-robot `/explo_planner`.
+un-namespaced, for a single-robot `/explo_planner`. nav2 reads two of them,
+the map (costmaps) and `traversability_filter`'s
+`/<robot>/pointcloud_2_laserscan` (collision monitor), so its params must
+name the namespaced topics: see [nav2_config.md](nav2_config.md).
 
 This starts only `traversability_filter` and `traversability_map`, with their
 shipped config. Do not use the package's own `traversability_mapping.launch.py`:
@@ -399,7 +405,8 @@ Levers:
   and inflation to match. With 50 lethal, the ring a parked robot sees around
   itself (step 6) becomes lethal to nav2 too. `footprint_clearing_enabled:
   true` on the static layer clears only the footprint, and the ring reaches
-  0.8 m, past a Bunker's ~0.39 m half-width.
+  0.8 m, past a Bunker's ~0.39 m half-width. bunker's current values:
+  [nav2_config.md](nav2_config.md).
 - **Goals outside nav2's global costmap.** The package's 20 m rolling global
   costmap cannot hold a goal more than 10 m away: 3–4 of ~45 goals per bag
   replay. nav2 (Jazzy, default tree) rejects such a goal at once with
@@ -416,7 +423,8 @@ Levers:
   goals' reach. The robot's own nav2 on 2026-07-31 rejected two hand-sent goals
   only 3.1 m and 4.8 m away the same way, so its global costmap is not the
   package's 20 m window; check it with `ros2 param dump
-  /global_costmap/global_costmap`. The planner's latched
+  /global_costmap/global_costmap` (bunker's current params: a 200 m window,
+  [nav2_config.md](nav2_config.md)). The planner's latched
   `~/traversability_map` covers the ROI + 5 m at a fixed origin and can
   replace it: a non-rolling global costmap (`rolling_window: false`) with a
   static layer on that topic (`map_subscribe_transient_local: true`) and

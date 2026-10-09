@@ -74,7 +74,7 @@ Five programs per robot, identical on both:
 | 1 | `lidar_localization` + EKF | hmr_localisation | NDT against the **shared** `gt_map_us050.pcd`. This is what puts both robots in one global `map` frame — no robot-to-robot pose estimation is needed. |
 | 2 | `scovox_mapping_node` (`mode: rolling`) | scovox | Per-robot voxel map; emits the LZ4 delta stream. |
 | 3 | `dscovox_mapping_node` | scovox | Fuses **both** robots' delta streams into this robot's global map. |
-| 4 | Nav2 with the GT costmap | — | Consumes `/<r>/goal_pose`, owns obstacle avoidance. |
+| 4 | Nav2 with the GT costmap | — | Consumes `/<r>/goal_pose`, owns obstacle avoidance. Runs in the robot's namespace: see [nav2_config.md](nav2_config.md). |
 | 5 | `explo_planner_node` | explo_planner | Viewpoint/vantage selection, coordination, metrics. |
 
 Only three things cross the mesh: each robot's `scovox_bin` delta stream,
@@ -290,7 +290,11 @@ ros2 run scovox_mapping scovox_mapping_node --ros-args \
 ```
 
 **5. Nav2** with the GT costmap, listening on `/<r>/goal_pose`, with out-of-AO
-cells painted lethal.
+cells painted lethal. It runs in the robot's namespace with TF left on
+`/tf`, and any traversability_mapping topic it reads is the namespaced one
+(bunker's costmaps and collision monitor read two);
+[nav2_config.md](nav2_config.md) has the checklist and the changes bunker's
+current params need.
 
 **6. Segmentation** (bunker), **multispectral calibration panel capture**
 (curt), E-stop test, then **start all recordings**.

@@ -462,7 +462,9 @@ The startup line confirms it: `Proximity stop: tracking peer 'curt' via
 /curt/pcl_pose`. The same startup block prints `cancel via
 '/curt/navigate_to_pose'` — that must be the platform's Nav2 action name
 (`proximity_nav_cancel_action`), or a hold cancels nothing and the robot keeps
-driving while the planner believes it has stopped.
+driving while the planner believes it has stopped. nav2 must run in the
+robot's namespace for the defaults to match
+([nav2_config.md](nav2_config.md)).
 
 ### Team size — `rendezvous_expected_peers`, `rendezvous_max_wait_sec`
 
