@@ -25,7 +25,7 @@ to their start point and wait there until the team is back in comms.
 | I want to… | Read |
 |------------|------|
 | Integrate or drive the planner from ROS (nodes, topics, parameters, tf) | [docs/ros_api.md](docs/ros_api.md) |
-| Configure a robot's nav2 for the planner (namespacing, topics, footprint) | [docs/nav2_config.md](docs/nav2_config.md) |
+| Run a robot's nav2 for the planner (namespaced launch, topics, footprint) | [docs/nav2_config.md](docs/nav2_config.md) |
 | Understand how the planner works | [explo_planner/README.md](explo_planner/README.md) |
 | Run a two-robot trial on real hardware | [docs/user_manual.md](docs/user_manual.md) |
 | Dry-run exploration off a bag first | [explo_planner/doc/dscovox_exploration_run.md](explo_planner/doc/dscovox_exploration_run.md) |

@@ -42,9 +42,11 @@ matches. See `scovox/docs/field_setup.md` for the mapping side.
 - **A navigator** subscribed to the goal topic. Nav2 is the supported path:
   `bt_navigator` subscribes `goal_pose` and wraps each received pose in a
   `NavigateToPose` action goal it sends itself. Each robot's nav2 runs in the
-  robot's namespace and reads the namespaced traversability topics:
-  [nav2_config.md](nav2_config.md) lists what it must match, and the changes
-  bunker's current nav2 params need (they run un-namespaced).
+  robot's namespace and reads the namespaced traversability topics.
+  `nav2_namespaced.launch.py namespace:=<robot> params_file:=<the robot's
+  nav2 params>` does both, from an un-namespaced params file such as
+  bunker's, left unchanged. [nav2_config.md](nav2_config.md) lists what nav2
+  must match and what the launch changes.
 
 ## Setup (once)
 
@@ -232,8 +234,9 @@ per-robot blocks read. The nodes' other topics move under the namespace too;
 frames do not (one TF tree). Without `namespace` the topics stay
 un-namespaced, for a single-robot `/explo_planner`. nav2 reads two of them,
 the map (costmaps) and `traversability_filter`'s
-`/<robot>/pointcloud_2_laserscan` (collision monitor), so its params must
-name the namespaced topics: see [nav2_config.md](nav2_config.md).
+`/<robot>/pointcloud_2_laserscan` (collision monitor), so nav2 must read
+the namespaced topics. `nav2_namespaced.launch.py` rewrites an un-namespaced
+params file to them ([nav2_config.md](nav2_config.md)).
 
 This starts only `traversability_filter` and `traversability_map`, with their
 shipped config. Do not use the package's own `traversability_mapping.launch.py`:
