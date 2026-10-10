@@ -1,189 +1,105 @@
 # explo_planner
 
-Next-Best-View (NBV) exploration planner for ROS 2. It selects viewpoints by
-**Expected Information Gain (EIG)** computed from
-[SCovox](https://github.com/kalhansb) Beta-conjugate occupancy maps, drives a
-robot toward the chosen goal through the navigation stack, and logs per-step
-metrics for experiments.
+Next-Best-View (NBV) exploration and perceptive exploitation planner for ROS 2.
+It picks viewpoints by **expected information gain (EIG)** over a fused
+[SCovox](https://github.com/kalhansb/scovox) Beta-conjugate occupancy map,
+sends each one to the navigation stack as a goal pose, and logs per-step
+metrics to CSV. When a tree target arrives it circles the trunk and dwells at
+vantage points so the rosbag captures close-range views.
 
-It runs single- or multi-robot: each robot plans against its own fused SCovox
-view and (optionally) deconflicts viewpoints with teammates through a MinPos
-intent table. The multi-planner comparison harness (entropy / frontier / random
-/ ssmi baselines, used for the ablation studies) lives on the `experiments`
-branch; `main` ships the EIG planner only.
+It runs alone or in a team. Each robot plans against its own fused map and
+talks to teammates only through a shared intent topic. There a MinPos intent
+table deconflicts their goals: the robot closer to a contested viewpoint keeps
+it. This package ships the EIG planner only. The
+baselines used for the ablations (entropy, frontier, random, SSMI) are on the
+`experiments` branch.
+
+To build, see the [root README](../README.md#build).
 
 ## How it works
 
-Each PLAN cycle the node:
+Each planning cycle the node:
 
-1. **Generates candidates** — a polar grid of viewpoints (radius × ring × yaw)
-   around the current robot pose, **plus one candidate per frontier-cluster
-   centroid** anywhere in the ROI (the long-range escape from a locally
-   exhausted neighbourhood). Both are filtered against a region-of-interest box
-   and, when `use_planning_map: true`, the 2D inflated `planning_map` for
-   free/occupied.
-2. **Scores each candidate** — simulated FOV ray-casting over the SCovox map
-   yields an expected information gain (EIG) from the Beta-conjugate occupancy.
-3. **Costs each candidate** — bounded grid Dijkstra over the `planning_map`
-   gives a reachable path cost. With the planning_map disabled (the default,
-   `use_planning_map: false`) the cost is straight-line distance and there is no
-   2D reachability/obstacle filtering — avoidance is left to the nav stack.
-4. **Picks the best** — SSMI-style information-per-distance utility
-   (Asgharivaskasi & Atanasov, TRO 2023):
+1. **Generates candidates.** One candidate per frontier-cluster centroid in
+   the region of interest (ROI). An optional polar grid of 96 viewpoints
+   around the robot (`candidate_enable_polar`, off in `shared_params.yaml`)
+   adds local options. Candidates outside the ROI are dropped. With
+   `use_planning_map: true`, candidates on blocked or unreachable cells of the
+   2D planning map are dropped too; frontier candidates first try to move to
+   a good cell within `candidate_snap_radius_m`.
+2. **Scores each candidate.** Simulated field-of-view ray casting over the
+   SCovox map gives its EIG.
+3. **Costs each candidate.** With the planning map, a bounded grid Dijkstra
+   gives the path cost and doubles as a reachability test. Without it (the
+   `shared_params.yaml` default) the cost is straight-line distance and
+   obstacle avoidance is left to the navigator.
+4. **Picks the best** by information per distance, SSMI-style (Asgharivaskasi
+   & Atanasov, T-RO 2023):
 
    ```
-   U(c) = info_gain(c) / (ε + path_cost(c))
+   U(c) = info_gain(c) / (ε + path_cost(c)),   ε = 0.1
    ```
 
-   Longer paths dilute a candidate's score; unreachable candidates get
-   `U = −∞` and sort last.
-5. **Navigates** to the goal with a distance-scaled timeout, a no-progress
-   watchdog (net displacement), a give-up on goals Nav2 aborts twice from the
-   same spot, and a TTL/radius blacklist of recently-failed goals to avoid
-   re-picking unreachable targets. Each goal ends with one `Goal end` log
-   line and the same fields in the per-step CSV.
-6. **Terminates** when the unknown fraction in the ROI stays below a threshold
-   for N consecutive cycles, or `max_steps` is reached.
+   Unreachable candidates get `U = −∞` and sort last.
+5. **Navigates** under a distance-scaled time budget and a no-progress
+   watchdog. It gives up a goal Nav2 aborts twice from the same spot, and
+   blacklists failed goals for a while so it does not re-pick them. Each goal
+   ends with one `Goal end` log line and the same fields in the per-step CSV.
+6. **Terminates** when the ROI's unknown fraction stays below a threshold for
+   N consecutive cycles, or at `max_steps`.
 
-Multi-robot coordination (optional) uses a MinPos intent table so teammates
-deconflict their selected viewpoints. Each robot plans against its own fused
-SCovox view — there is no central merger.
+The full method, with every number, is in
+[docs/planner_method.md](../docs/planner_method.md).
 
 ### Rendezvous reconnection (multi-robot, default on)
 
-The meeting point is the **mission start point** ("home"): each robot records
-the pose where it starts planning. The team launches inside one comms bubble, so
-robots parked at their own homes are in radio range of each other by
-construction.
-
-A robot that loses comms keeps exploring on its own; nothing happens mid-mission.
-When it exhausts exploration (coverage termination above, or `max_steps`) it
-counts the teammates it can hear:
-
-- **Team incomplete:** it drives home and **holds there until the whole team is
-  back in comms**, then re-plans against the now-merged map. If new frontiers
-  appeared it disperses again (MinPos splits them); if not, the team finishes
-  together. A reconnection on the way home releases it early.
-- **Team present:** it still drives home and goes `DONE` there, so the mission
-  ends with the team parked together where it launched.
-
-While returning, waiting and after `DONE` it keeps a 1 Hz presence intent on the
-bus so a later finisher can count it. Open tree targets are stood down for the
-return and resume after the barrier releases.
-
-This is `rendezvous_enabled` and it defaults **on**, but it only *activates*
-where it is meaningful: `coordination_enabled` must be on (the barrier waits on
-peer claims) and `rendezvous_expected_peers` must be positive. Single-robot runs
-and one-robot teams are therefore unaffected — it stays inert, and behaviour is
-bit-for-bit the finish-and-stop of before. Set `rendezvous_enabled:=false` to
-force that independent finish even in a multi-robot run.
-
-Home needs no configuration. The barrier waits for `rendezvous_expected_peers`
-teammates (the multi-robot launch sets this from the team size; set it by hand
-on hardware). Both waits are bounded for the field: `rendezvous_max_wait_sec`
-(600 s in `shared_params.yaml` and the multi-robot launch; `<= 0` = wait
-forever, which is also the bare C++ default) caps the wait at home — a robot that
-gives up still parks in `DONE` beaconing its presence — and
-`return_nav_max_timeout_sec` (600 s) plus the no-progress watchdog cap the drive
-home; if home cannot be reached the robot waits where it is. Keep
-`done_action: "idle"` (shipped): with `"shutdown"` the first robot to finish
-disappears and its teammate waits for nothing.
+A robot that loses comms keeps exploring. When it runs out of goals it drives
+back to its start point and waits there until the whole team is back in comms,
+then re-plans on the merged map. With the team already present it still drives
+home before finishing. Open tree targets are stood down for the return and
+resume once the team reconnects. It is active only with `coordination_enabled` and
+`rendezvous_expected_peers` > 0. `shared_params.yaml` ships `0`, which leaves
+it inert. `multi_robot_exploration.launch.py` and the per-robot blocks of the
+real-robot overlay set it; any other team launch must set it by hand. Keep
+`done_action: "idle"`: with `"shutdown"` the first robot to finish exits, and
+its teammate waits at home for a robot that is gone.
+Method: [planner_method.md §10.2](../docs/planner_method.md#102-rendezvous-reconnection).
+Field settings: [user_manual.md §3.3](../docs/user_manual.md#33-rendezvous-reconnection).
 
 ### Coordinated proximity stop (multi-robot, default on)
 
-MinPos deconflicts *goals*, not *paths*: two robots' commanded routes can still
-cross (the forest trial's routes cross with 0.0 m closest approach). While a nav
-goal is in flight, the planner therefore watches its teammates' live poses and
-**yields when a higher-priority teammate is moving nearby**: it cancels the
-in-flight Nav2 goal through the `NavigateToPose` action interface (no nav2
-configuration is touched) **and** publishes a brake goal at its own pose — the
-cancel is verified only through its async response, so the zero-travel goal
-covers a cancel that is lost or rejected — then parks in a `PROXIMITY_HOLD`
-state and resumes the same goal once the peer has cleared off or parked.
+MinPos deconflicts goals, not paths. While driving, a robot yields to a
+higher-priority teammate (the lexicographically smaller `robot_name`) that is
+moving within 5 m. It cancels its Nav2 goal, publishes a brake goal at its own
+pose, holds, and resumes the same goal once the peer is beyond 6 m or has
+parked. On hardware, set `proximity_peer_pose_topics` to the peers' localiser
+poses: the 1 Hz intent heartbeat alone lags by metres at field speeds. The node
+warns at startup when none are set, and warns that the guard will never hold if
+`coordination_enabled` is also false. This is
+coordination, not a certified safety stop. The crewed 1.5 m panic stop stays
+the backstop.
 
-Right of way is the **lexicographically smaller `robot_name`** — the same total
-order as the MinPos tiebreak. It is computed from ids alone, so both robots of a
-pair always agree on who yields: exactly one stops, never both (standoff) and
-never neither (race). The hold enters below `proximity_hold_dist_m` (5 m) and
-releases beyond `proximity_resume_dist_m` (6 m, hysteresis). The 5 m is sized
-against the **reaction budget**, not just the documented 1.5 m panic line: pose
-age + tick + cancel propagation + braking exceeds a second while the pair keeps
-closing at the peer's speed, which consumed the whole margin of the earlier 3 m
-default at field closing speeds. A peer that has stopped moving for
-`proximity_peer_static_sec` is treated as **parked** and released — a stationary
-robot is an ordinary costmap obstacle for the navigator, and holding against one
-would deadlock (e.g. a teammate waiting at home for the rendezvous) — **unless it
-sits inside `proximity_parked_keep_dist_m`** (1.5 m): a peer parked closer than
-the panic line keeps the hold until it moves off or `proximity_max_hold_sec`
-(120 s) forces a loud resume. Stationary planner states (dwell, integrate, plan)
-are exempt from holding for the same reason.
-
-Peer poses come from the 1 Hz intent heartbeat automatically, plus any
-`proximity_peer_pose_topics` entries (`"<robot>:<topic>"`). **On hardware, point
-those at the peers' localiser robot pose** (map frame, ~10 Hz, whatever that
-topic is called on the platform): the heartbeat alone leaves metre-scale pose
-lag at field closing speeds. Misconfiguration does not stay silent: the planner
-warns at startup when no pose topics are set, warns repeatedly while a
-configured topic has delivered nothing, and warns when
-`coordination_enabled=false` leaves the guard with no input at all (no heartbeat
-and no pose topics). The guard is inert in single-robot runs (no peer is ever
-tracked).
-
-For the operator and post-hoc analysis: the latched topic
-`/<robot>/proximity_hold_state` carries the current state
-(`hold peer=... dist=...` / `clear reason=... held=...`, reasons
-`clear|parked|stale|max-hold`),
-and the per-step CSV gains cumulative `prox_hold_count` / `prox_hold_total_sec`
-columns so holds can be correlated with the trajectory. Held time does not
-refund the nav budget: the resume continues the goal's drive-time clock where
-the hold interrupted it, so repeated holds cannot grant one goal unbounded time.
-
-This is best-effort **coordination, not a certified safety stop**: it needs live
-peer data, both planners alive, and Nav2 honouring the cancel; the right-of-way
-robot keeps driving and relies on its costmap to skirt the held robot. The
-crewed 1.5 m panic-stop procedure remains the hard backstop in the field.
+The latched topic `proximity_hold_state`, under the node's namespace (e.g.
+`/bunker/proximity_hold_state`), shows `hold peer=<id> dist=<m> n=<count>` or
+`clear reason=<clear|parked|stale|no-peer|max-hold> held=<s>`.
+Method: [planner_method.md §10.3](../docs/planner_method.md#103-coordinated-proximity-stop).
+Field settings: [user_manual.md §3.2](../docs/user_manual.md#32-coordinated-proximity-stop).
 
 ## Perceptive exploitation
 
-On top of exploration the planner runs an **exploitation** overlay (forest
-inspection, Scenario 2): when a tree target arrives it switches `EXPLORE →
-EXPLOIT`, circles the trunk at occlusion-free **vantage points** and dwells at
-each so the rosbag captures overlapping RGB-D/LiDAR views, then reverts to
-exploration when the target's vantages are covered. Sensor fusion of the
-captured data is **offline** — the planner only positions and dwells.
+When a `TreeTarget` arrives, the planner switches from EXPLORE to EXPLOIT. It
+places `n_vantages` (3) viewpoints on a circle around the trunk, keeps those
+with a clear line of sight, and drives to each and dwells so the rosbag
+captures overlapping views. A target completes after `min_vantages_required`
+clear-sightline dwells, counted across the team, or closes as partial when
+`exploit_target_timeout_sec` runs out. When the target queue drains, the
+planner returns to exploration. Teammates split a ring's angles through the
+intent table. The planner only positions and dwells; sensor fusion is offline.
 
-Targets arrive on a shared topic (`targets_topic`, default
-`/exploration/targets`) as `explo_planner_msgs/TreeTarget` messages. Two
-producers ship with the package: the live `tree_detector_node` (segments trunks
-out of the fused SCovox map and emits each once, with position-derived stable
-ids so every robot names a tree identically), and the time-based
-`target_scheduler_node` (publishes a preselected list on a schedule — the
-repeatable-experiment stand-in). The exploitation launch picks with
-`use_detector:=true|false`; the planner is agnostic to which one feeds it.
-
-**Vantage-point selection** (per active target, recomputed each `EXPLOIT_PLAN`
-tick so the map can improve a previously-blocked angle):
-
-1. **Generate** `n_vantages` viewpoints evenly spaced on a standoff circle
-   around the trunk (3 ⇒ ~120° apart). Standoff `= radius + vantage_standoff_m`,
-   clamped to `[fov_min_range + radius, fov_max_range]`; each viewpoint faces the
-   trunk.
-2. **Validate** each: inside the ROI, a free cell on the inflated
-   `planning_map`, reachable via the cost grid, and **line-of-sight clear** —
-   a ray-march to the trunk hits no known-occupied voxel before the trunk
-   surface (voxels at/inside the trunk are the trunk itself, not an occluder).
-3. **Select** the nearest (cost-grid path cost) valid, unvisited, non-blacklisted
-   vantage; navigate → dwell → mark visited. The target is **complete** once
-   `min_vantages_required` clear-LoS vantages are dwelled, or **partial** once no
-   selectable vantage remains.
-
-Vantages flow through the same candidate → cost → `RobotIntent`/MinPos pipeline
-as exploration, and multi-robot vantage deconfliction is live: each robot
-claims its selected vantage through the intent table (per-vantage MinPos, with
-yield rules for in-flight, mid-dwell and parked peers), and every intent
-carries a **team dwell-credit mask**, so with coordination on
-`min_vantages_required` is a team quota — robots take different angles on the
-same tree and their clear-LoS dwells count together.
+Targets come from the time-based `target_scheduler_node` (a preselected list)
+or the live `tree_detector_node`. `exploitation_experiment.launch.py` picks
+one with `use_detector:=true|false`. Method:
+[planner_method.md §11](../docs/planner_method.md#11-perceptive-exploitation).
 
 ## Architecture
 
@@ -200,198 +116,75 @@ map and talks to peers only through the shared intent topic:
                              /exploration/intents  ◀── every peer planner
 ```
 
+By default the map arrives on `/<robot>/dscovox_node/scovox`, goals go out on
+`/<robot>/goal_pose` and targets arrive on `/exploration/targets`. Every topic,
+action, tf and parameter is in
+[docs/ros_api.md §4.1](../docs/ros_api.md#41-explo_planner_node).
+
 The node logic is split into small, unit-tested modules:
 
 | Module | Responsibility |
 | --- | --- |
-| `explo_planner_node` | State machine (PLAN → NAVIGATE → INTEGRATE → LOG_STEP, plus EXPLOIT_PLAN/EXPLOIT_DWELL) and ROS wiring |
-| `candidate_generator` | Polar-grid viewpoint candidate generation |
-| `fov_evaluator` | Simulated FOV ray-casting for viewpoint evaluation |
-| `scoring` | Viewpoint scoring (EIG / entropy / frontier) |
-| `cost_grid` | Bounded 8-connected grid Dijkstra path cost over `planning_map` |
+| `explo_planner_node` | The 10 Hz state machine and all ROS wiring |
+| `candidate_generator` | Viewpoint candidates: frontier-cluster centroids and the polar grid |
+| `candidate_snap` | Moves a frontier candidate off a bad planning-map cell onto the nearest good one |
+| `fov_evaluator` | Simulated FOV ray casting for viewpoint evaluation |
+| `scoring` | Per-voxel scores (EIG, entropy, frontier, random) |
+| `cost_grid` | Bounded 8-connected grid Dijkstra path cost over the planning map |
 | `plan_map_query` | Pure 2D occupancy-grid cell queries |
+| `traversability_accumulator` | Stitches a robot-centred rolling grid window into one ROI-sized planning map |
+| `roi` | The ROI rectangle, optionally rotated and offset from the map frame |
 | `map_cache` | Read-only Bonxai grid rebuilt from ROS map messages |
-| `failed_goal_blacklist` | TTL + radius blacklist of recently-failed goals |
+| `failed_goal_blacklist` | TTL + radius blacklist of recently failed goals |
 | `coordination` | Multi-robot intent table + MinPos deconfliction |
 | `proximity_guard` | Coordinated proximity-stop arbiter (yield/hold/resume decisions) |
-| `target_queue` | Tree-target queue (ingest/dedup/lifecycle) for exploitation |
+| `target_queue` | Tree-target queue (ingest, dedup, lifecycle) for exploitation |
 | `vantage_planner` | Vantage-point generation + line-of-sight occlusion test |
 | `tree_detector` | Trunk segmentation over the fused map (stable position-derived ids) |
 | `metrics_logger` | Per-step CSV metric logging |
 | `planner_util` | Small shared pure helpers |
 
-Two further executables drive the exploitation targets topic: the live
-`tree_detector_node` (wraps the `tree_detector` module) and the time-based
-`target_scheduler_node` (publishes a preselected list on a schedule).
-
-## Build
-
-ROS 2 (`ament_cmake`) package. It depends on the SCovox packages
-(`scovox_core`, `scovox_msgs`), so build it in a workspace that overlays
-SCovox:
-
-```bash
-cd <ws>
-colcon build --packages-up-to explo_planner
-source install/setup.bash
-```
+Two further executables publish tree targets: `tree_detector_node` (wraps the
+`tree_detector` module) and `target_scheduler_node`.
 
 ## Run
 
-Single-robot experiment:
+`shared_params.yaml` ships `use_sim_time: false`. Sim and bag runs must pass
+`use_sim_time:=true`. With `true` and no `/clock` publisher the planner
+never ticks; it warns once after 10 s.
 
-```bash
-ros2 launch explo_planner exploration_experiment.launch.py \
-  robot:=atlas max_steps:=200 \
-  output_csv:=/tmp/exploration_eig.csv
-```
-
-Multi-robot (one planner per robot; expects Gazebo + per-robot mapping/nav
-already running):
-
-```bash
-ros2 launch explo_planner multi_robot_exploration.launch.py \
-  robots:=atlas,boreas coordination_enabled:=true
-```
-
-Exploration **+ exploitation** (planner + the time-based target scheduler;
-expects the fused map + nav stack already running):
-
-```bash
-ros2 launch explo_planner exploitation_experiment.launch.py \
-  robot:=atlas max_steps:=200 \
-  output_csv:=/tmp/exploitation.csv \
-  targets_file:=<pkg>/config/targets.yaml
-```
-
-### Real-robot trials (Docker)
-
-For a full two-robot field trial — bring-up order, per-robot configuration,
-what to watch, panic stops and data offload — see
-[`../docs/user_manual.md`](../docs/user_manual.md). It spans the localiser,
-mapping, nav and planner, so it sits at the repository root rather than in this
-package. The build and launch essentials are below.
-
-The planner has no container of its own — build and run it in an overlay
-workspace inside the running `scovox` container (image `scovox:jazzy`, the
-sibling repo's `compose.yaml`; it provides ROS 2 Jazzy plus the
-`scovox_core`/`scovox_msgs` dependencies at `/scovox/install`):
-
-```bash
-cd ../scovox && docker compose up -d && cd -
-docker exec scovox bash -c 'rm -rf /tmp/explo_ws/src/explo_planner && mkdir -p /tmp/explo_ws/src'
-docker cp . scovox:/tmp/explo_ws/src/explo_planner   # always onto a fresh dir, never an existing one
-docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash \
-  && cd /tmp/explo_ws && colcon build --packages-select explo_planner --cmake-args -DCMAKE_BUILD_TYPE=Release'
-```
-
-Prerequisites on the robot: the `map → odom → base_link` TF tree from the
-sibling `hmr_localisation` NDT localizer, per-robot SCovox + DSCovox mapping
-(scovox README, "Multi-robot mapping"), and a nav stack listening on
-`goal_topic`. Then, per robot:
-
-```bash
-docker exec scovox bash -c 'source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash \
-  && source /tmp/explo_ws/install/setup.bash \
-  && ros2 launch explo_planner exploration_experiment.launch.py robot:=atlas'
-```
+| To | Read |
+| --- | --- |
+| Launch in sim or on a bag (single robot, exploitation, two robots on one host) | [docs/ros_api.md §3](../docs/ros_api.md#3-quick-start), launch files in [§6](../docs/ros_api.md#6-launch-files) |
+| Build and run inside the `scovox` container | [docs/user_manual.md §4](../docs/user_manual.md#4-before-field-day) |
+| Run on one robot, and pick the config for each run | [docs/field_setup.md](../docs/field_setup.md#run) |
+| Run the two-robot field trial | [docs/user_manual.md §6](../docs/user_manual.md#6-bring-up-order) |
+| Dry-run on a bag | [doc/dscovox_exploration_run.md](doc/dscovox_exploration_run.md), [doc/dscovox_exploitation_run.md](doc/dscovox_exploitation_run.md) |
 
 ### Real-robot runs (Bunker Mini + CURT Mini)
 
 Layer [`config/exploration_real_robot.yaml`](config/exploration_real_robot.yaml)
-over the shared file with the `params_file` argument that both launch files
-accept. Its timeouts are derived from measured motion in the 2026-07-31 bags,
-and it carries each platform's `base_frame` — without which the node falls back
-to `<robot_name>/base_link`, a frame that exists on neither robot, and the
-planner never acquires a pose:
-
-```bash
-CFG=$(ros2 pkg prefix explo_planner)/share/explo_planner/config
-
-# two robots — per-robot blocks in the overlay supply the frames
-ros2 launch explo_planner multi_robot_exploration.launch.py \
-     robots:=bunker,curt params_file:=$CFG/exploration_real_robot.yaml
-
-# one robot — this launch has no namespace, so pass the frame as an argument
-ros2 launch explo_planner exploration_experiment.launch.py \
-     robot:=curt base_frame:=base_link_curt \
-     params_file:=$CFG/exploration_real_robot.yaml
-```
-
-The reasoning behind every value in the overlay, the script that measures them
-from a bag of the robot driving, and the site values that cannot be measured
-are in [docs/real_robot_tuning.md](../docs/real_robot_tuning.md).
-
-Read that file's header before the first run at a new site: the ROI box,
-`proximity_peer_pose_topics` and the bunker TF conflict all need attention and
-all fail *quietly* if skipped.
-
-All tuning lives in [`config/shared_params.yaml`](config/shared_params.yaml)
-(the shared parameter file, loaded by every launch file). It now ships **field defaults**: `use_sim_time:
-false`, `done_action: idle`, `terrain_relative_z: true`, `coordination_enabled:
-true`, and the forest-AO ROI. Sim and bag runs must pass `use_sim_time:=true`
-(every launch file declares the argument, and it overrides the yaml) — with
-`true` and no `/clock` publisher the planner's 10 Hz tick timer never fires and
-the node sits silently idle. Keep `roi_min_z`/`roi_max_z` inside the multi-robot
-share z-band; note that with `terrain_relative_z: true` they are **relative to
-the robot's z**, so the absolute share band must be a superset of everywhere
-that window can sit (see the KEEP-IN-SYNC comment in the yaml).
-
-Two settings must be matched to the navigator on each platform:
-
-- `goal_xy_tolerance` / `goal_yaw_tolerance` must be strictly **looser** than
-  nav2's goal checker (shipped defaults: 0.25 / 0.25). If they are tighter, nav2
-  stops inside its own tolerance but outside the planner's, the planner never
-  registers arrival, and it blacklists a goal the robot is standing on. The node
-  warns at startup if either is below 0.3.
-- `goal_republish_sec` throttles the keep-alive re-send of an unchanged goal.
-  Nav2 turns every `goal_pose` message into a fresh `NavigateToPose` goal, so an
-  unthrottled re-send makes `GoalUpdated` fire continuously, which halts the
-  recovery subtree while still consuming `RecoveryNode`'s retries — transient
-  failures become aborts instead of recoveries. Set `0` for publish-on-change
-  only once nav2 bringup is reliable enough not to need the keep-alive.
-
-### Key topics
-
-| Direction | Topic | Purpose |
-| --- | --- | --- |
-| sub | `/<robot>/dscovox_node/scovox` | SCovox Beta-conjugate occupancy map |
-| sub | `/<robot>/dscovox_node/planning_map` | 2D inflated grid for filtering / cost (only when `use_planning_map: true`) |
-| sub | `/exploration/targets` | Tree targets to exploit (`TreeTarget`; shared) |
-| pub | `goal_topic` | Selected NBV / vantage goal pose for the nav stack |
-| pub | `~/candidates` | Candidate / vantage markers (RViz) |
-| pub | `/exploration/intents` | MinPos intents (always published; consumed by peers when coordination is on) |
+over the shared file with `params_file:=`. It carries each platform's
+`base_frame` and timeouts measured from the robots' own bags; how each value
+was derived is in [docs/real_robot_tuning.md](../docs/real_robot_tuning.md).
+Before the first run at a new site, set the ROI box and
+`proximity_peer_pose_topics`
+([real_robot_tuning.md §4](../docs/real_robot_tuning.md#4-required-to-update-before-real-runs)),
+and fix bunker's doubled `odom → base_link` TF
+([field_setup.md, Requirements](../docs/field_setup.md#requirements)). All
+three fail quietly if skipped.
 
 ## Configuration
 
-All parameters live in [`config/shared_params.yaml`](config/shared_params.yaml),
-which is heavily commented. Common overrides:
-
-- `use_planning_map` — enable the 2D `planning_map` (free/occupied filter +
-  cost-grid reachability) in both exploration and exploitation. **Off by default**;
-  when off the planner never subscribes to it and runs on straight-line costs.
-- `roi_min/max_x/y` — exploration region. Also the box the coverage-done
-  measure is taken over, so unreachable columns inside it put a permanent floor
-  under `done_unknown_fraction`. Only needs keeping in sync with the
-  `planning_map` when `use_planning_map` is on — it is off by default, and the
-  dscovox merger publishes no `planning_map`. The tighter phase-1 AO box is
-  commented next to these values in the yaml — set it there when phase 2 is
-  not run the same day.
-- `roi_min/max_z` — vertical band, **robot-relative** when
-  `terrain_relative_z` is on. It must stay wide enough to contain the whole
-  ground-search window plus the re-band hysteresis; the node warns at startup
-  if it does not (see the invariant in the yaml).
-- `candidate_*` — polar candidate-grid density and radii
-- `fov_*` — FOV geometry for information-gain ray-casting
-- `coordination_enabled` — turn multi-robot MinPos on/off
-- `rendezvous_enabled` / `rendezvous_expected_peers` / `rendezvous_max_wait_sec`
-  / `return_nav_max_timeout_sec` — return-home-and-wait reconnection (see
-  "Rendezvous reconnection")
-- `exploitation_enabled` — turn the exploitation overlay on/off
-- `n_vantages` / `min_vantages_required` / `vantage_standoff_m` /
-  `exploit_dwell_sec` — vantage geometry and dwell behaviour
-
-The preselected target schedule for `target_scheduler_node` lives in
+Every parameter lives in [`config/shared_params.yaml`](config/shared_params.yaml),
+loaded by every launch file and commented with the reasoning behind each
+default. [docs/ros_api.md](../docs/ros_api.md#parameters) indexes them. The
+per-robot settings an operator must set, such as `robot_name`, the goal
+tolerances against Nav2's and the z-band, are in
+[user_manual.md §5](../docs/user_manual.md#5-per-robot-configuration). With
+`terrain_relative_z: true` the node warns at startup if `roi_min_z`/`roi_max_z`
+are too tight for the ground search (the invariant is in the yaml). The
+preselected target schedule for `target_scheduler_node` is
 [`config/targets.yaml`](config/targets.yaml).
 
 ## Tests
@@ -401,10 +194,8 @@ colcon test --packages-select explo_planner
 colcon test-result --verbose
 ```
 
-GTest suites cover scoring, candidate generation, FOV evaluation, cost grid,
-coordination, plan-map queries, the failed-goal blacklist, planner utils, the
-map cache, the proximity guard, the tree detector, the tree-target queue
-(dedup/lifecycle), and the vantage planner (spacing/standoff/line-of-sight).
+Every module in the table except `explo_planner_node` has a GTest suite,
+`test/test_<module>.cpp`.
 
 ## License
 

@@ -2,57 +2,33 @@
 
 ## Executive summary
 
-The planner's motion-dependent timeouts were re-derived from the two robots'
-own recordings and shipped as a hardware overlay on the shared parameter
-file. With the shipped defaults, a healthy CURT Mini would have failed goals
-it was about to reach, because the defaults assume a robot that is always
-moving.
+[`config/exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml)
+is the hardware overlay for the **Bunker Mini** (tracked) and the **CURT
+Mini** (wheeled). It sits on top of
+[`shared_params.yaml`](../explo_planner/config/shared_params.yaml) (§1). The
+shared timeouts assume a robot that keeps moving. CURT stands still for up to
+22.6 s on a healthy run, and both robots turn in place for 12 to 13 s to face
+a goal, so the overlay sizes the timeouts from their own recordings (§2):
 
-The evidence is one recording per robot from 2026-07-31, analysed for speed,
-yaw rate, standstill length and travel per time window (§2). Two facts drove
-every value. The CURT Mini is stationary half the time and stands still for
-up to 22.6 s while healthy, longer than the whole shipped 15 s watchdog
-window. Both platforms are skid-steer, so facing a goal costs a 12 to 13 s
-turn with zero translation, which the watchdog counts as no progress.
-
-| Parameter | Shipped | Hardware | Basis |
+| Parameter | `shared_params.yaml` | Overlay | § |
 |---|---|---|---|
-| `progress_window_sec` | 15 | 120 | a backstop behind Nav2's own progress checker; the shortest window no healthy stretch of either bag trips (§3.2) |
-| `progress_min_distance_m` | 0.2 | 0.25 | far below the smallest net travel in any 120 s window (2.33 m); also the `nav2_abort_limit` "same spot" radius (§3.2) |
-| `goal_rotate_timeout_sec` | 15 | 25 | one 180° turn plus settling (§3.3) |
-| `nav_speed_estimate_mps` | 0.15 | 0.22 bunker, 0.20 curt | measured wall-clock mean, standstills included (§3.4) |
-| `nav_max_timeout_sec` | 180 | 600 | backstop only; Nav2 aborts and the watchdog stop bad goals sooner (§3.4) |
-| `exploit_target_timeout_sec` | 300 | 720 | stays one failed hop (600) + 120 s above the cap (§3.4) |
-| `base_frame` | `<robot>/base_link` | `base_link`, `base_link_curt` | the default frame exists on neither robot (§3.1) |
+| `base_frame` | `""` → `<robot>/base_link` | `base_link` (bunker), `base_link_curt` (curt) | 3.1 |
+| `progress_window_sec` | 15 | 120 | 3.2 |
+| `progress_min_distance_m` | 0.2 | 0.25 | 3.2 |
+| `goal_rotate_timeout_sec` | 15 | 25 | 3.3 |
+| `nav_speed_estimate_mps` | 0.15 | 0.22 (bunker), 0.20 (curt) | 3.4 |
+| `nav_max_timeout_sec` | 180 | 600 | 3.4 |
+| `exploit_target_timeout_sec` | 300 | 720 | 3.4 |
 
-The navigation budget's safety factor and minimum were deliberately left
-alone, and its cap was raised rather than tightened. The watchdog is what
-catches a stuck robot and `nav2_abort_limit` what catches a goal Nav2 gives
-up on, so a tighter budget would only abort slow hops that were about to
-succeed. The pose-jump threshold is also
-unchanged but unvalidated, since neither recording contained a localisation
-correction (§3.5).
+It also turns on the planning map and sets each robot's name, team size, CSV
+path and topics (§1).
 
-Separately from tuning, three settings cannot come from any recording and
-must be set before a real run (§4): the ROI box for the site, the peers' pose
-topics for the proximity guard, and a finite rendezvous wait if the team may
-not reconvene.
+Before a real run, fix bunker's doubled `odom → base_link` TF edge (§2), and
+set what no recording can supply (§4): the ROI box, the peers' pose topics
+and the rendezvous wait.
 
----
-
-How the planner's motion-dependent parameters were set for the **Bunker Mini**
-(tracked) and the **CURT Mini** (wheeled), what the values rest on, and which
-parameters cannot be measured at all and must be set by hand before a real
-run. It covers the planner's own parameters only. Bring-up order, the mapper,
-the localiser and Nav2 are the [user manual](user_manual.md).
-
-The planner is checked out at `ws/src/explo_planner` inside the
-[`hmr_explo`](https://github.com/kalhansb/hmr_explo) workspace repo, which
-also holds the recordings, the bag runners and the scovox container used
-below. Everything here lands in one file in this repo,
-[`config/exploration_real_robot.yaml`](../explo_planner/config/exploration_real_robot.yaml),
-an overlay layered on
-[`shared_params.yaml`](../explo_planner/config/shared_params.yaml).
+Bring-up, the mapper, the localiser and Nav2 are in the
+[user manual](user_manual.md).
 
 **Contents**
 
@@ -69,86 +45,62 @@ an overlay layered on
 
 ## 1. How the overlay is layered
 
-Both launch files pass parameters to the node in this order, and **later
-entries win**:
+Both launch files pass parameters in this order. **Later entries win**:
 
 ```
 shared_params.yaml  →  params_file:=<overlay>  →  the launch file's own dict
 ```
 
-The overlay therefore carries only the keys where hardware differs from the
-shared file. Anything it does not mention is inherited, so there is one place
-to change a shared value and no drift between two copies.
-
-Three blocks, matched by node name:
+The overlay holds only the keys where hardware differs. The rest is
+inherited.
 
 | Block | Matches | Carries |
 |-------|---------|---------|
-| `/**` | every planner node | watchdog, rotate deadline |
-| `/bunker/explo_planner` | the node namespaced `/bunker` | frames, speed, name, team size, targets topic |
-| `/curt/explo_planner` | the node namespaced `/curt` | same for curt |
+| `/**` | every planner node | watchdog, rotate deadline, nav budget cap, exploit target timeout, planning map |
+| `/bunker/explo_planner` | the node in namespace `/bunker` | name, frames, speed, CSV path, team size, targets and planning-map topics |
+| `/curt/explo_planner` | the node in namespace `/curt` | same for curt |
+
+The planning-map keys are explained in [field_setup.md](field_setup.md),
+"The planning map" and "Traversability map".
 
 The node is named `explo_planner`
-([explo_planner_node.cpp:654](../explo_planner/src/explo_planner_node.cpp#L654)),
-so a per-robot block matches both the two-robot launch (which namespaces each
-node by robot) and a hand launch with `-r __ns:=/<robot>`. It does **not**
-match the single-robot launch, whose node is the un-namespaced
-`/explo_planner`.
+([explo_planner_node.cpp:926](../explo_planner/src/explo_planner_node.cpp#L926)).
+A per-robot block therefore matches the two-robot launch and a hand launch
+with `-r __ns:=/<robot>` (the field topology, user manual §6 step 7). It
+does **not** match the single-robot launch, whose node `/explo_planner` has
+no namespace. The run commands for each case are in
+[field_setup.md](field_setup.md), "Which config for which run".
 
-```bash
-CFG=$(ros2 pkg prefix explo_planner)/share/explo_planner/config
+Two rules follow:
 
-# Two robots, one host
-ros2 launch explo_planner multi_robot_exploration.launch.py \
-     robots:=bunker,curt params_file:=$CFG/exploration_real_robot.yaml
-
-# One planner per robot PC (the field topology, user manual §6 step 7)
-ros2 run explo_planner explo_planner_node --ros-args -r __ns:=/curt \
-     --params-file $CFG/shared_params.yaml \
-     --params-file $CFG/exploration_real_robot.yaml
-
-# One robot alone
-ros2 launch explo_planner exploration_experiment.launch.py \
-     robot:=curt base_frame:=base_link_curt \
-     params_file:=$CFG/exploration_real_robot.yaml
-```
-
-Two consequences of the ordering to keep in mind:
-
-- **The launch dict beats the overlay.** The single-robot launch always
-  passes `map_frame`, `base_frame`, `output_csv`, `max_steps`,
-  `dscovox_topic` and the trajectory-scoring keys from its arguments; the
-  two-robot launch passes `robot_name`, `output_csv`, `max_steps` and the
-  four coordination switches. Set those on the command line, not in the
-  overlay. That is why the single-robot command above carries `base_frame:=`.
-- **A key in the wrong block is silently dropped.** ROS 2 discards
-  parameters whose node key does not match, with no warning. Watchdog values
-  go under `/**`; anything platform-specific goes under the robot's own block.
+- **The launch dict beats the overlay.** Each launch file sets the keys
+  behind its own arguments ([ros_api.md](ros_api.md) §6). The two-robot
+  launch also sets `robot_name`, `output_csv` and
+  `rendezvous_expected_peers`. Set these through the launch. That is why the
+  single-robot launch needs `base_frame:=` as an argument.
+- **A key in the wrong block is silently dropped.** ROS 2 ignores
+  parameters under a node key that does not match. Shared values go under
+  `/**`, platform values under the robot's block.
 
 ---
 
 ## 2. How the values were derived
 
-Every timeout in the overlay comes from the robots' own recordings, not from
-guesses: the two 2026-07-31 bags in the workspace's `bags/` directory
-(bunker `2026_07_31_10_57_06__kalhan_2_`, curt
-`2026_07_31_11_24_12__kalhan_2_CURTMINI`), mounted at `/scovox/bags` in the
-scovox container. The planner was not running when they were recorded; only
-the TF tree was needed.
+The source is one recording per robot from 2026-07-31: bunker
+`2026_07_31_10_57_06__kalhan_2_` and curt
+`2026_07_31_11_24_12__kalhan_2_CURTMINI`. They are in the `bags/` directory
+of the [`hmr_explo`](https://github.com/kalhansb/hmr_explo) workspace repo,
+mounted at `/scovox/bags` in the scovox container. Only their TF tree is
+used. The planner was not running.
 
-The analysis is
-[`scripts/measure_bag_motion.py`](../scripts/measure_bag_motion.py), written
-for this and kept in the repo so it can be repeated after a platform change
-or for a new robot. It reads `/tf` and `/tf_static`, composes the base frame
-up to the root of its chain, and prints each figure next to the parameter it
-sizes. Static transforms are applied before the dynamic pass, because the
-curt bag records its `map_global → map_curt` transform partway through and
-applying it in stream order showed up as a fake 3 m jump.
+[`scripts/measure_bag_motion.py`](../scripts/measure_bag_motion.py) reads
+the TF tree and prints each figure next to the parameter it sizes. Rerun it
+after a platform change or for a new robot:
 
 ```bash
 # inside the scovox container, where rosbag2_py is installed
-python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_11_24_12__kalhan_2_CURTMINI base_link_curt
-python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_10_57_06__kalhan_2_ base_link --only-3d
+python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_11_24_12__kalhan_2_CURTMINI base_link_curt --windows 30,60,90,120
+python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_10_57_06__kalhan_2_ base_link --only-3d --windows 30,60,90,120
 ```
 
 | | Bunker Mini (tracked) | CURT Mini (wheeled) |
@@ -160,294 +112,212 @@ python3 scripts/measure_bag_motion.py /scovox/bags/2026_07_31_10_57_06__kalhan_2
 | 180° turn at p90 | 13.0 s | 12.0 s |
 | stationary fraction | 18 % | 49 % |
 | longest standstill | 1.9 s | 22.6 s |
-| min walked travel in any 30 s window | 1.33 m | 0.51 m |
 | min net displacement in any 30 s window | 0.00 m | 0.00 m |
 | 30 s windows under 0.25 m net | 10 % | 9 % |
 | 60 / 90 / 120 s windows under 0.25 m net | 0 / 0 / 0 % | 6 / 2 / 0 % |
 | min net displacement in any 120 s window | 3.23 m | 2.33 m |
 
-**What the figures say.** CURT is the binding constraint on every timeout: it
-is stationary half the time and stands still for up to 22.6 s at a stretch on
-a healthy run. Both robots share the `/**` block, so every shared value is
-sized for CURT and merely generous for bunker. Both platforms are skid-steer
-and cannot strafe: they stop and rotate in place to face a goal, and an
-in-place rotation translates zero metres, so every distance-over-time check
-has to tolerate at least one full 180° turn of no translation on a perfectly
-healthy robot.
+**CURT sets every timeout**, because it stands still far more and both
+robots share the `/**` block. Both robots are skid-steer, so they turn in
+place to face a goal and move 0 m doing it. Every distance-over-time check
+must allow at least one 180° turn with no translation.
 
-**What was wrong in the bunker recording.** The script's `EDGES` section
-exists because of it. Read plainly, the bunker bag gives a 60 Hz sample rate
-and a p99 single-tick jump of 49 m: two publishers were writing the
-`odom → base_link` edge, a 10 Hz 3D one and a 50 Hz planar one, disagreeing
-by about 6 m. Every figure derived from such a bag is nonsense. The bunker
-column above was recovered with `--only-3d`, which drops the planar
-publisher's samples by their signature (`z == 0`, yaw-only rotation). That
-reads an old recording; it does not fix the platform, and the overlay header
-carries the fault as a blocker for any real run.
+**The bunker recording has a TF fault.** Two publishers write its
+`odom → base_link` edge: a 10 Hz 3D one and a 50 Hz planar one, about 6 m
+apart. Read as-is, the bag gives a p99 single-tick jump of 49 m and wrong
+figures throughout. `--only-3d` drops the planar samples (`z == 0`,
+yaw-only rotation) so the old recording can be read. The platform itself
+must still be fixed: the overlay header lists the fault as a blocker for
+real runs, and the script's `EDGES` section reports it.
 
-**What the bags could not exercise.** The `map → odom` correction was
-constant in both recordings (odometry only, no loop closure), so
-`max_pose_jump_m` has never met a real relocalisation and is carried as
-unvalidated (§3.5). And since the planner was not driving the robots, no bag
-produced a single failure tag; the first run where those mean anything is the
-validation run (§5).
+**Not tested by the bags.** `map → odom` was constant in both (odometry
+only), so `max_pose_jump_m` is unvalidated (§3.5). The planner was not
+driving, so there are no failure tags yet. The validation run (§5) is the
+first test of both.
 
 ---
 
 ## 3. Parameters
 
-Each entry gives what the parameter does in the node, the shipped value
-against the hardware value, and how the hardware value follows from §2.
-"Inherited" means deliberately left at `shared_params.yaml`.
+Values are in the summary table. "Inherited" means left at
+`shared_params.yaml` on purpose.
 
 ### 3.1 `base_frame`, `map_frame`
 
 Left empty, `base_frame` defaults to `<robot_name>/base_link`
-([explo_planner_node.cpp:668](../explo_planner/src/explo_planner_node.cpp#L668)).
-On these robots the frames are `base_link` (bunker) and `base_link_curt`
-(curt), so the default names a frame that exists on neither. The lookup
-fails, the planner never acquires a pose, and it sits without ever reaching
-PLAN. Nothing else in the overlay matters until this is right.
+([explo_planner_node.cpp:940](../explo_planner/src/explo_planner_node.cpp#L940)),
+a frame neither robot has. The TF lookup fails, the planner never gets a
+pose, and it never reaches PLAN. Nothing else matters until this is right.
+Bunker uses `base_link`, curt `base_link_curt`. `map_frame` is `map` on
+both, or `map_curt` on curt if the two maps are not fused.
 
-| | bunker | curt |
-|---|---|---|
-| `base_frame` | `base_link` | `base_link_curt` |
-| `map_frame` | `map` | `map`, or `map_curt` if the two maps are not fused |
-
-The startup line to check is `EIG exploration planner ready: … frame=map
-base=base_link_curt`. If it prints `base=curt/base_link`, the overlay did not
-reach the node (wrong block, or the single-robot launch without
-`base_frame:=`).
+Check the startup line `EIG exploration planner ready: … frame=map
+base=base_link_curt`. `base=curt/base_link` means the overlay did not reach
+the node: wrong block, or the single-robot launch without `base_frame:=`.
 
 ### 3.2 `progress_window_sec`, `progress_min_distance_m`
 
 The no-progress watchdog
-([explo_planner_node.cpp:3065](../explo_planner/src/explo_planner_node.cpp#L3065)).
-On entering NAVIGATE the planner records where the robot stands. Every
-`progress_window_sec` it measures the straight-line distance from there to
-where the robot is now; if that is under `progress_min_distance_m` it fails
-the goal with `[no-progress]` and blacklists it (§3.6); otherwise it records
-the new spot and starts the next window. The check is on **net
-displacement**, not on distance closed to the goal and not on path walked: a
-robot rocking in place or driving out and back scores near zero, and so does
-one rotating in place or waiting for Nav2 to re-plan, even when nothing is
-wrong. (Until 2026-10 it summed the walked path. Pose jitter added ~1.5 m of
-that per 30 s to a parked bunker, so the watchdog never fired on it.)
+([explo_planner_node.cpp:3097](../explo_planner/src/explo_planner_node.cpp#L3097)).
+At the end of each `progress_window_sec` in NAVIGATE, the planner measures
+the straight-line distance from where the robot was when the window opened.
+Under `progress_min_distance_m`, it fails the goal with `[no-progress]` and
+blacklists it (§3.6).
 
-It is deliberately not applied during the final in-place rotate at the goal,
-but the turn-to-face at the *start* of a hop happens inside the first window.
+This is **net displacement**, so a healthy robot turning in place or
+waiting for Nav2 to re-plan scores near zero. The final turn at the goal is
+exempt. The turn to face the goal at the start of a hop is not.
 
-| | shipped | hardware |
-|---|---|---|
-| `progress_window_sec` | 15.0 | **120.0** |
-| `progress_min_distance_m` | 0.2 | **0.25** |
+**Window: 120 s.** CURT's longest healthy standstill (22.6 s) is longer than
+the shipped 15 s window, so the watchdog would blacklist goals a healthy
+robot was about to reach. The watchdog is a backstop. Nav2 ends most
+failures first:
 
-**Why the shipped values are unsafe here.** CURT's longest healthy standstill
-(22.6 s) is longer than the whole 15 s window. A healthy robot trips the
-watchdog, the goal it is standing next to is blacklisted for a minute, and
-the planner walks off to a worse one.
+- A goal Nav2 rejects fails on `nav2_abort_limit` within seconds.
+- A wedged robot trips Nav2's progress checker (0.5 m in 10 s). Its
+  recoveries end in an abort after about 2.5 to 3 minutes, and the planner
+  fails the goal on that abort (`nav2_abort_final_after_recovery`).
 
-**How the hardware values were chosen.**
+Only the watchdog ends a stall Nav2 does not report: Nav2 not running or not
+watched, or Nav2 reporting SUCCEEDED short of the planner's tolerance. So
+the window is sized never to fail a healthy robot. 120 s is the shortest
+window in which no stretch of either recording falls under 0.25 m net,
+operator stops included (§2). A stall is caught 120 to 240 s after it
+starts.
 
-- *Window*: the watchdog is a backstop behind Nav2, so it is sized to never
-  fail a healthy robot rather than to react fast. With Nav2 watched, a goal
-  Nav2 rejects fails on `nav2_abort_limit` within seconds. A wedged robot is
-  noticed first by Nav2's own progress checker (0.5 m net within 10 s),
-  which runs its recoveries; the default tree aborts after six recovery
-  rounds, about 2.5 to 3 minutes, and the planner fails the goal on that
-  first abort, since Nav2 ran its recoveries right there
-  (`nav2_abort_final_after_recovery`). What
-  only the watchdog ends is a stall Nav2 does not report at all: Nav2 not
-  running or not watched, or Nav2 reporting SUCCEEDED short of the planner's
-  tolerance, so that every keep-alive re-send succeeds at once and the robot
-  stays parked. 120 s is the shortest window in which no stretch of either
-  recording falls under 0.25 m net, operator stops included (table above:
-  9 % of CURT's 30 s windows did, 6 % at 60 s, 2 % at 90 s). The check runs
-  once per window, so a stall is caught 120 to 240 s after it starts.
-  Earlier value: 30 s, sized to clear CURT's longest standstill (22.6 s),
-  when the watchdog was the first line against a stuck robot.
-- *Distance*: 0.25 m was set at about half the smallest walked travel in
-  any 30 s window (0.51 m), when the check still summed the walked path. At
-  120 s the smallest net figure in either recording is 2.33 m, so 0.25 m
-  is very lenient; it is kept because it is also the radius within which
-  two Nav2 aborts count as "the same spot" for `nav2_abort_limit`. The
-  validation run (§5) is its first real test.
+**Distance: 0.25 m.** Far below the 2.33 m minimum net displacement at
+120 s. It is kept because it is also the "same spot" radius for
+`nav2_abort_limit`.
 
-**Re-tuning.** From the script's `STILL` line and `WINDOW` table: pick the
-window first, then set the distance at roughly half the `net min` figure for
-that window, read off a recording in which the robot was driven to goals
-throughout (a planner-driven run is best). Operator stops in a teleop
-recording pull that figure to 0, as in both 2026-07-31 bags. Raising the
-window costs nothing but reaction time on a truly stuck robot: it takes one
-to two full windows to notice, then the Nav2 recovery on the next goal.
+**Re-tuning.** From the script's `STILL` line and `WINDOW` table, pick the
+window, then set the distance to about half its `net min`. Use a recording
+driven to goals throughout, ideally by the planner. Operator stops in a
+teleop recording pull `net min` to 0, as in both 2026-07-31 bags.
 
 ### 3.3 `goal_rotate_timeout_sec`
 
 The rotate deadline
-([explo_planner_node.cpp:676](../explo_planner/src/explo_planner_node.cpp#L676)).
+([explo_planner_node.cpp:3060](../explo_planner/src/explo_planner_node.cpp#L3060)).
 Once the robot is inside `goal_xy_tolerance` and only the yaw remains, a
 separate deadline starts. Overrunning it fails the goal with
-`[budget-rotate]` — and blacklists a goal the robot has **already reached**.
+`[budget-rotate]` and blacklists a goal the robot has **already reached**.
 
-| | shipped | hardware |
-|---|---|---|
-| `goal_rotate_timeout_sec` | 15.0 | **25.0** |
+A 180° turn takes 12 to 13 s at the p90 yaw rate, which leaves the shipped
+15 s only 2 s to settle. 25 s is one turn plus a margin. To re-tune, take
+the script's `180 deg turn at p90` and add about 10 s.
 
-A 180° turn takes 12–13 s at the p90 yaw rate. The shipped 15 s leaves two
-seconds for Nav2 to settle. 25 s is one full turn plus a comfortable margin.
-Re-tune from the script's `180 deg turn at p90` figure: one turn plus about
-ten seconds.
-
-`goal_xy_tolerance` and `goal_yaw_tolerance` (0.4 / 0.4) must stay looser
-than Nav2's goal checker, or arrival is never registered and this deadline
-fires on every goal. That interaction is in the user manual §5.
+`goal_xy_tolerance` / `goal_yaw_tolerance` (0.4 / 0.4) must stay looser than
+Nav2's goal checker, or this deadline fires on every goal (user manual §5).
 
 ### 3.4 `nav_speed_estimate_mps` and the distance budget
 
-`nav_speed_estimate_mps`, `nav_safety_factor`, `nav_min_timeout_sec`,
-`nav_max_timeout_sec`
-([explo_planner_node.cpp:704](../explo_planner/src/explo_planner_node.cpp#L704),
-budget set at
-[:2075](../explo_planner/src/explo_planner_node.cpp#L2075)).
+The per-hop budget
+([explo_planner_node.cpp:2749](../explo_planner/src/explo_planner_node.cpp#L2749)):
 
 ```
 budget = clamp( distance / nav_speed_estimate_mps × nav_safety_factor,
                 nav_min_timeout_sec, nav_max_timeout_sec )
 ```
 
-`distance` is the straight line to the goal, or, when a planning map is in
-use, the planned path's length in metres if that is longer (not its cost,
-which roughness and clearance scale up). A hop that outlives its budget fails
-with `[budget]`. A goal Nav2 rejects does not wait for the budget:
-`nav2_abort_limit` (2) fails it as `[nav2-aborted]` after Nav2 aborts it
-twice in a row with the robot standing still, ~5 s apart. A goal Nav2 gives
-up on after running its recoveries where the robot stands fails at the first
-abort (`nav2_abort_final_after_recovery`).
+`distance` is the straight line, or the planned path's length if a planning
+map is in use and the path is longer. A hop that outlives its budget fails
+with `[budget]`. `nav_safety_factor` (3.0) and `nav_min_timeout_sec` (30 s)
+are inherited. With curt's values a 3 m hop gets 45 s, an 8 m hop 120 s and
+a 15 m hop 225 s. Only goals past 40 m (44 m on bunker) reach the 600 s cap.
 
-| | shipped | bunker | curt |
-|---|---|---|---|
-| `nav_speed_estimate_mps` | 0.15 | **0.22** | **0.20** |
-| `nav_safety_factor` | 3.0 | inherited | inherited |
-| `nav_min_timeout_sec` | 30.0 | inherited | inherited |
-| `nav_max_timeout_sec` | 180.0 | **600.0** | **600.0** |
+**Speed: the wall-clock mean.** The script's `LINEAR mean` includes
+standstills. CURT is stationary 49 % of the time, so a budget built from its
+moving speed would abort healthy hops.
 
-With curt's values a 3 m hop gets 45 s, an 8 m hop 120 s, a 15 m hop 225 s,
-and only goals past 40 m (44 m on bunker) the 600 s cap. The budget still
-scales with distance; the cap is not a flat 10 minutes per goal.
+**Cap: 600 s.** Nav2 and the watchdog end most bad goals first (§3.2). The
+budget is left with a robot that keeps moving but never arrives, such as one
+circling an obstacle: Nav2 replans with no overall time limit, and its
+progress checker stays satisfied. A cap of a few minutes would fail long
+healthy hops. 600 s still bounds the circling case.
 
-**Why the cap is 10 minutes.** With Nav2 watched, the budget is the last of
-three stops. A goal Nav2 rejects fails on `nav2_abort_limit` within seconds,
-and a robot that stops moving is ended by Nav2's own give-up or the watchdog
-(§3.2). The
-one case left for the budget is a robot that keeps moving but never arrives:
-Nav2's default behaviour tree replans at 1 Hz with no overall time limit, and
-its progress checker (0.5 m in 10 s) is satisfied by a robot circling an
-obstacle. A cap of a few minutes would fail long healthy hops; 10 minutes
-still bounds the circling case.
-
-**The speed is the wall-clock mean, not a moving speed.** The script's
-`LINEAR mean` is path over total time, standstills included. That is the
-number the budget needs: CURT is stationary 49 % of the time, so a budget
-built from its speed while moving would abort healthy hops. The safety factor
-of 3 is then real headroom for detours, not a correction for waiting.
-
-**Do not tighten the budget to catch a stuck robot.** Nav2 and the
-watchdog (§3.2) do that job. Shortening the budget only aborts slow hops
-that were about to succeed. If `[budget]` fires on goals the robot was still
-visibly approaching, raise `nav_safety_factor` or the cap; leave the speed at
+**Do not tighten the budget to catch a stuck robot.** That only aborts slow
+hops that were about to succeed. If `[budget]` fires on goals the robot was
+still approaching, raise `nav_safety_factor` or the cap. Leave the speed at
 the measurement.
 
-Raising the cap has one coupling: `exploit_target_timeout_sec` keeps
-charging across failed hops and must stay above `nav_max_timeout_sec`, or a
-tree closes PARTIAL after its first failed vantage approach. The overlay sets
-it to 720 s, one worst-case failed hop plus the shipped 120 s margin.
+**Keep `exploit_target_timeout_sec` above the cap.** It keeps charging
+across failed hops, so below the cap a tree closes PARTIAL after its first
+failed vantage approach. 720 s is one failed hop (600 s) plus the shipped
+120 s margin.
 
 ### 3.5 `max_pose_jump_m`
 
-Pose-jump rejection
-([explo_planner_node.cpp:719](../explo_planner/src/explo_planner_node.cpp#L719),
-applied in `trackDistance` at
-[:3949](../explo_planner/src/explo_planner_node.cpp#L3949)).
-Any single-tick pose step larger than this is treated as a localisation
-correction rather than travel and is **not** added to the cumulative
-distance. At the 10 Hz tick, 1.0 m means 10 m/s, so it cannot reject real
-motion: the fastest measured sample (2.26 m/s) moves 0.23 m per tick.
+Pose-jump rejection, in `trackDistance`
+([explo_planner_node.cpp:5033](../explo_planner/src/explo_planner_node.cpp#L5033)).
+A single-tick pose step above this counts as a localisation correction, not
+travel. It is not added to `distance_traveled`, and the watchdog's start
+point moves with it. At the 10 Hz tick, 1.0 m means 10 m/s. The fastest
+measured sample (2.26 m/s) moves 0.23 m per tick, so real motion is safe.
 
-| | shipped | hardware |
-|---|---|---|
-| `max_pose_jump_m` | 1.0 | inherited, **unvalidated** |
+Inherited at 1.0 and **unvalidated** (§2). Two ways it can go wrong:
 
-Unvalidated because the bags never exercised it (§2). Two ways it can
-misbehave in the field:
-
-- **Set too low** — real motion is discarded, the cumulative distance
-  freezes, and the watchdog (§3.2) fails a robot that is driving perfectly.
-  Keep it well above the max speed × 0.1 s.
-- **A broken TF edge** — two publishers on `odom → base` (the bunker case in
-  §2) make the pose flicker by metres every tick. Every step is swallowed as
-  a "teleport", the distance freezes, and the watchdog fires as above. The
-  symptom in the log is a stream of `Pose jump of X m in one tick exceeds
-  max_pose_jump_m` warnings while the robot is plainly moving. That is a
-  platform fault, not a parameter to tune.
+- **Set too low.** Real motion is discarded and the watchdog fails a robot
+  that is driving normally. Keep it well above max speed × 0.1 s.
+- **Broken TF edge.** Two publishers on `odom → base` (the bunker fault)
+  make the pose flick by metres every tick, with the same result. The log
+  shows a stream of `Pose jump of X m in one tick (…) exceeds
+  max_pose_jump_m` while the robot is plainly moving. Fix the platform, not
+  the parameter.
 
 After the validation run, grep the log for `Pose jump of`. Rare hits at
-moments the localiser corrected are fine. Continuous hits mean the TF edge.
+localiser corrections are fine. Continuous hits mean the TF edge.
 
 ### 3.6 `failed_goal_radius_m`, `failed_goal_ttl_sec`
 
-The failed-goal blacklist, inherited at 2.0 m / 60 s. Every `[no-progress]`,
-`[budget]` or `[budget-rotate]` failure parks a 2 m disc around the goal for
-60 s. This is why a false watchdog trip costs more than one hop: the region
-the robot is standing in becomes off-limits and it drives somewhere worse.
-Tune the three timeouts above until failures are rare and genuine before
-touching either of these. Three failures on the same spot is a panic-stop
-trigger (user manual §9), not a tuning problem.
+The failed-goal blacklist, inherited at 2.0 m / 60 s: every failed goal
+blocks a 2 m disc for 60 s. A false watchdog trip therefore costs more than
+one hop, because the area the robot is in becomes off-limits. Tune the
+timeouts above before touching these. Three failures on the same spot is a
+panic-stop trigger (user manual §9), not a tuning problem.
 
 ---
 
 ## 4. Required to update before real runs
 
 No recording can supply these. They are wrong by default and **fail
-quietly**, so they are set before the first run at a site, not tuned
-afterwards.
+quietly**. User manual §5 has the operator's list. This section gives the
+reasons.
 
 ### ROI box — `roi_min_x` … `roi_max_y`
 
 Candidates outside the box are discarded
-([explo_planner_node.cpp:785](../explo_planner/src/explo_planner_node.cpp#L785)),
-and the coverage-done test measures the unknown fraction over the box only.
-The shipped values (−51.3…100.9 × −38.7…74.5) are the extent of a **previous
-site**. A box that misses the survey area starves the planner of candidates
-and it declares done with the site unexplored; a box far larger than the
-reachable area puts a permanent floor under the unknown fraction and
-coverage-done never fires. Both robots must carry the identical box.
-`roi_min_z` / `roi_max_z` (−5.5 / 4.0) are robot-relative and should span
-ground to canopy.
+([candidate_generator.cpp](../explo_planner/src/candidate_generator.cpp)),
+and coverage-done measures the unknown fraction inside it only.
+`shared_params.yaml` ships the tree block of the hmr_localisation gt_map
+site: 100 × 25 m, yawed 25.75°. Seven keys set it: `roi_yaw_deg`,
+`roi_origin_x`, `roi_origin_y`, and `roi_min/max_x/y` in the yawed frame.
+`roi_yaw_deg: 0` with origin (0, 0) gives a plain map-frame box.
+
+A box that misses the survey area starves the planner, and it declares done
+with the site unexplored. A box much larger than the reachable area leaves a
+floor under the unknown fraction, and coverage-done never fires. To fit the
+box to the ground-truth map, see [field_setup.md](field_setup.md), "Area of
+interest from the ground-truth map".
 
 ### Peer poses — `proximity_peer_pose_topics`
 
-The proximity guard runs on the 1 Hz intent heartbeat unless this lists the
-peers' localiser poses. Entries are `"<robot_name>:<topic>"`, the topic a
-`PoseWithCovarianceStamped` in the map frame
-([explo_planner_node.cpp:1195](../explo_planner/src/explo_planner_node.cpp#L1195)).
-A bare topic without the `name:` prefix is skipped with a warning.
-
-Why the heartbeat is not enough on these platforms: the hold distance is
-5 m, and between two heartbeats the pair can close by
+Unset, the proximity guard runs on the 1 Hz intent heartbeat. The hold
+distance is 5 m, and between heartbeats the pair can close by:
 
 | closing speed | per heartbeat |
 |---|---|
 | both at p90 (0.51 + 0.60 m/s) | 1.1 m |
 | both at max (1.99 + 2.26 m/s) | 4.3 m |
 
-At the worst case that is nearly the whole hold distance unseen. A 30 Hz pose
-brings it to under 0.15 m.
+The localiser's 30 Hz pose cuts the worst case to under 0.15 m.
 
-It is left unset in the overlay rather than guessed, because a wrong topic
-name produces exactly the same silent never-holds behaviour as no topic at
-all. The NDT pipeline publishes its pose as `/pcl_pose`; confirm the
-namespaced name on the platform with `ros2 topic info -v`, then set in each
-robot's block:
+Entries are `"<robot_name>:<topic>"`, a map-frame
+`PoseWithCovarianceStamped`
+([explo_planner_node.cpp:1680](../explo_planner/src/explo_planner_node.cpp#L1680)).
+An entry without the `name:` prefix is skipped with a warning. The overlay
+leaves the key unset, because a wrong topic name fails as silently as none.
+The NDT pipeline publishes `/pcl_pose`. Confirm the namespaced name with
+`ros2 topic info -v`, then set:
 
 ```yaml
 /bunker/explo_planner:
@@ -458,109 +328,102 @@ robot's block:
     proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]
 ```
 
-The startup line confirms it: `Proximity stop: tracking peer 'curt' via
-/curt/pcl_pose`. The same startup block prints `cancel via
-'/curt/navigate_to_pose'` — that must be the platform's Nav2 action name
-(`proximity_nav_cancel_action`), or a hold cancels nothing and the robot keeps
-driving while the planner believes it has stopped. nav2 must run in the
-robot's namespace for the defaults to match
-([nav2_config.md](nav2_config.md)).
+On bunker, startup then logs `Proximity stop: tracking peer 'curt' via
+/curt/pcl_pose` and `cancel via '/bunker/navigate_to_pose'`. The cancel
+action (`proximity_nav_cancel_action`) must be the platform's Nav2 action,
+or a hold cancels nothing and the robot keeps driving. The default matches
+only when Nav2 runs in the robot's namespace ([nav2_config.md](nav2_config.md)).
 
 ### Team size — `rendezvous_expected_peers`, `rendezvous_max_wait_sec`
 
-Rendezvous is inert at the shipped `expected_peers: 0` (the
-`rendezvous_expected_peers` declaration in
-[explo_planner_node.cpp](../explo_planner/src/explo_planner_node.cpp)).
-The overlay's per-robot blocks set it to 1, and the two-robot launch sets it
-from the team size anyway. The single-robot launch matches neither, so a
-robot running alone keeps it at 0 — which is right: with no teammate to
-wait for, it simply finishes where exploration ends.
+Rendezvous is inert at the shipped `rendezvous_expected_peers: 0`. The
+overlay's per-robot blocks set 1, and the two-robot launch sets it to the
+team size minus one. The single-robot launch matches neither block, so a
+robot alone keeps 0. That is right: with no teammate, it finishes where
+exploration ends.
 
-`rendezvous_max_wait_sec` inherits 600 s from `shared_params.yaml`. A robot
-that exhausts its goals after losing comms drives back to its start point and
-holds there until the team is complete or the 600 s run out; a robot that gives
-up parks in `DONE` and keeps beaconing. Set `<= 0` to wait forever — right only
-for a controlled trial where someone is watching. The drive home is capped
-separately by `return_nav_max_timeout_sec` (600 s).
+`rendezvous_max_wait_sec` is 600 s: from `shared_params.yaml` on a hand
+launch, from the `rendezvous_max_wait_sec:=` argument on the two-robot
+launch. When it runs out, a robot waiting at its start point parks in `DONE`
+(user manual §3.3). 0 waits forever. Use that only in a controlled trial
+with someone watching.
 
 ### Calibrated from the validation run
 
-`done_unknown_fraction` (0.05) and `candidate_enable_polar` (true) are site
-behaviour, not motion, and can only be set once the planner has driven the
-site. The user manual §5 says what to watch for both.
+`done_unknown_fraction` (0.05) and `candidate_enable_polar` (false) depend
+on the site, not on motion, so they can only be set once the planner has
+driven it. User manual §5 says what to watch for both.
 
 ---
 
 ## 5. Reading the validation run
 
-The validation run is the first run on the real robots with this overlay. The
-bags never had the planner driving (§2), so it is the first time a failure
-tag means anything. Each failure line names its cause:
+The validation run is the first real-robot run with this overlay, and the
+first in which failure tags mean anything. Each failure line names its
+cause:
 
 ```
-Step 12: navigation failed [no-progress] after 31.2s at goal (14.20, -3.10). Blacklisted; 2 active failed-goal entries.
+Step 12: navigation failed [no-progress] after 121.4s at goal (14.20, -3.10), robot at (11.80, -2.40) 2.50 m short. Blacklisted; 2 active failed-goal entries.
 ```
 
 | Tag | The robot was … | Then adjust |
 |-----|-----------------|-------------|
-| `[no-progress]` | driving or turning normally | raise `progress_window_sec`, or lower `progress_min_distance_m` (§3.2) |
-| `[no-progress]` | genuinely wedged | nothing — it worked; a shorter window only if it took too long to notice |
-| `[budget]` | still approaching the goal | raise `nav_safety_factor` or `nav_max_timeout_sec` (and `exploit_target_timeout_sec` with it); keep the speed (§3.4) |
-| `[budget]` | circling or re-routing, never closing in | nothing — it worked; this is the case the cap is for (§3.4) |
-| `[budget-rotate]` | at the goal, still turning | raise `goal_rotate_timeout_sec` (§3.3); check the tolerances against Nav2 |
+| `[no-progress]` | driving or turning normally | raise `progress_window_sec` or lower `progress_min_distance_m` (§3.2) |
+| `[no-progress]` | genuinely wedged | nothing. Shorten the window only if it took too long to notice |
+| `[budget]` | still approaching the goal | raise `nav_safety_factor` or `nav_max_timeout_sec` (and `exploit_target_timeout_sec` with it). Keep the speed (§3.4) |
+| `[budget]` | circling or re-routing, never closing in | nothing. This is the case the cap is for |
+| `[budget-rotate]` | at the goal, still turning | raise `goal_rotate_timeout_sec` (§3.3) |
 | `[budget-rotate]` | at the goal, not moving | tolerances tighter than Nav2's goal checker (user manual §5) |
-| `[nav2-aborted]` with `0 recovery(ies)` | parked, Nav2 refused the goal twice | expected now and then; the `nav2 abort reason` line (Jazzy) names it. Many `GOAL_OUTSIDE_MAP` (204): Nav2's global costmap is smaller than the goals' reach (field setup, "Goals outside nav2's global costmap") |
-| `[nav2-aborted]` with recoveries | wedged; Nav2 tried its recoveries there and gave up once | nothing — it worked. Many on the same kind of ground: the planning map lets goals into it (field setup, "Traversability map") |
+| `[nav2-aborted]` with `0 recovery(ies)` | parked, Nav2 refused the goal twice | nothing if rare. The `nav2 abort reason` line (Jazzy) names it. Many `GOAL_OUTSIDE_MAP` (204): Nav2's global costmap is too small (field setup, "Goals outside nav2's global costmap") |
+| `[nav2-aborted]` with recoveries | wedged. Nav2 ran its recoveries and gave up | nothing. Many on the same kind of ground: the planning map lets goals onto it (field setup, "Traversability map") |
 
-Every goal, reached ones included, also ends with one line of fixed shape,
-with the same fields in the CSV (`goal_outcome`, `nav_elapsed_sec`,
-`goal_path_length_m`, `nav2_aborts`, `nav2_recoveries`, `nav2_error_code`):
+Every goal, reached ones included, also ends with one `Goal end` line. The
+CSV has the same fields (`goal_outcome`, `nav_elapsed_sec`,
+`goal_path_length_m`, `nav2_aborts`, `nav2_recoveries`, `nav2_error_code`).
+Tabulate them to see outcomes per goal kind, budget used and Nav2
+recoveries.
 
 ```
-Goal end [nav2-aborted] step 12 explore (14.20, -3.10): 6.1s of 120s budget, path 11.8 m, 11.40 m short; nav2 ABORTED, 2 abort(s), 0 recovery(ies), last error 204 GOAL_OUTSIDE_MAP
+Goal end [nav2-aborted] step 12 explore (14.20, -3.10): 6.1s of 177s budget, path 11.8 m, 11.40 m short; nav2 ABORTED, 2 abort(s), 0 recovery(ies), last error 204 GOAL_OUTSIDE_MAP
 ```
 
-Tabulate those to see where the time went: the outcomes per goal kind, how
-much of each budget was used, and how often Nav2 needed recoveries.
-
-Warnings that mean a setting did not take:
+Lines that mean a setting did not take:
 
 | Line | Meaning |
 |------|---------|
 | `frame=map base=curt/base_link` | overlay not applied, or `base_frame:=` missing on the single-robot launch (§3.1) |
-| `Pose jump of … exceeds max_pose_jump_m` continuously | broken TF edge (§3.5), not a parameter |
-| `Proximity stop: no peer pose topics configured` | peer poses unset (§4) |
-| `proximity_peer_pose_topics entry '…' is not '<robot_name>:<topic>'` | missing the `name:` prefix |
-| `Rendezvous inactive (… expected_peers=0)` | team size not set for this node |
+| `Pose jump of … exceeds max_pose_jump_m`, continuously | broken TF edge (§3.5) |
+| `proximity_peer_pose_topics entry '…' is not '<robot_name>:<topic>'` | missing the `name:` prefix (§4) |
+
+For the rendezvous and proximity warnings, see user manual §6, "Startup
+lines that confirm a correct launch".
 
 In the metrics CSV, `distance_traveled` should climb whenever the robot
-moves. A flat trace while it is driving means the pose is not being tracked
-(§3.1) or every step is being rejected (§3.5); either way the watchdog will
-fire next.
+moves. A flat trace while it drives means the pose is not tracked (§3.1) or
+every step is rejected (§3.5), and the watchdog fires next.
 
 ---
 
 ## 6. Trying a change against a bag first
 
-The bag runners at the root of the `hmr_explo` workspace
-(`run_explo_dual.sh`, `run_explo_curtmini.sh`) layer
+The bag runners (`run_explo_dual.sh`, `run_explo_curtmini.sh`, in `ws/src/`
+of the `hmr_explo` repo) load
 [`config/exploration_fused_bag.yaml`](../explo_planner/config/exploration_fused_bag.yaml),
-which **disables** the watchdog (`progress_min_distance_m: 0.0`). A recording
-cannot react to the planner's goals, so the robot in the bag never drives
-toward them and the watchdog would fail every goal. Bag replay therefore
-cannot validate the watchdog by observation; only by measurement, which is
-what the script in §2 is for.
+which **turns the watchdog off** (`progress_min_distance_m: 0.0`). A
+recording does not drive toward the planner's goals, so the watchdog would
+fail them all. Replay cannot test the watchdog. The §2 script measures for
+it instead.
 
-What a replay does validate, before any battery is spent:
+A replay does check, before any battery is spent:
 
 - the `frame=… base=…` startup line and pose acquisition,
-- `distance_traveled` climbing as the recorded robot moves, and the absence
-  of `Pose jump` warnings,
+- `distance_traveled` climbing as the recorded robot moves, with no
+  `Pose jump` warnings,
 - candidate counts inside the ROI box, and where the unknown fraction
-  plateaus for `done_unknown_fraction`.
+  levels off (for `done_unknown_fraction`).
 
-To check the hardware overlay itself against a bag, add it as a second
-`--params-file` before the bag overlay, so the bag file's `use_sim_time` and
+To check the hardware overlay against a bag, add it as an extra
+`--params-file` before the bag file, so the bag file's `use_sim_time` and
 watchdog-off still win.
 
 ---
