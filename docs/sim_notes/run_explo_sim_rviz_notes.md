@@ -1832,6 +1832,16 @@ between arms; the chase simply no longer decides when the clock stops.
 Like DONE_UNKNOWN this is the definition of the primary endpoint, so it MUST
 be identical across arms and runs at a different value are not comparable.
 Recorded in the manifest for that reason.
+
+Addendum (gen 41): DONE_CRITERION=cell_latch applies the same latch per
+robot (first tick, any state, never un-finishes) to the worst census cell
+instead of the whole ROI. Every cell not written off must reach
+DONE_UNKNOWN (CL D1/D2: 90%, done_unknown 0.10). The census is built only
+on the planning_map grid of the 2d modes, so the runner and run_campaign
+refuse cell_latch unless PLANNER_MODE is 2d_frontier, 2d_raycast or
+2d_route and DONE_SOURCE=planning_map. The node also refuses it unless
+done_unknown_fraction equals the effective cell_covered_max_unknown_2d
+(R6), which is 0.10 in shared_params.yaml.
 ```
 
 ### ros-domain-id

@@ -862,12 +862,14 @@ fi
 # 3D frontier centroids scored by the FOV EIG ray cast. 2d_frontier /
 # 2d_raycast: planning_map frontiers scored by frontier length / by unknown
 # area in view, with the cell census on that grid under the yaml's cell_*_2d
-# pair, not CELL_COVERED_U / CELL_EXPLORING_U. Every mode stops on the same
-# done latch.
+# pair, not CELL_COVERED_U / CELL_EXPLORING_U. 2d_route: 2d_raycast's grid,
+# each step served as a viewpoint route on goal_route (DESIGN_route_planner.md).
+# Every mode stops on the done latch DONE_CRITERION names; cell_latch needs a
+# 2d mode.
 PLANNER_MODE="${PLANNER_MODE:-3d}"
 case "$PLANNER_MODE" in
-  3d|2d_frontier|2d_raycast) ;;
-  *) echo "FATAL: PLANNER_MODE='$PLANNER_MODE' is not 3d, 2d_frontier or 2d_raycast." >&2
+  3d|2d_frontier|2d_raycast|2d_route) ;;
+  *) echo "FATAL: PLANNER_MODE='$PLANNER_MODE' is not 3d, 2d_frontier, 2d_raycast or 2d_route." >&2
      exit 2 ;;
 esac
 # Planner ROI half-extent (m), sim only, square about the world origin. The
@@ -965,12 +967,14 @@ VOXEL_RES="$(flt "${VOXEL_RES:-0.20}")"
 DONE_UNKNOWN="$(flt "${DONE_UNKNOWN:-0.64}")"
 # latch (default): a robot is finished the first tick its own fused ROI unknown
 # fraction reaches DONE_UNKNOWN, in any state, and never un-finishes; streak is
-# the old rule. Part of the endpoint: same across arms.
-# (notes: done-criterion-latch)
+# the old rule. cell_latch: the same latch on the worst census cell instead of
+# the ROI (every cell not written off must reach DONE_UNKNOWN), so it needs a
+# 2d mode and DONE_SOURCE=planning_map (checked below). Part of the endpoint:
+# same across arms. (notes: done-criterion-latch)
 DONE_CRITERION="${DONE_CRITERION:-latch}"
 case "$DONE_CRITERION" in
-  latch|streak) ;;
-  *) echo "DONE_CRITERION must be 'latch' or 'streak', got '$DONE_CRITERION'" >&2
+  latch|streak|cell_latch) ;;
+  *) echo "DONE_CRITERION must be 'latch', 'streak' or 'cell_latch', got '$DONE_CRITERION'" >&2
      exit 2 ;;
 esac
 # Which map the done latch measures (explo_planner done_coverage_source).
@@ -983,6 +987,30 @@ DONE_SOURCE="${DONE_SOURCE:-scovox}"
 case "$DONE_SOURCE" in
   scovox|planning_map) ;;
   *) echo "FATAL: DONE_SOURCE='$DONE_SOURCE' is not scovox or planning_map." >&2
+     exit 2 ;;
+esac
+# cell_latch reads the census of the planning_map grid, which only the 2d modes
+# keep; the node refuses it otherwise, after a whole bring-up.
+if [ "$DONE_CRITERION" = cell_latch ]; then
+  case "$PLANNER_MODE:$DONE_SOURCE" in
+    2d_frontier:planning_map|2d_raycast:planning_map|2d_route:planning_map) ;;
+    *) echo "FATAL: DONE_CRITERION=cell_latch needs PLANNER_MODE 2d_frontier, 2d_raycast or" >&2
+       echo "       2d_route and DONE_SOURCE=planning_map (got $PLANNER_MODE, $DONE_SOURCE)." >&2
+       exit 2 ;;
+  esac
+fi
+# The coverage-loops plan (DESIGN_coverage_loops.md), a 2d_route parameter.
+# none (default): the allocator's tours. A bare <name>.yaml resolves under the
+# installed config/coverage_loops/; an absolute .yaml path is used as given.
+# The file is checked against this run once the install is sourced.
+COVERAGE_PLAN="${COVERAGE_PLAN:-none}"
+case "$COVERAGE_PLAN" in
+  none) ;;
+  /*.yaml|[A-Za-z0-9_]*.yaml)
+    [ "$PLANNER_MODE" = 2d_route ] || {
+      echo "FATAL: COVERAGE_PLAN=$COVERAGE_PLAN needs PLANNER_MODE=2d_route (got $PLANNER_MODE)." >&2
+      exit 2; } ;;
+  *) echo "FATAL: COVERAGE_PLAN='$COVERAGE_PLAN' is not none, a .yaml name or an absolute .yaml path." >&2
      exit 2 ;;
 esac
 OUTDIR="${OUTDIR:-/tmp/explo_sim_$(date +%Y%m%d_%H%M%S)}"
@@ -1046,6 +1074,51 @@ set -u
 PLANNER_SHARE=$(ros2 pkg prefix explo_planner)/share/explo_planner
 TARGETS="${TARGETS:-$PLANNER_SHARE/config/targets_flatforest.yaml}"
 [ -f "$TARGETS" ] || { echo "ERROR no such targets file: $TARGETS"; exit 2; }
+# COVERAGE_PLAN resolved and checked against this run's roster and grid before
+# anything starts; the node's loader does the structural checks. /usr/bin/python3
+# for yaml, as for the roster. The handout is logged with the cell world.
+COVERAGE_PLAN_PATH=none
+SHA256_COVERAGE_PLAN=none
+COVERAGE_PLAN_HANDOUT=""
+if [ "$COVERAGE_PLAN" != none ]; then
+  case "$COVERAGE_PLAN" in
+    /*) COVERAGE_PLAN_PATH="$COVERAGE_PLAN" ;;
+    *)  COVERAGE_PLAN_PATH="$PLANNER_SHARE/config/coverage_loops/$COVERAGE_PLAN" ;;
+  esac
+  [ -f "$COVERAGE_PLAN_PATH" ] || {
+    echo "FATAL: COVERAGE_PLAN=$COVERAGE_PLAN: no such file $COVERAGE_PLAN_PATH" >&2
+    exit 2; }
+  COVERAGE_PLAN_HANDOUT="$(/usr/bin/python3 - "$COVERAGE_PLAN_PATH" "$N_ROBOTS" \
+      "$ROBOTS" "$CELL_SIZE_M" "$ROI_HALF" <<'PY'
+import sys, yaml
+path, n, robots = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
+cs, half = float(sys.argv[4]), float(sys.argv[5])
+try:
+    p = yaml.safe_load(open(path))["coverage_plan"]
+    g, lists = p["grid"], p["lists"]
+    bad = []
+    if p.get("version") != 1:
+        bad.append(f"version={p.get('version')!r}, not 1")
+    if p.get("n_robots") != n:
+        bad.append(f"n_robots={p.get('n_robots')!r}, not N_ROBOTS={n}")
+    if sorted(str(l.get("robot")) for l in lists) != sorted(robots):
+        bad.append(f"list robots {[l.get('robot') for l in lists]}, not ROBOTS {robots}")
+    if abs(float(g["cell_size_m"]) - cs) > 1e-9:
+        bad.append(f"grid.cell_size_m={g['cell_size_m']}, not CELL_SIZE_M={cs}")
+    if [float(v) for v in g["roi"]] != [-half, half, -half, half]:
+        bad.append(f"grid.roi={g['roi']}, not +-ROI_HALF={half}")
+    if float(g["yaw_deg"]) != 0.0:
+        bad.append(f"grid.yaw_deg={g['yaw_deg']}, not 0")
+except Exception as e:  # unreadable or missing keys: refuse, never guess
+    bad = [f"unreadable ({type(e).__name__}: {e})"]
+if bad:
+    sys.exit("FATAL: COVERAGE_PLAN " + path + ": " + "; ".join(bad))
+print(" ".join(f"L{l.get('index', i)}={l['robot']}(helps L{l.get('helps')})"
+               for i, l in enumerate(lists)))
+PY
+)" || exit 2
+  SHA256_COVERAGE_PLAN=$(sha256sum -b "$COVERAGE_PLAN_PATH" | cut -c1-16)
+fi
 
 # RViz layout + viz URDF are read from the SOURCE tree, not the install share:
 # both are pure config, so editing them applies on the next run with no rebuild.
@@ -1517,7 +1590,8 @@ if [ "$RECORD" != "0" ]; then
       BAG_TOPICS+=( /$r/imu/data /$r/cmd_vel
                     /$r/scovox_node/planning_map
                     /$r/scovox_node/global_planning_map
-                    /$r/goal_pose /$r/explo_planner/candidates )
+                    /$r/goal_pose /$r/explo_planner/candidates
+                    /$r/goal_route /$r/simple_nav_3d/active_route )
     done
     BAG_TOPICS+=( /exploration/targets )
   fi
@@ -1572,6 +1646,11 @@ if [ "$CELL_WORLD" = "1" ]; then
   log "  ROI [-$ROI_HALF,$ROI_HALF]^2 at ${CELL_SIZE_M}m -> $(awk -v h="$ROI_HALF" -v c="$CELL_SIZE_M" 'BEGIN{n=int((2*h)/c); if (n*c < 2*h) n++; printf "%dx%d", n, n}') cells"
 else
   log "cell world OFF (CELL_WORLD=0) — no cell params passed, planner is the pre-M-TARE binary at defaults"
+fi
+if [ "$COVERAGE_PLAN" != none ]; then
+  log "coverage plan $COVERAGE_PLAN: $COVERAGE_PLAN_PATH (sha256 $SHA256_COVERAGE_PLAN), lists $COVERAGE_PLAN_HANDOUT"
+else
+  log "coverage plan none: the allocator's tours (PLANNER_MODE=$PLANNER_MODE)"
 fi
 if [ "$TEAM_WORLD" = "1" ]; then
   log "team world exchange ON: ${TEAM_WORLD_HZ} Hz$([ "$COMMS" = 1 ] && echo " through the emulator" || echo " on the shared bus (COMMS=0: no dropout is possible, so this measures the merge, not the healing)")"
@@ -1782,8 +1861,15 @@ MANIFEST="$OUTDIR/run_manifest.txt"
   echo "transmission_model=$TX_MODEL"
   # Absent: a manifest from before the 2D modes, which ran 3d. A 2D cell's
   # cell_covered_max_unknown / cell_exploring_min_unknown above are not the
-  # ones its census used; its events.jsonl params carry the effective pair.
+  # ones its census used; cell_*_2d_in_params below and its events.jsonl
+  # params carry the effective pair.
   echo "planner_mode=$PLANNER_MODE"
+  # The coverage-loops plan: the knob, the file the node loaded and its hash
+  # (none, none, none for the allocator). Absent: a manifest from before the
+  # plans, which ran none.
+  echo "coverage_plan=$COVERAGE_PLAN"
+  echo "coverage_plan_path=$COVERAGE_PLAN_PATH"
+  echo "sha256_coverage_plan=$SHA256_COVERAGE_PLAN"
   echo
   echo "# --- held fixed ---"
   echo "relay_queue_max_bytes=$RELAY_QUEUE_BYTES"
@@ -1947,6 +2033,11 @@ PY
   # a params file that failed to install turns it off.
   # (notes: manifest-params-file-hash)
   planner_params="$WS/install/explo_planner/share/explo_planner/config/shared_params.yaml"
+  # The 2d census pair (D1) and 2d_route's route params also live only in the
+  # params file; probed like done_action below.
+  _probe_keys="cell_covered_max_unknown_2d cell_exploring_min_unknown_2d
+               route_viewpoint_spacing_m route_min_gain_m2 route_max_viewpoints
+               route_reorder_gain"
   if [ -e "$planner_params" ]; then
     echo "sha256_shared_params=$(sha256sum -b "$planner_params" 2>/dev/null \
       | cut -c1-16)"
@@ -1966,6 +2057,11 @@ PY
     echo "coord_claim_radius_m_in_params=$(sed -n \
       's/^[[:space:]]*coord_claim_radius_m:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
       "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
+    for _k in $_probe_keys; do
+      echo "${_k}_in_params=$(sed -n \
+        "s/^[[:space:]]*$_k:[[:space:]]*\"\{0,1\}\([^\"#]*\)\"\{0,1\}.*/\1/p" \
+        "$planner_params" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')"
+    done
   else
     # Write every key as missing, not just the hash: an absent key is
     # indistinguishable from an old manifest, and a params file that failed to
@@ -1978,6 +2074,7 @@ PY
     # written before the key existed.
     echo "global_alloc_comms_mask_in_params=missing"
     echo "coord_claim_radius_m_in_params=missing"
+    for _k in $_probe_keys; do echo "${_k}_in_params=missing"; done
   fi
   # World provenance: the scenario names a world short name, which
   # _world_registry.py maps to an SDF. The SDF's internal world name must equal
@@ -2103,6 +2200,11 @@ for r in $ROBOTS; do
   # Quoted as a YAML string: bare `off` parses as bool false and the node
   # refuses to start (the string parameter cannot take a bool).
   EXTRA+=( -p "arm:='$ARM'" )
+  # Coverage loops: the stored per-N cell lists replace the allocator's tours.
+  # COVERAGE_PLAN=none passes nothing and the node keeps the allocator.
+  if [ "$COVERAGE_PLAN" != none ]; then
+    EXTRA+=( -p coverage_plan_path:="$COVERAGE_PLAN_PATH" )
+  fi
   if [ "$COMMS" = "1" ]; then
     EXTRA+=( -p team_beacon_pub_topic:=exploration/team_beacon
              -p team_beacon_sub_topics:="$(peers_ros_array "$r" 'rx/' '/exploration/team_beacon')" )

@@ -30,6 +30,9 @@ Env:    GATE_ROOT                   campaign root (default /home/kalhan/hmr_camp
                                     pass the banked generation's own number to
                                     re-gate an older campaign, e.g. 5 for a
                                     gen-16 one or 3 for a gen-9 one)
+        GATE_DONE_UNKNOWN           check 14's done_unknown_fraction bound
+                                    (default 0.640; pass the campaign's own
+                                    --done-unknown, e.g. 0.10 for gen 41)
 Exit:   0  no hard failures, every population non-empty
         1  hard failures, or no cells for the tag
         2  the generation identity was never declared
@@ -302,7 +305,9 @@ def cfg_val(v):
         return repr(float(v))
     return json.dumps(v)
 
-DONE_UNKNOWN_FRACTION = 0.640
+# Check 14's bound. Pass the campaign's own --done-unknown in GATE_DONE_UNKNOWN
+# (gen 41: 0.10); the default keeps banked campaigns re-gateable.
+DONE_UNKNOWN_FRACTION = float(os.environ.get("GATE_DONE_UNKNOWN", "0.640"))
 # Event-log schema pin for check 3d. Re-gate a banked campaign by passing its
 # own number in GATE_SCHEMA_VERSION, never by editing the pin:
 # (notes: gate-schema-pin-override)

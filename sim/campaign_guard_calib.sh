@@ -782,6 +782,7 @@ done_seek_enabled=false
 reconnect_midrun_silence_sec=90
 team_world_hz=1.0
 meeting_interval_sec=300.0
+coverage_plan=none
 EOF
   echo "arm=$1"
 }
@@ -802,12 +803,13 @@ rg() {
   else
     rg_manifest "$_arm" > "$_cell/run_manifest.txt"
   fi
-  # RG_EXTRA, when set, is one more manifest line (a key the fixture lacks).
+  # RG_EXTRA, when set, is more manifest lines (keys the fixture lacks).
   [ -n "${RG_EXTRA:-}" ] && echo "$RG_EXTRA" >> "$_cell/run_manifest.txt"
-  # RG_ENV, when set, is the campaign's one --env token (the full-map cases).
+  # RG_ENV, when set, is the campaign's one --env token (the full-map cases);
+  # RG_DC its --done-criterion (the cell_latch cases).
   _out=$(MIN_FREE_MB=999999999999 timeout 60 "$CS" --root "$_root" --tag rg \
            --duration 3000 --scenario flatforest_dense_2robot_lidar.yaml \
-           ${RG_ENV:+--env "$RG_ENV"} \
+           ${RG_ENV:+--env "$RG_ENV"} ${RG_DC:+--done-criterion "$RG_DC"} \
            --arms "$_arm" --seeds 1 2>&1)
   _rc=$?
   if echo "$_out" | grep -q "ABORT: rg_${_arm}_seed1 is complete but its manifest says"; then
@@ -965,6 +967,33 @@ rg ABORT "an old cell (absent) under a 2d_raycast campaign"   "$RG_ARM" planner_
 rg ABORT "a 2d_frontier cell under a 2d_raycast campaign"     "$RG_ARM" planner_mode 2d_frontier
 RG_ENV="PLANNER_MODE=2d"
 rg "REFUSED(rc=2)" "PLANNER_MODE=2d fails up front"           "$RG_ARM"
+RG_ENV="PLANNER_MODE=2d_route"
+rg SKIP  "a 2d_route cell resumes a 2d_route campaign"        "$RG_ARM" planner_mode 2d_route
+rg ABORT "an old cell (absent) under a 2d_route campaign"     "$RG_ARM" planner_mode "<none>"
+rg ABORT "a 2d_raycast cell under a 2d_route campaign"        "$RG_ARM" planner_mode 2d_raycast
+unset RG_ENV
+rg ABORT "a 2d_route cell under a 3d campaign"                "$RG_ARM" planner_mode 2d_route
+# coverage_plan: absent is none, every manifest from before the plans. A
+# campaign that runs plan_n2.yaml needs it installed under
+# install/explo_planner/share/explo_planner/config/coverage_loops/.
+rg SKIP  "coverage_plan absent predates it: none"             "$RG_ARM" coverage_plan "<none>"
+rg ABORT "a plan cell under an allocator campaign"            "$RG_ARM" coverage_plan plan_n2.yaml
+RG_ENV="PLANNER_MODE=2d_route COVERAGE_PLAN=plan_n2.yaml"
+RG_EXTRA="planner_mode=2d_route"
+rg SKIP  "a plan cell resumes the same plan"                  "$RG_ARM" coverage_plan plan_n2.yaml
+rg ABORT "an allocator cell under a plan campaign"            "$RG_ARM" coverage_plan none
+rg ABORT "an old cell (absent) under a plan campaign"         "$RG_ARM" coverage_plan "<none>"
+rg ABORT "a plan_n3 cell under a plan_n2 campaign"            "$RG_ARM" coverage_plan plan_n3.yaml
+unset RG_EXTRA
+RG_ENV="COVERAGE_PLAN=plan_n2.yaml"
+rg "REFUSED(rc=2)" "COVERAGE_PLAN without 2d_route fails up front" "$RG_ARM"
+RG_ENV="PLANNER_MODE=2d_route COVERAGE_PLAN=nosuch.yaml"
+rg "REFUSED(rc=2)" "an uninstalled plan name fails up front"  "$RG_ARM"
+RG_ENV="PLANNER_MODE=2d_route COVERAGE_PLAN=plan_n2"
+rg "REFUSED(rc=2)" "a plan name without .yaml fails up front" "$RG_ARM"
+# An existing file, so only the .yaml check can refuse it.
+RG_ENV="PLANNER_MODE=2d_route COVERAGE_PLAN=$CS"
+rg "REFUSED(rc=2)" "an existing non-.yaml plan path fails up front" "$RG_ARM"
 unset RG_ENV
 # done_coverage_source: absent is scovox, every manifest from before it was
 # recorded.
@@ -978,6 +1007,22 @@ rg ABORT "a scovox cell under a planning_map campaign"        "$RG_ARM" done_cov
 RG_ENV="DONE_SOURCE=auto"
 rg "REFUSED(rc=2)" "DONE_SOURCE=auto fails up front"          "$RG_ARM"
 unset RG_ENV
+# done_criterion cell_latch: only a 2d mode on the planning_map census.
+RG_DC=cell_latch
+RG_ENV="PLANNER_MODE=2d_raycast"
+rg "REFUSED(rc=2)" "cell_latch on the scovox source fails up front" "$RG_ARM"
+RG_ENV="DONE_SOURCE=planning_map"
+rg "REFUSED(rc=2)" "cell_latch under PLANNER_MODE=3d fails up front" "$RG_ARM"
+RG_ENV="PLANNER_MODE=2d_raycast DONE_SOURCE=planning_map"
+RG_EXTRA=$'planner_mode=2d_raycast\ndone_coverage_source=planning_map'
+rg SKIP  "a cell_latch cell resumes a cell_latch campaign"    "$RG_ARM" done_criterion cell_latch
+rg ABORT "a latch cell under a cell_latch campaign"           "$RG_ARM" done_criterion latch
+unset RG_DC
+rg ABORT "a cell_latch cell under a latch campaign"           "$RG_ARM" done_criterion cell_latch
+unset RG_ENV RG_EXTRA
+RG_DC=cell
+rg "REFUSED(rc=2)" "--done-criterion cell fails up front"     "$RG_ARM"
+unset RG_DC
 # meeting_interval_sec: absent is 300, every manifest from before the runner
 # passed it; a present but empty line is not absent.
 rg SKIP  "meeting_interval_sec absent predates it: 300"       "$RG_ARM" meeting_interval_sec "<none>"
@@ -1076,7 +1121,8 @@ for _spec in SEPARATION_WEIGHT:SEPARATION_WEIGHT_REQ \
              SHARE_FULL_PERIOD_S:SHARE_FULL_PERIOD_REQ \
              TX_MODEL:TX_MODEL_REQ \
              PLANNER_MODE:PLANNER_MODE_REQ \
-             DONE_SOURCE:DONE_SOURCE_REQ; do
+             DONE_SOURCE:DONE_SOURCE_REQ \
+             COVERAGE_PLAN:COVERAGE_PLAN_REQ; do
   _ek=${_spec%%:*}; _vn=${_spec#*:}
   cases=$((cases+1))
   _ld=$(sed -n "s/^$_ek=\"\${$_ek:-\(.*\)}\"$/\1/p" "$LAUNCHER" | head -1)

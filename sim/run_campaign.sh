@@ -22,6 +22,7 @@
 # Moved comments: docs/sim_notes/run_campaign_notes.md
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS="$(cd "$HERE/../../.." && pwd)"           # …/hmr_explo/ws
 
 ROOT=""; CELLS=""; ARMS=""; SEEDS=""; TAG="run"
 # No default: DURATION is the censoring horizon and defines the primary
@@ -265,7 +266,7 @@ TEAM_WORLD_HZ_REQ="$(env_val TEAM_WORLD_HZ 1.0)"
 # by nothing but stays in both lists on purpose. (notes: ambient-knob-warning)
 for _amb in LINK_GATE MIDRUN_SILENCE \
             CELL_WORLD TEAM_WORLD TEAM_WORLD_HZ GLOBAL_ALLOC RECONNECT_GATE \
-            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR RDV_INTERVAL \
+            RENDEZVOUS_SCHEDULE PURSUIT_PREDICTOR RDV_INTERVAL COVERAGE_PLAN \
             STOP_ON_DONE DONE_GRACE_S HANG_HB GATES_STRICT POLL_S \
             CLOCK_EVERY_S CLOCK_DEADMAN_S CLOCK_FAIL_MAX MAP_AGREE_MAX_PCT \
             GZ_GUI; do
@@ -353,6 +354,8 @@ DONE_SOURCE_REQ=$(env_val DONE_SOURCE scovox)
 # The meeting interval (meeting_interval_sec), default duplicated from the
 # runner.
 RDV_INTERVAL_REQ=$(env_val RDV_INTERVAL 300)
+# The coverage-loops plan (2d_route only), default duplicated from the runner.
+COVERAGE_PLAN_REQ=$(env_val COVERAGE_PLAN none)
 # Checked here too, so a bad value fails once rather than per cell after a
 # bring-up each; the runner's own checks stay authoritative.
 case "$SHARE_FULL_PERIOD_REQ" in
@@ -365,12 +368,45 @@ case "$TX_MODEL_REQ" in
   *) log "ABORT: TX_MODEL='$TX_MODEL_REQ' is not admission or progressive."; exit 2 ;;
 esac
 case "$PLANNER_MODE_REQ" in
-  3d|2d_frontier|2d_raycast) ;;
-  *) log "ABORT: PLANNER_MODE='$PLANNER_MODE_REQ' is not 3d, 2d_frontier or 2d_raycast."; exit 2 ;;
+  3d|2d_frontier|2d_raycast|2d_route) ;;
+  *) log "ABORT: PLANNER_MODE='$PLANNER_MODE_REQ' is not 3d, 2d_frontier, 2d_raycast or 2d_route."; exit 2 ;;
 esac
 case "$DONE_SOURCE_REQ" in
   scovox|planning_map) ;;
   *) log "ABORT: DONE_SOURCE='$DONE_SOURCE_REQ' is not scovox or planning_map."; exit 2 ;;
+esac
+# The runner checks the plan's content against the roster and grid; here only
+# the value, the mode and an installed name.
+case "$COVERAGE_PLAN_REQ" in
+  none) ;;
+  /*.yaml|[A-Za-z0-9_]*.yaml)
+    if [ "$PLANNER_MODE_REQ" != 2d_route ]; then
+      log "ABORT: COVERAGE_PLAN=$COVERAGE_PLAN_REQ needs PLANNER_MODE=2d_route (got $PLANNER_MODE_REQ)."
+      exit 2
+    fi
+    case "$COVERAGE_PLAN_REQ" in
+      /*) _plan="$COVERAGE_PLAN_REQ" ;;
+      *)  _plan="$WS/install/explo_planner/share/explo_planner/config/coverage_loops/$COVERAGE_PLAN_REQ" ;;
+    esac
+    if [ ! -f "$_plan" ]; then
+      log "ABORT: COVERAGE_PLAN=$COVERAGE_PLAN_REQ: no such file $_plan"
+      exit 2
+    fi
+    unset _plan ;;
+  *) log "ABORT: COVERAGE_PLAN='$COVERAGE_PLAN_REQ' is not none, a .yaml name or an absolute .yaml path."
+     exit 2 ;;
+esac
+# cell_latch reads the planning_map census, which only the 2d modes keep.
+case "$DONE_CRITERION" in
+  latch|streak) ;;
+  cell_latch)
+    case "$PLANNER_MODE_REQ:$DONE_SOURCE_REQ" in
+      2d_frontier:planning_map|2d_raycast:planning_map|2d_route:planning_map) ;;
+      *) log "ABORT: --done-criterion cell_latch needs PLANNER_MODE 2d_frontier, 2d_raycast or"
+         log "       2d_route and DONE_SOURCE=planning_map (got $PLANNER_MODE_REQ, $DONE_SOURCE_REQ)."
+         exit 2 ;;
+    esac ;;
+  *) log "ABORT: DONE_CRITERION='$DONE_CRITERION' is not latch, streak or cell_latch."; exit 2 ;;
 esac
 if [ "$COMMS_ON" = "0" ] && { [ "$TX_MODEL_REQ" != admission ] || \
      awk -v v="$SHARE_FULL_PERIOD_REQ" 'BEGIN { exit !(v + 0 > 0) }'; }; then
@@ -447,6 +483,7 @@ for cell in "${CELL_LIST[@]}"; do
       "transmission_model=$TX_MODEL_REQ" \
       "planner_mode=$PLANNER_MODE_REQ" \
       "done_coverage_source=$DONE_SOURCE_REQ" \
+      "coverage_plan=$COVERAGE_PLAN_REQ" \
       "radio=$RADIO_ON" \
       "done_seek_enabled=false"
     do
@@ -471,6 +508,10 @@ for cell in "${CELL_LIST[@]}"; do
       # off, and auto reads scovox without one.
       if [ "$k" = "done_coverage_source" ] && [ -z "$have" ]; then
         have=scovox
+      fi
+      # Absent is none: every manifest from before the coverage-loops plans.
+      if [ "$k" = "coverage_plan" ] && [ -z "$have" ]; then
+        have=none
       fi
       if [ "${have:-<absent>}" != "$want" ]; then
         log "ABORT: $name is complete but its manifest says $k=${have:-<absent>},"
@@ -633,7 +674,7 @@ for cell in "${CELL_LIST[@]}"; do
       -u TREE_ATTEN -u MAX_RANGE -u CELL_SIZE_M \
       -u SEPARATION_WEIGHT -u SEPARATION_RADIUS_M -u SEPARATION_MAX_AGE_SEC \
       -u SHARE_FULL_PERIOD_S -u TX_MODEL -u PLANNER_MODE -u DONE_SOURCE \
-      -u RDV_INTERVAL \
+      -u RDV_INTERVAL -u COVERAGE_PLAN \
       -u DONE_GRACE_S -u HANG_HB -u POLL_S \
       -u CLOCK_EVERY_S -u CLOCK_DEADMAN_S -u CLOCK_FAIL_MAX \
       -u MAP_AGREE_MAX_PCT -u GZ_GUI \
