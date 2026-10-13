@@ -1577,6 +1577,31 @@ who explores what.
 A v11 reader parses every row correctly and needs no change. The stamp
 moves so that a fold can REFUSE to pool, which no additive-compatibility
 argument would have let it do.
+
+v14: FIRST STAMPED BY THE GENERATION 41 BINARY, via kGen41SchemaVersion.
+kSchemaVersion stays 12 and kGen34SchemaVersion stays 13, so the scripts
+that regex either one out of this header keep reading theirs. The
+vocabulary widens by six kinds at the tail of kEventKinds, all written
+through logTeamEvent:
+
+    route_plan      a 2d_route step or refresh: tier, cell, cover, length
+    route_progress  a waypoint passed, or dropped (residual / occupied)
+    route_end       how a route ended (completed, cell_finished, ...)
+    list_cell       the P arm's list walk: a cell started/finished/skipped
+    help            the P arm switched to helping another list
+    cell_stop       this robot's per-cell picture at its latch, or at
+                    run_end if it never latched
+
+cell_stop is emitted in EVERY arm, including R at the shipped defaults, so
+unlike the v4 kinds it is not opt-in.
+
+Additive fields, both appended at the end of their rows:
+  - cell_census: written_off, written_off_ids, cell_unknown;
+  - allocation: tour_source ("allocator" | "list" | "help").
+
+Nothing was removed or renamed, so a v13 reader parses every v14 row. The
+stamp moves so that a fold can refuse to pool gen 41 (route arms, the
+written-off flag on the wire, the cell_latch stop) with gens 34-40.
 ```
 
 ### explog-event-kinds-authority

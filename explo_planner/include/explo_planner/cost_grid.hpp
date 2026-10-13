@@ -45,6 +45,16 @@ public:
   /// (notes: costgrid-flood-radius-cap)
   void floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m);
 
+  /// floodFrom(source_xy, radius_cap_m) that stops once every target is
+  /// settled. Targets are deduplicated by grid cell; an out-of-bounds target,
+  /// or a blocked one other than the source cell, is not waited for. Returns
+  /// how many distinct waited-for targets were settled. costTo / reachable /
+  /// extractPath are exact for settled cells (every target among them); any
+  /// other cell may hold a tentative cost and must not be read.
+  int floodUntil(const Eigen::Vector3f& source_xy,
+                 const std::vector<Eigen::Vector3f>& targets_xy,
+                 float radius_cap_m);
+
   /// O(1) lookup of the shortest-path distance from the source used in the
   /// most recent floodFrom(...) call to the cell containing `xy`. Returns
   /// kInfCost if the cell is impassable, unreachable, outside the bounded

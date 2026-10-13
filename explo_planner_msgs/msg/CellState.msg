@@ -21,6 +21,7 @@ uint16 id
 # Normalised exploration status. These three values are the ENTIRE wire
 # vocabulary; the local-only COVERED_BY_OTHERS / EXPLORING_BY_OTHERS are
 # normalised down to COVERED / EXPLORING before send.
+# Bit 0x80 marks a team-wide write-off and is valid on COVERED only (0x82).
 uint8 UNSEEN=0
 uint8 EXPLORING=1
 uint8 COVERED=2

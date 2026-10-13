@@ -189,9 +189,18 @@
     # cast. "2d_frontier" / "2d_raycast": frontiers of the 2D planning_map
     # (needs use_planning_map), binned by frontier_cluster_radius_m and scored
     # by frontier length / by unknown grid area in view within fov_max_range;
-    # the cell census then reads the same grid (cell_*_2d thresholds). Coverage
-    # termination and the step metrics stay on the fused 3D map in every mode.
+    # the cell census then reads the same grid (cell_*_2d thresholds).
+    # "2d_route": 2d_raycast's grid, with each step served as a viewpoint route
+    # (route_* below). Coverage termination and the step metrics stay on the
+    # fused 3D map in every mode.
     planner_mode: "3d"
+    # 2d_route only (DESIGN_route_planner.md §5.8): lattice spacing (m), also
+    # the route-mode visited radius; marginal-cover stop and residual drop
+    # (m^2); route length cap; order hysteresis.
+    route_viewpoint_spacing_m: 2.5
+    route_min_gain_m2: 20.0
+    route_max_viewpoints: 12
+    route_reorder_gain: 0.10
     # Smallest 8-connected planning_map frontier component kept (2d modes).
     grid_frontier_min_cells: 3
     # Inset (m) of the frontier search band from the ROI z band, bottom and top;
@@ -307,8 +316,10 @@
     cell_covered_max_frontier_frac: 0.95
     # The same pair for the 2d planner modes, whose census reads the
     # planning_map. That grid saturates (seen cells read 0 unknown), so the
-    # library defaults hold there.
-    cell_covered_max_unknown_2d: 0.15
+    # library's 0.35 holds there; covered is 0.10, the 90% a coverage-loops
+    # cell must reach (CL D1), the same as done_unknown_fraction under
+    # done_criterion cell_latch.
+    cell_covered_max_unknown_2d: 0.10
     cell_exploring_min_unknown_2d: 0.35
 
     # Reconnect master switch; false = the control arm. reconnect_mode picks the

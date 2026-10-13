@@ -876,6 +876,11 @@ void ExperimentLog::logCellCensus(const ExperimentContext& ctx,
   num("cell_frontier_frac_median", e.cell_frontier_frac_median);
   num("cell_frontier_frac_at_best_unknown",
       e.cell_frontier_frac_at_best_unknown);
+  // Gen 41. Always written, including as "", so an empty list is a measured
+  // "none written off", not an absent key.
+  integer("written_off", e.written_off);
+  text("written_off_ids", e.written_off_ids);
+  text("cell_unknown", e.cell_unknown);
   end();
 }
 
@@ -945,6 +950,7 @@ void ExperimentLog::logAllocation(const ExperimentContext& ctx,
   boolean("reordered", e.reordered);
   integer("focus_skips", e.focus_skips);
   text("demoted", e.demoted);
+  text("tour_source", e.tour_source);
   end();
 }
 
@@ -1073,10 +1079,17 @@ void ExperimentLog::logTeamEvent(const ExperimentContext& ctx,
   else if (kind == "chase")         begin("chase", ctx);
   else if (kind == "homing")        begin("homing", ctx);
   else if (kind == "team_finished") begin("team_finished", ctx);
+  // Gen 41 (schema 14): the node's route and coverage-loop events.
+  else if (kind == "route_plan")     begin("route_plan", ctx);
+  else if (kind == "route_progress") begin("route_progress", ctx);
+  else if (kind == "route_end")      begin("route_end", ctx);
+  else if (kind == "list_cell")      begin("list_cell", ctx);
+  else if (kind == "help")           begin("help", ctx);
+  else if (kind == "cell_stop")      begin("cell_stop", ctx);
   else {
     if (team_events_unknown_++ == 0) {
       RCLCPP_ERROR(logger_,
-          "ExperimentLog: TeamCore event kind '%s' has no writer; not written. "
+          "ExperimentLog: team event kind '%s' has no writer; not written. "
           "Further unknown kinds are counted in run_end.team_events_unknown.",
           kind.c_str());
     }

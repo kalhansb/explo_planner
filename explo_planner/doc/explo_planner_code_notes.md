@@ -42,6 +42,7 @@ One section per source file, in file order. Each entry names the function (or se
 - [src/proximity_guard.cpp](#srcproximity_guardcpp) — 1
 - [src/pursuit_predictor.cpp](#srcpursuit_predictorcpp) — 6
 - [src/reconnect_gate.cpp](#srcreconnect_gatecpp) — 7
+- [src/route_builder.cpp](#srcroute_buildercpp) — 1
 - [src/separation.cpp](#srcseparationcpp) — 2
 - [src/target_scheduler_node.cpp](#srctarget_scheduler_nodecpp) — 1
 - [src/tree_detector_node.cpp](#srctree_detector_nodecpp) — 8
@@ -2698,6 +2699,24 @@ this robot is always built in_comms, and a vehicle exempt from the test can
 take any cell — so no_plan.unassigned cannot be non-empty while self is in
 the vehicle set. The column was meant to report comms-mask starvation and
 cannot; dead-column status is recorded in CODE_TODO with the rest.
+```
+
+## src/route_builder.cpp
+
+### route-lattice-offset
+
+**Why the lattice is half-offset** — in `routeLattice`, attached to the `(i + 0.5) * spacing` placement (added 2026-10-13, gen 41)
+
+```text
+routeLattice places points at roi.min + (i+0.5)*spacing (BUILD_PLAN R14,
+spec §3.3) rather than at the ROI corner (RP §5.2 item 3). Corner-anchored
+at 2.5 m, 21 of 41 axis values sit exactly on 0.2 m map-cell edges and
+every 8th on a 20 m cell boundary, where planMapCellAt (double),
+CostGrid::worldToGrid (float) and CellGrid::idAt can floor to different
+cells. With the half offset every point is a quarter map cell from any 0.2
+m edge and 1.25 m from any 20 m boundary (64 points per 20 m cell). It is
+still world-anchored, so the 1.25 m continuity identity matches the same
+points across solves.
 ```
 
 ## src/separation.cpp

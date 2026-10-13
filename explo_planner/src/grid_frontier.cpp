@@ -153,7 +153,7 @@ std::vector<GridFrontier> findGridFrontiers(
 int gridVisibleUnknown(const nav_msgs::msg::OccupancyGrid& g,
                        const Roi2D& roi, const Eigen::Vector3f& pos, float yaw,
                        float hfov, int h_rays, float min_range,
-                       float max_range) {
+                       float max_range, std::vector<int32_t>* cells_out) {
   const GridBox roi_box = gridBoxOf(g, roi);
   if (roi_box.empty() || !(max_range > 0.0f) || !(hfov > 0.0f)) return 0;
   const int w = static_cast<int>(g.info.width);
@@ -200,7 +200,10 @@ int gridVisibleUnknown(const nav_msgs::msg::OccupancyGrid& g,
         const int lx = cx - x0 + R, ly = cy - y0 + R;
         if (lx >= 0 && ly >= 0 && lx < side && ly < side) {
           uint8_t& s = seen[static_cast<size_t>(ly) * side + lx];
-          if (!s) { s = 1; ++count; }
+          if (!s) {
+            s = 1; ++count;
+            if (cells_out) cells_out->push_back(cy * w + cx);
+          }
         }
       }
       if (t_next_x < t_next_y) {

@@ -137,6 +137,90 @@ void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m) {
   }
 }
 
+int CostGrid::floodUntil(const Eigen::Vector3f& source_xy,
+                         const std::vector<Eigen::Vector3f>& targets_xy,
+                         float radius_cap_m) {
+  if (dims_x_ <= 0 || dims_y_ <= 0) {
+    return 0;
+  }
+
+  // floodFrom's body, plus a count of the targets still to settle. Up to the
+  // stop the pops are floodFrom's, so settled costs and parents match it.
+  std::fill(cost_.begin(), cost_.end(), kInfCost);
+  parent_.assign(cost_.size(), -1);
+
+  int sx = 0;
+  int sy = 0;
+  if (!worldToGrid(source_xy.x(), source_xy.y(), sx, sy)) {
+    return 0;
+  }
+  // Sorted, distinct target cells the flood can settle: in bounds, and not
+  // blocked unless it is the source cell (which seeds blocked).
+  std::vector<int> pend;
+  pend.reserve(targets_xy.size());
+  for (const auto& t : targets_xy) {
+    int tx = 0, ty = 0;
+    if (!worldToGrid(t.x(), t.y(), tx, ty)) continue;
+    const int ti = idx(tx, ty);
+    if (!blocked_[ti] || ti == idx(sx, sy)) pend.push_back(ti);
+  }
+  std::sort(pend.begin(), pend.end());
+  pend.erase(std::unique(pend.begin(), pend.end()), pend.end());
+  if (pend.empty()) return 0;
+
+  bool can_seed = !blocked_[idx(sx, sy)];
+  for (int k = 0; !can_seed && k < 8; ++k) {
+    const int nx = sx + kDx[k];
+    const int ny = sy + kDy[k];
+    if (inBounds(nx, ny) && !blocked_[idx(nx, ny)]) can_seed = true;
+  }
+  if (!can_seed) return 0;
+  cost_[idx(sx, sy)] = 0.0f;
+
+  float cap = radius_cap_m;
+  if (!(cap > 0.0f)) {
+    cap = std::numeric_limits<float>::infinity();
+  }
+
+  using Node = std::pair<float, int>;  // (cost, flat index)
+  std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
+  pq.emplace(0.0f, idx(sx, sy));
+
+  int settled = 0;
+  while (!pq.empty()) {
+    auto [c, i] = pq.top();
+    pq.pop();
+
+    if (c > cost_[i]) continue;
+    if (c > cap) break;
+    // A non-stale pop is final, and each cell has exactly one.
+    if (std::binary_search(pend.begin(), pend.end(), i) &&
+        ++settled == static_cast<int>(pend.size())) {
+      return settled;
+    }
+
+    int gx = i % dims_x_;
+    int gy = i / dims_x_;
+
+    for (int k = 0; k < 8; ++k) {
+      int nx = gx + kDx[k];
+      int ny = gy + kDy[k];
+      if (!inBounds(nx, ny)) continue;
+      int ni = idx(nx, ny);
+      if (blocked_[ni]) continue;
+
+      float nc = c + kStepMul[k] * resolution_;
+      if (nc > cap) continue;
+      if (nc < cost_[ni]) {
+        cost_[ni] = nc;
+        parent_[ni] = i;
+        pq.emplace(nc, ni);
+      }
+    }
+  }
+  return settled;
+}
+
 float CostGrid::costTo(const Eigen::Vector3f& xy) const {
   int gx = 0;
   int gy = 0;

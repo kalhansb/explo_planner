@@ -419,6 +419,15 @@ struct CellCensusEvent {
   /// that very cell, which the medians cannot.
   /// (notes: explog-census-frontier-at-best)
   double cell_frontier_frac_at_best_unknown = -1.0;
+  // --- gen 41 (schema 14): write-offs and the per-cell measure ----------
+  /// Cells written off (team-wide, never lowered) and their ids, ascending,
+  /// comma-separated; "" when none.
+  int written_off = 0;
+  std::string written_off_ids;
+  /// Unknown fraction per cell id in id order, 3 decimals, -1 when the cell
+  /// is unmeasured, comma-separated. Read across rows, it dates each cell's
+  /// crossing of the covered threshold.
+  std::string cell_unknown;
 };
 
 /// team_exchange payload: one received TeamWorld, stamped when drained, one per
@@ -571,6 +580,10 @@ struct AllocationEvent {
   /// bounds nothing about elapsed time. (notes: explog-alloc-focus-skips)
   int focus_skips = 0;
   std::string demoted;
+  /// Gen 41 (schema 14): where this robot's tour came from. "allocator" (the
+  /// solve's own tour), or in the P arm "list" or "help" when the plan walk
+  /// replaced it. The solve and the rest of this row are the same in all arms.
+  std::string tour_source = "allocator";
 };
 
 /// `AllocationEvent::picked_rank` for a goal that came from outside every
@@ -859,6 +872,11 @@ class ExperimentLog {
   /// 33 keeps kSchemaVersion. Named apart so the scripts that read
   /// `kSchemaVersion = N` from this header keep reading gen 33's.
   static constexpr int kGen34SchemaVersion = 13;
+  /// The schema the gen-41 node stamps. It adds the route and coverage-loop
+  /// kinds at the end of kEventKinds and fields to cell_census and
+  /// allocation. Named apart, like kGen34SchemaVersion, so the scripts that
+  /// read either constant from this header keep reading theirs.
+  static constexpr int kGen41SchemaVersion = 14;
 
   /// Every event value this writer can emit, and the only authority on that
   /// set: the equivalence gate relies on it to tell whether a new kind
@@ -878,6 +896,9 @@ class ExperimentLog {
       // --- gen 34 (schema 13), the gen-34 node only ---
       "team_activity", "plan", "booking", "exchange", "chase", "homing",
       "team_finished", "tick",
+      // --- gen 41 (schema 14) ---
+      "route_plan", "route_progress", "route_end", "list_cell", "help",
+      "cell_stop",
   };
   static constexpr size_t kEventKindCount =
       sizeof(kEventKinds) / sizeof(kEventKinds[0]);
@@ -932,7 +953,8 @@ class ExperimentLog {
   // class of bug this file exists to prevent.
   // ----------------------------------------------------------------
   /// The schema run_start stamps: kSchemaVersion unless set before
-  /// startRun(). Only the gen-34 node sets it (kGen34SchemaVersion).
+  /// startRun(). Only the gen-34 node (kGen34SchemaVersion) and the gen-41
+  /// node (kGen41SchemaVersion) set it.
   void setSchemaVersion(int v) { schema_version_ = v; }
   int schemaVersion() const { return schema_version_; }
 
@@ -1097,11 +1119,13 @@ class ExperimentLog {
   // Gen 34 (schema 13)
   // ----------------------------------------------------------------
 
-  /// One TeamCore event (team_core.hpp TeamEvent): `kind` is the event value
-  /// and the fields follow the envelope in order. The kinds are
-  /// team_activity, plan, booking, exchange, chase, homing and team_finished.
-  /// Any other is not written; it is counted and reported in run_end as
-  /// team_events_unknown, so a kind added to TeamCore without a writer shows.
+  /// One TeamCore event (team_core.hpp TeamEvent), or one of the gen-41
+  /// node's own: `kind` is the event value and the fields follow the envelope
+  /// in order. The kinds are team_activity, plan, booking, exchange, chase,
+  /// homing and team_finished, and from gen 41 (schema 14) route_plan,
+  /// route_progress, route_end, list_cell, help and cell_stop. Any other is
+  /// not written; it is counted and reported in run_end as
+  /// team_events_unknown, so a kind added without a writer shows.
   void logTeamEvent(const ExperimentContext& ctx, const std::string& kind,
                     const LogFields& fields);
   long long teamEventsUnknown() const { return team_events_unknown_; }

@@ -20,6 +20,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 # ==================================================================
 # Provenance
@@ -78,6 +79,8 @@ add_library(explo_planner_lib
   src/separation.cpp
   src/team_core.cpp
   src/leg.cpp
+  src/route_builder.cpp
+  src/coverage_plan.cpp
 )
 
 target_include_directories(explo_planner_lib PUBLIC
@@ -87,6 +90,7 @@ target_include_directories(explo_planner_lib PUBLIC
 
 target_link_libraries(explo_planner_lib
   PUBLIC Eigen3::Eigen
+  PRIVATE yaml-cpp
 )
 
 ament_target_dependencies(explo_planner_lib PUBLIC
@@ -199,6 +203,10 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_grid_frontier test/test_grid_frontier.cpp)
   target_link_libraries(test_grid_frontier explo_planner_lib)
+  ament_add_gtest(test_route_builder test/test_route_builder.cpp)
+  target_link_libraries(test_route_builder explo_planner_lib)
+  ament_add_gtest(test_coverage_plan test/test_coverage_plan.cpp)
+  target_link_libraries(test_coverage_plan explo_planner_lib)
 
   ament_add_gtest(test_failed_goal_blacklist test/test_failed_goal_blacklist.cpp)
   target_link_libraries(test_failed_goal_blacklist explo_planner_lib)

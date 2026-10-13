@@ -1,8 +1,11 @@
 // Moved comments: doc/explo_planner_code_notes.md
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <random>
+#include <set>
 #include <vector>
 
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -309,4 +312,175 @@ TEST(CostGrid, FullyEnclosedSourceReachesNothing) {
   // reachability filter for the tick; 0 and the old 1 are both below it, so
   // this change is inert there by design. Pinned so that stays true.
   EXPECT_LT(cg.reachedCellCount(), 10u);
+}
+
+// ---------------------------------------------------------------------------
+// floodUntil
+// ---------------------------------------------------------------------------
+
+// On random obstacle grids, every target floodFrom reaches is settled by
+// floodUntil with the same cost bit for bit and the same path, the return
+// counts exactly those distinct targets, and the early stop never reaches a
+// cell floodFrom does not. Catches counting a target on a stale pop (the stop
+// then comes before the last target is final) and an off-by-one stop.
+TEST(CostGrid, FloodUntilMatchesFloodFromOnSettledTargets) {
+  std::mt19937 rng(20261012);
+  auto uni = [&](double a, double b) {
+    return std::uniform_real_distribution<double>(a, b)(rng);
+  };
+  auto pick = [&](int n) {
+    return std::uniform_int_distribution<int>(0, n - 1)(rng);
+  };
+  const float kRes[3] = {0.2f, 0.5f, 1.0f};
+  int compared = 0, early = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    const int w = 30 + pick(91), h = 30 + pick(91);
+    const float res = kRes[pick(3)];
+    auto grid = makeGrid(w, h, res, static_cast<float>(uni(-5.0, 5.0)),
+                         static_cast<float>(uni(-5.0, 5.0)));
+    const double p_occ = uni(0.0, 0.35);
+    for (auto& v : grid.data) {
+      if (uni(0.0, 1.0) < p_occ) v = 100;
+      else if (pick(4) == 0) v = -1;          // unknown is passable
+    }
+    // Cell centres jittered inside the cell, so the cell is unambiguous.
+    auto inCell = [&](int gx, int gy) {
+      Eigen::Vector3f p = cellCenter(grid, gx, gy);
+      p.x() += static_cast<float>(uni(-0.3, 0.3)) * res;
+      p.y() += static_cast<float>(uni(-0.3, 0.3)) * res;
+      return p;
+    };
+    const int sgx = pick(w), sgy = pick(h);
+    const Eigen::Vector3f src = inCell(sgx, sgy);
+    const float cap = pick(3) == 0 ? 0.0f : static_cast<float>(uni(1.0, 40.0));
+
+    std::vector<Eigen::Vector3f> targets;
+    std::set<int> waited;  // distinct cells floodUntil waits for
+    const int nt = pick(13);
+    for (int k = 0; k < nt; ++k) {
+      const int kind = pick(10);
+      if (kind == 0) {                        // off the grid
+        targets.push_back(Eigen::Vector3f(-1000.0f, 3.0f, 0.0f));
+        continue;
+      }
+      const int gx = kind == 1 ? sgx : pick(w);
+      const int gy = kind == 1 ? sgy : pick(h);
+      targets.push_back(inCell(gx, gy));
+      if (kind == 2) targets.push_back(inCell(gx, gy));   // same cell twice
+      const bool src_cell = gx == sgx && gy == sgy;
+      if (grid.data[static_cast<size_t>(gy) * w + gx] != 100 || src_cell)
+        waited.insert(gy * w + gx);
+    }
+
+    CostGrid a, b;
+    a.build(grid);
+    b.build(grid);
+    a.floodFrom(src, cap);
+    const int ret = b.floodUntil(src, targets, cap);
+
+    int expect_settled = 0;
+    for (int ci : waited) {
+      const Eigen::Vector3f t = cellCenter(grid, ci % w, ci / w);
+      if (std::isfinite(a.costTo(t))) ++expect_settled;
+    }
+    EXPECT_EQ(ret, expect_settled) << "trial " << trial;
+    for (const auto& t : targets) {
+      if (!std::isfinite(a.costTo(t))) continue;
+      EXPECT_EQ(b.costTo(t), a.costTo(t)) << "trial " << trial;
+      EXPECT_EQ(b.extractPath(t), a.extractPath(t)) << "trial " << trial;
+      ++compared;
+    }
+    EXPECT_LE(b.reachedCellCount(), a.reachedCellCount()) << "trial " << trial;
+    if (b.reachedCellCount() < a.reachedCellCount()) ++early;
+  }
+  EXPECT_GT(compared, 1000);
+  EXPECT_GT(early, 100) << "the early stop should usually stop early";
+}
+
+// An open 40 m grid: a target 2 m away settles after a few hundred cells,
+// not the whole map.
+TEST(CostGrid, FloodUntilStopsEarly) {
+  auto grid = makeGrid(200, 200, 0.2f, -20.0f, -20.0f);
+  CostGrid a, b;
+  a.build(grid);
+  b.build(grid);
+  const Eigen::Vector3f src(0.1f, 0.1f, 0.0f), tgt(2.1f, 0.1f, 0.0f);
+  a.floodFrom(src, 0.0f);
+  EXPECT_EQ(b.floodUntil(src, {tgt}, 0.0f), 1);
+  EXPECT_EQ(a.reachedCellCount(), 40000u);
+  EXPECT_LT(b.reachedCellCount(), 1000u);
+  EXPECT_EQ(b.costTo(tgt), a.costTo(tgt));
+  EXPECT_NEAR(b.costTo(tgt), 2.0f, 1e-4f);
+}
+
+// What is waited for and what the return counts. Each case pins one rule:
+// off-grid and blocked targets are not waited for (the flood still stops at
+// the real one); duplicates count once; the source settles at 0 even when
+// it is blocked; an enclosed or out-of-cap target exhausts the flood and is
+// not counted; no target returns 0 with the last flood cleared.
+TEST(CostGrid, FloodUntilTargetEdgeCases) {
+  auto grid = makeGrid(60, 60, 0.5f);
+  // A sealed free pocket at (50,50): its 8 neighbours blocked.
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+      if (dx || dy) block(grid, 50 + dx, 50 + dy);
+  block(grid, 20, 10);                      // a lone blocked target cell
+  block(grid, 10, 30);                      // the blocked-source case
+  const Eigen::Vector3f src = cellCenter(grid, 10, 10);
+  const Eigen::Vector3f near = cellCenter(grid, 14, 10);
+  const Eigen::Vector3f far = cellCenter(grid, 40, 10);
+  const Eigen::Vector3f pocket = cellCenter(grid, 50, 50);
+  const Eigen::Vector3f off(-100.0f, 5.0f, 0.0f);
+
+  CostGrid full, cg;
+  full.build(grid);
+  cg.build(grid);
+  full.floodFrom(src, 0.0f);
+  const size_t all = full.reachedCellCount();
+
+  EXPECT_EQ(cg.floodUntil(src, {near}, 0.0f), 1);
+  const size_t one = cg.reachedCellCount();
+  EXPECT_LT(one, all / 4);
+  EXPECT_EQ(cg.costTo(near), full.costTo(near));
+
+  // Off-grid and blocked targets: not waited for, so the same early stop.
+  EXPECT_EQ(cg.floodUntil(src, {off, cellCenter(grid, 20, 10), near}, 0.0f),
+            1);
+  EXPECT_EQ(cg.reachedCellCount(), one);
+  EXPECT_FALSE(cg.reachable(cellCenter(grid, 20, 10)));
+
+  // Duplicates, including two points in one cell, count once.
+  const Eigen::Vector3f near2 = near + Eigen::Vector3f(0.2f, -0.2f, 0.0f);
+  EXPECT_EQ(cg.floodUntil(src, {near, near2, near}, 0.0f), 1);
+  EXPECT_EQ(cg.reachedCellCount(), one);
+
+  // The source is settled first, at 0, and nothing else is reached.
+  EXPECT_EQ(cg.floodUntil(src, {src}, 0.0f), 1);
+  EXPECT_EQ(cg.costTo(src), 0.0f);
+  EXPECT_EQ(cg.reachedCellCount(), 1u);
+
+  // A blocked source with a free neighbour still seeds and is waited for.
+  const Eigen::Vector3f bsrc = cellCenter(grid, 10, 30);
+  EXPECT_EQ(cg.floodUntil(bsrc, {bsrc}, 0.0f), 1);
+  EXPECT_EQ(cg.costTo(bsrc), 0.0f);
+
+  // An enclosed target: the flood exhausts its component; only `far` counts.
+  EXPECT_EQ(cg.floodUntil(src, {pocket, far}, 0.0f), 1);
+  EXPECT_EQ(cg.reachedCellCount(), all);
+  EXPECT_FALSE(cg.reachable(pocket));
+  EXPECT_EQ(cg.costTo(far), full.costTo(far));
+
+  // Beyond the cap: stays unreached and uncounted.
+  EXPECT_EQ(cg.floodUntil(src, {far}, 5.0f), 0);
+  EXPECT_FALSE(cg.reachable(far));
+
+  // No target (or none it can wait for): 0, and the previous flood is gone.
+  cg.floodFrom(src, 0.0f);
+  EXPECT_EQ(cg.floodUntil(src, {}, 0.0f), 0);
+  EXPECT_EQ(cg.reachedCellCount(), 0u);
+  EXPECT_EQ(cg.floodUntil(src, {off}, 0.0f), 0);
+  EXPECT_EQ(cg.reachedCellCount(), 0u);
+  // An off-grid source reaches nothing.
+  EXPECT_EQ(cg.floodUntil(off, {near}, 0.0f), 0);
+  EXPECT_EQ(cg.reachedCellCount(), 0u);
 }

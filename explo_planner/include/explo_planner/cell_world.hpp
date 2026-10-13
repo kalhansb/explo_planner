@@ -201,8 +201,10 @@ public:
     uint32_t   update_id = 0;
     /// Last observation applied, for diagnostics and the census event.
     CellObservation obs;
-    /// Written off by the staleness rule: the census still records obs but
-    /// no longer reclassifies the cell. (notes: cell-written-off)
+    /// Written off by the staleness rule, here or by a peer (the flag travels
+    /// as kWireWrittenOff): the census still records obs but no longer
+    /// reclassifies the cell, and no peer can lower it.
+    /// (notes: cell-written-off)
     bool       written_off = false;
   };
 
@@ -251,7 +253,7 @@ public:
   /// One cell as it travels: exactly the fields of CellState.msg, decoupled
   /// from the generated type so this unit and its tests do not depend on ROS.
   /// `status` is the RAW wire byte, not a CellStatus, so a peer sending a
-  /// value outside {0,1,2} can be counted rather than silently coerced.
+  /// value outside {0,1,2,0x82} can be counted rather than silently coerced.
   struct WireCell {
     uint16_t id        = 0;
     uint8_t  status    = 0;
@@ -259,14 +261,20 @@ public:
     uint32_t update_id = 0;
   };
 
+  /// Wire status bit 7: the cell is written off team-wide (CL D2). Only
+  /// COVERED carries it, so (2 | kWireWrittenOff) is the one valid such byte.
+  static constexpr uint8_t kWireWrittenOff = 0x80;
+
   /// This robot's whole census in the wire vocabulary, one entry per cell, in
-  /// id order. Full state every time — see TeamWorld.msg on why there are no
-  /// deltas.
+  /// id order; a written-off COVERED goes as 2 | kWireWrittenOff, so the flag
+  /// relays at N>=3. Full state every time — see TeamWorld.msg on why there
+  /// are no deltas.
   std::vector<WireCell> toWire() const;
 
-  /// FNV-1a over every cell's normalised wire status in id order, nothing else,
-  /// so robots with the same shared belief match. update_id and known_by are
-  /// excluded on purpose (rules 1 and 2). (notes: cell-shared-hash)
+  /// FNV-1a over every cell's toWire() status byte in id order, nothing else,
+  /// so robots with the same shared belief (write-offs included) match.
+  /// update_id and known_by are excluded on purpose (rules 1 and 2).
+  /// (notes: cell-shared-hash)
   uint32_t sharedHash() const;
 
   /// FNV-1a over edges_, size folded in first. A detector only: edges_ is never
@@ -284,13 +292,13 @@ public:
     /// caller that cannot tell them apart will report the second as the first.
     std::string refused;
 
-    int applied         = 0;  ///< cells whose local status changed
+    int applied         = 0;  ///< cells whose local status or write-off changed
     int known_by_only   = 0;  ///< statuses already agreed; only the mask grew
     int agreed_noop     = 0;  ///< agreed, and we already knew everyone it named
     int refused_guard   = 0;  ///< the guard table declined the peer's claim
     int refused_local   = 0;  ///< local-priority: my neighbourhood, my call
     int out_of_range    = 0;  ///< id not in this grid — config fault, not noise
-    int bad_status      = 0;  ///< byte outside {0,1,2}: not a wire status
+    int bad_status      = 0;  ///< byte outside {0,1,2,0x82}: not a wire status
 
     /// Every entry offered lands in exactly one bucket, so a caller can assert
     /// this against the message's cell count and catch a merge that silently
@@ -303,8 +311,9 @@ public:
 
   /// Guard-table merge of a peer's census; an out-of-range sender_id is refused
   /// wholesale. local_priority_centre (-1 = off): first-hand EXPLORING in its
-  /// 3x3 refuses the peer. Never touches update_id or lowers a first-hand
-  /// COVERED. (notes: cell-merge-wire)
+  /// 3x3 refuses the peer. A peer's write-off is adopted ahead of local
+  /// priority, and a written-off cell is never lowered. Never touches
+  /// update_id or lowers a first-hand COVERED. (notes: cell-merge-wire)
   MergeStats mergeWire(int sender_id, const std::vector<WireCell>& cells,
                        int local_priority_centre = -1);
 
@@ -330,6 +339,18 @@ public:
     double coveredFraction() const;
   };
   Census census() const;
+
+  /// D2 stop measure: max unknownFraction() over the cells not written off,
+  /// from a FRESH census of size() entries; *worst_id gets the argmax (lowest
+  /// id on a tie). -1 (never done) when the world is unconfigured, the sizes
+  /// differ, or any counted cell is unmeasured (total_columns <= 0), and then
+  /// *worst_id gets the first such cell (-1 on a size mismatch). Home is
+  /// counted like any other cell. With every cell written off: 0, id -1.
+  double perCellWorstUnknown(const std::vector<CellObservation>& fresh,
+                             int* worst_id = nullptr) const;
+
+  /// Ids of the written-off cells (own or adopted), ascending.
+  std::vector<int> writtenOffIds() const;
 
   // --- Adjacency graph ---------------------------------------------------
   // 8-connected centroids with Euclidean weights: a cheap approximation of

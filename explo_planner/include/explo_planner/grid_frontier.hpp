@@ -7,6 +7,7 @@
 /// testable on hand-built grids. Cell classes follow plan_map_query: -1
 /// unknown, 0..49 free, >= 50 occupied or inflated.
 
+#include <cstdint>
 #include <vector>
 
 #include <Eigen/Core>
@@ -56,10 +57,13 @@ std::vector<GridFrontier> findGridFrontiers(
 /// first occupied cell or the grid edge. Unknown cells do not stop a ray;
 /// cells nearer than min_range are not counted. At least enough rays are cast
 /// to space them one cell apart at max_range, so far cells are not skipped.
+/// cells_out (optional) gets the map index (gy * width + gx) of each counted
+/// cell appended, in first-reach order, so it grows by exactly the count.
 int gridVisibleUnknown(const nav_msgs::msg::OccupancyGrid& g,
                        const Roi2D& roi, const Eigen::Vector3f& pos, float yaw,
                        float hfov, int h_rays, float min_range,
-                       float max_range);
+                       float max_range,
+                       std::vector<int32_t>* cells_out = nullptr);
 
 /// censusFromMap's 2D counterpart, measured on the planning_map. A column is a
 /// grid cell whose centre lies in the cell and is observed when known (not -1);

@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <random>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include <Eigen/Core>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -295,6 +298,135 @@ TEST(GridFrontier, OccupiedOrOffGridStartSeesNothing) {
                                0.0f, kTwoPi, 16, 0.0f, 5.0f), 0);
   EXPECT_EQ(gridVisibleUnknown(g, kHuge, Eigen::Vector3f(-3.0f, 5.5f, 0.0f),
                                0.0f, kTwoPi, 16, 0.0f, 5.0f), 0);
+}
+
+// The cell list is the count, cell for cell: on random grids, poses and
+// parameters the list has exactly count entries, all distinct, unknown, inside
+// the ROI box and on the grid, and a non-empty list is only appended to.
+// Catches a push outside the dedup, before the min-range or ROI test, or with
+// x and y swapped in the index.
+TEST(GridFrontier, VisibleCellsMatchCountOnRandomGrids) {
+  std::mt19937 rng(20261012);
+  auto uni = [&](double a, double b) {
+    return std::uniform_real_distribution<double>(a, b)(rng);
+  };
+  auto pick = [&](int n) {
+    return std::uniform_int_distribution<int>(0, n - 1)(rng);
+  };
+  const float kHfov[3] = {kTwoPi, 1.0f, 0.3f};
+  const int kRays[2] = {1, 96};
+  const float kMinR[3] = {0.0f, 0.3f, 1.0f};
+  const float kMaxR[3] = {2.0f, 5.0f, 20.0f};
+  int nonzero = 0;
+  for (int trial = 0; trial < 300; ++trial) {
+    const int w = 60 + pick(81), h = 60 + pick(81);
+    const float res = pick(2) ? 0.2f : 0.5f;
+    const float ox = static_cast<float>(uni(-5.0, 5.0));
+    const float oy = static_cast<float>(uni(-5.0, 5.0));
+    auto g = makeGrid(w, h, res, -1, ox, oy);
+    const double p_unk = uni(0.3, 0.7), p_occ = uni(0.0, 0.2);
+    for (auto& v : g.data) {
+      const double u = uni(0.0, 1.0);
+      v = u < p_unk ? -1
+        : u < p_unk + p_occ ? 100 : static_cast<int8_t>(pick(50));
+    }
+    const float ext_x = w * res, ext_y = h * res;
+    Eigen::Vector3f pos(ox + static_cast<float>(uni(0.0, ext_x)),
+                        oy + static_cast<float>(uni(0.0, ext_y)), 0.0f);
+    // 1 in 10 starts off the grid, 1 in 10 on an occupied cell, else free.
+    const int mode = pick(10);
+    const auto c = cellOf(g, pos);
+    if (mode == 0)
+      pos.x() = ox - static_cast<float>(uni(0.1, 5.0));
+    else if (c.first >= 0 && c.first < w && c.second >= 0 && c.second < h)
+      setCell(g, c.first, c.second, mode == 1 ? 100 : 0);
+    const float yaw = static_cast<float>(uni(-M_PI, M_PI));
+    const float hfov = kHfov[pick(3)];
+    const int rays = kRays[pick(2)];
+    const float min_r = kMinR[pick(3)], max_r = kMaxR[pick(3)];
+    Roi2D roi = kHuge;
+    if (pick(4) != 0) {
+      // A sub-ROI near the start, so it usually clips what the rays reach.
+      const float x0 = pos.x() - static_cast<float>(uni(-2.0, max_r));
+      const float y0 = pos.y() - static_cast<float>(uni(-2.0, max_r));
+      roi = {x0, x0 + static_cast<float>(uni(0.0, 2.0 * max_r)), y0,
+             y0 + static_cast<float>(uni(0.0, 2.0 * max_r))};
+      if (pick(10) == 0) std::swap(roi.min_x, roi.max_x);         // empty
+    }
+
+    const int n =
+        gridVisibleUnknown(g, roi, pos, yaw, hfov, rays, min_r, max_r);
+    std::vector<int32_t> cells;
+    ASSERT_EQ(gridVisibleUnknown(g, roi, pos, yaw, hfov, rays, min_r, max_r,
+                                 &cells), n) << "trial " << trial;
+    ASSERT_EQ(static_cast<int>(cells.size()), n) << "trial " << trial;
+    if (n > 0) ++nonzero;
+
+    std::vector<int32_t> sorted = cells;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT_TRUE(std::adjacent_find(sorted.begin(), sorted.end()) ==
+                sorted.end())
+        << "trial " << trial << ": a cell listed twice";
+    const GridBox box = gridBoxOf(g, roi);
+    for (int32_t i : cells) {
+      ASSERT_GE(i, 0) << "trial " << trial;
+      ASSERT_LT(i, w * h) << "trial " << trial;
+      EXPECT_LT(g.data[static_cast<size_t>(i)], 0) << "trial " << trial;
+      EXPECT_TRUE(box.contains(i % w, i / w)) << "trial " << trial;
+    }
+
+    std::vector<int32_t> pre = {-7, 12345};
+    EXPECT_EQ(gridVisibleUnknown(g, roi, pos, yaw, hfov, rays, min_r, max_r,
+                                 &pre), n);
+    ASSERT_EQ(pre.size(), cells.size() + 2) << "trial " << trial;
+    EXPECT_EQ(pre[0], -7);
+    EXPECT_EQ(pre[1], 12345);
+    EXPECT_TRUE(std::equal(cells.begin(), cells.end(), pre.begin() + 2));
+  }
+  EXPECT_GT(nonzero, 100) << "too few trials saw anything to compare";
+}
+
+// Exact membership. Along a one-row corridor the cells are entered at
+// t = gx - 0.5, so with min_range 3 the first counted cell is gx 4, and the
+// wall at gx 10 ends the list. In the open, every unknown cell left of a wall
+// and clear of min_range is listed, and none at or behind the wall.
+TEST(GridFrontier, VisibleCellsStopAtWallsAndRespectMinRange) {
+  auto row = makeGrid(30, 1, 1.0f);
+  setCell(row, 0, 0, 0);
+  setCell(row, 10, 0, 100);
+  std::vector<int32_t> cells;
+  EXPECT_EQ(gridVisibleUnknown(row, kHuge, Eigen::Vector3f(0.5f, 0.5f, 0.0f),
+                               0.0f, 0.01f, 8, 3.0f, 20.0f, &cells), 6);
+  EXPECT_EQ(cells, (std::vector<int32_t>{4, 5, 6, 7, 8, 9}));
+
+  auto g = makeGrid(41, 41, 1.0f);
+  setCell(g, 20, 20, 0);
+  for (int y = 0; y < 41; ++y) setCell(g, 24, y, 100);
+  setCell(g, 18, 22, 0);                     // a known free cell is not listed
+  cells.clear();
+  const int n =
+      gridVisibleUnknown(g, kHuge, Eigen::Vector3f(20.5f, 20.5f, 0.0f), 0.0f,
+                         kTwoPi, 16, 3.0f, 10.0f, &cells);
+  ASSERT_EQ(static_cast<int>(cells.size()), n);
+  const std::set<int32_t> got(cells.begin(), cells.end());
+  for (int32_t i : cells) {
+    const int gx = i % 41, gy = i / 41;
+    EXPECT_LT(gx, 24) << "listed at or behind the wall: " << gx << "," << gy;
+    const double d = std::hypot(gx - 20.0, gy - 20.0);
+    EXPECT_GE(d, 3.0 - 0.71) << gx << "," << gy;   // entered at t >= t_min
+    EXPECT_LE(d, 10.0 + 0.71) << gx << "," << gy;
+  }
+  EXPECT_EQ(got.count(22 * 41 + 18), 0u);
+  int must = 0;
+  for (int gy = 0; gy < 41; ++gy) {
+    for (int gx = 0; gx < 24; ++gx) {
+      const double d = std::hypot(gx - 20.0, gy - 20.0);
+      if (d < 3.0 + 0.71 || d > 6.0 || (gx == 18 && gy == 22)) continue;
+      ++must;
+      EXPECT_EQ(got.count(gy * 41 + gx), 1u) << "missed " << gx << "," << gy;
+    }
+  }
+  EXPECT_GT(must, 50);
 }
 
 // ---------------------------------------------------------------------------

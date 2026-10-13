@@ -7,17 +7,17 @@ Sections follow the order of the source file and are grouped by the function (or
 ## Contents
 
 - [File scope, before the class](#file-scope-before-the-class) — 5
-- [class ExploPlannerNode — declarations](#class-exploplannernode--declarations) — 185
-- [ExploPlannerNode::ExploPlannerNode (constructor)](#exploplannernodeexploplannernode-constructor) — 107
+- [class ExploPlannerNode — declarations](#class-exploplannernode--declarations) — 192
+- [ExploPlannerNode::ExploPlannerNode (constructor)](#exploplannernodeexploplannernode-constructor) — 110
 - [ExploPlannerNode::onFusionCounters](#exploplannernodeonfusioncounters) — 2
 - [ExploPlannerNode::loadLatestMap](#exploplannernodeloadlatestmap) — 1
 - [ExploPlannerNode::tick](#exploplannernodetick) — 10
 - [ExploPlannerNode::transitionTo](#exploplannernodetransitionto) — 13
 - [ExploPlannerNode::allocVehicles](#exploplannernodeallocvehicles) — 3
 - [ExploPlannerNode::separationAnchors](#exploplannernodeseparationanchors) — 1
-- [ExploPlannerNode::doPlan](#exploplannernodedoplan) — 53
+- [ExploPlannerNode::doPlan](#exploplannernodedoplan) — 56
 - [ExploPlannerNode::coverageUnknownFraction](#exploplannernodecoverageunknownfraction) — 1
-- [ExploPlannerNode::doNavigate](#exploplannernodedonavigate) — 9
+- [ExploPlannerNode::doNavigate](#exploplannernodedonavigate) — 10
 - [ExploPlannerNode::failGoal](#exploplannernodefailgoal) — 1
 - [ExploPlannerNode::recordExplorationComplete](#exploplannernoderecordexplorationcomplete) — 3
 - [ExploPlannerNode::finishNow](#exploplannernodefinishnow) — 1
@@ -73,7 +73,7 @@ Sections follow the order of the source file and are grouped by the function (or
 - [ExploPlannerNode::checkProximityHold](#exploplannernodecheckproximityhold) — 1
 - [ExploPlannerNode::enterProximityHold](#exploplannernodeenterproximityhold) — 1
 - [ExploPlannerNode::abandonNavGoal](#exploplannernodeabandonnavgoal) — 3
-- [ExploPlannerNode::doProximityHold](#exploplannernodedoproximityhold) — 4
+- [ExploPlannerNode::doProximityHold](#exploplannernodedoproximityhold) — 5
 - [ExploPlannerNode::fillCommonMetrics](#exploplannernodefillcommonmetrics) — 6
 - [ExploPlannerNode::metricsTick](#exploplannernodemetricstick) — 6
 - [ExploPlannerNode::expCtx](#exploplannernodeexpctx) — 1
@@ -93,7 +93,7 @@ Sections follow the order of the source file and are grouped by the function (or
 - [ExploPlannerNode::holdDwelledVantage](#exploplannernodeholddwelledvantage) — 4
 - [ExploPlannerNode::doExploitPlan](#exploplannernodedoexploitplan) — 13
 - [ExploPlannerNode::doExploitDwell](#exploplannernodedoexploitdwell) — 8
-- [ExploPlannerNode::updatePoseFromTF](#exploplannernodeupdateposefromtf) — 4
+- [ExploPlannerNode::updatePoseFromTF](#exploplannernodeupdateposefromtf) — 5
 - [ExploPlannerNode::trackDistance](#exploplannernodetrackdistance) — 1
 - [ExploPlannerNode::publishGoal](#exploplannernodepublishgoal) — 1
 - [ExploPlannerNode::republishGoal](#exploplannernoderepublishgoal) — 1
@@ -334,6 +334,38 @@ run (the homing traverse), deferred the ending to doReturnSync
 (keepAppointmentOnFinish), or merely declined to latch again. The one
 path that answers false while finished is the at-the-cell hold, which is
 gated on a state doPlan cannot be in.
+```
+
+### cell-stop-snapshot
+
+**The cell_stop snapshot** — attached to `double logCellStop(const char* at, double roi_unknown_fraction,`
+
+```text
+cell_stop (gen 41, D2) is the per-cell picture at the moment this
+robot's coverage latch is first set, under either latching criterion
+(latch, cell_latch), including a latch reached after another ending;
+or, for a robot that never latched, at run end from logRunEnd, just
+before run_end. One per robot per run.
+
+The census is FRESH from the planning_map in the 2D modes (the cached
+one is up to a census period old), else the cached per-cell
+observations. worst_cell / worst_u are CellWorld::perCellWorstUnknown
+on that census: the max unknown fraction over the cells not written
+off, -1 when a counted cell is unmeasured. Under cell_latch it is the
+value the latch tested.
+
+roi_unknown_fraction is the ROI value: the value the latch tested under
+latch, a fresh unknownFractionInRoi under cell_latch (whose latch tested
+the worst cell instead), and the last metrics row's value at run end.
+cell_unknown is one unknown fraction per cell id (3 decimals, -1 when
+unmeasured), cell_status the local 0-4 statuses in id order, and
+written_off_ids CellWorld::writtenOffIds() as is. home_cell is
+homeCellId(); it is here because run_start is written before the first
+pose (see home-cell-never-written-off).
+
+Nothing is emitted without a configured cell world. The worst cell is
+computed even with no event log, because the "Per-cell stop:" line
+prints it.
 ```
 
 ### coverage-decision-sample-invariant
@@ -1006,6 +1038,184 @@ without immediately replacing it with another goal. Same stop mechanics as
 enterProximityHold (cancel-all + brake goal at our own pose), none of the
 hold bookkeeping. See the definition for the invariant this enforces and
 the collision that motivated it.
+```
+
+### route-publish-and-ids
+
+**Route publishing and route ids** — attached to `void publishRoute(const std::vector<RouteWaypoint>& waypoints, int64_t id_ns);`
+
+```text
+2d_route (gen 41). Every route-built step goes out on goal_route as a
+nav_msgs/Path, one waypoint or many (R29); walk steps, brakes and legs
+stay on goal_pose. The navigator keys a route on header.stamp: a NEW
+stamp replaces whatever it holds, a repeat of the held stamp is a
+keep-alive it ignores, and any goal_pose preempts the route. So
+publishGoal clears route_active_ (R22): after it the navigator no
+longer holds the route, whatever the step state says.
+
+Ids (R19): nextRouteId() is sim now() in nanoseconds, raised to the last
+published id + 1 on a tie, so ids strictly increase and one id never
+carries two contents. publishRoute stores the id and resets route_sent_
+(the waypoint positions as published), route_passed_ = 0 and
+last_route_pub_time_. It is for NEW ids only: a keep-alive republishes
+the remaining suffix under route_id_ns_ without calling it, and moves
+only last_route_pub_time_.
+
+z follows publishGoal's flatten_goal_z rule; each pose header carries
+the route's stamp and frame.
+```
+
+### route-keepalive-same-id
+
+**Route keep-alive under the held id** — attached to `void republishRoute();`
+
+```text
+R22. While the navigator holds a route, doNavigate must not call
+republishGoal: any goal_pose ends the route at the navigator, and
+republishGoal's change detection would put the head on goal_pose. The
+keep-alive re-sends the held route instead, every goal_republish_sec
+(never when goal_republish_sec <= 0, as republishGoal), under the SAME
+id. The navigator ignores a repeat of its last accepted id, so a live
+route is not restarted at k = 0; a navigator that lost its state (a
+restart) accepts it as new. The content is the unpassed suffix,
+route_plan_.waypoints[route_passed_..], which is what the navigator
+still drives: a navigator that accepts the suffix afresh echoes
+remaining counts that still read as passes against route_sent_. Only
+last_route_pub_time_ moves; route_sent_ and route_passed_ keep the
+indexing of the route as first published under the id.
+
+The same applies at the rotate branch, which a route step never reaches
+(R15: the FOV is omnidirectional, so arrival does not wait on yaw).
+```
+
+### navigate-route-checks
+
+**The route step's checks in NAVIGATE** — attached to `bool routeNavigate();`
+
+```text
+2d_route (gen 41, BUILD_PLAN §4.2 item 2). While a route-built step is
+driven (route_step_active_), each NAVIGATE tick runs, in this order:
+
+a. Passes. The navigator echoes the remaining waypoints on active_route
+   under the held id; the subscription keeps only the id and the count.
+   passed = size - remaining - route_passed_. Each passed waypoint goes
+   into visited_goals_ (R16: route viewpoints test it at the lattice
+   spacing) with route_progress{passed}. The new head becomes
+   current_goal_ and the intent, the nav budget is extended on the new
+   leg and the progress window re-armed (R17), then refreshRoute("pass")
+   re-plans and publishes only on a material change.
+b. P5 (CL). The served cell reads COVERED or COVERED_BY_OTHERS (a
+   write-off included): route_end{cell_finished}, LOG_STEP, no brake.
+   The next PLAN's route or goal replaces the old one at the navigator
+   (R18), so a finished cell costs no stop-go.
+c. Occupied. Every unpassed waypoint now inside an obstacle or its
+   inflation is dropped (route_progress{dropped_occupied}). It is not
+   blacklisted and fails nothing (R24, D6); the single-goal abort is
+   skipped on a route step.
+d. Residual, 1 Hz on sim time. When fewer than minTierCells of the
+   head's marginal tier set are still unknown (or the map geometry
+   changed: -1), the head was seen on the way and is dropped
+   (route_progress{dropped_residual}).
+f. After a drop: an emptied route ends the step (route_end{exhausted},
+   LOG_STEP, no brake); otherwise refreshRoute re-plans and publishes
+   under a new id, since the content changed. Either way the tick ends
+   there: the watchdogs below run on the next tick at the earliest, so
+   no failGoal brake (goal_pose) goes out in the same tick as the new
+   goal_route, whose delivery order across topics is not guaranteed.
+
+e, g and h are doNavigate's own code: arrival only at the last waypoint
+(R21), the watchdogs (route_end{failed} before an unchanged failGoal,
+whose brake ends the route), and the keep-alive (republishRoute while
+route_active_). route_sent_ and route_plan_.waypoints stay index-aligned
+throughout: a drop erases from both, and every drop is followed by a new
+id or the end of the step, so the navigator's echo is always counted
+against the route it holds. wp in route_progress is the waypoint's index
+in the route as published under route_id_ns_; remaining is read after
+the pass or drop.
+```
+
+### route-refresh
+
+**In-route re-plans** — attached to `bool refreshRoute(const char* trigger, bool force_publish);`
+
+```text
+R20 (RP §5.3/§5.4; CL, with no transit trigger). A refresh re-runs the
+builder inside NAVIGATE on the step's stored inputs: the tier cells
+F/F2, their later cells and the route cells, as doPlan committed them.
+It prunes the failed and visited lists on sim time, rebuilds cost_grid_
+and floods it from the current pose (skip_reachability below doPlan's
+floor of 10 reached cells), recomputes the planning_map frontier
+centres as doPlan does, and passes the unpassed waypoints as
+prev_remaining so a re-plan keeps their order. The solve is timed on
+the steady clock.
+
+It publishes under a new id when forced (a waypoint was dropped, so the
+held content changed) or on a material change: routeMaterialChange, the
+head moved more than 1.25 m or the length differs from L_rem by more
+than route_reorder_gain. L_rem is the remaining route on the same flood,
+costTo(held head) plus the held legs after it; a non-finite L_rem counts
+as a change. Otherwise the held route stays (route_plan{published:false,
+reason:no_material_change}). Every refresh emits route_plan{kind:
+refresh} with its trigger (pass, residual, occupied) and the id it
+published or kept.
+
+No tier member (kNone) ends the route (R30): route_plan{reason:
+no_tier_member}, route_end{exhausted}, LOG_STEP. A refresh never
+touches step_, the allocator, the bookkeeping or the "selected goal"
+line. A published refresh replaces route_plan_ and route_sent_
+(publishRoute) and moves route_served_cell_ with the plan, so P5 and
+route_end follow the cell the held route serves (a refresh may switch
+tier); the head change then goes through routeHeadChanged.
+```
+
+### route-head-budget
+
+**Watchdogs across route legs** — attached to `void routeHeadChanged(bool new_leg);`
+
+```text
+R17. NAVIGATE's watchdogs time a route step as a whole.
+state_enter_time_ is never reset (it feeds the state_change dwell and
+the proximity-hold backdating), so each head change sets nav_budget_sec_
+= time since NAVIGATE entry + navBudgetSec(straight distance to the new
+head). failGoal then still reports a true elapsed > budget inequality;
+on nav_goal_failed, elapsed and budget are route-cumulative.
+
+A pass re-arms the no-progress window: reaching the passed waypoint is
+progress. A head change from a refresh (a drop, or a material change)
+extends the budget the same way but does not re-arm the window, so a
+wedged robot whose heads keep being re-planned still fails on no
+progress. Without the extension, a head dropped late in its leg would
+leave its replacement only the old leg's remainder and fail it
+spuriously.
+
+current_goal_ follows the head (score 0, as at the step) because the
+arrival test, failGoal's blacklist and the beacon read it; the intent is
+rebuilt and published at once so peers see the new claim.
+```
+
+### plan-scan-cells-events
+
+**list_cell events from the cell statuses** — attached to `void planScanCells();`
+
+```text
+Coverage loops (P arm, gen 41). list_cell events date each plan cell
+from the cell statuses: "started" when the walk first makes it the
+focus k (doPlan), then exactly one closing event: "finished" if this
+robot had started it, "skipped" if it never had, or "written_off" for
+this robot's own stale-focus write-off (doPlan bookkeeping).
+plan_cell_ev_ holds the per-cell state (0 untouched, 1 started, 2
+closed), so a cell closes once. A cell is finished at COVERED or
+COVERED_BY_OTHERS (CL P1), write-offs included; by is self or
+self_writeoff for a COVERED cell, peer or peer_writeoff for
+COVERED_BY_OTHERS.
+
+While helping, the first time the robot stands in an unfinished cell of
+the helped list it emits help_reached_unfinished (plan_help_reached_):
+help that arrived before the cell was finished.
+
+The scan covers the own list and, while helping, the helped list. It
+runs at every census (updateCellWorld), so a finish is dated to within
+cell_census_period_s, and at every PLAN before the step's "started".
 ```
 
 ### team-world-publish-timer-only
@@ -4509,6 +4719,25 @@ One h_step of slack is the honest tolerance -- anything inside it is a
 circle the ray comb cannot distinguish from a closed one.
 ```
 
+### route-mode-params
+
+**Route params and the omnidirectional requirement** — attached to `if (route_mode_) {`
+
+```text
+planner_mode=2d_route (gen 41) is the 2d_raycast walk with a route
+builder in front of it. The four route params (viewpoint spacing, min
+gain, max viewpoints, reorder gain; BUILD_PLAN §2.8) are declared only
+in this mode, so no other arm carries an inert knob (R26), and they are
+refused rather than clamped when out of range. The builder's other
+inputs (the too-close and failed radii, the 2D sensor model) come from
+the walk's own params in routeParams(), so the route filters and scores
+the way the walk does.
+
+The FOV must be omnidirectional (R15): coverage sets are cast at yaw 0
+and route arrival does not gate on yaw, which only holds for a sensor
+that sees all round.
+```
+
 ### param-utility-cost-exponent
 
 **Clamping the utility cost exponent** — attached to `utility_cost_exponent_ = dp("utility_cost_exponent", 1.0);`
@@ -5246,6 +5475,23 @@ for the floor that makes them so, and how to read replacements off the
 cell_census quantiles rather than guess them.
 ```
 
+### cell-latch-threshold-consistency
+
+**cell_latch needs one threshold** — attached to `if (done_criterion_ == "cell_latch") {`
+
+```text
+done_criterion=cell_latch (gen 41, R3-R6) latches when the worst cell
+not written off reads unknown <= done_unknown_fraction on a fresh
+census of the planning_map. It needs the cell world and a 2D planner
+(the census reads the planning_map), the planning_map coverage source,
+and done_unknown_fraction equal to the effective covered threshold
+(cell_covered_max_unknown_2d). Then "a list cell is finished" and "this
+robot stops" are the same 90%: a robot cannot stop while its own world
+still calls a cell unfinished, nor keep going on cells it already calls
+covered. A mismatch is FATAL, not a warning, because the run would
+measure a different rule from the one its manifest names.
+```
+
 ### teamworld-p2-switch-prereqs
 
 **TeamWorld exchange switch and prerequisites** — attached to `team_world_hz_ = dp("team_world_hz", 0.0);`
@@ -5329,6 +5575,26 @@ part of the P3 claim: it is the machinery P4's reconnection value is
 built from, and turning it on here would fold an untested cost model
 into the phase whose gate is about focus agreement. See
 GlobalAllocator::Config::comms_mask.
+```
+
+### coverage-plan-load
+
+**Loading the coverage plan** — attached to `const std::string coverage_plan_path =`
+
+```text
+P arm (gen 41, R8/R9). A coverage plan is a stored list of cells per
+robot, generated offline and loaded and fully validated by
+loadCoveragePlanFile against this robot's grid and fleet. With a plan,
+this robot's list walk replaces the allocator's tour every step; the
+solve still runs and logs, so the allocation event keeps its fields. It
+needs the route planner (the plan is driven with routes), the cell
+world (cells and statuses; finished = COVERED or COVERED_BY_OTHERS) and
+the allocator (whose block the walk lives in). A missing piece, a
+refused file or no list for this robot is FATAL.
+
+run_start records the path in every arm ("" = no plan, the R and A
+arms) and, with a plan, its version, this robot's list, the list count,
+the helps permutation, the home cell and the file's sha256.
 ```
 
 ### reconnect-gate-p4-silence-vs-info
@@ -7367,6 +7633,28 @@ grid pulled via the topic), over the effective (robot-relative in
 terrain mode) z band.
 ```
 
+### route-orphan-guard
+
+**No route left driving unwatched** — attached to `if (route_active_) {`
+
+```text
+R18. Leaving a route step does not stop the navigator: the next PLAN
+publishes a new route or goal, which replaces the old one with no
+stop-go. A PLAN tick that publishes nothing (no candidates, every
+candidate rejected, starvation) would leave the old route driven with
+nobody watching it, so it ends the route: a brake through abandonNavGoal
+(whose goal_pose clears route_active_) and the step state cleared.
+route_active_ is never set outside 2d_route, so the other modes are
+unaffected.
+
+No route_end is logged here. Every NAVIGATE exit clears route_step_active_
+and logs its own route_end before PLAN runs; the only route still held at
+this point is one endRouteStep left on purpose (cell_finished, exhausted:
+no brake, the next step replaces it), and its id already has its
+route_end. The brake is counted from the INFO line "Abandoning nav goal
+[route-orphaned]". (BUILD_PLAN §5: 'orphaned' left the route_end enum.)
+```
+
 ### plan-trajectory-scoring
 
 **Endpoint versus trajectory EIG scoring** — attached to `{`
@@ -7545,6 +7833,25 @@ this is a handful of ints, and a dangling reference into a structure the
 rest of this function keeps mutating is not worth saving them.
 ```
 
+### plan-walk-replaces-tour
+
+**The plan walk replaces the tour** — attached to `if (plan_active_) {`
+
+```text
+P arm (gen 41, R9, CL P3). The allocator's tour is replaced by
+planWalk: this robot's stored list minus its finished cells, in list
+order, never re-ordered. Once every non-home cell of its own list is
+finished the robot helps, for good: the helped list walked backwards
+from its last non-home cell, then home. tour_source says which ("list"
+or "help"; "allocator" otherwise) and the help event marks the switch.
+
+From the tour, in every arm with the allocator: the tier cells F =
+tour[0] and F2 = tour[1] (R12), the cells after each (the builder's
+tie-break), and the stand cells (route_cells: the own or helped list in
+P, the tour otherwise). The rest of the allocator block (rank bands,
+bookkeeping, write-off) runs on the replaced tour unchanged.
+```
+
 ### alloc-broadcast-tour-every-solve
 
 **Broadcast tour assigned on every solve** — attached to `my_tour_ = tour;`
@@ -7665,6 +7972,29 @@ retained past expiry by the grace window so the vantage contests stay
 closed across delivery gaps, but out here a graced claim would keep a
 frontier candidate yielded to a peer we have not heard from in 10+
 seconds — exploration keeps the original TTL semantics.
+```
+
+### plan-route-branch
+
+**The route branch in front of the walk** — attached to `bool route_found = false;`
+
+```text
+2d_route (gen 41, RP §5.2 + CL P2). With a tier cell and a planning
+map, buildRoute picks viewpoints that cover tier cell F (else F2) and
+orders them into an open route from the robot. It applies the walk's
+filters to its points (too close, map cell, reachability on
+cost_grid_'s flood, visited, failed, MinPos through lost_to_claim), so
+on a route step its rejections are added to the walk tally (C10). With
+no route (kNone) the walk runs exactly as in 2d_raycast, on its own
+tally.
+
+prev_remaining is the held route's unpassed waypoints: when picks match
+them the builder keeps their order, so a re-plan does not turn the
+robot round. The route's head stands in for the walk's pick in
+current_goal_ (score 0). In the step row, info and cost are the route's
+covered area and length and the separation discount is 1; the
+allocator's picked rank is tier - 1 (C9, C11). The solve is timed on
+the steady clock (solve_ms_steady).
 ```
 
 ### plan-amnesty-single-helper
@@ -8090,6 +8420,23 @@ before the ring is ever tried. Termination is preserved: each
 approach must land meaningfully NEARER the trunk than the last
 (computeApproachGoal returns false otherwise), so the resets are
 finite and the hold-and-retry path still runs down the timer.
+```
+
+### navigate-route-completed
+
+**A route step completes at its last waypoint** — attached to `if (route_step_active_) {`
+
+```text
+R21 and BUILD_PLAN §4.2 item 2e. The 0.4 m arrival applies only when
+the head is the last waypoint; the navigator passes the others at its
+pass radius (2.0 m), so an intermediate head never ends the step. On
+arrival the route is consumed: route_passed_ = size (route_end
+{completed} reports waypoints_left 0), and the step state and
+route_active_ are cleared. The navigator finishes the last waypoint on
+its own at its 0.2 m tolerance, so nothing is left for this node to
+drive or watch: the next PLAN passes no prev_remaining, and a PLAN tick
+that publishes nothing does not brake the robot on its viewpoint. Then today's arrival
+runs unchanged: visited entry, clearNear, INTEGRATE.
 ```
 
 ### navigate-visited-goals-break-cycle
@@ -13474,6 +13821,33 @@ exploit give-up timer gets the held time back for the same reason: a
 hold is not target stall.
 ```
 
+### prox-hold-resume-route
+
+**Resuming a route after a hold** — attached to `if (route_step_active_ && prox_route_was_active_) {`
+
+```text
+R23. The hold's brake is a goal_pose, which ended the route at the
+navigator; the navigator keeps that route's id as its last accepted id
+and would ignore it as a keep-alive. So the resume keeps the backdating
+and the fresh progress window, then:
+
+- P5 first: if the served cell finished during the hold, the step ends
+  there (route_end{cell_finished}, LOG_STEP, right after the release's
+  transition to NAVIGATE) instead of re-sending a route that the next
+  PLAN would replace at once;
+- otherwise the unpassed waypoints go out under a NEW id. route_plan_ is
+  trimmed to them, so it stays index-aligned with route_sent_, which
+  publishRoute resets with route_passed_ = 0.
+
+No route_plan event is written for the re-send (the builder does not
+run). The INFO line names the old and new ids, and all of the step's
+events share the envelope's step. A pass the navigator made in the tick
+before the hold and not yet counted is not lost: the re-sent route
+starts at that waypoint, which the navigator passes again on accept if
+the robot is still inside its pass radius, else after a short drive
+back toward it.
+```
+
 ### prox-hold-escape-leg-refund
 
 **Refunding held time to the escape leg** — attached to `if (appointment_escape_active_) {`
@@ -14583,6 +14957,18 @@ pose. Deliberately its own latch and not have_pose_ — that flag drops and
 returns with TF health, and re-recording here would move "home" to
 wherever TF last recovered. The coords are logged so the verify script can
 check them against the scenario's declared spawns.
+```
+
+### home-cell-never-written-off
+
+**The home cell is never written off** — attached to `if (cell_world_.configured()) {`
+
+```text
+R11 (gen 41, all arms, for D3 symmetry): the stale-focus demotion never
+writes off the home cell. Home is the coverage plan's home cell in P,
+else the cell of the home pose. The plan asked for it in run_start, but
+run_start is written before the first pose, so it is logged here, once,
+at home capture, and again as home_cell in cell_stop.
 ```
 
 ### mission-return-breadcrumb-trail

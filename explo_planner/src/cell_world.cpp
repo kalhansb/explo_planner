@@ -319,6 +319,7 @@ std::vector<CellWorld::WireCell> CellWorld::toWire() const {
     WireCell w;
     w.id        = static_cast<uint16_t>(i);
     w.status    = normaliseForWire(cells_[i].status);  // rule 3
+    if (cells_[i].written_off && w.status == 2) w.status |= kWireWrittenOff;
     w.known_by  = cells_[i].known_by;
     w.update_id = cells_[i].update_id;
     out.push_back(w);
@@ -332,7 +333,9 @@ uint32_t CellWorld::sharedHash() const {
   // by accident. configHash() covers geometry; this guards callers that compare
   // digests without comparing grids. (notes: cellworld-shared-hash-count)
   f.i64(static_cast<int64_t>(cells_.size()));
-  for (const auto& c : cells_) f.byte(normaliseForWire(c.status));
+  // The byte toWire() sends, so a write-off counts as shared belief and the
+  // digest is unchanged while nothing is written off.
+  for (const WireCell& w : toWire()) f.byte(w.status);
   return f.h;
 }
 
@@ -399,11 +402,32 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
   for (const WireCell& w : cells) {
     const int id = static_cast<int>(w.id);
     if (!grid_.valid(id)) { ++st.out_of_range; continue; }
-    if (w.status > 2)     { ++st.bad_status;   continue; }
+    // Only COVERED may carry the write-off bit: 0x80, 0x81, 0x83.. are garbage.
+    const bool wo = w.status == (2u | kWireWrittenOff);
+    if (w.status > 2 && !wo) { ++st.bad_status; continue; }
 
     Cell& c = cells_[static_cast<size_t>(id)];
     const CellStatus peer  = fromWire(w.status);
     const CellStatus local = c.status;
+
+    // A write-off is team-wide (CL D2), so it is adopted ahead of local
+    // priority: every robot must drop the same cells from its stop rule.
+    if (wo) {
+      const uint32_t before = c.known_by;
+      c.known_by |= w.known_by | sender_bit;
+      if (!c.written_off) {
+        c.written_off = true;  // pins classify(), as an own write-off does
+        // Relayed, so no update_id bump (rule 1).
+        if (normaliseForWire(local) != 2)
+          c.status = CellStatus::COVERED_BY_OTHERS;
+        ++st.applied;
+      } else if (c.known_by != before) {
+        ++st.known_by_only;
+      } else {
+        ++st.agreed_noop;
+      }
+      continue;
+    }
 
     // mTARE's local-priority rule: a peer update to a cell in the
     // local-priority neighbourhood that we are EXPLORING is refused entirely,
@@ -427,6 +451,9 @@ CellWorld::MergeStats CellWorld::mergeWire(int sender_id,
       else                      ++st.agreed_noop;
       continue;
     }
+
+    // Nobody lowers a write-off, not even a source in known_by (CL P4/D2).
+    if (c.written_off) { ++st.refused_guard; continue; }
 
     // --- the guard table, on disagreement -----------------------------------
     CellStatus adopt = local;
@@ -499,6 +526,33 @@ CellWorld::Census CellWorld::census() const {
     }
   }
   return c;
+}
+
+double CellWorld::perCellWorstUnknown(const std::vector<CellObservation>& fresh,
+                                      int* worst_id) const {
+  if (worst_id) *worst_id = -1;
+  if (!configured() || fresh.size() != cells_.size()) return -1.0;
+  double worst = 0.0;
+  int wid = -1;
+  for (size_t i = 0; i < cells_.size(); ++i) {
+    if (cells_[i].written_off) continue;
+    const double u = fresh[i].unknownFraction();
+    // The -1 sentinel would pass any <= test: unmeasured is never done.
+    if (u < 0.0) {
+      if (worst_id) *worst_id = static_cast<int>(i);
+      return -1.0;
+    }
+    if (wid < 0 || u > worst) { worst = u; wid = static_cast<int>(i); }
+  }
+  if (worst_id) *worst_id = wid;
+  return worst;
+}
+
+std::vector<int> CellWorld::writtenOffIds() const {
+  std::vector<int> out;
+  for (size_t i = 0; i < cells_.size(); ++i)
+    if (cells_[i].written_off) out.push_back(static_cast<int>(i));
+  return out;
 }
 
 // --- Adjacency -------------------------------------------------------------

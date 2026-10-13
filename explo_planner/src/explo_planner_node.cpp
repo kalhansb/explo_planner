@@ -54,6 +54,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav2_msgs/action/navigate_to_pose.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
@@ -80,6 +81,8 @@
 #include "explo_planner/failed_goal_blacklist.hpp"
 #include "explo_planner/fleet_identity.hpp"
 #include "explo_planner/cell_world.hpp"
+#include "explo_planner/coverage_plan.hpp"
+#include "explo_planner/route_builder.hpp"
 #include "explo_planner/separation.hpp"
 #include "explo_planner/global_allocator.hpp"
 #include "explo_planner/reconnect_gate.hpp"
@@ -161,6 +164,27 @@ enum class Phase { EXPLORE, EXPLOIT };
 // comms link-index subscription. (notes: latched-qos-contract)
 inline rclcpp::QoS latchedQos() {
   return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+}
+
+// Gen 41 csv event fields (cell_census, cell_stop): ids comma-separated in the
+// order given, and one unknown fraction per cell id at 3 decimals, -1 when the
+// cell cannot be measured.
+inline std::string joinIds(const std::vector<int>& ids) {
+  std::string s;
+  for (size_t i = 0; i < ids.size(); ++i)
+    s += (i ? "," : "") + std::to_string(ids[i]);
+  return s;
+}
+inline std::string unknownCsv(const std::vector<double>& u) {
+  std::string s;
+  char buf[16];
+  for (size_t i = 0; i < u.size(); ++i) {
+    if (u[i] < 0.0) std::snprintf(buf, sizeof(buf), "-1");
+    else            std::snprintf(buf, sizeof(buf), "%.3f", u[i]);
+    s += (i ? "," : "");
+    s += buf;
+  }
+  return s;
 }
 
 // ==================================================================
@@ -255,6 +279,13 @@ private:
   /// that published a goal or changed state must return true.
   /// (notes: latch-coverage-done-return-contract)
   bool maybeLatchCoverageDone(double unk, const char* source);
+  /// cell_stop (D2): each cell's unknown fraction, status and write-off, at
+  /// this robot's latch (`at` "latch") or at run end when it never latched.
+  /// Returns the worst unknown fraction over the cells not written off (-1:
+  /// cannot measure) and its cell in *worst_id. Computes even with no log.
+  /// (notes: cell-stop-snapshot)
+  double logCellStop(const char* at, double roi_unknown_fraction,
+                     int* worst_id);
   /// Records the unknown fraction a completion decision tested, for
   /// recordExplorationComplete to stamp. Every termination path calls it except
   /// doLogStep's step-budget ending, where fillCommonMetrics already wrote it.
@@ -268,6 +299,10 @@ private:
   // done_coverage_source_. Sets *source to the label of the source actually
   // used ("planning_map" / "scovox"); returns -1 when it cannot measure.
   double coverageUnknownFraction(const char** source) const;
+  /// done_criterion=cell_latch measure (R4): the worst unknown fraction over the
+  /// cells not written off, on a fresh census of the planning_map; -1 with no
+  /// map or an unmeasured cell, named in *worst_id. *source = "planning_map".
+  double cellLatchUnknown(const char** source, int* worst_id) const;
   bool isCellFree(const Eigen::Vector3f& pos) const;
   bool isCellOccupied(const Eigen::Vector3f& pos) const;
 
@@ -312,6 +347,66 @@ private:
   void updateCellWorld(double roi_unknown_fraction, const char* coverage_source);
   /// Draw the cell world as a flat colour-coded grid on its own topic.
   void publishCellViz();
+
+  // --- 2d_route and coverage loops (gen 41) ---
+  /// Puts a route step on goal_route under id_ns (header.stamp), even a single
+  /// waypoint (R29). Sets route_active_, route_id_ns_, route_sent_,
+  /// route_passed_ = 0 and last_route_pub_time_: a NEW id only, never a
+  /// keep-alive. (notes: route-publish-and-ids)
+  void publishRoute(const std::vector<RouteWaypoint>& waypoints, int64_t id_ns);
+  /// Next route id (R19): sim now() in ns, above the last id published.
+  int64_t nextRouteId() const;
+  /// Unpassed waypoints of the held route: route_sent_ from route_passed_.
+  std::vector<Eigen::Vector3f> routeRemaining() const;
+  /// The route builder's parameters: the four route params plus the walk's
+  /// too-close and failed radii and the 2D sensor model.
+  RouteParams routeParams() const;
+  /// Ends the route step's bookkeeping: route_step_active_ false and
+  /// route_served_cell_ -1. Does not touch the navigator.
+  void clearRouteStep();
+  /// route_plan event for a step or refresh of route plan rp under id_ns.
+  void logRoutePlan(const char* kind, const char* trigger, const RoutePlan& rp,
+                    int64_t id_ns, double solve_ms, bool published,
+                    const char* reason);
+  /// route_end event for the held route (route_id_ns_, route_plan_).
+  void logRouteEnd(const char* reason);
+  /// route_progress event for waypoint wp of the held route (its index as
+  /// published under route_id_ns_); `remaining` is read after the action.
+  void logRouteProgress(int wp, const char* action, const Eigen::Vector3f& pos);
+  /// Puts waypoints[from..] on goal_route under id_ns and stamps
+  /// last_route_pub_time_; publishRoute and the keep-alive share it.
+  void sendRoutePath(const std::vector<RouteWaypoint>& waypoints, size_t from,
+                     int64_t id_ns);
+  /// Keep-alive (R22): the held route's unpassed waypoints under the SAME id,
+  /// every goal_republish_sec_. (notes: route-keepalive-same-id)
+  void republishRoute();
+  /// A route step's NAVIGATE checks a-d and f (BUILD_PLAN §4.2 item 2), in
+  /// order; true when the step ended and NAVIGATE was left.
+  /// (notes: navigate-route-checks)
+  bool routeNavigate();
+  /// In-route re-plan (R20, R30) on the step's stored cells; never a step.
+  /// Publishes a new id on force_publish or a material change; true when it
+  /// found no tier member and ended the step. (notes: route-refresh)
+  bool refreshRoute(const char* trigger, bool force_publish);
+  /// The head changed: current_goal_ and the intent follow it and the nav
+  /// budget is extended on the new leg (R17); new_leg (a pass) also re-arms
+  /// the progress window. (notes: route-head-budget)
+  void routeHeadChanged(bool new_leg);
+  /// P5: the cell the route step serves reads COVERED or COVERED_BY_OTHERS.
+  bool routeCellFinished() const;
+  /// Ends the route step without a brake (R18): route_end{reason}, the claim
+  /// released, the step state cleared, NAVIGATE -> LOG_STEP.
+  void endRouteStep(const char* reason, const char* transition_reason);
+  /// The cell never written off (R11): the plan's home in P, else the cell of
+  /// home_pos_ once captured; -1 otherwise.
+  int homeCellId() const;
+  /// A plan cell is finished when COVERED or COVERED_BY_OTHERS (CL P1).
+  bool planCellFinished(int cell) const;
+  /// list_cell finished/skipped/help_reached_unfinished events from the cell
+  /// statuses; P only. (notes: plan-scan-cells-events)
+  void planScanCells();
+  /// list_cell event for one cell, named by its place in the walked list.
+  void logListCell(int cell, const char* action, const char* by);
 
   // --- Parameters ---
   std::string robot_name_;
@@ -580,6 +675,55 @@ private:
   // The sensor model the 2d_raycast gain casts with (fov_* params).
   FovConfig fov_cfg_2d_;
 
+  // ---- planner_mode=2d_route (gen 41) ----
+  // A route over the tier cell replaces the walk's single goal when one can be
+  // built (RP §5.2, CL P2); the walk is the 2d_raycast walk, unchanged.
+  bool route_mode_ = false;
+  // The four route params (spacing, min gain, max viewpoints, reorder gain);
+  // routeParams() adds the rest.
+  RouteParams route_cfg_;
+  std::string active_route_topic_;   // the navigator's remaining route (N2)
+  // Route state. route_active_: the navigator holds route_id_ns_ (cleared by
+  // any goal_pose publish, R22). route_sent_ is the route as last published
+  // under a new id; route_passed_ counts its waypoints passed.
+  bool    route_active_ = false;
+  int64_t route_id_ns_ = 0;
+  std::vector<Eigen::Vector3f> route_sent_;
+  int     route_passed_ = 0;
+  rclcpp::Time last_route_pub_time_{0, 0, RCL_ROS_TIME};
+  // The held route's plan (the step's, or the last refresh's).
+  RoutePlan route_plan_;
+  // Route step state, valid while route_step_active_ (this NAVIGATE drives a
+  // route-built step): the cell it serves (P5) and the step's builder inputs,
+  // which refreshes reuse. Walk steps leave it inactive with cell -1.
+  bool    route_step_active_ = false;
+  int     route_served_cell_ = -1;
+  int     route_step_tier_cells_[2] = {-1, -1};
+  std::vector<int> route_step_later_[2];
+  std::vector<int> route_step_cells_;
+  rclcpp::Time route_start_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_residual_check_{0, 0, RCL_ROS_TIME};
+  // The navigator's active_route feedback for route_id_ns_ only: the id and
+  // the remaining count of the last message (a drop is a pass).
+  int64_t last_active_route_id_ns_ = 0;
+  int     last_active_route_n_ = 0;
+  bool    have_active_route_msg_ = false;
+  // route_active_ at hold entry: the resume re-sends the route (R23).
+  bool    prox_route_was_active_ = false;
+
+  // ---- Coverage plan (P arm, gen 41) ----
+  // coverage_plan_path loaded: the stored list walk replaces the allocator's
+  // tour (R9). plan_cell_ev_ per cell: 0 untouched, 1 started, 2 closed
+  // (finished/skipped/written_off emitted); plan_help_reached_ per cell: the
+  // help_reached_unfinished event was emitted.
+  bool plan_active_ = false;
+  CoveragePlan plan_;
+  int  plan_my_list_ = -1;
+  bool plan_helping_ = false;
+  int  plan_help_list_ = -1;
+  std::vector<uint8_t> plan_cell_ev_;
+  std::vector<uint8_t> plan_help_reached_;
+
   // --- Exploitation ---
   // Phase 2 (DESIGN_gen34.md Q66). Read so a launch file that sets it is
   // checked, and fatal when true; the node explores only.
@@ -593,6 +737,9 @@ private:
   std::unique_ptr<MetricsLogger> logger_;
   std::unique_ptr<ExperimentLog> exp_log_;
   std::unique_ptr<CostGrid> cost_grid_;
+  // The route builder's pairwise-flood scratch (2d_route); never cost_grid_,
+  // whose flood from the robot the builder reads.
+  std::unique_ptr<CostGrid> route_pair_grid_;
   std::unique_ptr<Coordination> coord_;
   std::unique_ptr<ProximityGuard> prox_guard_;
 
@@ -753,6 +900,10 @@ private:
       fusion_counters_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr plan_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
+  // Route steps (2d_route): nav_msgs/Path, header.stamp = the route id.
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr goal_route_pub_;
+  // The navigator's remaining route (2d_route only).
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr active_route_sub_;
   // Last goal actually put on the wire, for republishGoal()'s change
   // detection + keep-alive throttle. Not valid until have_last_goal_pub_.
   Eigen::Vector3f last_goal_pub_pos_ = Eigen::Vector3f::Zero();
@@ -1210,8 +1361,10 @@ ExploPlannerNode::ExploPlannerNode()
   // "latch" (default): own fused-map ROI unknown fraction, tested every metrics
   // tick in every state, on first touch, no rendezvous gate. "streak": the
   // doPlan-top test described above. (notes: param-done-criterion-latch)
+  // "cell_latch" (gen 41, R3): the latch on the worst cell instead of the ROI.
   done_criterion_ = dp("done_criterion", std::string("latch"));
-  if (done_criterion_ != "latch" && done_criterion_ != "streak") {
+  if (done_criterion_ != "latch" && done_criterion_ != "streak" &&
+      done_criterion_ != "cell_latch") {
     RCLCPP_WARN(get_logger(),
         "Unknown done_criterion '%s' — falling back to 'latch'.",
         done_criterion_.c_str());
@@ -1334,13 +1487,14 @@ ExploPlannerNode::ExploPlannerNode()
   // that silently ran 3d would carry a 2d arm's name.
   planner_mode_ = dp("planner_mode", std::string("3d"));
   if (planner_mode_ != "3d" && planner_mode_ != "2d_frontier" &&
-      planner_mode_ != "2d_raycast") {
+      planner_mode_ != "2d_raycast" && planner_mode_ != "2d_route") {
     RCLCPP_FATAL(get_logger(),
-        "planner_mode='%s' is not 3d, 2d_frontier or 2d_raycast.",
+        "planner_mode='%s' is not 3d, 2d_frontier, 2d_raycast or 2d_route.",
         planner_mode_.c_str());
     throw std::runtime_error("unknown planner_mode '" + planner_mode_ + "'");
   }
   planner_2d_ = planner_mode_ != "3d";
+  route_mode_ = planner_mode_ == "2d_route";
   grid_frontier_min_cells_ =
       std::max(1, static_cast<int>(dp("grid_frontier_min_cells", 3)));
   if (planner_2d_) {
@@ -1351,7 +1505,9 @@ ExploPlannerNode::ExploPlannerNode()
         planner_mode_.c_str(), grid_frontier_min_cells_,
         frontier_cluster_radius_m_,
         planner_mode_ == "2d_frontier" ? "frontier length"
-                                       : "unknown grid area in view");
+        : route_mode_ ? "unknown grid area in view, and routes cover the "
+                        "focus cell where they can"
+                      : "unknown grid area in view");
   }
 
   // FOV evaluation. Defaults are the VLP-16 the robots carry, matching the SDF;
@@ -1395,6 +1551,34 @@ ExploPlannerNode::ExploPlannerNode()
   fcfg.roi_min_z = roi_min_z_;
   fcfg.roi_max_z = roi_max_z_;
   fov_cfg_2d_ = fcfg;
+
+  // 2d_route (gen 41). Declared only in route mode (no inert knobs, R26) and
+  // refused rather than clamped. Coverage sets are cast at yaw 0, so the
+  // sensor must be omnidirectional (R15). (notes: route-mode-params)
+  if (route_mode_) {
+    if (!fov_is_omnidirectional_) {
+      RCLCPP_FATAL(get_logger(),
+          "planner_mode=2d_route needs an omnidirectional FOV model (fov_hfov "
+          "%.4f rad over %d rays is directional): route coverage sets are cast "
+          "at yaw 0.", fcfg.hfov, fcfg.h_rays);
+      throw std::runtime_error("2d_route requires an omnidirectional FOV");
+    }
+    route_cfg_.spacing_m      = dp_f("route_viewpoint_spacing_m", 2.5);
+    route_cfg_.min_gain_m2    = dp_f("route_min_gain_m2", 20.0);
+    route_cfg_.max_viewpoints = dp("route_max_viewpoints", 12);
+    route_cfg_.reorder_gain   = dp_f("route_reorder_gain", 0.10);
+    if (!(route_cfg_.spacing_m > 0.0f) || !(route_cfg_.min_gain_m2 > 0.0f) ||
+        route_cfg_.max_viewpoints < 1 ||
+        !(route_cfg_.reorder_gain >= 0.0f && route_cfg_.reorder_gain < 1.0f)) {
+      RCLCPP_FATAL(get_logger(),
+          "2d_route params out of range: route_viewpoint_spacing_m=%.3f and "
+          "route_min_gain_m2=%.3f must be > 0, route_max_viewpoints=%d >= 1, "
+          "route_reorder_gain=%.3f in [0, 1).",
+          route_cfg_.spacing_m, route_cfg_.min_gain_m2,
+          route_cfg_.max_viewpoints, route_cfg_.reorder_gain);
+      throw std::runtime_error("2d_route params out of range");
+    }
+  }
 
   // 0 = auto -> candidate_max_radius + 2 m slack at flood time.
   cost_grid_radius_cap_m_ = dp("cost_grid_radius_cap_m", 0.0);
@@ -1684,6 +1868,12 @@ ExploPlannerNode::ExploPlannerNode()
     exp_log_->addParamStr("done_criterion", done_criterion_);
     exp_log_->addParamStr("done_action", done_action_);
     exp_log_->addParamStr("planner_mode", planner_mode_);
+    if (route_mode_) {
+      exp_log_->addParamNum("route_viewpoint_spacing_m", route_cfg_.spacing_m);
+      exp_log_->addParamNum("route_min_gain_m2", route_cfg_.min_gain_m2);
+      exp_log_->addParamNum("route_max_viewpoints", route_cfg_.max_viewpoints);
+      exp_log_->addParamNum("route_reorder_gain", route_cfg_.reorder_gain);
+    }
     exp_log_->addParamNum("grid_frontier_min_cells", grid_frontier_min_cells_);
     exp_log_->addParamNum("mission_home_tol_m", mission_home_tol_m_);
     exp_log_->addParamNum("mission_return_max_sec", mission_return_max_sec_);
@@ -1718,6 +1908,7 @@ ExploPlannerNode::ExploPlannerNode()
         "events. Only the per-step CSV will be written.");
   }
   cost_grid_ = std::make_unique<CostGrid>();
+  route_pair_grid_ = std::make_unique<CostGrid>();
   // Bound peer-advertised claim radii by our own exploration disc — the largest
   // claim this planner considers legitimate. Resolved above, so the auto
   // (= fov_max_range) case is already a concrete number here.
@@ -1729,6 +1920,16 @@ ExploPlannerNode::ExploPlannerNode()
   // --- ROS interfaces ---
   std::string goal_topic = dp("goal_topic",
       std::string("/" + robot_name_ + "/goal_pose"));
+  // The navigator's route topics (2d_route, gen 41): routes out, its remaining
+  // route back.
+  const std::string goal_route_topic = dp("goal_route_topic",
+      std::string("/" + robot_name_ + "/goal_route"));
+  active_route_topic_ = dp("active_route_topic",
+      std::string("/" + robot_name_ + "/simple_nav_3d/active_route"));
+  if (exp_log_ && route_mode_) {
+    exp_log_->addParamStr("goal_route_topic", goal_route_topic);
+    exp_log_->addParamStr("active_route_topic", active_route_topic_);
+  }
   // The same OccupancyGrid the global planner consumes. We use it to
   // reject candidate viewpoints whose cell is occupied/inflated/unknown
   // before publishing them as goals.
@@ -1832,6 +2033,25 @@ ExploPlannerNode::ExploPlannerNode()
       exp_log_->addParamNum("cell_grid_hash", cell_world_.grid().configHash());
       exp_log_->addParamNum("cell_nx", cell_world_.grid().nx);
       exp_log_->addParamNum("cell_ny", cell_world_.grid().ny);
+    }
+  }
+  // R6: cell_latch stops at the per-cell threshold that finishes a cell, on the
+  // planning_map the 2D census reads. (notes: cell-latch-threshold-consistency)
+  if (done_criterion_ == "cell_latch") {
+    const double cov_max = cell_world_enable_
+        ? cell_world_.config().covered_max_unknown : -1.0;
+    if (!cell_world_enable_ || !planner_2d_ ||
+        done_coverage_source_ != "planning_map" ||
+        std::abs(done_unknown_fraction_ - cov_max) > 1e-9) {
+      RCLCPP_FATAL(get_logger(),
+          "done_criterion=cell_latch needs cell_world_enable=true (%s), a 2D "
+          "planner_mode (%s), done_coverage_source=planning_map (%s) and "
+          "done_unknown_fraction=%.6f equal to the effective "
+          "cell_covered_max_unknown(_2d)=%.6f.",
+          cell_world_enable_ ? "true" : "false", planner_mode_.c_str(),
+          done_coverage_source_.c_str(), done_unknown_fraction_, cov_max);
+      throw std::runtime_error("done_criterion=cell_latch: inconsistent "
+                               "thresholds or sources");
     }
   }
 
@@ -2018,7 +2238,7 @@ ExploPlannerNode::ExploPlannerNode()
       cell_world_.configured() ? cell_world_.grid().configHash() : 0u;
 
   if (exp_log_) {
-    exp_log_->setSchemaVersion(ExperimentLog::kGen34SchemaVersion);
+    exp_log_->setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
     exp_log_->addParamStr("arm", gen34::armName(arm_));
     exp_log_->addParamNum("expected_peers", expectedPeers());
     exp_log_->addParamBool("cell_merge_local_priority",
@@ -2112,6 +2332,68 @@ ExploPlannerNode::ExploPlannerNode()
       exp_log_->addParamNum("global_alloc_max_candidates",
                             alloc_cfg_.max_candidates);
       exp_log_->addParamNum("global_alloc_focus_skip_k", alloc_focus_skip_k_);
+    }
+  }
+
+  // 2d_route serves the allocator's focus cell; without it every step would
+  // silently be a 2d_raycast walk step.
+  if (route_mode_ && (!cell_world_enable_ || !global_alloc_enable_)) {
+    RCLCPP_FATAL(get_logger(),
+        "planner_mode=2d_route needs cell_world_enable=true and "
+        "global_alloc_enable=true.");
+    throw std::runtime_error(
+        "2d_route requires cell_world_enable and global_alloc_enable");
+  }
+
+  // ---- Coverage plan (gen 41, P arm) ----------------------------------------
+  // "" = no plan (R and A arms). A plan replaces the allocator's tour with this
+  // robot's stored list (R9), so it needs the route planner, the cell world
+  // and the allocator, whose bookkeeping it keeps. (notes: coverage-plan-load)
+  const std::string coverage_plan_path =
+      dp("coverage_plan_path", std::string(""));
+  if (!coverage_plan_path.empty()) {
+    if (!route_mode_ || !cell_world_enable_ || !global_alloc_enable_) {
+      RCLCPP_FATAL(get_logger(),
+          "coverage_plan_path='%s' needs planner_mode=2d_route (%s), "
+          "cell_world_enable=true and global_alloc_enable=true.",
+          coverage_plan_path.c_str(), planner_mode_.c_str());
+      throw std::runtime_error("coverage_plan_path requires 2d_route, "
+                               "cell_world_enable and global_alloc_enable");
+    }
+    std::string err;
+    if (!loadCoveragePlanFile(coverage_plan_path, cell_world_.grid(),
+                              team_robot_names_, &plan_, &err)) {
+      RCLCPP_FATAL(get_logger(), "coverage plan '%s' refused: %s",
+                   coverage_plan_path.c_str(), err.c_str());
+      throw std::runtime_error("coverage plan refused: " + err);
+    }
+    plan_my_list_ = planListOf(plan_, robot_name_);
+    if (plan_my_list_ < 0) {
+      RCLCPP_FATAL(get_logger(),
+          "coverage plan '%s' has no list for robot '%s'.",
+          coverage_plan_path.c_str(), robot_name_.c_str());
+      throw std::runtime_error("coverage plan has no list for " + robot_name_);
+    }
+    plan_active_ = true;
+    plan_cell_ev_.assign(static_cast<size_t>(cell_world_.size()), 0);
+    plan_help_reached_.assign(static_cast<size_t>(cell_world_.size()), 0);
+    RCLCPP_INFO(get_logger(),
+        "Coverage plan '%s' v%d: list %d of %zu (%zu cells, home cell %d), "
+        "helps list %d once its own cells are finished.",
+        coverage_plan_path.c_str(), plan_.version, plan_my_list_,
+        plan_.lists.size(), plan_.lists[static_cast<size_t>(plan_my_list_)].size(),
+        plan_.home_id, plan_.helps[static_cast<size_t>(plan_my_list_)]);
+  }
+  if (exp_log_) {
+    exp_log_->addParamStr("coverage_plan_path", coverage_plan_path);
+    if (plan_active_) {
+      exp_log_->addParamNum("coverage_plan_version", plan_.version);
+      exp_log_->addParamNum("coverage_plan_list", plan_my_list_);
+      exp_log_->addParamNum("coverage_plan_n_lists",
+                            static_cast<double>(plan_.lists.size()));
+      exp_log_->addParamStr("coverage_plan_helps", joinIds(plan_.helps));
+      exp_log_->addParamNum("coverage_plan_home_cell", plan_.home_id);
+      exp_log_->addParamStr("coverage_plan_sha256", plan_.source_sha256);
     }
   }
 
@@ -2263,6 +2545,22 @@ ExploPlannerNode::ExploPlannerNode()
 
   goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       goal_topic, 10);
+  goal_route_pub_ = create_publisher<nav_msgs::msg::Path>(goal_route_topic, 10);
+  // The navigator's remaining route, echoed under the held route's id: only
+  // the count is kept, for the current id; doNavigate reads a drop as passes.
+  if (route_mode_) {
+    active_route_sub_ = create_subscription<nav_msgs::msg::Path>(
+        active_route_topic_, 10,
+        [this](nav_msgs::msg::Path::SharedPtr msg) {
+          const int64_t id =
+              static_cast<int64_t>(msg->header.stamp.sec) * 1000000000LL +
+              static_cast<int64_t>(msg->header.stamp.nanosec);
+          if (id != route_id_ns_) return;
+          last_active_route_id_ns_ = id;
+          last_active_route_n_ = static_cast<int>(msg->poses.size());
+          have_active_route_msg_ = true;
+        });
+  }
 
   viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "~/candidates", 10);
@@ -3135,6 +3433,12 @@ void ExploPlannerNode::applyActivity() {
     // The exploration claim is released: a peer may take the goal this robot
     // is leaving.
     have_active_intent_ = false;
+    // A route step ends here; the team state's goal or brake clears the route
+    // at the navigator (publishGoal).
+    if (route_step_active_) {
+      logRouteEnd("preempted");
+      clearRouteStep();
+    }
   }
   const char* act = gen34::activityName(team_out_.activity);
   if (holding) leaveProximityHold(act);
@@ -3449,12 +3753,22 @@ void ExploPlannerNode::doPlan() {
   // low-unknown ticks. Under latch it repeats the metrics-tick check so it
   // works with the sampler off; maybeLatchCoverageDone is idempotent.
   // (notes: plan-coverage-saturation-check)
-  if (done_criterion_ == "latch") {
+  if (done_criterion_ == "latch" || done_criterion_ == "cell_latch") {
     if (done_unknown_fraction_ > 0.0) {
       const char* cov_src = "";
-      const double unk = coverageUnknownFraction(&cov_src);
+      // cell_latch: the worst cell on a fresh census (R4), not the ROI.
+      int unmeasured_cell = -1;
+      const double unk = done_criterion_ == "cell_latch"
+                             ? cellLatchUnknown(&cov_src, &unmeasured_cell)
+                             : coverageUnknownFraction(&cov_src);
       if (maybeLatchCoverageDone(unk, cov_src)) return;
-      if (unk < 0.0) {
+      if (unk < 0.0 && done_criterion_ == "cell_latch") {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+            "Coverage termination (cell_latch, done_unknown_fraction=%.3f) "
+            "INACTIVE: cell %d cannot be measured on the planning_map (no map, "
+            "or no columns); stopping only at max_steps=%d.",
+            done_unknown_fraction_, unmeasured_cell, max_steps_);
+      } else if (unk < 0.0) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
             "Coverage termination (done_unknown_fraction=%.3f) INACTIVE: "
             "source '%s' cannot measure the ROI unknown fraction (no "
@@ -3573,6 +3887,12 @@ void ExploPlannerNode::doPlan() {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "No valid candidates. Retrying next tick.");
     noteStarvedPlan();
+    // R18: publishing nothing must not leave a held route driven unwatched.
+    // (notes: route-orphan-guard)
+    if (route_active_) {
+      abandonNavGoal("route-orphaned");  // the step's route_end is already out
+      clearRouteStep();
+    }
     return;
   }
 
@@ -3619,8 +3939,9 @@ void ExploPlannerNode::doPlan() {
                           && cost_grid_ && !skip_reachability;
     if (planner_2d_) {
       // 2d_frontier keeps the lengths set above (polar candidates score 0);
-      // 2d_raycast scores every candidate by the unknown area in view.
-      if (planner_mode_ == "2d_raycast" && latest_plan_map_) {
+      // 2d_raycast, and 2d_route for its fallback walk, score every candidate
+      // by the unknown area in view.
+      if ((planner_mode_ == "2d_raycast" || route_mode_) && latest_plan_map_) {
         const float res = latest_plan_map_->info.resolution;
         for (auto& c : candidates) {
           c.score = res * res * static_cast<float>(gridVisibleUnknown(
@@ -3723,6 +4044,10 @@ void ExploPlannerNode::doPlan() {
   Allocation alloc;
   AllocationEvent alloc_ev;
   bool alloc_ran = false;
+  // The route step's cells (R12): tier cells F (k) and F2 (k+1, -1 if none),
+  // the tie-break cells after each, and the stand cells. Route mode reads them.
+  int step_F = -1, step_F2 = -1;
+  std::vector<int> step_route_cells, step_later[2];
   if (global_alloc_enable_ && cell_world_.configured()) {
     alloc_ran = true;
     const CellGrid& g = cell_world_.grid();
@@ -3749,10 +4074,50 @@ void ExploPlannerNode::doPlan() {
     std::vector<int> tour;
     if (self_idx >= 0 && self_idx < static_cast<int>(alloc.tours.size()))
       tour = alloc.tours[static_cast<size_t>(self_idx)];
+    // P (R9): the stored list's unfinished cells replace the tour every step
+    // (CL P3); the solve and its logging stay. (notes: plan-walk-replaces-tour)
+    if (plan_active_) {
+      const PlanWalk w = planWalk(plan_, plan_my_list_, plan_helping_,
+                                  [this](int c) { return planCellFinished(c); });
+      plan_helping_   = w.helping;
+      plan_help_list_ = w.help_list;
+      tour = w.remaining;
+      step_route_cells = w.route_cells;
+      alloc_ev.tour_source = plan_helping_ ? "help" : "list";
+      if (w.help_started_now) {
+        const int tc = w.help_target_cell;
+        const int tcol = g.valid(tc) ? g.col(tc) : -1;
+        const int trow = g.valid(tc) ? g.row(tc) : -1;
+        RCLCPP_INFO(get_logger(),
+            "Coverage plan: list %d finished; helping list %d from its cell %d "
+            "[%d,%d].", plan_my_list_, w.help_list, tc, tcol, trow);
+        if (exp_log_) {
+          exp_log_->logTeamEvent(expCtx(), "help", LogFields{
+              LogField::integer("list", plan_my_list_),
+              LogField::integer("target_list", w.help_list),
+              LogField::integer("target_cell", tc),
+              LogField::integer("target_col", tcol),
+              LogField::integer("target_row", trow)});
+        }
+      }
+    } else {
+      step_route_cells = tour;
+    }
     // Broadcast copy, assigned on every solve including empty ones, so a
     // refused allocation clears the route on the air rather than leaving a
     // stale one. (notes: alloc-broadcast-tour-every-solve)
     my_tour_ = tour;
+    step_F  = tour.empty() ? -1 : tour[0];
+    step_F2 = tour.size() > 1 ? tour[1] : -1;
+    if (tour.size() > 1) step_later[0].assign(tour.begin() + 1, tour.end());
+    if (tour.size() > 2) step_later[1].assign(tour.begin() + 2, tour.end());
+    if (plan_active_) {
+      planScanCells();
+      if (step_F >= 0 && plan_cell_ev_[static_cast<size_t>(step_F)] == 0) {
+        plan_cell_ev_[static_cast<size_t>(step_F)] = 1;
+        logListCell(step_F, "started", "self");
+      }
+    }
     bool reordered = false;
     if (!tour.empty()) {
       // cell id -> tour rank of the earliest tour cell whose neighbourhood
@@ -3948,12 +4313,69 @@ void ExploPlannerNode::doPlan() {
   };
 
   WalkTally tally;
-  for (size_t idx : order) {
-    if (!admissible(idx, tally)) continue;
-    current_goal_ = candidates[idx];
-    selected_idx = idx;
-    found = true;
-    break;
+  // 2d_route: a route serving tier cell F (else F2) replaces the walk; kNone
+  // runs the walk unchanged. The builder applies the walk's filters, its
+  // rejections count viewpoints (C10). (notes: plan-route-branch)
+  bool route_found = false;
+  RoutePlan route_pick;
+  double route_solve_ms = -1.0;
+  if (route_mode_ && step_F >= 0 && latest_plan_map_ && !skip_reachability) {
+    RouteInputs in;
+    in.map  = latest_plan_map_.get();
+    in.roi  = {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_};
+    in.grid = &cell_world_.grid();
+    in.robot = robot_pos;
+    in.route_cells = step_route_cells;
+    in.tier_cell[0] = step_F;
+    in.tier_cell[1] = step_F2;
+    in.later_cells[0] = step_later[0];
+    in.later_cells[1] = step_later[1];
+    for (const auto& c : candidates)
+      if (c.is_frontier) in.frontier_centres.push_back(c.position);
+    in.robot_flood = cost_grid_.get();
+    in.skip_reachability = skip_reachability;
+    in.visited = &visited_goals_;
+    in.failed  = &failed_goals_;
+    // The walk's MinPos test (admissible step 4).
+    if (coord_ && coord_->enabled()) {
+      in.lost_to_claim = [&](const Eigen::Vector3f& q) {
+        const auto* peer = coord_->claimMatching(
+            q, static_cast<float>(coord_claim_radius_m_), &plan_start);
+        return peer != nullptr &&
+               !coord_->selfWinsAgainst(robot_pos, q, *peer, robot_name_);
+      };
+    }
+    if (route_active_) in.prev_remaining = routeRemaining();
+    const auto t_route0 = std::chrono::steady_clock::now();
+    route_pick = buildRoute(in, routeParams(), *route_pair_grid_);
+    route_solve_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_route0).count();
+    if (route_pick.outcome != RoutePlan::Outcome::kNone) {
+      const RouteRejects& rj = route_pick.rejects;
+      tally.too_close   += rj.too_close;
+      tally.map         += rj.map;
+      tally.unreachable += rj.unreachable;
+      tally.blacklist   += rj.visited + rj.failed;
+      tally.visited     += rj.visited;
+      tally.minpos      += rj.claim;
+      const RouteWaypoint& head = route_pick.waypoints.front();
+      current_goal_ = CandidateViewpoint();
+      current_goal_.position    = head.position;
+      current_goal_.yaw         = head.yaw;
+      current_goal_.is_frontier = head.is_frontier;
+      current_goal_.score       = 0.0f;
+      route_found = true;
+      found = true;
+    }
+  }
+  if (!route_found) {
+    for (size_t idx : order) {
+      if (!admissible(idx, tally)) continue;
+      current_goal_ = candidates[idx];
+      selected_idx = idx;
+      found = true;
+      break;
+    }
   }
   // This walk is the one whose rejections are real; the counterfactual's are
   // discarded. Aliased rather than copied so the amnesty block below, which
@@ -3969,7 +4391,7 @@ void ExploPlannerNode::doPlan() {
   std::vector<size_t>& visited_only    = tally.visited_suppressed;
   // Whether the pick came from the walk itself rather than from the amnesty
   // fallback below. sep_reordered is only defined for a walk pick — see there.
-  const bool found_in_walk = found;
+  const bool found_in_walk = found && !route_found;
   // One amnesty for both suppression tiers. bl is the blacklist that suppressed
   // the pool and so orders and dates it; source is the log word for the tier
   // granting the reprieve. (notes: plan-amnesty-single-helper)
@@ -4039,7 +4461,9 @@ void ExploPlannerNode::doPlan() {
   // rejected must still log the allocation.
   // (notes: alloc-bookkeeping-placement)
   if (alloc_ran) {
-    alloc_ev.picked_rank = found ? alloc_rank[selected_idx] : -1;
+    // A route step has no candidate: its tier reads as the rank (C9).
+    alloc_ev.picked_rank = route_found ? route_pick.tier - 1
+                                       : (found ? alloc_rank[selected_idx] : -1);
 
     // alloc_focus_skips_ is per cell id and counts appearances as focus in
     // which the cell's unknown fraction did not drop, whatever the pick's
@@ -4049,7 +4473,9 @@ void ExploPlannerNode::doPlan() {
     const int focus = alloc_ev.focus_cell;
     if (focus >= 0 && focus < static_cast<int>(alloc_focus_skips_.size())) {
       const double u = cell_world_.cell(focus).obs.unknownFraction();
-      if (found && u >= 0.0) {
+      // R10: in route mode only a built route counts; a walk fallback neither
+      // adds nor resets.
+      if (found && (!route_mode_ || route_found) && u >= 0.0) {
         if (u < alloc_focus_unknown_[focus]) {
           alloc_focus_skips_[focus] = 0;
         } else {
@@ -4073,7 +4499,9 @@ void ExploPlannerNode::doPlan() {
           cell_world_.applyObservation(
               censusFromMap(*map_cache_, cell_world_.grid()));
         }
-        if (shouldDemoteStaleFocus(alloc_focus_skips_[focus],
+        // R11: home is never written off, in any arm.
+        if (focus != homeCellId() &&
+            shouldDemoteStaleFocus(alloc_focus_skips_[focus],
                                    alloc_focus_skip_k_,
                                    cell_world_.status(focus))) {
           // A written-off first-hand COVERED that neither a peer nor this
@@ -4083,6 +4511,10 @@ void ExploPlannerNode::doPlan() {
           // (notes: alloc-focus-demotion-one-way)
           cell_world_.commitSelf(focus, CellStatus::COVERED, true);
           alloc_ev.demoted = std::to_string(focus);
+          if (plan_active_) {
+            logListCell(focus, "written_off", "self_writeoff");
+            plan_cell_ev_[static_cast<size_t>(focus)] = 2;
+          }
           RCLCPP_WARN(get_logger(),
               "Global allocator: focus cell %d made no progress on %d "
               "consecutive solves that held it as focus, and still reads "
@@ -4096,7 +4528,13 @@ void ExploPlannerNode::doPlan() {
     if (exp_log_) exp_log_->logAllocation(expCtx(), alloc_ev);
     // The pick was made for a tour that still held the written-off cell, so
     // it is not driven: stay in PLAN and re-solve next tick without it.
-    if (!alloc_ev.demoted.empty()) return;
+    if (!alloc_ev.demoted.empty()) {
+      if (route_found) {
+        logRoutePlan("step", "step", route_pick, -1, route_solve_ms, false,
+                     "focus_written_off");
+      }
+      return;
+    }
   }
 
   // ---- Rejection profile of THIS attempt ------------------------------
@@ -4133,6 +4571,11 @@ void ExploPlannerNode::doPlan() {
         rejected_blacklist, rejected_visited, rejected_minpos,
         consecutive_all_rejected_);
     noteStarvedPlan();
+    // R18, as at the no-candidates return. (notes: route-orphan-guard)
+    if (route_active_) {
+      abandonNavGoal("route-orphaned");  // the step's route_end is already out
+      clearRouteStep();
+    }
     return;  // stay in PLAN, retry next tick
   }
   // Reset only on a tick that actually selected a goal, so the counter measures
@@ -4194,6 +4637,13 @@ void ExploPlannerNode::doPlan() {
   // necessarily the most-discounted one or the one that led: the walk above
   // can reject the leader on the map, reachability, the blacklist or MinPos.
   pending_sep_discount_ = sep_discount[selected_idx];
+  // A route step has no candidate (selected_idx is 0): info is the area the
+  // route reveals, cost its length, and no discount applied (C10/C11).
+  if (route_found) {
+    pending_selected_info_gain_ = route_pick.covered_m2;
+    pending_selected_path_cost_ = route_pick.route_len_m;
+    pending_sep_discount_       = 1.0f;
+  }
   // pending_sep_reordered_: 1 yes, 0 no, -1 not asked (term off, nothing
   // selected, or amnesty pick). Compares picks by re-walking the same filter
   // chain on undiscounted utility; exact as admissibility ignores score.
@@ -4247,6 +4697,17 @@ void ExploPlannerNode::doPlan() {
       rejected_unreachable, rejected_blacklist, rejected_visited,
       rejected_minpos,
       static_cast<size_t>(presentPeerCount()), plan_ms);
+  // The route step, as an extra line: the line above is parsed and unchanged.
+  const int64_t route_id = route_found ? nextRouteId() : -1;
+  if (route_found) {
+    RCLCPP_INFO(get_logger(),
+        "Step %d: route id=%lld tier=%d cell=%d wp=%zu covered=%.0fm2 "
+        "len=%.1fm steady=%.1fms kept=%d",
+        step_, static_cast<long long>(route_id), route_pick.tier,
+        route_pick.served_cell, route_pick.waypoints.size(),
+        route_pick.covered_m2, route_pick.route_len_m, route_solve_ms,
+        route_pick.order_kept ? 1 : 0);
+  }
 
   // Throttled, and only when the term is on: shows a pilot the treatment acting
   // without the CSV, without doubling the planner log.
@@ -4262,7 +4723,26 @@ void ExploPlannerNode::doPlan() {
                                           ? "no" : "not asked"));
   }
 
-  publishGoal(current_goal_);
+  // R29: a route-built step goes on goal_route, even with one waypoint; a
+  // walk step on goal_pose (which ends any held route, R22).
+  if (route_found) {
+    publishRoute(route_pick.waypoints, route_id);
+    route_plan_ = std::move(route_pick);
+    route_step_active_ = true;
+    route_served_cell_ = route_plan_.served_cell;
+    route_step_tier_cells_[0] = step_F;
+    route_step_tier_cells_[1] = step_F2;
+    route_step_later_[0] = step_later[0];
+    route_step_later_[1] = step_later[1];
+    route_step_cells_ = step_route_cells;
+    route_start_time_ = this->now();
+    last_residual_check_ = route_start_time_;
+    logRoutePlan("step", "step", route_plan_, route_id, route_solve_ms, true,
+                 "");
+  } else {
+    publishGoal(current_goal_);
+    if (route_mode_) clearRouteStep();
+  }
   publishCandidateViz(candidates);
 
   // Build & publish the multi-robot intent for this goal. Always
@@ -4287,8 +4767,13 @@ void ExploPlannerNode::doPlan() {
   float dx = current_goal_.position.x() - robot_pos.x();
   float dy = current_goal_.position.y() - robot_pos.y();
   float dist = std::sqrt(dx * dx + dy * dy);
-  if (std::isfinite(pending_selected_path_cost_))
+  // A route step budgets its first leg; each pass extends it (R17).
+  if (route_found) {
+    if (std::isfinite(route_plan_.waypoints[0].leg_cost_m))
+      dist = std::max(dist, route_plan_.waypoints[0].leg_cost_m);
+  } else if (std::isfinite(pending_selected_path_cost_)) {
     dist = std::max(dist, pending_selected_path_cost_);
+  }
   nav_budget_sec_ = navBudgetSec(dist, nav_speed_est_mps_, nav_safety_factor_,
                                  nav_min_timeout_sec_, nav_max_timeout_sec_);
   // Both anchors mark NAVIGATE entry; reuse the timestamp transitionTo()
@@ -4327,6 +4812,17 @@ double ExploPlannerNode::coverageUnknownFraction(const char** source) const {
                                            roi_min_y_, roi_max_y_);
 }
 
+// cell_latch (R4): the worst unknown fraction over the cells not written off,
+// on a FRESH census of the planning_map, not the cached one (5-10 s old).
+double ExploPlannerNode::cellLatchUnknown(const char** source,
+                                          int* worst_id) const {
+  *source = "planning_map";
+  *worst_id = -1;
+  if (!latest_plan_map_ || !cell_world_.configured()) return -1.0;
+  return cell_world_.perCellWorstUnknown(
+      censusFromPlanMap(*latest_plan_map_, cell_world_.grid()), worst_id);
+}
+
 bool ExploPlannerNode::isCellFree(const Eigen::Vector3f& pos) const {
   // No map: not free (matches the old kCellNoData -> v >= 0 failure).
   return latest_plan_map_ &&
@@ -4344,10 +4840,15 @@ bool ExploPlannerNode::isCellOccupied(const Eigen::Vector3f& pos) const {
 // ==================================================================
 
 void ExploPlannerNode::doNavigate() {
+  // 2d_route: a route step's passes, P5, drops and refreshes run first, in
+  // that order. (notes: navigate-route-checks)
+  if (route_step_active_ && routeNavigate()) return;
   // Abort if the goal cell is now inside an obstacle or its inflation zone.
   // Skipped without a planning_map: isCellOccupied treats no map as occupied
   // and would abort every goal. (notes: navigate-goal-inside-obstacle)
-  if (latest_plan_map_ && isCellOccupied(current_goal_.position)) {
+  // A route step drops an occupied waypoint instead (R24, above).
+  if (!route_step_active_ && latest_plan_map_ &&
+      isCellOccupied(current_goal_.position)) {
     RCLCPP_WARN(get_logger(),
         "Step %d: goal (%.2f, %.2f) is now inside an obstacle — "
         "aborting navigation and re-planning.",
@@ -4370,10 +4871,23 @@ void ExploPlannerNode::doNavigate() {
   // An omnidirectional sensor sees the same whichever way it faces, so the
   // arrival gate does not wait on yaw (see fov_is_omnidirectional_).
   const bool yaw_required = !fov_is_omnidirectional_;
-  if (dist < goal_xy_tol_) {
+  // R21: a route step arrives only at its last waypoint; the navigator passes
+  // the others at its pass radius.
+  const bool head_is_last = !route_step_active_ ||
+      route_passed_ + 1 >= static_cast<int>(route_sent_.size());
+  if (dist < goal_xy_tol_ && head_is_last) {
     float yaw_err = std::remainder(latest_yaw_ - current_goal_.yaw,
                                    2.0f * static_cast<float>(M_PI));
     if (!yaw_required || std::abs(yaw_err) < goal_yaw_tol_) {
+      // A route step is complete: nothing is left to drive or watch, and the
+      // navigator finishes the last waypoint itself.
+      // (notes: navigate-route-completed)
+      if (route_step_active_) {
+        route_passed_ = static_cast<int>(route_sent_.size());
+        logRouteEnd("completed");
+        clearRouteStep();
+        route_active_ = false;
+      }
       // Exploration goal reached: integrate the new observation.
       have_active_intent_ = false;
       // Record the reached goal in visited_goals_ so the next PLAN does not
@@ -4408,6 +4922,11 @@ void ExploPlannerNode::doNavigate() {
     }
     const double rotate_elapsed = (now - rotate_start_time_).seconds();
     if (rotate_elapsed > goal_rotate_timeout_sec_) {
+      // Unreachable on a route step (R15: omnidirectional, no yaw wait).
+      if (route_step_active_) {
+        logRouteEnd("failed");
+        clearRouteStep();
+      }
       failGoal("budget-rotate", (now - state_enter_time_).seconds(),
                "rotate_elapsed_sec", rotate_elapsed, goal_rotate_timeout_sec_);
       return;
@@ -4415,15 +4934,24 @@ void ExploPlannerNode::doNavigate() {
     // Keep re-publishing so the navigator keeps servicing the yaw. The
     // no-progress watchdog is deliberately not applied here: rotating in place
     // accumulates no translation. (notes: navigate-rotate-republish)
-    republishGoal(current_goal_);
+    if (route_active_) {
+      republishRoute();
+    } else {
+      republishGoal(current_goal_);
+    }
     return;
   }
 
   auto now = this->now();
   double elapsed = (now - state_enter_time_).seconds();
 
-  // 1) Distance-budgeted hard timeout.
+  // 1) Distance-budgeted hard timeout. On a route step it is cumulative over
+  // the legs (R17); the route ends before failGoal, which stays as is.
   if (elapsed > nav_budget_sec_) {
+    if (route_step_active_) {
+      logRouteEnd("failed");
+      clearRouteStep();
+    }
     failGoal("budget", elapsed, "nav_elapsed_sec", elapsed, nav_budget_sec_);
     return;
   }
@@ -4440,6 +4968,10 @@ void ExploPlannerNode::doNavigate() {
       // progress window against progress_min_distance_m. test_name carries the
       // units so no consumer has to infer them from `reason` and then get them
       // wrong.
+      if (route_step_active_) {
+        logRouteEnd("failed");
+        clearRouteStep();
+      }
       failGoal("no-progress", elapsed, "window_progress_m",
                static_cast<double>(delta),
                static_cast<double>(progress_min_distance_m_));
@@ -4449,8 +4981,13 @@ void ExploPlannerNode::doNavigate() {
     progress_check_pos_ = latest_pos_;
   }
 
-  // Keep-alive re-send (throttled; see republishGoal).
-  republishGoal(current_goal_);
+  // Keep-alive re-send (throttled; see republishGoal). A held route is kept
+  // alive under its own id; a goal_pose would end it (R22).
+  if (route_active_) {
+    republishRoute();
+  } else {
+    republishGoal(current_goal_);
+  }
 }
 
 // Park the current goal in the failed-goal blacklist with a tagged reason
@@ -4559,7 +5096,8 @@ void ExploPlannerNode::noteCoverageDecisionSample(double unk,
 // path back out. It answers one question — has this robot's own map of the ROI
 // reached the threshold yet — and the answer is monotone in time.
 bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
-  if (done_criterion_ != "latch") return false;
+  if (done_criterion_ != "latch" && done_criterion_ != "cell_latch")
+    return false;
   if (coverage_latched_) return false;           // first touch only
   if (done_unknown_fraction_ <= 0.0) return false;
   // unk < 0 is "cannot measure", NOT "fully explored". Guarding on >= 0 is what
@@ -4570,6 +5108,13 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   coverage_latched_       = true;
   coverage_latch_t_sim_   = this->now().seconds();
   coverage_latch_unknown_ = unk;
+  // cell_stop in every criterion; under cell_latch unk is the worst cell's u,
+  // so the event's ROI value is measured here.
+  int stop_worst = -1;
+  const double stop_worst_u = logCellStop(
+      "latch",
+      done_criterion_ == "cell_latch" ? unknownFractionInRoi() : unk,
+      &stop_worst);
   // Another ending came first (starvation, the step budget): the crossing is
   // recorded as the coverage latch, but it is not a second exploration
   // ending, and its line must not read "Exploration complete" (§11.7).
@@ -4596,8 +5141,70 @@ bool ExploPlannerNode::maybeLatchCoverageDone(double unk, const char* source) {
   // exploration_complete before anything moves. What follows (wait, meet,
   // home) is TeamCore's, and the next tick's activity switches the state.
   // true stops the caller, so doPlan publishes no goal on the latch tick.
+  if (done_criterion_ == "cell_latch") {
+    const CellGrid& g = cell_world_.grid();
+    const std::vector<int> wo = cell_world_.writtenOffIds();
+    std::string wo_cells;
+    for (int id : wo) {
+      wo_cells += (wo_cells.empty() ? "[" : " [") + std::to_string(g.col(id)) +
+                  "," + std::to_string(g.row(id)) + "]";
+    }
+    RCLCPP_INFO(get_logger(),
+        "Per-cell stop: worst cell %d [%d,%d] u=%.3f <= %.3f; %d written off: "
+        "%s",
+        stop_worst, g.valid(stop_worst) ? g.col(stop_worst) : -1,
+        g.valid(stop_worst) ? g.row(stop_worst) : -1, stop_worst_u,
+        done_unknown_fraction_, static_cast<int>(wo.size()),
+        wo_cells.empty() ? "none" : wo_cells.c_str());
+  }
   latchFinished("coverage-latched");
   return true;
+}
+
+// cell_stop at the latch or at run end, on a fresh census in the 2D modes.
+// (notes: cell-stop-snapshot)
+double ExploPlannerNode::logCellStop(const char* at,
+                                     double roi_unknown_fraction,
+                                     int* worst_id) {
+  *worst_id = -1;
+  if (!cell_world_.configured()) return -1.0;
+  const int n = cell_world_.size();
+  std::vector<CellWorld::CellObservation> obs;
+  if (planner_2d_ && latest_plan_map_) {
+    obs = censusFromPlanMap(*latest_plan_map_, cell_world_.grid());
+  } else {
+    obs.reserve(static_cast<size_t>(n));
+    for (int id = 0; id < n; ++id) obs.push_back(cell_world_.cell(id).obs);
+  }
+  const double worst_u = cell_world_.perCellWorstUnknown(obs, worst_id);
+  if (!exp_log_) return worst_u;
+  std::vector<double> u(static_cast<size_t>(n), -1.0);
+  std::string status;
+  int n_unseen = 0;
+  for (int id = 0; id < n; ++id) {
+    if (static_cast<size_t>(id) < obs.size())
+      u[static_cast<size_t>(id)] = obs[static_cast<size_t>(id)].unknownFraction();
+    const CellStatus s = cell_world_.status(id);
+    if (s == CellStatus::UNSEEN) ++n_unseen;
+    status += (id ? "," : "") + std::to_string(static_cast<int>(s));
+  }
+  exp_log_->logTeamEvent(expCtx(), "cell_stop", LogFields{
+      LogField::str("at", at),
+      LogField::str("rule", done_criterion_),
+      LogField::num("threshold", done_unknown_fraction_),
+      LogField::integer("worst_cell", *worst_id),
+      LogField::num("worst_u", worst_u),
+      LogField::num("roi_unknown_fraction", roi_unknown_fraction),
+      LogField::integer("nx", cell_world_.grid().nx),
+      LogField::integer("ny", cell_world_.grid().ny),
+      LogField::integer("grid_hash",
+          static_cast<long long>(cell_world_.grid().configHash())),
+      LogField::integer("home_cell", homeCellId()),
+      LogField::str("cell_unknown", unknownCsv(u)),
+      LogField::str("cell_status", status),
+      LogField::str("written_off_ids", joinIds(cell_world_.writtenOffIds())),
+      LogField::integer("n_unseen", n_unseen)});
+  return worst_u;
 }
 
 void ExploPlannerNode::noteMapSize(double t_sim_sec, double voxels) {
@@ -4795,6 +5402,8 @@ void ExploPlannerNode::enterProximityHold(const ProximityGuard::Decision& d) {
         "brake goal is the only stop command.",
         proximity_nav_cancel_action_.c_str());
   }
+  // The brake ends a held route at the navigator; the resume re-sends it.
+  prox_route_was_active_ = route_active_;
   CandidateViewpoint brake;
   brake.position = latest_pos_;
   brake.yaw = latest_yaw_;
@@ -4907,6 +5516,26 @@ void ExploPlannerNode::doProximityHold() {
       now - rclcpp::Duration::from_seconds(prox_nav_elapsed_sec_);
   progress_check_time_ = now;
   progress_check_pos_ = latest_pos_;
+  // A route step (R23): P5 first, else the unpassed waypoints under a NEW id,
+  // since the navigator ignores its last id. (notes: prox-hold-resume-route)
+  if (route_step_active_ && prox_route_was_active_) {
+    if (routeCellFinished()) {
+      endRouteStep("cell_finished", "route-cell-finished");
+      return;
+    }
+    const int64_t old_id = route_id_ns_;
+    const size_t done = std::min(static_cast<size_t>(route_passed_),
+                                 route_plan_.waypoints.size());
+    route_plan_.waypoints.erase(
+        route_plan_.waypoints.begin(),
+        route_plan_.waypoints.begin() + static_cast<std::ptrdiff_t>(done));
+    publishRoute(route_plan_.waypoints, nextRouteId());
+    RCLCPP_INFO(get_logger(),
+        "Step %d: route id=%lld re-sent as id=%lld after the hold, %zu "
+        "waypoint(s) left.", step_, static_cast<long long>(old_id),
+        static_cast<long long>(route_id_ns_), route_plan_.waypoints.size());
+    return;
+  }
   publishGoal(current_goal_);
 }
 
@@ -5096,7 +5725,18 @@ void ExploPlannerNode::metricsTick() {
   // fillCommonMetrics. Must stay last so the qualifying row is logged and
   // counted first. Safe to transition: same exclusive callback group as tick().
   // (notes: metrics-tick-coverage-latch-hook)
-  maybeLatchCoverageDone(last_unknown_fraction_, last_coverage_source_);
+  if (done_criterion_ == "cell_latch") {
+    // cell_latch tests the worst cell on a fresh census (R4), not the ROI
+    // value the row carries; skipped once latched, it can only refuse then.
+    if (!coverage_latched_ && done_unknown_fraction_ > 0.0) {
+      const char* cell_src = "";
+      int worst_cell = -1;
+      const double cell_unk = cellLatchUnknown(&cell_src, &worst_cell);
+      maybeLatchCoverageDone(cell_unk, cell_src);
+    }
+  } else {
+    maybeLatchCoverageDone(last_unknown_fraction_, last_coverage_source_);
+  }
 }
 
 // ==================================================================
@@ -5208,6 +5848,11 @@ void ExploPlannerNode::expPeerSweep() {
 
 void ExploPlannerNode::logRunEnd(const char* reason) {
   if (!exp_log_) return;
+  // A robot that never latched gets its cell_stop here, before run_end.
+  if (!coverage_latched_) {
+    int worst_cell = -1;
+    logCellStop("run_end", last_unknown_fraction_, &worst_cell);
+  }
   RunEndEvent e;
   e.reason     = reason;
   e.steps      = step_;
@@ -5406,6 +6051,19 @@ void ExploPlannerNode::updatePoseFromTF() {
     RCLCPP_INFO(get_logger(),
         "MISSION-RETURN home recorded: (%.2f, %.2f, %.2f) yaw %.2f.",
         home_pos_.x(), home_pos_.y(), home_pos_.z(), home_yaw_);
+    // R11's home cell, logged here: run_start is written before the first
+    // pose. (notes: home-cell-never-written-off)
+    if (cell_world_.configured()) {
+      const CellGrid& g = cell_world_.grid();
+      const int home = homeCellId();
+      RCLCPP_INFO(get_logger(),
+          "Home cell %d [%d,%d] (%s; home pose in cell %d); it is never "
+          "written off.",
+          home, g.valid(home) ? g.col(home) : -1,
+          g.valid(home) ? g.row(home) : -1,
+          plan_active_ ? "coverage plan" : "home pose",
+          g.idAt(home_pos_.x(), home_pos_.y()));
+    }
   }
 }
 
@@ -5462,6 +6120,8 @@ void ExploPlannerNode::publishGoal(const CandidateViewpoint& vp) {
   last_goal_pub_yaw_  = vp.yaw;
   last_goal_pub_time_ = goal.header.stamp;
   have_last_goal_pub_ = true;
+  // Any goal_pose ends a held route at the navigator (R22).
+  route_active_ = false;
 }
 
 // Keep-alive for states still driving (NAVIGATE and the Leg states): publishes
@@ -5490,6 +6150,371 @@ void ExploPlannerNode::republishGoal(const CandidateViewpoint& vp) {
   if (goal_republish_sec_ <= 0.0) return;  // publish-on-change only
   if ((this->now() - last_goal_pub_time_).seconds() >= goal_republish_sec_)
     publishGoal(vp);
+}
+
+// ==================================================================
+// 2d_route (gen 41): route publishing and route events
+// ==================================================================
+
+// The navigator keys a route on header.stamp: a new id replaces the held route,
+// a repeat is a keep-alive and ignored. (notes: route-publish-and-ids)
+void ExploPlannerNode::publishRoute(const std::vector<RouteWaypoint>& waypoints,
+                                    int64_t id_ns) {
+  sendRoutePath(waypoints, 0, id_ns);
+  route_active_ = true;
+  route_id_ns_ = id_ns;
+  route_sent_.clear();
+  for (const RouteWaypoint& wp : waypoints) route_sent_.push_back(wp.position);
+  route_passed_ = 0;
+}
+
+void ExploPlannerNode::sendRoutePath(
+    const std::vector<RouteWaypoint>& waypoints, size_t from, int64_t id_ns) {
+  nav_msgs::msg::Path path;
+  path.header.stamp.sec = static_cast<int32_t>(id_ns / 1000000000LL);
+  path.header.stamp.nanosec = static_cast<uint32_t>(id_ns % 1000000000LL);
+  path.header.frame_id = map_frame_;
+  path.poses.reserve(waypoints.size() - std::min(from, waypoints.size()));
+  for (size_t i = from; i < waypoints.size(); ++i) {
+    const RouteWaypoint& wp = waypoints[i];
+    geometry_msgs::msg::PoseStamped p;
+    p.header = path.header;
+    p.pose.position.x = wp.position.x();
+    p.pose.position.y = wp.position.y();
+    // Same z rule as publishGoal. (notes: goal-z-flatten)
+    p.pose.position.z = flatten_goal_z_ ? 0.0 : wp.position.z();
+    p.pose.orientation = yawToQuat(wp.yaw);
+    path.poses.push_back(p);
+  }
+  if (goal_route_pub_->get_subscription_count() == 0) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "No subscriber on the goal route topic — nothing is driving the "
+        "route. Check the navigator is up and its goal_route topic matches "
+        "goal_route_topic.");
+  }
+  goal_route_pub_->publish(path);
+  last_route_pub_time_ = this->now();
+}
+
+// (notes: route-keepalive-same-id)
+void ExploPlannerNode::republishRoute() {
+  if (goal_republish_sec_ <= 0.0) return;  // as republishGoal
+  if ((this->now() - last_route_pub_time_).seconds() < goal_republish_sec_)
+    return;
+  sendRoutePath(route_plan_.waypoints,
+                static_cast<size_t>(std::max(route_passed_, 0)), route_id_ns_);
+}
+
+int64_t ExploPlannerNode::nextRouteId() const {
+  const int64_t ns = this->now().nanoseconds();
+  return ns > route_id_ns_ ? ns : route_id_ns_ + 1;
+}
+
+std::vector<Eigen::Vector3f> ExploPlannerNode::routeRemaining() const {
+  const size_t from = std::min(static_cast<size_t>(std::max(route_passed_, 0)),
+                               route_sent_.size());
+  return std::vector<Eigen::Vector3f>(route_sent_.begin() + from,
+                                      route_sent_.end());
+}
+
+RouteParams ExploPlannerNode::routeParams() const {
+  RouteParams p = route_cfg_;
+  p.min_goal_dist_m = std::max(goal_xy_tol_, cand_min_goal_dist_);
+  p.failed_radius_m = failed_goal_radius_m_;
+  p.hfov      = fov_cfg_2d_.hfov;
+  p.h_rays    = fov_cfg_2d_.h_rays;
+  p.min_range = fov_cfg_2d_.min_range;
+  p.max_range = fov_cfg_2d_.max_range;
+  return p;
+}
+
+void ExploPlannerNode::clearRouteStep() {
+  route_step_active_ = false;
+  route_served_cell_ = -1;
+}
+
+void ExploPlannerNode::logRoutePlan(const char* kind, const char* trigger,
+                                    const RoutePlan& rp, int64_t id_ns,
+                                    double solve_ms, bool published,
+                                    const char* reason) {
+  if (!exp_log_) return;
+  const CellGrid& g = cell_world_.grid();
+  const bool valid = cell_world_.configured() && g.valid(rp.served_cell);
+  // Per waypoint, in drive order: the unknown it reveals inside the tier cell.
+  const double cell_m2 = static_cast<double>(rp.geom.resolution) *
+                         static_cast<double>(rp.geom.resolution);
+  std::string marginal;
+  char buf[32];
+  for (size_t i = 0; i < rp.waypoints.size(); ++i) {
+    std::snprintf(buf, sizeof(buf), "%.1f",
+                  rp.waypoints[i].marginal_cells * cell_m2);
+    marginal += (i ? "," : "");
+    marginal += buf;
+  }
+  exp_log_->logTeamEvent(expCtx(), "route_plan", LogFields{
+      LogField::str("kind", kind),
+      LogField::str("trigger", trigger),
+      LogField::integer("route_id_ns", id_ns),
+      LogField::integer("tier", rp.tier),
+      LogField::integer("cell", rp.served_cell),
+      LogField::integer("col", valid ? g.col(rp.served_cell) : -1),
+      LogField::integer("row", valid ? g.row(rp.served_cell) : -1),
+      LogField::integer("n_points", rp.n_points),
+      LogField::integer("n_admissible", rp.n_admissible),
+      LogField::integer("n_tier", rp.n_tier_members),
+      LogField::integer("n_selected", static_cast<long long>(rp.waypoints.size())),
+      LogField::str("marginal_m2", marginal),
+      LogField::num("covered_m2", rp.covered_m2),
+      LogField::num("covered_later_m2", rp.covered_later_m2),
+      LogField::num("route_len_m", rp.route_len_m),
+      LogField::num("solve_ms_steady", solve_ms),
+      LogField::boolean("order_kept", rp.order_kept),
+      LogField::boolean("published", published),
+      LogField::str("reason", reason)});
+}
+
+void ExploPlannerNode::logRouteEnd(const char* reason) {
+  if (!exp_log_) return;
+  const int c = route_plan_.served_cell;
+  const bool valid = cell_world_.configured() && cell_world_.grid().valid(c);
+  const size_t passed = std::min(static_cast<size_t>(std::max(route_passed_, 0)),
+                                 route_sent_.size());
+  exp_log_->logTeamEvent(expCtx(), "route_end", LogFields{
+      LogField::integer("route_id_ns", route_id_ns_),
+      LogField::str("reason", reason),
+      LogField::integer("cell", c),
+      LogField::integer("status",
+          valid ? static_cast<int>(cell_world_.cell(c).status) : -1),
+      LogField::boolean("written_off",
+          valid && cell_world_.cell(c).written_off),
+      LogField::integer("known_by",
+          valid ? static_cast<long long>(cell_world_.cell(c).known_by) : 0),
+      LogField::integer("waypoints_left",
+          static_cast<long long>(route_sent_.size() - passed)),
+      LogField::num("route_age_sec",
+          (this->now() - route_start_time_).seconds())});
+}
+
+void ExploPlannerNode::logRouteProgress(int wp, const char* action,
+                                        const Eigen::Vector3f& pos) {
+  if (!exp_log_) return;
+  exp_log_->logTeamEvent(expCtx(), "route_progress", LogFields{
+      LogField::integer("route_id_ns", route_id_ns_),
+      LogField::integer("wp", wp),
+      LogField::str("action", action),
+      LogField::num("x", pos.x()),
+      LogField::num("y", pos.y()),
+      LogField::integer("remaining",
+          static_cast<long long>(route_sent_.size()) - route_passed_)});
+}
+
+// Checks a-d and f of a route step, each tick in this order; e, g and h are
+// doNavigate's own arrival, watchdogs and keep-alive. route_sent_ and
+// route_plan_.waypoints stay index-aligned: a drop erases from both, and every
+// drop is followed by a new id or the end of the step.
+// (notes: navigate-route-checks)
+bool ExploPlannerNode::routeNavigate() {
+  const auto now = this->now();
+  // a. Passes: the navigator's remaining count for the held id fell. It never
+  // passes the last waypoint, so the head stays valid.
+  if (have_active_route_msg_ && last_active_route_id_ns_ == route_id_ns_) {
+    const int n = static_cast<int>(route_sent_.size());
+    const int passed_now = std::min(n - last_active_route_n_ - route_passed_,
+                                    n - 1 - route_passed_);
+    if (passed_now > 0) {
+      for (int i = 0; i < passed_now; ++i) {
+        const int wp = route_passed_;
+        visited_goals_.add(route_sent_[wp], now.seconds());
+        ++route_passed_;
+        logRouteProgress(wp, "passed", route_sent_[wp]);
+      }
+      routeHeadChanged(/*new_leg=*/true);
+      if (refreshRoute("pass", false)) return true;
+    }
+  }
+  // b. P5: the served cell finished; no brake, the next step replaces the
+  // route (R18).
+  if (routeCellFinished()) {
+    endRouteStep("cell_finished", "route-cell-finished");
+    return true;
+  }
+  // f, after each drop: an emptied route ends the step, else the changed
+  // route is re-planned and goes out under a new id. Either way the tick ends
+  // here: a watchdog brake must not share a tick with the new route.
+  const auto after_drop = [this](const char* trigger) {
+    if (route_passed_ >= static_cast<int>(route_sent_.size())) {
+      endRouteStep("exhausted", "route-exhausted");
+      return true;
+    }
+    refreshRoute(trigger, true);
+    return true;
+  };
+  if (!latest_plan_map_) return false;
+  // c. Occupied waypoints are dropped, never blacklisted (R24).
+  bool dropped = false;
+  for (size_t i = static_cast<size_t>(route_passed_),
+              wp = static_cast<size_t>(route_passed_);
+       i < route_sent_.size(); ++wp) {
+    if (!isCellOccupied(route_sent_[i])) {
+      ++i;
+      continue;
+    }
+    const Eigen::Vector3f pos = route_sent_[i];
+    route_sent_.erase(route_sent_.begin() + static_cast<std::ptrdiff_t>(i));
+    route_plan_.waypoints.erase(route_plan_.waypoints.begin() +
+                                static_cast<std::ptrdiff_t>(i));
+    logRouteProgress(static_cast<int>(wp), "dropped_occupied", pos);
+    dropped = true;
+  }
+  if (dropped && after_drop("occupied")) return true;
+  // d. Residual, 1 Hz on sim time: the head's marginal tier set is mostly
+  // seen already (or the map geometry changed: -1).
+  if ((now - last_residual_check_).seconds() >= 1.0) {
+    last_residual_check_ = now;
+    const RouteWaypoint& head = route_plan_.waypoints[route_passed_];
+    const int left = routeStillUnknown(*latest_plan_map_, route_plan_.geom,
+                                       head.residual_cells);
+    if (left < minTierCells(route_cfg_.min_gain_m2,
+                            latest_plan_map_->info.resolution)) {
+      const Eigen::Vector3f pos = head.position;
+      route_sent_.erase(route_sent_.begin() + route_passed_);
+      route_plan_.waypoints.erase(route_plan_.waypoints.begin() +
+                                  route_passed_);
+      logRouteProgress(route_passed_, "dropped_residual", pos);
+      if (after_drop("residual")) return true;
+    }
+  }
+  return false;
+}
+
+// (notes: route-refresh)
+bool ExploPlannerNode::refreshRoute(const char* trigger, bool force_publish) {
+  if (!latest_plan_map_) return false;
+  const auto now = this->now();
+  failed_goals_.prune(now.seconds(), failed_goal_ttl_sec_);
+  visited_goals_.prune(now.seconds(), visited_goal_ttl_sec_);
+  // A fresh flood from the current pose; doPlan's filter floor of 10 cells.
+  cost_grid_->build(*latest_plan_map_);
+  cost_grid_->floodFrom(latest_pos_,
+                        static_cast<float>(cost_grid_radius_cap_m_));
+  RouteInputs in;
+  in.map  = latest_plan_map_.get();
+  in.roi  = {roi_min_x_, roi_max_x_, roi_min_y_, roi_max_y_};
+  in.grid = &cell_world_.grid();
+  in.robot = latest_pos_;
+  in.route_cells = route_step_cells_;
+  in.tier_cell[0] = route_step_tier_cells_[0];
+  in.tier_cell[1] = route_step_tier_cells_[1];
+  in.later_cells[0] = route_step_later_[0];
+  in.later_cells[1] = route_step_later_[1];
+  // doPlan's 2D frontier candidates, at the robot's z.
+  for (const GridFrontier& f : findGridFrontiers(
+           *latest_plan_map_, in.roi, frontier_cluster_radius_m_,
+           grid_frontier_min_cells_)) {
+    in.frontier_centres.emplace_back(f.position.x(), f.position.y(),
+                                     latest_pos_.z());
+  }
+  in.robot_flood = cost_grid_.get();
+  in.skip_reachability = cost_grid_->reachedCellCount() < 10;
+  in.visited = &visited_goals_;
+  in.failed  = &failed_goals_;
+  if (coord_ && coord_->enabled()) {
+    in.lost_to_claim = [this, now](const Eigen::Vector3f& q) {
+      const auto* peer = coord_->claimMatching(
+          q, static_cast<float>(coord_claim_radius_m_), &now);
+      return peer != nullptr &&
+             !coord_->selfWinsAgainst(latest_pos_, q, *peer, robot_name_);
+    };
+  }
+  in.prev_remaining = routeRemaining();
+  const RouteParams p = routeParams();
+  const auto t0 = std::chrono::steady_clock::now();
+  RoutePlan rp = buildRoute(in, p, *route_pair_grid_);
+  const double solve_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  const bool none = rp.outcome == RoutePlan::Outcome::kNone;
+  bool publish = !none && force_publish;
+  if (!none && !publish) {
+    // L_rem: the robot to the held head on this flood, then the held legs.
+    const Eigen::Vector3f& head = route_sent_[route_passed_];
+    float l_rem = cost_grid_->costTo(head);
+    for (size_t i = static_cast<size_t>(route_passed_) + 1;
+         i < route_plan_.waypoints.size(); ++i)
+      l_rem += route_plan_.waypoints[i].leg_cost_m;
+    publish = routeMaterialChange(rp.waypoints.front().position,
+                                  rp.route_len_m, head, l_rem, p);
+  }
+  const int64_t id = publish ? nextRouteId() : route_id_ns_;
+  logRoutePlan("refresh", trigger, rp, id, solve_ms, publish,
+               none ? "no_tier_member"
+                    : (publish ? "" : "no_material_change"));
+  if (none) {
+    endRouteStep("exhausted", "route-exhausted");  // R30
+    return true;
+  }
+  if (!publish) return false;
+  publishRoute(rp.waypoints, id);
+  route_plan_ = std::move(rp);
+  route_served_cell_ = route_plan_.served_cell;
+  routeHeadChanged(/*new_leg=*/false);
+  RCLCPP_INFO(get_logger(),
+      "Step %d: route refresh [%s] id=%lld tier=%d cell=%d wp=%zu "
+      "covered=%.0fm2 len=%.1fm steady=%.1fms kept=%d",
+      step_, trigger, static_cast<long long>(id), route_plan_.tier,
+      route_plan_.served_cell, route_plan_.waypoints.size(),
+      route_plan_.covered_m2, route_plan_.route_len_m, solve_ms,
+      route_plan_.order_kept ? 1 : 0);
+  return false;
+}
+
+// (notes: route-head-budget)
+void ExploPlannerNode::routeHeadChanged(bool new_leg) {
+  const auto now = this->now();
+  const RouteWaypoint& head = route_plan_.waypoints[route_passed_];
+  current_goal_ = CandidateViewpoint();
+  current_goal_.position    = head.position;
+  current_goal_.yaw         = head.yaw;
+  current_goal_.is_frontier = head.is_frontier;
+  current_goal_.score       = 0.0f;
+  if (intent_pub_ && coord_) {
+    current_intent_msg_ = coord_->buildIntent(
+        current_goal_, latest_pos_, now,
+        static_cast<float>(coord_claim_ttl_sec_),
+        static_cast<float>(coord_claim_radius_m_),
+        /*planner_type_id (eig)=*/0u, map_frame_);
+    publishIntent();
+    have_active_intent_ = true;
+  }
+  // R17: cumulative from NAVIGATE entry; state_enter_time_ is never reset.
+  const double so_far = (now - state_enter_time_).seconds();
+  const float leg = (head.position - latest_pos_).head<2>().norm();
+  nav_budget_sec_ = so_far + navBudgetSec(leg, nav_speed_est_mps_,
+                                          nav_safety_factor_,
+                                          nav_min_timeout_sec_,
+                                          nav_max_timeout_sec_);
+  if (new_leg) {
+    progress_check_time_ = now;
+    progress_check_pos_ = latest_pos_;
+  }
+}
+
+bool ExploPlannerNode::routeCellFinished() const {
+  return route_served_cell_ >= 0 && cell_world_.configured() &&
+         cell_world_.grid().valid(route_served_cell_) &&
+         planCellFinished(route_served_cell_);
+}
+
+void ExploPlannerNode::endRouteStep(const char* reason,
+                                    const char* transition_reason) {
+  RCLCPP_INFO(get_logger(),
+      "Step %d: route id=%lld ended [%s], cell %d, %zu waypoint(s) left.",
+      step_, static_cast<long long>(route_id_ns_), reason, route_served_cell_,
+      route_sent_.size() -
+          std::min(static_cast<size_t>(route_passed_), route_sent_.size()));
+  logRouteEnd(reason);
+  clearRouteStep();
+  have_active_intent_ = false;
+  transitionTo(State::LOG_STEP, transition_reason);
 }
 
 void ExploPlannerNode::publishCandidateViz(
@@ -5702,9 +6727,18 @@ void ExploPlannerNode::updateCellWorld(double roi_unknown_fraction,
                          cell_ff.size()) - 1];
     ev.cell_frontier_frac_at_best_unknown = ff_at_best_u;
   }
+  const std::vector<int> wo_ids = cell_world_.writtenOffIds();
+  ev.written_off     = static_cast<int>(wo_ids.size());
+  ev.written_off_ids = joinIds(wo_ids);
+  std::vector<double> cell_unknown(static_cast<size_t>(cell_world_.size()));
+  for (int id = 0; id < cell_world_.size(); ++id)
+    cell_unknown[static_cast<size_t>(id)] =
+        cell_world_.cell(id).obs.unknownFraction();
+  ev.cell_unknown = unknownCsv(cell_unknown);
 
   if (exp_log_) exp_log_->logCellCensus(expCtx(), ev);
   publishCellViz();
+  if (plan_active_) planScanCells();
 }
 
 void ExploPlannerNode::publishCellViz() {
@@ -5756,6 +6790,84 @@ void ExploPlannerNode::publishCellViz() {
   }
 
   cell_viz_pub_->publish(ma);
+}
+
+// ==================================================================
+// Coverage loops (gen 41): plan cells and their events
+// ==================================================================
+
+int ExploPlannerNode::homeCellId() const {
+  if (plan_active_) return plan_.home_id;
+  if (!have_home_ || !cell_world_.configured()) return -1;
+  return cell_world_.grid().idAt(home_pos_.x(), home_pos_.y());
+}
+
+bool ExploPlannerNode::planCellFinished(int cell) const {
+  const CellStatus s = cell_world_.status(cell);
+  return s == CellStatus::COVERED || s == CellStatus::COVERED_BY_OTHERS;
+}
+
+// Each list cell closes once: finished if this robot started it, skipped if
+// not. Runs every census and every PLAN. (notes: plan-scan-cells-events)
+void ExploPlannerNode::planScanCells() {
+  if (!plan_active_ || !cell_world_.configured()) return;
+  const CellGrid& g = cell_world_.grid();
+  const int here = g.idAt(latest_pos_.x(), latest_pos_.y());
+  auto scan = [&](const std::vector<int>& list, bool help_list) {
+    for (int c : list) {
+      if (!g.valid(c)) continue;
+      const bool finished = planCellFinished(c);
+      if (finished && plan_cell_ev_[c] != 2) {
+        const bool wo = cell_world_.cell(c).written_off;
+        const char* by = cell_world_.status(c) == CellStatus::COVERED
+                             ? (wo ? "self_writeoff" : "self")
+                             : (wo ? "peer_writeoff" : "peer");
+        logListCell(c, plan_cell_ev_[c] == 1 ? "finished" : "skipped", by);
+        plan_cell_ev_[c] = 2;
+      } else if (help_list && !finished && c == here &&
+                 !plan_help_reached_[c]) {
+        logListCell(c, "help_reached_unfinished", "self");
+        plan_help_reached_[c] = 1;
+      }
+    }
+  };
+  scan(plan_.lists[plan_my_list_], false);
+  if (plan_helping_ && plan_help_list_ >= 0)
+    scan(plan_.lists[plan_help_list_], true);
+}
+
+void ExploPlannerNode::logListCell(int cell, const char* action,
+                                   const char* by) {
+  if (!exp_log_ || !cell_world_.configured()) return;
+  const CellGrid& g = cell_world_.grid();
+  if (!g.valid(cell)) return;
+  // Named by its place in the walked list: the helped list while helping,
+  // else (or when absent there) the own list.
+  int list = plan_helping_ && plan_help_list_ >= 0 ? plan_help_list_
+                                                    : plan_my_list_;
+  auto posIn = [&](int l) {
+    const std::vector<int>& L = plan_.lists[l];
+    const auto it = std::find(L.begin(), L.end(), cell);
+    return it == L.end() ? -1 : static_cast<int>(it - L.begin());
+  };
+  int pos = posIn(list);
+  if (pos < 0 && list != plan_my_list_) {
+    list = plan_my_list_;
+    pos = posIn(list);
+  }
+  const CellWorld::Cell& c = cell_world_.cell(cell);
+  exp_log_->logTeamEvent(expCtx(), "list_cell", LogFields{
+      LogField::integer("list", list),
+      LogField::integer("pos", pos),
+      LogField::integer("cell", cell),
+      LogField::integer("col", g.col(cell)),
+      LogField::integer("row", g.row(cell)),
+      LogField::str("action", action),
+      LogField::str("by", by),
+      LogField::integer("known_by", static_cast<long long>(c.known_by)),
+      LogField::integer("status", static_cast<int>(c.status)),
+      LogField::num("unknown_frac", c.obs.unknownFraction()),
+      LogField::boolean("helping", plan_helping_)});
 }
 
 // ==================================================================

@@ -6,6 +6,7 @@
 #include <scovox_msgs/msg/scovox_map.hpp>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <vector>
 
 using namespace explo_planner;
@@ -1402,4 +1403,358 @@ TEST(CellWorldIntercept, ShrinksAsTheCellsThePeerKnewAboutChange) {
 
   EXPECT_TRUE(w.interceptCandidates(-1).empty()) << "no bit, no claim";
   EXPECT_TRUE(w.interceptCandidates(kMaxTeamSize).empty());
+}
+
+// ===========================================================================
+// Team-wide write-offs on the wire and the per-cell stop (CL D2)
+// ===========================================================================
+
+namespace {
+
+constexpr uint8_t kWo = 2u | CellWorld::kWireWrittenOff;   // 0x82
+
+/// The 3x3 fixture world under another fleet id.
+CellWorld makePeer(int self_id) {
+  CellWorld w;
+  EXPECT_EQ(w.configure(makeCellGrid(-15.0f, 15.0f, -15.0f, 15.0f, 10.0f),
+                        goodConfig(), self_id), "")
+      << "fixture failed to configure";
+  return w;
+}
+
+/// The campaign grid: 20 m cells over [-50, 50]^2, 5x5, home [2,2] = id 12.
+/// A cell holds 100 x 100 columns of the 0.2 m planning map.
+CellWorld makeCampaignWorld() {
+  CellWorld w;
+  EXPECT_EQ(w.configure(makeCellGrid(-50.0f, 50.0f, -50.0f, 50.0f, 20.0f),
+                        goodConfig(), 0), "")
+      << "fixture failed to configure";
+  return w;
+}
+
+}  // namespace
+
+TEST(CellWorldWriteOff, WrittenOffTravelsAndSticks) {
+  // A's write-off reaches B as a write-off, not as a plain COVERED that looks
+  // like a real finish, and B's own census cannot undo it. Cell 0 is the
+  // plain-COVERED control on both robots.
+  CellWorld a = makeWorld();  // self 0
+  selfCover(a, 0);
+  selfExplore(a, 4);
+  ASSERT_TRUE(a.commitSelf(4, CellStatus::COVERED, true));
+  const std::vector<CellWorld::WireCell> from_a = a.toWire();
+  EXPECT_EQ(from_a[4].status, kWo) << "the originator's write-off has the bit";
+  EXPECT_EQ(from_a[0].status, 2u) << "a real finish does not";
+
+  CellWorld b = makePeer(1);
+  selfCover(b, 5);   // B finished 5 itself, and 6 as the control
+  selfCover(b, 6);
+  std::vector<CellWorld::WireCell> msg = from_a;
+  msg[5] = wc(5, kWo, robotBit(0));   // A has also written off 5
+  const CellWorld::MergeStats st = b.mergeWire(0, msg);
+  EXPECT_EQ(st.examined(), b.size());
+
+  EXPECT_EQ(b.status(4), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(b.cell(4).written_off);
+  EXPECT_EQ(b.cell(4).update_id, 0u) << "relayed: rule 1";
+  EXPECT_TRUE(maskHas(b.cell(4).known_by, 0));
+  EXPECT_EQ(b.status(5), CellStatus::COVERED) << "own COVERED keeps provenance";
+  EXPECT_TRUE(b.cell(5).written_off);
+  EXPECT_EQ(b.status(0), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_FALSE(b.cell(0).written_off) << "a plain COVERED is not a write-off";
+  EXPECT_FALSE(b.cell(6).written_off);
+
+  // B's census then sees half of every cell unknown: above the 0.35 release,
+  // so its own plain COVERED (6) drops to EXPLORING, while both adopted
+  // write-offs hold, and own evidence cannot reclaim 4 as first-hand either.
+  std::vector<CellWorld::CellObservation> half(9, obs(100, 50));
+  b.applyObservation(half);
+  EXPECT_EQ(b.status(6), CellStatus::EXPLORING) << "control: the census bites";
+  EXPECT_EQ(b.status(5), CellStatus::COVERED);
+  EXPECT_EQ(b.status(4), CellStatus::COVERED_BY_OTHERS);
+  std::vector<CellWorld::CellObservation> full(9, obs(100, 100));
+  b.applyObservation(full);
+  EXPECT_EQ(b.status(4), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(b.cell(4).written_off);
+  EXPECT_TRUE(b.cell(5).written_off);
+
+  const std::vector<CellWorld::WireCell> from_b = b.toWire();
+  EXPECT_EQ(from_b[4].status, kWo);
+  EXPECT_EQ(from_b[5].status, kWo);
+  EXPECT_EQ(from_b[0].status, 2u);
+
+  // Only COVERED carries the bit: a written-off EXPLORING (reachable only by
+  // calling commitSelf directly) goes as plain 1, never as the garbage 0x81.
+  CellWorld c = makeWorld();
+  ASSERT_TRUE(c.commitSelf(3, CellStatus::EXPLORING, true));
+  EXPECT_EQ(c.toWire()[3].status, 1u);
+}
+
+TEST(CellWorldWriteOff, WrittenOffBypassesLocalPriority) {
+  // B is exploring cells 4 and 1, inside its own 3x3. Local priority refuses
+  // a peer's plain COVERED there, but a write-off is the team giving up on
+  // the cell, so every robot must drop it.
+  CellWorld b = makePeer(1);
+  selfExplore(b, 4);
+  selfExplore(b, 1);
+  const CellWorld::MergeStats st =
+      b.mergeWire(0, {wc(4, kWo, robotBit(0)), wc(1, kWo, robotBit(0))},
+                  /*centre=*/4);
+  EXPECT_EQ(st.applied, 2);
+  EXPECT_EQ(st.refused_local, 0);
+  EXPECT_EQ(b.status(4), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(1), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(b.cell(4).written_off);
+  EXPECT_TRUE(b.cell(1).written_off);
+
+  // Paired control: the same claim without the bit is refused, so the bypass
+  // above is the bit's doing and not a disabled rule.
+  CellWorld u = makePeer(1);
+  selfExplore(u, 4);
+  EXPECT_EQ(u.mergeWire(0, {wc(4, 2, robotBit(0))}, /*centre=*/4).refused_local,
+            1);
+  EXPECT_EQ(u.status(4), CellStatus::EXPLORING);
+}
+
+TEST(CellWorldWriteOff, WrittenOffIsNeverRetracted) {
+  // A plain COVERED_BY_OTHERS can be retracted by its source (a peer in
+  // known_by now saying EXPLORING); an adopted write-off cannot, by anyone.
+  CellWorld b = makePeer(1);
+  ASSERT_EQ(b.mergeWire(0, {wc(0, kWo, robotBit(0)), wc(1, 2)}).applied, 2);
+  ASSERT_TRUE(maskHas(b.cell(0).known_by, 0));
+  ASSERT_TRUE(maskHas(b.cell(1).known_by, 0));
+
+  const CellWorld::MergeStats st = b.mergeWire(0, {wc(0, 1), wc(1, 1)});
+  EXPECT_EQ(st.refused_guard, 1);
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(b.status(0), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(b.cell(0).written_off);
+  EXPECT_EQ(b.status(1), CellStatus::EXPLORING_BY_OTHERS)
+      << "control: the same retraction of a plain COVERED is honoured";
+
+  // A third party is refused too, and a plain COVERED (a peer that has not
+  // heard of the write-off yet) agrees without clearing the flag.
+  EXPECT_EQ(b.mergeWire(2, {wc(0, 1)}).refused_guard, 1);
+  EXPECT_EQ(b.mergeWire(2, {wc(0, 2, robotBit(2))}).known_by_only, 1);
+  EXPECT_EQ(b.status(0), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(b.cell(0).written_off);
+  EXPECT_EQ(b.toWire()[0].status, kWo);
+}
+
+TEST(CellWorldWriteOff, WrittenOffRelaysAtN3) {
+  // A writes off cell 2; C hears only B. Without the relay C would keep cell 2
+  // in its stop rule while A and B had dropped it.
+  CellWorld a = makeWorld();  // self 0
+  selfExplore(a, 2);
+  ASSERT_TRUE(a.commitSelf(2, CellStatus::COVERED, true));
+  CellWorld b = makePeer(1);
+  CellWorld c = makePeer(2);
+
+  ASSERT_EQ(b.mergeWire(0, a.toWire()).applied, 1);
+  const CellWorld::MergeStats st = c.mergeWire(1, b.toWire());
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(c.status(2), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_TRUE(c.cell(2).written_off);
+  EXPECT_TRUE(maskHas(c.cell(2).known_by, 0)) << "A's bit came through B";
+  EXPECT_TRUE(maskHas(c.cell(2).known_by, 1));
+  EXPECT_EQ(c.toWire()[2].status, kWo) << "and C relays it onward";
+  EXPECT_EQ(c.writtenOffIds(), std::vector<int>({2}));
+  // All three now hold the same shared belief, write-off included.
+  EXPECT_EQ(a.sharedHash(), b.sharedHash());
+  EXPECT_EQ(b.sharedHash(), c.sharedHash());
+}
+
+TEST(CellWorldWriteOff, MalformedWrittenOffByteIsBad) {
+  // Only COVERED can be written off, so 0x82 is the one byte with the bit
+  // set that means anything. The rest are garbage and must be counted, not
+  // coerced into a write-off of an UNSEEN or EXPLORING cell.
+  CellWorld w = makeWorld();
+  const CellWorld::MergeStats st = w.mergeWire(
+      1, {wc(0, 0x80), wc(1, 0x81), wc(2, 0x83), wc(3, 0xFF), wc(4, kWo)});
+  EXPECT_EQ(st.bad_status, 4);
+  EXPECT_EQ(st.applied, 1);
+  EXPECT_EQ(st.examined(), 5);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(w.status(i), CellStatus::UNSEEN) << "cell " << i;
+    EXPECT_FALSE(w.cell(i).written_off) << "cell " << i;
+  }
+  EXPECT_TRUE(w.cell(4).written_off);
+}
+
+TEST(CellWorldSharedHash, SharedHashUnchangedWithoutWriteOffs) {
+  // Golden digests recorded from the code before the write-off bit existed:
+  // with nothing written off the bit must not move team_convergence's
+  // readout. Then a write-off must move it, since it is shared belief now.
+  const CellWorld empty = makeWorld();
+  EXPECT_EQ(empty.sharedHash(), 0xb0d4b924u);
+
+  // Every local status: COVERED, EXPLORING, COVERED_BY_OTHERS,
+  // EXPLORING_BY_OTHERS, then UNSEEN.
+  CellWorld mixed = makeWorld();
+  selfCover(mixed, 0);
+  selfExplore(mixed, 1);
+  mixed.mergeWire(1, {wc(2, 2), wc(3, 1)});
+  ASSERT_EQ(mixed.status(2), CellStatus::COVERED_BY_OTHERS);
+  ASSERT_EQ(mixed.status(3), CellStatus::EXPLORING_BY_OTHERS);
+  EXPECT_EQ(mixed.sharedHash(), 0xbd1c5c28u);
+
+  // The campaign grid with every status drawn at random (all five occur).
+  CellWorld r = makeCampaignWorld();
+  std::mt19937 rng(20261012u);
+  for (int id = 0; id < r.size(); ++id) {
+    switch (rng() % 5u) {
+      case 1: r.commitSelf(id, CellStatus::EXPLORING); break;
+      case 2: r.commitSelf(id, CellStatus::COVERED); break;
+      case 3: r.mergeWire(1, {wc(id, 2)}); break;
+      case 4: r.mergeWire(1, {wc(id, 1)}); break;
+      default: break;
+    }
+  }
+  const CellWorld::Census cen = r.census();
+  ASSERT_EQ(cen.unseen, 6);
+  ASSERT_EQ(cen.exploring, 9);
+  ASSERT_EQ(cen.covered, 5);
+  ASSERT_EQ(cen.exploring_by_others, 3);
+  ASSERT_EQ(cen.covered_by_others, 2);
+  EXPECT_EQ(r.sharedHash(), 0x1a92ba6eu);
+
+  // Writing off a cell already COVERED changes no status, only the flag.
+  ASSERT_EQ(mixed.status(0), CellStatus::COVERED);
+  mixed.commitSelf(0, CellStatus::COVERED, true);
+  EXPECT_NE(mixed.sharedHash(), 0xbd1c5c28u)
+      << "two robots that disagree on a write-off must hash apart";
+}
+
+TEST(CellWorldWriteOff, ExaminedStaysExactWithWriteOffs) {
+  // Every path a write-off can take, in one message with local priority on
+  // (centre 4: the whole 3x3). Each entry lands in exactly one existing
+  // bucket, so the caller's examined() == message size check still holds.
+  CellWorld b = makePeer(1);
+  selfExplore(b, 1);
+  selfCover(b, 2);
+  selfExplore(b, 5);
+  ASSERT_EQ(b.mergeWire(0, {wc(3, kWo, robotBit(0)), wc(4, kWo, robotBit(0)),
+                            wc(6, kWo, robotBit(0)), wc(8, kWo, robotBit(0))})
+                .applied,
+            4);
+
+  const std::vector<CellWorld::WireCell> msg = {
+      wc(0, kWo, robotBit(0)),   // UNSEEN -> adopted:            applied
+      wc(1, kWo, robotBit(0)),   // own EXPLORING, priority area: applied
+      wc(2, kWo, robotBit(0)),   // own COVERED, flag only:       applied
+      wc(3, kWo, robotBit(0)),   // already written off, same:    agreed_noop
+      wc(4, kWo, robotBit(2)),   // already written off, new bit: known_by_only
+      wc(5, 2, robotBit(0)),     // plain COVERED, priority area: refused_local
+      wc(6, 1, robotBit(0)),     // retraction of a write-off:    refused_guard
+      wc(7, 0x81),               //                               bad_status
+      wc(7, 0x80),               //                               bad_status
+      wc(8, 2, robotBit(2)),     // plain agreement, new bit:     known_by_only
+      wc(99, kWo),               //                               out_of_range
+  };
+  const CellWorld::MergeStats st = b.mergeWire(0, msg, /*centre=*/4);
+  EXPECT_EQ(st.refused, "");
+  EXPECT_EQ(st.applied, 3);
+  EXPECT_EQ(st.agreed_noop, 1);
+  EXPECT_EQ(st.known_by_only, 2);
+  EXPECT_EQ(st.refused_local, 1);
+  EXPECT_EQ(st.refused_guard, 1);
+  EXPECT_EQ(st.bad_status, 2);
+  EXPECT_EQ(st.out_of_range, 1);
+  EXPECT_EQ(st.examined(), static_cast<int>(msg.size()));
+
+  EXPECT_EQ(b.status(0), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(1), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(2), CellStatus::COVERED);
+  EXPECT_EQ(b.status(5), CellStatus::EXPLORING);
+  EXPECT_EQ(b.status(6), CellStatus::COVERED_BY_OTHERS);
+  EXPECT_EQ(b.status(7), CellStatus::UNSEEN);
+  EXPECT_EQ(b.cell(4).known_by, robotBit(0) | robotBit(2));
+  EXPECT_EQ(b.writtenOffIds(), std::vector<int>({0, 1, 2, 3, 4, 6, 8}));
+}
+
+TEST(CellWorldPerCellStop,
+     PerCellWorstUnknownExcludesWrittenOffAndRefusesUnmeasured) {
+  // The D2 stop measure on the campaign grid. Home (id 12) is an ordinary
+  // counted cell; a written-off cell is not counted, however unknown; an
+  // unmeasured counted cell blocks the stop (its -1 sentinel would pass any
+  // <= test); the caller's 0.10 holds a cell exactly 10% unknown.
+  CellWorld w = makeCampaignWorld();
+  ASSERT_EQ(w.size(), 25);
+  ASSERT_EQ(w.grid().idAt(0.0f, 0.0f), 12);
+  std::vector<CellWorld::CellObservation> f(25, obs(10000, 9500));  // u 0.05
+  f[12] = obs(10000, 9200);                                           // u 0.08
+  f[4]  = obs(10000, 1000);                                           // u 0.90
+
+  int id = -7;
+  EXPECT_NEAR(w.perCellWorstUnknown(f, &id), 0.90, 1e-12);
+  EXPECT_EQ(id, 4) << "control: not written off, so cell 4 is the worst";
+
+  ASSERT_TRUE(w.commitSelf(4, CellStatus::COVERED, true));
+  EXPECT_NEAR(w.perCellWorstUnknown(f, &id), 0.08, 1e-12);
+  EXPECT_EQ(id, 12) << "home is counted";
+
+  // An adopted write-off is excluded too.
+  ASSERT_EQ(w.mergeWire(1, {wc(12, kWo)}).applied, 1);
+  EXPECT_NEAR(w.perCellWorstUnknown(f, &id), 0.05, 1e-12);
+  EXPECT_EQ(id, 0) << "a tie goes to the lowest id";
+  CellWorld fresh_world = makeCampaignWorld();
+  EXPECT_NEAR(fresh_world.perCellWorstUnknown(f, &id), 0.90, 1e-12);
+
+  // Exactly 10% of the columns unknown passes the 0.10 rule; one more fails.
+  CellWorld v = makeCampaignWorld();
+  std::vector<CellWorld::CellObservation> g(25, obs(10000, 10000));   // u 0
+  EXPECT_EQ(v.perCellWorstUnknown(g, &id), 0.0);
+  EXPECT_EQ(id, 0) << "all clear still names a cell";
+  g[7] = obs(10000, 9000);
+  const double u10 = v.perCellWorstUnknown(g, &id);
+  EXPECT_EQ(u10, g[7].unknownFraction());
+  EXPECT_EQ(id, 7);
+  EXPECT_LE(u10, 0.10);
+  g[7] = obs(10000, 8999);
+  EXPECT_GT(v.perCellWorstUnknown(g, &id), 0.10);
+
+  // Unmeasured: never done, and the first such counted cell is named.
+  g[7] = obs(10000, 9000);
+  g[20] = obs(0, 0);
+  g[22] = obs(0, 0);
+  EXPECT_EQ(v.perCellWorstUnknown(g, &id), -1.0);
+  EXPECT_EQ(id, 20);
+  ASSERT_TRUE(v.commitSelf(20, CellStatus::COVERED, true));
+  ASSERT_TRUE(v.commitSelf(22, CellStatus::COVERED, true));
+  EXPECT_EQ(v.perCellWorstUnknown(g, &id), u10)
+      << "an unmeasured written-off cell does not block";
+  EXPECT_EQ(id, 7);
+
+  // Wrong census size or no world: cannot measure.
+  std::vector<CellWorld::CellObservation> short_census(24, obs(10000, 10000));
+  std::vector<CellWorld::CellObservation> long_census(26, obs(10000, 10000));
+  id = 3;
+  EXPECT_EQ(v.perCellWorstUnknown(short_census, &id), -1.0);
+  EXPECT_EQ(id, -1);
+  EXPECT_EQ(v.perCellWorstUnknown(long_census), -1.0);
+  EXPECT_EQ(CellWorld().perCellWorstUnknown({}, &id), -1.0);
+  EXPECT_EQ(id, -1);
+
+  // Every cell written off: nothing left to hold the stop.
+  CellWorld all = makeWorld();
+  for (int i = 0; i < all.size(); ++i)
+    ASSERT_TRUE(all.commitSelf(i, CellStatus::COVERED, true));
+  EXPECT_EQ(all.perCellWorstUnknown(std::vector<CellWorld::CellObservation>(
+                                        9, obs(100, 0)), &id),
+            0.0);
+  EXPECT_EQ(id, -1);
+}
+
+TEST(CellWorldWriteOff, WrittenOffIdsAscending) {
+  // The cell_stop and census events print this list; own and adopted
+  // write-offs made out of id order still come back ascending.
+  CellWorld w = makeWorld();
+  EXPECT_TRUE(w.writtenOffIds().empty());
+  ASSERT_TRUE(w.commitSelf(7, CellStatus::COVERED, true));
+  ASSERT_EQ(w.mergeWire(1, {wc(2, kWo)}).applied, 1);
+  ASSERT_TRUE(w.commitSelf(5, CellStatus::COVERED, true));
+  ASSERT_EQ(w.mergeWire(1, {wc(0, kWo)}).applied, 1);
+  ASSERT_TRUE(w.commitSelf(1, CellStatus::COVERED));  // control: no write-off
+  EXPECT_EQ(w.writtenOffIds(), std::vector<int>({0, 2, 5, 7}));
+  EXPECT_TRUE(CellWorld().writtenOffIds().empty());
 }

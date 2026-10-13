@@ -579,3 +579,188 @@ TEST(ExperimentLogGen34, EveryTeamCoreKindHasAWriter) {
   }
   EXPECT_EQ(log.teamEventsUnknown(), 0);
 }
+
+// ── Gen 41 (schema 14) ──────────────────────────────────────────────────────
+
+namespace {
+
+const std::vector<std::string> kGen41Kinds = {
+    "route_plan", "route_progress", "route_end", "list_cell", "help",
+    "cell_stop"};
+
+/// Every row of one event kind, in file order.
+std::vector<std::string> findRows(const std::vector<std::string>& lines,
+                                  const std::string& event) {
+  const std::string tag = "\"event\":\"" + event + "\"";
+  std::vector<std::string> out;
+  for (const std::string& l : lines)
+    if (l.find(tag) != std::string::npos) out.push_back(l);
+  return out;
+}
+
+bool endsWith(const std::string& s, const std::string& tail) {
+  return s.size() >= tail.size() &&
+         s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+}  // namespace
+
+// The gen-41 node stamps 14; the two older constants stay put, because the
+// scripts that read `kSchemaVersion = N` and `kGen34SchemaVersion = N` from
+// the header still score gen 33 and gen 34 cells.
+TEST(ExperimentLogGen41, SchemaStampIs14AndTheOlderPinsStay) {
+  EXPECT_EQ(ExperimentLog::kSchemaVersion, 12);
+  EXPECT_EQ(ExperimentLog::kGen34SchemaVersion, 13);
+  EXPECT_EQ(ExperimentLog::kGen41SchemaVersion, 14);
+  TempLogPath tmp("g41_schema");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+  }
+  EXPECT_NE(findRow(readLines(tmp.path), "run_start").find("\"schema_version\":14"),
+            std::string::npos);
+}
+
+// The six kinds are the tail of kEventKinds, right after gen 34's last, in
+// the order the build plan fixed. sim/equiv_gate.py reads everything from
+// kFirstV4EventKind on as opt-in; the vocabulary test only checks membership,
+// so this pins the position.
+TEST(ExperimentLogGen41, RouteKindsAreTheDeclaredTail) {
+  ASSERT_GE(ExperimentLog::kEventKindCount,
+            ExperimentLog::kFirstV4EventKind + kGen41Kinds.size() + 1);
+  const size_t base = ExperimentLog::kEventKindCount - kGen41Kinds.size();
+  EXPECT_EQ(std::string(ExperimentLog::kEventKinds[base - 1]), "tick");
+  for (size_t i = 0; i < kGen41Kinds.size(); ++i) {
+    EXPECT_EQ(std::string(ExperimentLog::kEventKinds[base + i]), kGen41Kinds[i])
+        << "kEventKinds[" << base + i << "]";
+  }
+}
+
+// Each gen-41 kind goes through logTeamEvent: one row under its own name, its
+// fields right after the envelope in order, and nothing counted as unknown.
+// The vocabulary test allows a declared kind with no writer, so a kind
+// dropped from the writer chain, or wired to another kind's begin(), is
+// caught here. The fields are arbitrary (the writer does not check them); a
+// large integer pins route_id_ns staying exact.
+TEST(ExperimentLogGen41, EveryRouteKindIsWrittenAndNotCountedUnknown) {
+  TempLogPath tmp("g41_kinds");
+  const long long id0 = 2999999999999LL;   // ~3000 s of sim time in ns
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
+    ExperimentContext ctx;
+    ctx.state = "NAVIGATE";
+    ctx.step = 42;
+    log.startRun(ctx, {});
+    for (size_t i = 0; i < kGen41Kinds.size(); ++i) {
+      const long long n = static_cast<long long>(i);
+      log.logTeamEvent(ctx, kGen41Kinds[i],
+                       {LogField::str("tag", kGen41Kinds[i]),
+                        LogField::integer("route_id_ns", id0 + n),
+                        LogField::num("u", 0.125 * static_cast<double>(n)),
+                        LogField::boolean("flag", i % 2 == 0)});
+    }
+    EXPECT_EQ(log.teamEventsUnknown(), 0);
+    log.logRunEnd(ctx, RunEndEvent{});
+  }
+  const auto lines = readLines(tmp.path);
+  for (size_t i = 0; i < kGen41Kinds.size(); ++i) {
+    const std::vector<std::string> rows = findRows(lines, kGen41Kinds[i]);
+    ASSERT_EQ(rows.size(), 1u) << kGen41Kinds[i];
+    const std::string want =
+        "\"state\":\"NAVIGATE\",\"step\":42,\"tag\":\"" + kGen41Kinds[i] +
+        "\",\"route_id_ns\":" + std::to_string(id0 + static_cast<long long>(i)) +
+        ",\"u\":" + std::to_string(0.125 * static_cast<double>(i)) +
+        ",\"flag\":" + (i % 2 == 0 ? "true" : "false") + "}";
+    EXPECT_TRUE(endsWith(rows[0], want)) << rows[0] << "\nwant tail " << want;
+  }
+  const std::string end = findRow(lines, "run_end");
+  EXPECT_NE(end.find("\"team_events_unknown\":0"), std::string::npos) << end;
+}
+
+// An undeclared kind is still refused and counted at schema 14, run_end
+// included. The names are the ones the specs floated before the plan fixed
+// the vocabulary, plus a near miss of a real kind; the real one between them
+// is still written.
+TEST(ExperimentLogGen41, UnknownKindIsStillCountedAtSchema14) {
+  TempLogPath tmp("g41_unknown");
+  const std::vector<std::string> unknown = {"help_cell", "cell_final",
+                                            "route_cell_finished", "route_plans"};
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    log.logTeamEvent(ctx, unknown[0], {LogField::integer("cell", 3)});
+    log.logTeamEvent(ctx, unknown[1], {});
+    log.logTeamEvent(ctx, "cell_stop", {LogField::str("at", "latch")});
+    log.logTeamEvent(ctx, unknown[2], {});
+    log.logTeamEvent(ctx, unknown[3], {});
+    EXPECT_EQ(log.teamEventsUnknown(), 4);
+    log.logRunEnd(ctx, RunEndEvent{});
+  }
+  const auto lines = readLines(tmp.path);
+  for (const std::string& k : unknown)
+    EXPECT_TRUE(findRow(lines, k).empty()) << k << " was written";
+  EXPECT_NE(findRow(lines, "cell_stop").find("\"at\":\"latch\"}"), std::string::npos);
+  const std::string end = findRow(lines, "run_end");
+  EXPECT_NE(end.find("\"team_events_unknown\":4"), std::string::npos) << end;
+}
+
+// cell_census gains the write-offs and the per-cell measure at the END of the
+// row, after every older field. Read back from the bytes, with values a
+// swapped key would fail on; the defaults are written as 0 and "", never
+// omitted, so "none written off" is a measured reading.
+TEST(ExperimentLogGen41, CellCensusCarriesWriteOffsAndPerCellUnknown) {
+  TempLogPath tmp("g41_census");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    CellCensusEvent e;
+    log.logCellCensus(ctx, e);
+    e.written_off = 2;
+    e.written_off_ids = "3,17";
+    e.cell_unknown = "0.083,-1,0.412,0.100";
+    log.logCellCensus(ctx, e);
+  }
+  const std::vector<std::string> rows = findRows(readLines(tmp.path), "cell_census");
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_TRUE(endsWith(rows[0],
+                       "\"cell_frontier_frac_at_best_unknown\":-1.000000,"
+                       "\"written_off\":0,\"written_off_ids\":\"\","
+                       "\"cell_unknown\":\"\"}"))
+      << rows[0];
+  EXPECT_TRUE(endsWith(rows[1],
+                       "\"cell_frontier_frac_at_best_unknown\":-1.000000,"
+                       "\"written_off\":2,\"written_off_ids\":\"3,17\","
+                       "\"cell_unknown\":\"0.083,-1,0.412,0.100\"}"))
+      << rows[1];
+}
+
+// allocation gains tour_source at the end of the row. Its default is
+// "allocator", which is what every arm's solve writes unless the P arm's plan
+// walk replaced the tour ("list" / "help").
+TEST(ExperimentLogGen41, AllocationCarriesTourSource) {
+  TempLogPath tmp("g41_alloc");
+  {
+    ExperimentLog log(tmp.path, "r", rclcpp::get_logger("t"));
+    log.setSchemaVersion(ExperimentLog::kGen41SchemaVersion);
+    ExperimentContext ctx;
+    log.startRun(ctx, {});
+    AllocationEvent e;
+    log.logAllocation(ctx, e);
+    e.demoted = "7";
+    e.tour_source = "help";
+    log.logAllocation(ctx, e);
+  }
+  const std::vector<std::string> rows = findRows(readLines(tmp.path), "allocation");
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_TRUE(endsWith(rows[0], "\"demoted\":\"\",\"tour_source\":\"allocator\"}"))
+      << rows[0];
+  EXPECT_TRUE(endsWith(rows[1], "\"demoted\":\"7\",\"tour_source\":\"help\"}"))
+      << rows[1];
+}

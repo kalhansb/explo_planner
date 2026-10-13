@@ -213,9 +213,18 @@ EXPLORING whenever the unknown fraction is above exploring_min_unknown.
 A stuck cell sits there by definition, so the demotion undid itself
 within one census period and the robot went back to the same cell.
 
-The flag is local. It is not on the wire and not in sharedHash(): peers
-see an ordinary COVERED, and a peer that adopts it as COVERED_BY_OTHERS
-already cannot lower it with its own evidence (relayed-raise-only).
+The flag travels team-wide (CL D2). toWire() sends a written-off cell
+whose normalised status is COVERED as 2 | kWireWrittenOff (0x82); 0x82 is
+the only valid byte with bit 7 set. A peer adopts it in mergeWire BEFORE
+local priority, because every robot must drop the same cells from its
+per-cell stop rule. On adoption it sets written_off (which pins classify()
+as an own write-off does), sets status COVERED_BY_OTHERS unless the local
+status already normalises to COVERED, ORs sender_bit | w.known_by into
+known_by, and does not bump update_id (rule 1). Because toWire() emits the
+bit for adopted cells too, the flag relays at N>=3. Nobody lowers a
+written-off cell, not even a source in known_by: any non-agreeing peer
+status is refused_guard, checked before the guard table. The flag is
+folded into sharedHash() (see cell-shared-hash).
 ```
 
 ### cell-codec-beside-machine
@@ -258,6 +267,14 @@ Deliberately NOT a hash of the whole cell record:
     the same shared fact, and the `*_BY_OTHERS` distinction is local
     bookkeeping about provenance.
 What is left is exactly the state the exchange is supposed to make agree.
+
+The folded byte is the one toWire() sends, so the write-off bit (0x80) is
+included. While nothing is written off the byte equals the normalised
+status, and the digest is bit-identical to the pre-write-off hash (pinned
+by SharedHashUnchangedWithoutWriteOffs with goldens 0xb0d4b924, 0xbd1c5c28
+and 0x1a92ba6e). Two robots that agree on status but disagree on a
+write-off hash apart, so team_convergence.py sees the write-off as shared
+belief.
 ```
 
 ### cell-edge-hash
@@ -319,6 +336,13 @@ claim about the same ground is refused outright. The robot is standing in
 it and the peer is not.
 
 Never touches update_id (rule 1) and never lowers a first-hand COVERED.
+
+Write-off handling. A 0x82 entry is adopted ahead of local priority (see
+cell-written-off). Bucket mapping, so examined() stays exact: a first
+adoption counts as applied; a repeat with new known_by bits counts as
+known_by_only; a pure repeat counts as agreed_noop; any lowering of a
+written-off cell counts as refused_guard; 0x80, 0x81 and 0x83..0xff count
+as bad_status, because only COVERED may carry the bit.
 ```
 
 ### cell-intercept-candidates
