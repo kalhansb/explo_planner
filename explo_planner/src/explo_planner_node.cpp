@@ -4883,7 +4883,10 @@ void ExploPlannerNode::doNavigate() {
   // Skipped without a planning_map: isCellOccupied treats no map as occupied
   // and would abort every goal. (notes: navigate-goal-inside-obstacle)
   // A route step drops an occupied waypoint instead (R24, above).
-  if (!route_step_active_ && latest_plan_map_ &&
+  // P's home wait drives to home as TeamCore homing does: the navigator snaps
+  // a start pose the plan map reads occupied, and arrival is mission_home_tol_m.
+  const bool home_goal = plan_active_ && current_goal_.position == home_pos_;
+  if (!route_step_active_ && !home_goal && latest_plan_map_ &&
       isCellOccupied(current_goal_.position)) {
     RCLCPP_WARN(get_logger(),
         "Step %d: goal (%.2f, %.2f) is now inside an obstacle — "
@@ -4911,7 +4914,7 @@ void ExploPlannerNode::doNavigate() {
   // the others at its pass radius.
   const bool head_is_last = !route_step_active_ ||
       route_passed_ + 1 >= static_cast<int>(route_sent_.size());
-  if (dist < goal_xy_tol_ && head_is_last) {
+  if (dist < (home_goal ? mission_home_tol_m_ : goal_xy_tol_) && head_is_last) {
     float yaw_err = std::remainder(latest_yaw_ - current_goal_.yaw,
                                    2.0f * static_cast<float>(M_PI));
     if (!yaw_required || std::abs(yaw_err) < goal_yaw_tol_) {

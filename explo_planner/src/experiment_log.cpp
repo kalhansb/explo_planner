@@ -1086,6 +1086,7 @@ void ExperimentLog::logTeamEvent(const ExperimentContext& ctx,
   else if (kind == "list_cell")      begin("list_cell", ctx);
   else if (kind == "help")           begin("help", ctx);
   else if (kind == "cell_stop")      begin("cell_stop", ctx);
+  else if (kind == "home_wait")      begin("home_wait", ctx);
   else {
     if (team_events_unknown_++ == 0) {
       RCLCPP_ERROR(logger_,

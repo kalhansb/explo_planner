@@ -898,7 +898,7 @@ class ExperimentLog {
       "team_finished", "tick",
       // --- gen 41 (schema 14) ---
       "route_plan", "route_progress", "route_end", "list_cell", "help",
-      "cell_stop",
+      "cell_stop", "home_wait",
   };
   static constexpr size_t kEventKindCount =
       sizeof(kEventKinds) / sizeof(kEventKinds[0]);
@@ -1123,7 +1123,7 @@ class ExperimentLog {
   /// node's own: `kind` is the event value and the fields follow the envelope
   /// in order. The kinds are team_activity, plan, booking, exchange, chase,
   /// homing and team_finished, and from gen 41 (schema 14) route_plan,
-  /// route_progress, route_end, list_cell, help and cell_stop. Any other is
+  /// route_progress, route_end, list_cell, help, cell_stop and home_wait. Any other is
   /// not written; it is counted and reported in run_end as
   /// team_events_unknown, so a kind added without a writer shows.
   void logTeamEvent(const ExperimentContext& ctx, const std::string& kind,

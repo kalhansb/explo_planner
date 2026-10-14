@@ -586,7 +586,7 @@ namespace {
 
 const std::vector<std::string> kGen41Kinds = {
     "route_plan", "route_progress", "route_end", "list_cell", "help",
-    "cell_stop"};
+    "cell_stop", "home_wait"};
 
 /// Every row of one event kind, in file order.
 std::vector<std::string> findRows(const std::vector<std::string>& lines,

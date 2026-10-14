@@ -1595,6 +1595,10 @@ through logTeamEvent:
 cell_stop is emitted in EVERY arm, including R at the shipped defaults, so
 unlike the v4 kinds it is not opt-in.
 
+home_wait (the P home-wait update, 2026-10-14, still v14): the P arm's
+list and help walk is empty and the robot drives home to wait; fields list
+and dist_m. Appended at the tail, so nothing earlier moves.
+
 Additive fields, both appended at the end of their rows:
   - cell_census: written_off, written_off_ids, cell_unknown;
   - allocation: tour_source ("allocator" | "list" | "help").
