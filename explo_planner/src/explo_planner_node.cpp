@@ -3740,6 +3740,22 @@ void ExploPlannerNode::doPlan() {
 
   phase_ = Phase::EXPLORE;
 
+  // P with its list and help walked waits at home for the team's maps (the
+  // reunion of CL line 58) until the metrics tick latches it: no map ingest
+  // or planning while it waits. A reopened cell refills the walk and sends it
+  // back out.
+  if (plan_active_ && have_home_ &&
+      (latest_pos_ - home_pos_).head<2>().norm() <= mission_home_tol_m_ &&
+      planWalk(plan_, plan_my_list_, plan_helping_,
+               [this](int c) { return planCellFinished(c); })
+          .remaining.empty()) {
+    if (route_active_) {
+      abandonNavGoal("route-orphaned");
+      clearRouteStep();
+    }
+    return;
+  }
+
   // Rebuild the local map_cache_ from the latest fused map received on the
   // topic (ROI-clipped) so frontier extraction + FOV scoring below run on
   // fresh consensus data.
@@ -4368,7 +4384,19 @@ void ExploPlannerNode::doPlan() {
       found = true;
     }
   }
-  if (!route_found) {
+  // P with its list and help walked (no tier cell) drives home, not the walk.
+  const bool home_wait = alloc_ran && plan_active_ && step_F < 0;
+  if (home_wait) {
+    current_goal_ = CandidateViewpoint();
+    current_goal_.position = home_pos_;
+    current_goal_.yaw      = home_yaw_;
+    found = true;
+    if (exp_log_) {
+      exp_log_->logTeamEvent(expCtx(), "home_wait", LogFields{
+          LogField::integer("list", plan_my_list_),
+          LogField::num("dist_m", (robot_pos - home_pos_).head<2>().norm())});
+    }
+  } else if (!route_found) {
     for (size_t idx : order) {
       if (!admissible(idx, tally)) continue;
       current_goal_ = candidates[idx];
@@ -4390,8 +4418,8 @@ void ExploPlannerNode::doPlan() {
   std::vector<size_t>& suppressed_only = tally.suppressed;
   std::vector<size_t>& visited_only    = tally.visited_suppressed;
   // Whether the pick came from the walk itself rather than from the amnesty
-  // fallback below. sep_reordered is only defined for a walk pick — see there.
-  const bool found_in_walk = found && !route_found;
+  // fallback below or home. sep_reordered is only defined for a walk pick.
+  const bool found_in_walk = found && !route_found && !home_wait;
   // One amnesty for both suppression tiers. bl is the blacklist that suppressed
   // the pool and so orders and dates it; source is the log word for the tier
   // granting the reprieve. (notes: plan-amnesty-single-helper)
@@ -4461,9 +4489,10 @@ void ExploPlannerNode::doPlan() {
   // rejected must still log the allocation.
   // (notes: alloc-bookkeeping-placement)
   if (alloc_ran) {
-    // A route step has no candidate: its tier reads as the rank (C9).
+    // A route step has no candidate: its tier reads as the rank (C9). Home
+    // has neither: -1.
     alloc_ev.picked_rank = route_found ? route_pick.tier - 1
-                                       : (found ? alloc_rank[selected_idx] : -1);
+                         : (found && !home_wait ? alloc_rank[selected_idx] : -1);
 
     // alloc_focus_skips_ is per cell id and counts appearances as focus in
     // which the cell's unknown fraction did not drop, whatever the pick's
@@ -4642,6 +4671,13 @@ void ExploPlannerNode::doPlan() {
   if (route_found) {
     pending_selected_info_gain_ = route_pick.covered_m2;
     pending_selected_path_cost_ = route_pick.route_len_m;
+    pending_sep_discount_       = 1.0f;
+  } else if (home_wait) {   // home has no candidate either: no info, its cost
+    pending_selected_info_gain_ = 0.0f;
+    pending_selected_path_cost_ =
+        skip_reachability || !cost_grid_
+            ? (robot_pos - home_pos_).head<2>().norm()
+            : cost_grid_->costTo(home_pos_);
     pending_sep_discount_       = 1.0f;
   }
   // pending_sep_reordered_: 1 yes, 0 no, -1 not asked (term off, nothing
