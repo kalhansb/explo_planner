@@ -1278,8 +1278,8 @@ ExploPlannerNode::ExploPlannerNode()
   // reuses ids unreliably (e.g. a detector with no tracker).
   target_dedup_radius_m_ = dp("target_dedup_radius_m", 0.0);
   int   n_vantages       = dp("n_vantages", 3);
-  // Default 2-of-3: tolerate one occluded/unreachable angle and still call a
-  // trunk "successfully exploited". Set == n_vantages to require a full ring.
+  // C++ fallback 2-of-3: tolerate one occluded/unreachable angle and still call
+  // a trunk "successfully exploited". shared_params.yaml ships 3, the full ring.
   min_vantages_required_ = dp("min_vantages_required", 2);
   double vantage_standoff_m   = dp("vantage_standoff_m", 2.0);
   double vantage_start_angle_deg = dp("vantage_start_angle_deg", 0.0);

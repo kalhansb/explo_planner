@@ -24,9 +24,10 @@ Each planning cycle the node:
    the region of interest (ROI). An optional polar grid of 96 viewpoints
    around the robot (`candidate_enable_polar`, off in `shared_params.yaml`)
    adds local options. Candidates outside the ROI are dropped. With
-   `use_planning_map: true`, candidates on blocked or unreachable cells of the
-   2D planning map are dropped too; frontier candidates first try to move to
-   a good cell within `candidate_snap_radius_m`.
+   `use_planning_map: true`, a candidate on a blocked or unreachable cell of
+   the 2D planning map first moves to the nearest good cell within
+   `candidate_snap_radius_m`, and is dropped if there is none. Frontier
+   candidates may land on unknown cells; the rest need known free ones.
 2. **Scores each candidate.** Simulated field-of-view ray casting over the
    SCovox map gives its EIG.
 3. **Costs each candidate.** With the planning map, a bounded grid Dijkstra
@@ -42,8 +43,9 @@ Each planning cycle the node:
 
    Unreachable candidates get `U = −∞` and sort last.
 5. **Navigates** under a distance-scaled time budget and a no-progress
-   watchdog. It gives up a goal Nav2 aborts twice from the same spot, and
-   blacklists failed goals for a while so it does not re-pick them. Each goal
+   watchdog. It gives up a goal Nav2 aborts twice from the same spot, or once
+   if Nav2 had already run its recoveries there, and blacklists failed goals
+   for a while so it does not re-pick them. Each goal
    ends with one `Goal end` log line and the same fields in the per-step CSV.
 6. **Terminates** when the ROI's unknown fraction stays below a threshold for
    N consecutive cycles, or at `max_steps`.
@@ -140,12 +142,13 @@ The node logic is split into small, unit-tested modules:
 | `proximity_guard` | Coordinated proximity-stop arbiter (yield/hold/resume decisions) |
 | `target_queue` | Tree-target queue (ingest, dedup, lifecycle) for exploitation |
 | `vantage_planner` | Vantage-point generation + line-of-sight occlusion test |
-| `tree_detector` | Trunk segmentation over the fused map (stable position-derived ids) |
+| `tree_detector` | Trunk segmentation over the fused map, and the gate that decides when a tree is nominated |
 | `metrics_logger` | Per-step CSV metric logging |
 | `planner_util` | Small shared pure helpers |
 
 Two further executables publish tree targets: `tree_detector_node` (wraps the
-`tree_detector` module) and `target_scheduler_node`.
+`tree_detector` module and gives each tree a stable id derived from its
+position) and `target_scheduler_node`.
 
 ## Run
 
