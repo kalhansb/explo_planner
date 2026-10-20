@@ -55,7 +55,8 @@ void MetricsLogger::writeHeader() {
         << "vantage_los_clear,dwell_sec,"
         << "prox_hold_count,prox_hold_total_sec,"
         << "goal_outcome,nav_elapsed_sec,goal_path_length_m,"
-        << "nav2_aborts,nav2_recoveries,nav2_error_code\n";
+        << "nav2_aborts,nav2_recoveries,nav2_error_code,"
+        << "pick_fallback\n";
   header_written_ = true;
 }
 
@@ -92,7 +93,8 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.goal_path_length_m << ","
         << m.nav2_aborts << ","
         << m.nav2_recoveries << ","
-        << m.nav2_error_code << "\n";
+        << m.nav2_error_code << ","
+        << m.pick_fallback << "\n";
   file_.flush();
 }
 

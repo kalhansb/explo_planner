@@ -173,7 +173,7 @@ values: [real_robot_tuning.md](real_robot_tuning.md).
 | `planning_map_unknown_value` | double | `0` | The v an unseen (−1) cell counts as in the path cost, clamped to 0–99. |
 | `planning_map_clearance_m` | double | `0` | Passable cells this close to an obstacle (m) are never goals and cost the penalty below. |
 | `planning_map_clearance_penalty` | double | `1` | Step-cost multiplier in that zone (≥ 1). |
-| `candidate_snap_radius_m` | double | `2.0` (C++ `0`) | Frontier candidates on an obstacle, in the clearance zone or unreachable move to the nearest good cell within this radius (m), else are rejected. Planning map only. |
+| `candidate_snap_radius_m` | double | `2.0` (C++ `0`) | Candidates on an obstacle, in the clearance zone or unreachable move to the nearest good cell within this radius (m), else are rejected; frontier candidates may land on unknown cells. Planning map only. |
 | `planning_map_robot_clear_m` | double | `0` | Blocked cells this close to the robot (m) stay obstacles for goals but not for its own path search, so a LiDAR that sees the robot's body cannot wall it in. |
 
 **Navigation gates and watchdogs**
@@ -195,6 +195,7 @@ values: [real_robot_tuning.md](real_robot_tuning.md).
 | `tf_stale_warn_sec` | double | `1.0` | Warn when the newest `map_frame` → `base_frame` transform is older than this (s); the last pose is kept. `≤ 0` disables. |
 | `max_pose_jump_m` | double | `1.0` | A one-tick pose change above this (m) is a relocalisation jump, left out of distance and the watchdog. `0` disables. |
 | `failed_goal_radius_m` / `failed_goal_ttl_sec` | double | `2.0` / `60` | Blacklist disc (m) and lifetime (s) around a failed goal. |
+| `visited_goal_radius_m` / `visited_goal_ttl_sec` | double | `6` / `120` (C++ `0` / `120`) | The same for a reached exploration goal: candidates within the radius (m, XY) are skipped for the lifetime (s), counted as `blk=`. Radius `0` = off. If it is what leaves no candidate, the planner picks the one whose latest reached goal within the radius is oldest (warns `going back to the area left longest ago`; step line ends `REVISIT`; CSV `pick_fallback` = `revisit`); that pick still obeys `candidate_min_goal_dist_m`, the failed-goal blacklist and peer claims. The lifetime also applies with the radius `0`: a pick with `candidate_min_goal_dist_m` relaxed skips 2 m around reached goals. |
 
 **Coverage-based termination**
 
@@ -216,6 +217,8 @@ values: [real_robot_tuning.md](real_robot_tuning.md).
 | `candidate_ground_z` | double | `0.15` | Flat mode: candidates at or below this z (m) skip the occupancy check (ground voxels). |
 | `candidate_occ_thresh` | double | `0.7` | Occupancy at or above this blocks a candidate. |
 | `frontier_cluster_radius_m` | double | `5.0` | Frontier clustering bin edge (m). |
+| `frontier_z_lo_offset_m` / `frontier_z_hi_offset_m` | double | `0` / `0` | The frontier search starts this far (m) above the bottom of the ROI z-band and stops this far below its top. Negative values count as 0; if the two cross, the whole band is searched (warns). In terrain mode the result is a flat slab, not a height above the ground. |
+| `candidate_min_goal_dist_m` | double | `4.0` (C++ `0`) | Exploration candidates closer to the robot than this (m, XY) are rejected, counted as `close=`. If that leaves none, it is dropped for that pick, which still skips candidates within `visited_goal_radius_m` (at least 2 m) of a goal reached in the last `visited_goal_ttl_sec` (counted as `blk=`). Such a pick warns, its step line ends `HOP RELAXED` with counts from the relaxed walk, and its CSV row has `pick_fallback` = `hop-relaxed`. `0` = off; negative or non-finite is treated as off (warns); warns if not above `goal_xy_tolerance`. |
 | `roi_min_x` / `roi_max_x` / `roi_min_y` / `roi_max_y` | double | `0` / `100` / `0` / `25` (C++ `-15` / `15` / `-15` / `15`) | XY box in the ROI frame (m). Candidates must lie in it; coverage is measured over it. |
 | `roi_yaw_deg` / `roi_origin_x` / `roi_origin_y` | double | `25.75` / `-40.30` / `-31.54` (C++ `0` / `0` / `0`) | The ROI frame: the map frame rotated by `roi_yaw_deg` about map point (`roi_origin_x`, `roi_origin_y`). All zero = the map frame. |
 | `roi_min_z` / `roi_max_z` | double | `-5.5` / `4.0` (C++ `-0.5` / `2.0`) | Map ingest z-band (m), robot-relative with `terrain_relative_z`. Upstream z-filters must cover it. |
@@ -538,6 +541,7 @@ written to `output_csv`. Columns, in order:
 | `goal_outcome` | How the goal that ended since the previous row ended: `reached`, `budget`, `budget-rotate`, `no-progress`, `nav2-aborted`, `goal-in-obstacle` (its cell became an obstacle), `target-switch`, `yielded` (a teammate picked the same vantage at the same moment), `team-reconnected` (drive home cut short). Empty if none ended. Ends that write no row of their own (the last four, a reached approach waypoint, and every drive home) are joined to the next row's with `+`, e.g. `goal-in-obstacle+budget`; the next five columns describe the last of them. Ends still pending when the run stops get one last row at DONE. |
 | `nav_elapsed_sec`, `goal_path_length_m` | Time the goal took (s), and the distance its budget was built from (m): planned path length, or the straight line. |
 | `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | nav2's aborts of this goal, the recoveries it ran on it, and the last abort's error code (Jazzy; `-1` = none, or Humble). `0` / `0` / `-1` when nav2 is not watched. |
+| `pick_fallback` | How the goal was picked when the normal walk left no candidate: `hop-relaxed` (`candidate_min_goal_dist_m` dropped) or `revisit` (every candidate near a recently reached goal; the area left longest ago). Empty for a normal pick and in exploit. |
 
 ---
 

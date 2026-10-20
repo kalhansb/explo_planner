@@ -57,11 +57,17 @@ std::vector<std::string> readLines(const std::filesystem::path& p) {
   return lines;
 }
 
+// Keeps a trailing empty field ("a,b," is three fields): the last column,
+// pick_fallback, is empty on most rows.
 std::vector<std::string> splitCsv(const std::string& line) {
   std::vector<std::string> fields;
-  std::stringstream ss(line);
-  std::string f;
-  while (std::getline(ss, f, ',')) fields.push_back(f);
+  std::string::size_type start = 0;
+  while (true) {
+    const auto comma = line.find(',', start);
+    fields.push_back(line.substr(start, comma - start));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
   return fields;
 }
 
@@ -92,7 +98,7 @@ TEST(MetricsLogger, HeaderAndRowHaveSameColumnCount) {
   EXPECT_EQ(splitCsv(lines[0]).size(), splitCsv(lines[1]).size());
   // Pin the width too: a field added to StepMetrics but wired into NEITHER
   // writeHeader nor logStep is invisible to the comparison above.
-  EXPECT_EQ(splitCsv(lines[0]).size(), 32u)
+  EXPECT_EQ(splitCsv(lines[0]).size(), 33u)
       << "column count changed — update writeHeader, logStep, and the "
          "expected list in ColumnOrderMatchesHeaderNames together";
 }
@@ -138,6 +144,7 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
   m.nav2_aborts             = 30;
   m.nav2_recoveries         = 31;
   m.nav2_error_code         = 32;
+  m.pick_fallback           = "revisit";
 
   TempDir dir;
   auto csv = dir.file("m.csv");
@@ -181,9 +188,11 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
       {"nav2_aborts", 30},
       {"nav2_recoveries", 31},
       {"nav2_error_code", 32},
+      {"pick_fallback", 0},  // string column
   };
   const std::vector<std::pair<std::string, std::string>> text_columns = {
-      {"phase", "exploit"}, {"goal_outcome", "nav2-aborted"}};
+      {"phase", "exploit"}, {"goal_outcome", "nav2-aborted"},
+      {"pick_fallback", "revisit"}};
 
   auto names  = splitCsv(lines[0]);
   auto values = splitCsv(lines[1]);
@@ -270,6 +279,7 @@ TEST(MetricsLogger, ExploreRowCarriesDocumentedDefaults) {
   EXPECT_EQ(valueOf(names, values, "nav2_aborts"), "0");
   EXPECT_EQ(valueOf(names, values, "nav2_recoveries"), "0");
   EXPECT_EQ(valueOf(names, values, "nav2_error_code"), "-1");
+  EXPECT_EQ(valueOf(names, values, "pick_fallback"), "");
 }
 
 // The header is written once, on the first row — not per row.

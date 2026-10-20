@@ -110,6 +110,10 @@ position and a heading, because what a sensor sees depends on both.
 free voxel next to unobserved space: the boundary of what is known. Frontier
 voxels anywhere in the ROI are binned into 5 m cubes, and each bin's centroid
 becomes a candidate, heading along the bearing from the robot to the centroid.
+In the October 2026 field maps 86–91 % of voxels counted as frontier, so
+frontiers never ran out, and two bins stacked in z gave pairs of candidates
+0.7–1.1 m apart; once the robot reaches one, the minimum hop (§7) rejects the
+other.
 Frontiers are what let the planner commit to crossing the map. A purely local
 candidate set finishes one area and then has nothing worth visiting, because
 every nearby viewpoint is already known.
@@ -203,11 +207,28 @@ and sort last.
 The planner walks the ranking and takes the first candidate that passes every
 filter:
 
-1. not within arrival tolerance of the robot (a goal already reached wastes a
-   step);
+1. at least 4 m from the robot. A goal inside arrival tolerance is already
+   reached. The rest of the 4 m is for z-stacked pairs: in the field the
+   robot bounced between the two goals of one, because once their EIG
+   stopped falling after the first visit the nearer one won every cycle. Each
+   goal but the last was reached, so the blacklist only stepped in at the end
+   of a streak. If the hop is what leaves no candidate, the walk is repeated
+   without it, still applying filter 3, so a robot whose remaining
+   candidates are all near it still moves without going straight back;
 2. on free, reachable ground, when a 2D grid exists to check;
-3. not within 2 m of a goal that failed in the last 60 s (§8);
+3. not within 6 m of a goal reached in the last 120 s, nor within 2 m of one
+   that failed in the last 60 s (§8). The first part is for two goals more
+   than 4 m apart taking turns as the nearest, which the hop alone left
+   happening in simulation (4.3 m apart). 6 m is just above the frontier bin
+   size, so skipping a reached goal skips the bin that produced it;
 4. not contested by a teammate with a better claim (§10.1).
+
+If the reached-goal part of filter 3 is what leaves no candidate, the planner
+takes the candidate (still at least 4 m away, not failed, not contested)
+whose latest reached goal within 6 m is oldest: it goes back to the area it left
+longest ago, so it tours old goals instead of idling or bouncing between the
+newest two. A pick made by either fallback is marked in the step log and the
+CSV (`pick_fallback`).
 
 The winner is published as a goal pose and broadcast as an intent.
 
@@ -582,7 +603,8 @@ Specific known issues are tracked in
 | Parameter | Default | Role |
 | --- | --- | --- |
 | Frontier cluster size | 5 m | Long-range candidate granularity |
-| Polar candidates: rings / bearings / headings | 3 / 8 / 4, **off** | 96 local candidates per cycle when enabled |
+| Minimum hop | 4 m | Stops the bounce between goals about 1 m apart |
+| Polar candidates: rings / bearings / headings | 3 / 8 / 4, **off** | 96 local candidates per cycle when enabled; the minimum hop rejects the 2 m ring |
 | Polar candidate radii | 2–8 m | Local viewpoint spacing |
 | Ground clearance | 0.3 m | Viewpoint height above local ground (terrain mode) |
 | Sensor model | 60° × 45°, 0.3–10 m, 16 × 12 rays | Simulated field of view for scoring |
@@ -593,6 +615,7 @@ Specific known issues are tracked in
 | Nav2 give-up | 2 aborts in a row, robot still; 1 after ≥ 2 recoveries within 1 m | Ends goals Nav2 rejects or cannot reach |
 | Arrival tolerance | 0.4 m, 0.4 rad; 15 s to rotate | Must be looser than the navigator's own checker |
 | Failed-goal blacklist | 2 m for 60 s | Prevents re-selecting failed goals |
+| Reached-goal suppression | 6 m for 120 s | Stops two goals more than 4 m apart taking turns |
 | Coverage termination | < 5 % unknown, 3 consecutive measurements | Saturation criterion |
 | MinPos claim | 10 m disc, 5 s TTL, 1 Hz | Goal deconfliction |
 | Rendezvous wait / return ceiling | 600 s / 600 s | Bounds both rendezvous legs |

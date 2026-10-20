@@ -70,9 +70,10 @@
     planning_map_unknown_value: 0.0
     planning_map_clearance_m: 0.0
     planning_map_clearance_penalty: 1.0
-    # Frontier candidates on an obstacle, in the clearance zone or unreachable
-    # move to the nearest good cell within this radius before scoring (0 =
-    # just reject them). Only acts with a planning map.
+    # Candidates on an obstacle, in the clearance zone or unreachable move to
+    # the nearest good cell within this radius before scoring (0 = just reject
+    # them); frontier candidates may land on unknown cells. Only acts with a
+    # planning map.
     candidate_snap_radius_m: 2.0
     # Blocked cells within this radius of the robot are passable for its own
     # path search (the cells stay obstacles for goals). A LiDAR that sees the
@@ -96,6 +97,23 @@
     # Set these from the actual goal_checker params on each platform.
     goal_xy_tolerance: 0.4
     goal_yaw_tolerance: 0.4
+    # Minimum XY distance (m) from the robot to an EXPLORE candidate; 0 = off
+    # (a negative value is treated as off). It stops the nearest-frontier
+    # ping-pong. On 2026-10-19 the robot went back and forth between two goals
+    # 0.67-1.12 m apart for 11-20 steps in three runs. Each pair came from two
+    # frontier bins stacked in z in the same 5 m column. The pair's info
+    # stopped falling after the first visit, and U = info / (0.1 + cost) kept
+    # picking whichever was nearer. Every goal in a streak was reached except
+    # the last, so the failed-goal blacklist only stepped in at the end.
+    # When the hop helps reject every candidate, the planner drops it for that
+    # pick but still skips goals near one reached in the last
+    # visited_goal_ttl_sec (visited_goal_radius_m, at least 2 m). It warns
+    # "Relaxing it for this pick", the step line ends "HOP RELAXED" and the
+    # CSV row has pick_fallback = hop-relaxed. Many such picks with a high
+    # blk= or minpos= mean the far goals have failed or a teammate claimed
+    # them, not that the hop is too large. visited_goal_radius_m below stops
+    # two goals more than 4 m apart taking turns.
+    candidate_min_goal_dist_m: 4.0
     # Deadline for the in-place rotation after the XY goal is reached, timed
     # from arrival. Separate from the nav_* travel budget on purpose: sharing
     # that budget failed (and blacklisted) goals the robot was already
@@ -180,6 +198,26 @@
     failed_goal_radius_m: 2.0
     failed_goal_ttl_sec: 60.0
 
+    # Recently reached goals; radius 0 = off. An EXPLORE candidate within
+    # visited_goal_radius_m of a goal reached in the last visited_goal_ttl_sec
+    # is skipped and counted under `blk=` in the per-step log. It is for two
+    # goals more than the minimum hop apart taking turns as the nearest: in
+    # sim, with the hop alone a pair 4.3 m apart did that, and it took this
+    # filter to stop it. 6 m is just above frontier_cluster_radius_m, so
+    # skipping a reached goal skips the bin that produced it. When it is what
+    # leaves no candidate, the planner goes back to the area it left longest
+    # ago, still at least the minimum hop away: it warns "going back to the
+    # area left longest ago", the step line ends "REVISIT" and the CSV row has
+    # pick_fallback = revisit. The robot ends within goal_xy_tolerance of the
+    # goal it reached, so the radius is also the minimum hop after a reached
+    # goal. Long drives often failed on 2026-10-19 (nav2's map->odom timing
+    # race and controller crashes); if nav2 still fails them, 0 turns this
+    # off. Tuned in sim (6 m, 180 s); not yet run in the field. The TTL also
+    # applies with the radius 0: a pick with the minimum hop relaxed skips 2 m
+    # around goals reached within it.
+    visited_goal_radius_m: 6.0
+    visited_goal_ttl_sec: 120.0
+
     # Coverage-based termination. Once the unknown fraction in the ROI drops
     # below done_unknown_fraction for done_min_consecutive_steps measurements
     # in a row (each on a new step or a new fused map; a PLAN retry on the same
@@ -243,6 +281,16 @@
     # one centroid per bin is emitted as a long-range candidate. Larger ->
     # fewer, coarser frontier targets.
     frontier_cluster_radius_m: 5.0
+    # Frontier search band: the search starts lo m above the bottom of the
+    # ROI z band and stops hi m below its top; 0 / 0 = the whole band. They
+    # only narrow it, and are insets, so they must change with roi_min_z /
+    # roi_max_z. Off for the field: the band is one flat slab at the band's
+    # reference z, which lags the robot by up to the re-band hysteresis (see
+    # roi_min_z). On a slope a thin band misses ground frontiers uphill and
+    # keeps frontiers above the ground downhill. Tuned in a flat sim with a
+    # +-15 deg lidar.
+    frontier_z_lo_offset_m: 0.0
+    frontier_z_hi_offset_m: 0.0
 
     # Region of interest (XY rectangle, metres). The planner will not select
     # candidates outside it, and it also bounds the fused-map ingest clip, the

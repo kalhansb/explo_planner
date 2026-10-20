@@ -41,7 +41,13 @@ Each planning cycle the node:
    U(c) = info_gain(c) / (ε + path_cost(c)),   ε = 0.1
    ```
 
-   Unreachable candidates get `U = −∞` and sort last.
+   Unreachable candidates get `U = −∞` and sort last. Candidates under 4 m
+   away (`candidate_min_goal_dist_m`) are skipped, so the robot does not
+   bounce between two goals about 1 m apart, and so are candidates within
+   6 m of a goal reached in the last 120 s (`visited_goal_radius_m`), so two
+   farther goals do not take turns either. When the 4 m limit leaves none it
+   is dropped for that pick; when the 6 m one does, the robot goes back to
+   the area it left longest ago.
 5. **Navigates** under a distance-scaled time budget and a no-progress
    watchdog. It gives up a goal Nav2 aborts twice from the same spot, or once
    if Nav2 had already run its recoveries there, and blacklists failed goals
@@ -129,7 +135,7 @@ The node logic is split into small, unit-tested modules:
 | --- | --- |
 | `explo_planner_node` | The 10 Hz state machine and all ROS wiring |
 | `candidate_generator` | Viewpoint candidates: frontier-cluster centroids and the polar grid |
-| `candidate_snap` | Moves a frontier candidate off a bad planning-map cell onto the nearest good one |
+| `candidate_snap` | Moves a candidate off a bad planning-map cell onto the nearest good one |
 | `fov_evaluator` | Simulated FOV ray casting for viewpoint evaluation |
 | `scoring` | Per-voxel scores (EIG, entropy, frontier, random) |
 | `cost_grid` | Bounded 8-connected grid Dijkstra path cost over the planning map |

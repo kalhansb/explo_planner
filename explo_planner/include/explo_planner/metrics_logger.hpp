@@ -63,6 +63,12 @@ struct StepMetrics {
   int    nav2_aborts              = 0;
   int    nav2_recoveries          = 0;
   int    nav2_error_code          = -1;
+
+  // How this step's goal was picked when the normal walk left no candidate
+  // (EXPLORE only): "hop-relaxed" (candidate_min_goal_dist_m dropped) or
+  // "revisit" (every candidate near a recently reached goal; the area left
+  // longest ago). "" for a normal pick and in exploit.
+  std::string pick_fallback;
 };
 
 class MetricsLogger {

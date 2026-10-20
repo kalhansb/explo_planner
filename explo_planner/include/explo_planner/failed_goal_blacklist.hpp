@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <deque>
 #include <utility>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -30,6 +31,10 @@ public:
   /// True if the XY of `pos` is within `radius_m` of any stored entry.
   bool isNear(const Eigen::Vector3f& pos, double radius_m) const;
 
+  /// Time of the newest entry within `radius_m` (XY) of `pos`, or -infinity
+  /// if there is none.
+  double newestTimeNear(const Eigen::Vector3f& pos, double radius_m) const;
+
   std::size_t size() const { return entries_.size(); }
   bool empty() const { return entries_.empty(); }
 
@@ -37,5 +42,13 @@ private:
   // (xy position, time declared failed, seconds).
   std::deque<std::pair<Eigen::Vector3f, double>> entries_;
 };
+
+/// Order for the visited-goal fallback: indices into `positions`, the one
+/// whose newest entry within `radius_m` is oldest first, so the robot goes
+/// back to the area it left longest ago. Stable: equal times keep the input
+/// order (the caller's utility ranking).
+std::vector<std::size_t> leastRecentFirst(
+    const FailedGoalBlacklist& bl,
+    const std::vector<Eigen::Vector3f>& positions, double radius_m);
 
 } // namespace explo_planner

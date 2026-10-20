@@ -227,7 +227,9 @@ How each overlay value was derived, and the keys to update before real runs:
 | ROI box | 100 × 25 m, yawed 25.75° (the gt_map site's tree block) | Set it to the area being worked. A box that misses the area starves the planner of goals. One much larger than the reachable area stops coverage-done firing, so the run ends on battery. The startup log prints the ROI's map-frame extent. |
 | Z-band | `roi_min/max_z` = `-5.5 … +4.0`, **robot-relative** | Moves with the robot. SCovox/DScovox `share_roi_z_min/max` are **absolute** and must cover everywhere the band can sit, or voxels near its edge read as unknown (starved candidates, phantom frontiers). |
 | `done_unknown_fraction` | `0.05` × 3 steps | **Calibrate on the validation run**: set it above where the logged `source=scovox` fraction levels off. |
-| `candidate_enable_polar` | `false` (frontier goals only) | Turn it on if, on the validation run, the robot runs out of goals near the ROI corners and oscillates. Adds 96 sample goals around the robot. |
+| `candidate_min_goal_dist_m` | `4.0` | Stops the robot bouncing between two goals about 1 m apart. `0` = off; a negative value is treated as off. When it would leave no goal, the planner drops it for that pick but still skips goals near one reached recently (next row). Such a pick warns `Relaxing it for this pick`, ends its step line with `HOP RELAXED` and has `pick_fallback` = `hop-relaxed` in the CSV. If they are frequent, read the warning's counts: a high `blk=` or `minpos=` means the far goals have failed or a teammate claimed them, which lowering the hop does not fix. |
+| `visited_goal_radius_m` / `visited_goal_ttl_sec` | `6.0` / `120` | Skips goals within 6 m of one reached in the last 2 minutes, so two goals more than 4 m apart do not take turns. When that leaves no goal, the robot goes back to the area it left longest ago (warns `going back to the area left longest ago`, step line `REVISIT`, CSV `pick_fallback` = `revisit`). It makes most drives 6 m or longer: if nav2 is still failing long drives, set the radius to `0`. Not yet run in the field. |
+| `candidate_enable_polar` | `false` (frontier goals only) | Turn it on if, on the validation run, the robot runs out of goals near the ROI corners and oscillates. Adds 96 sample goals around the robot on rings at 2, 5 and 8 m; the default 4 m hop skips the 2 m ring. |
 
 ---
 
@@ -422,6 +424,7 @@ Written to `output_csv` on each robot. Columns worth watching live:
 | `prox_hold_count`, `prox_hold_total_sec` | Cumulative proximity holds. Compare with the trajectory afterwards. |
 | `goal_outcome`, `nav_elapsed_sec`, `goal_path_length_m` | How each goal ended, how long it took, and its route length. A run of `no-progress` / `nav2-aborted` means the robot is fighting the terrain. |
 | `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | Nav2's side of the same goal (error code on Jazzy only). |
+| `pick_fallback` | `hop-relaxed` or `revisit` when a fallback picked the goal (see `candidate_min_goal_dist_m` and `visited_goal_radius_m`), empty otherwise. Many in a row can mean the robot is bouncing again. |
 
 ---
 

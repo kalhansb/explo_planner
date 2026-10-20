@@ -118,4 +118,28 @@ Nav2GiveUp nav2GiveUp(int abort_limit, int streak, bool final_after_recovery,
 /// and behaviour (7xx) codes. "" for 0 and for codes it does not know.
 const char* nav2ErrorName(int code);
 
+/// Distance gate for an exploration candidate `dist_sq` (squared XY metres)
+/// from the robot.
+enum class HopGate {
+  kPass,      ///< far enough
+  kAtFeet,    ///< inside the arrival tolerance: already reached
+  kUnderHop,  ///< past the arrival tolerance but inside the minimum hop
+};
+
+/// The gate for `dist_sq` with arrival tolerance `xy_tol` and minimum hop
+/// `min_hop` (m); both bounds are exclusive, so a candidate exactly at one
+/// passes it. A `min_hop` at or below `xy_tol`, negative or NaN never gives
+/// kUnderHop.
+HopGate hopGate(float dist_sq, double xy_tol, double min_hop);
+
+/// `candidate_min_goal_dist_m` as the walk uses it: a negative or non-finite
+/// value is off (0).
+double sanitizeMinHop(double min_hop);
+
+/// When the walk relaxes the minimum hop it also skips candidates within this
+/// XY radius (m) of a goal reached in the last visited_goal_ttl_sec, so the
+/// pick is not the goal the robot just came from. Above the widest bounce pair
+/// seen in the field (1.12 m).
+constexpr double kRelaxedRevisitRadiusM = 2.0;
+
 } // namespace explo_planner

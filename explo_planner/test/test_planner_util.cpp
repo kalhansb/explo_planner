@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include "explo_planner/planner_util.hpp"
 
@@ -160,4 +161,32 @@ TEST(PlannerUtil, Nav2ErrorName) {
   EXPECT_STREQ(nav2ErrorName(208), "NO_VALID_PATH");
   EXPECT_STREQ(nav2ErrorName(0), "");
   EXPECT_STREQ(nav2ErrorName(9999), "");
+}
+
+TEST(PlannerUtil, HopGate) {
+  using G = HopGate;
+  // Arrival tolerance 0.4 m, minimum hop 4 m.
+  EXPECT_EQ(hopGate(0.3f * 0.3f, 0.4, 4.0), G::kAtFeet);
+  EXPECT_EQ(hopGate(1.0f * 1.0f, 0.4, 4.0), G::kUnderHop);  // a z-stacked twin
+  EXPECT_EQ(hopGate(4.0f * 4.0f, 0.4, 4.0), G::kPass);      // exactly 4 m passes
+  EXPECT_EQ(hopGate(5.0f * 5.0f, 0.4, 4.0), G::kPass);
+  // Hop off (0) or not above the tolerance: only the tolerance applies.
+  EXPECT_EQ(hopGate(1.0f, 0.4, 0.0), G::kPass);
+  EXPECT_EQ(hopGate(0.1f, 0.4, 0.0), G::kAtFeet);
+  EXPECT_EQ(hopGate(0.1f, 0.4, 0.3), G::kAtFeet);
+  // The relaxed pass calls it with min_hop = xy_tol: just past the tolerance
+  // passes there but not under the 4 m hop.
+  EXPECT_EQ(hopGate(0.5f * 0.5f, 0.4, 0.4), G::kPass);
+  EXPECT_EQ(hopGate(0.5f * 0.5f, 0.4, 4.0), G::kUnderHop);
+  // Negative or NaN is off, not a hop of |min_hop|.
+  EXPECT_EQ(hopGate(1.0f, 0.4, -4.0), G::kPass);
+  EXPECT_EQ(hopGate(1.0f, 0.4, std::nan("")), G::kPass);
+}
+
+TEST(PlannerUtil, SanitizeMinHop) {
+  EXPECT_DOUBLE_EQ(sanitizeMinHop(4.0), 4.0);
+  EXPECT_DOUBLE_EQ(sanitizeMinHop(0.0), 0.0);
+  EXPECT_DOUBLE_EQ(sanitizeMinHop(-1.0), 0.0);
+  EXPECT_DOUBLE_EQ(sanitizeMinHop(std::numeric_limits<double>::infinity()), 0.0);
+  EXPECT_DOUBLE_EQ(sanitizeMinHop(std::nan("")), 0.0);
 }

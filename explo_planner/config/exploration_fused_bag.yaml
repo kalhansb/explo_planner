@@ -11,7 +11,7 @@
 # NOTHING CONSUMES THE GOAL: the "robot" replays the bag trajectory, so
 # every NAVIGATE leg ends by the distance-budgeted timeout and the planner
 # replans — that is the point: a fresh candidate set + selection every
-# ~27-45 s of BAG time along the recorded walk. The no-progress watchdog is
+# ~45 s of BAG time along the recorded walk (see the budget block). The no-progress watchdog is
 # deliberately disabled (see the nav block); on a skid-steer platform that
 # is not chasing the goal it fires on turns and pauses, not on real stalls.
 #
@@ -73,6 +73,13 @@
     # tighter gate here lets the navigator stop inside its own tolerance but
     # outside ours, failing a goal the robot is standing on.
     goal_yaw_tolerance: 0.4
+    # Same minimum hop and recently-visited filter as shared_params.yaml, so
+    # a bag dry run exercises them (the replay scripts load only this file).
+    # The filter only acts on a reached goal, which here needs the recorded
+    # walk to pass within goal_xy_tolerance of it.
+    candidate_min_goal_dist_m: 4.0
+    visited_goal_radius_m: 6.0
+    visited_goal_ttl_sec: 120.0
     goal_rotate_timeout_sec: 20.0    # skid-steer 180 deg in place, slow yaw rate
     integrate_wait: 2.0
 
@@ -81,8 +88,9 @@
     # (use_sim_time: true), so it is independent of the `ros2 bag play --rate`.
     # speed 0.15 m/s is the survey pace measured off the replayed TF (~0.13);
     # the stock 0.5 m/s is a driving-robot number and made every budget 3x
-    # too short. Candidate radii are 2-8 m, so this yields a replan every
-    # ~27 s (2 m goal) to 45 s (>=3.4 m, ceiling) of bag time.
+    # too short. Goals >= 3.4 m away hit the 45 s ceiling, and the 4 m
+    # minimum hop leaves only those (a relaxed pick can be nearer, down to
+    # the 15 s floor), so this yields a replan about every 45 s of bag time.
     nav_speed_estimate_mps: 0.15
     nav_safety_factor: 2.0
     nav_min_timeout_sec: 15.0

@@ -4,6 +4,8 @@
 #include "explo_planner/failed_goal_blacklist.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <numeric>
 
 namespace explo_planner {
 
@@ -35,6 +37,34 @@ bool FailedGoalBlacklist::isNear(const Eigen::Vector3f& pos,
     if (dx * dx + dy * dy < r2) return true;
   }
   return false;
+}
+
+double FailedGoalBlacklist::newestTimeNear(const Eigen::Vector3f& pos,
+                                           double radius_m) const {
+  const float r2 = static_cast<float>(radius_m * radius_m);
+  double newest = -std::numeric_limits<double>::infinity();
+  for (const auto& [p, t] : entries_) {
+    float dx = pos.x() - p.x();
+    float dy = pos.y() - p.y();
+    if (dx * dx + dy * dy < r2) newest = std::max(newest, t);
+  }
+  return newest;
+}
+
+std::vector<std::size_t> leastRecentFirst(
+    const FailedGoalBlacklist& bl,
+    const std::vector<Eigen::Vector3f>& positions, double radius_m) {
+  std::vector<double> newest(positions.size());
+  for (std::size_t i = 0; i < positions.size(); ++i) {
+    newest[i] = bl.newestTimeNear(positions[i], radius_m);
+  }
+  std::vector<std::size_t> order(positions.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     return newest[a] < newest[b];
+                   });
+  return order;
 }
 
 } // namespace explo_planner

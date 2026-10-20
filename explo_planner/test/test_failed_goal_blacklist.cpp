@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <vector>
+
 #include <Eigen/Core>
 
 #include "explo_planner/failed_goal_blacklist.hpp"
@@ -96,4 +99,42 @@ TEST(FailedGoalBlacklist, FutureStampedEntryIsNotPruned) {
   bl.prune(/*now_sec=*/100.0, /*ttl_sec=*/60.0);
   EXPECT_EQ(bl.size(), 1u);
   EXPECT_TRUE(bl.isNear(p(3, 3), 1.0));
+}
+
+// newestTimeNear: the newest entry inside the radius (XY), -inf when none.
+TEST(FailedGoalBlacklist, NewestTimeNear) {
+  FailedGoalBlacklist bl;
+  EXPECT_TRUE(std::isinf(bl.newestTimeNear(p(0, 0), 5.0)));
+  bl.add(p(0, 0), 10.0);
+  bl.add(p(1, 0), 30.0);
+  bl.add(p(20, 0), 50.0);
+  EXPECT_DOUBLE_EQ(bl.newestTimeNear(p(0.5f, 0), 2.0), 30.0);
+  EXPECT_DOUBLE_EQ(bl.newestTimeNear(p(-1.5f, 0), 2.0), 10.0);  // only (0,0)
+  EXPECT_DOUBLE_EQ(bl.newestTimeNear(p(20, 1, 9), 2.0), 50.0);  // z ignored
+  const double none = bl.newestTimeNear(p(10, 0), 2.0);
+  EXPECT_TRUE(std::isinf(none) && none < 0.0);
+}
+
+// The visited-goal fallback order: a never-visited area first, then the one
+// left longest ago; ties keep the input (utility) order.
+TEST(FailedGoalBlacklist, LeastRecentFirst) {
+  FailedGoalBlacklist bl;
+  bl.add(p(0, 0), 100.0);   // where the robot is now
+  bl.add(p(10, 0), 40.0);   // left 60 s ago
+  bl.add(p(0, 10), 70.0);   // left 30 s ago
+  const std::vector<Eigen::Vector3f> pos = {
+      p(1, 0),         // 0: next to the robot (100)
+      p(0, 11),        // 1: 70
+      p(10, 1),        // 2: 40
+      p(0.5f, 0.5f),   // 3: 100, ties with 0
+      p(30, 30),       // 4: never visited
+  };
+  const auto order = leastRecentFirst(bl, pos, 6.0);
+  ASSERT_EQ(order.size(), 5u);
+  EXPECT_EQ(order[0], 4u);
+  EXPECT_EQ(order[1], 2u);
+  EXPECT_EQ(order[2], 1u);
+  EXPECT_EQ(order[3], 0u);
+  EXPECT_EQ(order[4], 3u);
+  EXPECT_TRUE(leastRecentFirst(bl, {}, 6.0).empty());
 }

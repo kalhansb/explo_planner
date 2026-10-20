@@ -4,6 +4,7 @@
 #include "explo_planner/planner_util.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace explo_planner {
 
@@ -129,6 +130,18 @@ const char* nav2ErrorName(int code) {
     case 724: return "DRIVE_ON_HEADING_INVALID_INPUT";
     default:  return "";
   }
+}
+
+HopGate hopGate(float dist_sq, double xy_tol, double min_hop) {
+  if (dist_sq < static_cast<float>(xy_tol * xy_tol)) return HopGate::kAtFeet;
+  if (min_hop > xy_tol && dist_sq < static_cast<float>(min_hop * min_hop)) {
+    return HopGate::kUnderHop;
+  }
+  return HopGate::kPass;
+}
+
+double sanitizeMinHop(double min_hop) {
+  return (std::isfinite(min_hop) && min_hop > 0.0) ? min_hop : 0.0;
 }
 
 } // namespace explo_planner

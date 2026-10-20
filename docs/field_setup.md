@@ -105,7 +105,7 @@ single-robot launches (`exploration_experiment.launch.py`, or
 | One robot, sim/defaults | `exploration_experiment.launch.py robot:=<name>` | `shared_params.yaml` |
 | One robot, hardware | same, plus `base_frame:=<frame> params_file:=$CFG/exploration_real_robot.yaml` | shared + the overlay's `/**` block (its per-robot blocks do not match an un-namespaced node) |
 | Two robots, hardware | `multi_robot_exploration.launch.py robots:=bunker,curt params_file:=$CFG/exploration_real_robot.yaml` | shared + `/**` + the `/bunker/…` and `/curt/…` blocks |
-| Bag replay (map-test-2) | `ws/src/run_explo_experiment.sh` (hmr_explo) | shared + `exploration_fused_bag.yaml` |
+| Bag replay (map-test-2) | `ws/src/run_explo_experiment.sh` (hmr_explo) | `exploration_fused_bag.yaml` only (not shared) |
 | Bag replay (CURT Mini) | `ws/src/run_explo_curtmini.sh` (hmr_explo) | see the script header |
 
 On the single-robot launch the frames, `output_csv` and `max_steps` come
@@ -180,8 +180,9 @@ planning map sets what `path_cost` measures and which goals are allowed:
   reachable.
 - **On.** The planner runs a Dijkstra search over the 2D grid from the robot
   (`CostGrid`, 8-connected). `path_cost` becomes the shortest path around
-  obstacles, candidates the search cannot reach are dropped, and
-  non-frontier candidates on unknown cells are rejected. The grid is rebuilt
+  obstacles. Candidates the search cannot reach, and non-frontier
+  candidates on unknown cells, first move to a good cell nearby ("Snaps",
+  below) and are dropped if there is none. The grid is rebuilt
   only when a new map arrives, and the search reruns only on a new map or
   after 0.25 m of motion.
 
@@ -264,10 +265,11 @@ nodes read them with `as_double()` and die on an integer.
 3. **Keeps clear.** Passable cells within `planning_map_clearance_m` (0.6 m)
    of an obstacle are never a goal, and cost `planning_map_clearance_penalty`
    (3×) to drive through.
-4. **Snaps.** A frontier candidate on an obstacle, in the clearance zone or
+4. **Snaps.** A candidate on an obstacle, in the clearance zone or
    unreachable moves to the nearest good cell within
-   `candidate_snap_radius_m` (2 m) inside the ROI. Its yaw is re-aimed at its
-   old spot and its z re-seated on the terrain. With no good cell it stays
+   `candidate_snap_radius_m` (2 m) inside the ROI. A frontier candidate moved
+   more than 0.5 m is re-aimed at its old spot; others keep their yaw. In
+   terrain mode its z is re-seated on the ground. With no good cell it stays
    put and the filters drop it.
 5. **Costs the path.** A passable cell with score v costs
    `step × (1 + planning_map_trav_weight × v / 100)`. With weight 1, rough

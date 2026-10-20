@@ -394,6 +394,8 @@ private:
   int    max_steps_;
   double map_resolution_;
   double goal_xy_tol_;
+  // Minimum XY distance from the robot to an EXPLORE candidate; 0 = off.
+  double cand_min_goal_dist_{0.0};
   double goal_yaw_tol_;
   // Deadline for the post-arrival in-place rotation, measured from the first
   // tick the robot is inside goal_xy_tol_ — NOT shared with nav_budget_sec_,
@@ -535,6 +537,11 @@ private:
   // bin. Larger -> fewer, coarser long-range targets. The sibling roi_*_z args
   // to findFrontierCentroids are already params; this was the lone hardcoded one.
   float frontier_cluster_radius_m_ = 5.0f;
+  // Insets (m) of the frontier search band from the bottom and top of the
+  // effective ROI band. Both 0 = the whole band.
+  bool  frontier_band_set_ = false;
+  float frontier_z_lo_off_ = 0.0f;
+  float frontier_z_hi_off_ = 0.0f;
 
   // --- Exploitation params ---
   // When false the exploitation overlay is inert (no target subscription is
@@ -693,6 +700,10 @@ private:
 
   // Recently-failed goals (TTL + radius blacklist).
   FailedGoalBlacklist failed_goals_;
+  // Recently reached exploration goals: same structure, opposite trigger.
+  FailedGoalBlacklist visited_goals_;
+  double visited_goal_radius_m_ = 0.0;   // 0 = feature off
+  double visited_goal_ttl_sec_  = 120.0;
 
   // Per-navigate-cycle state for the smart timeout. The no-progress window
   // measures net XY displacement from progress_check_pos_, not summed travel.
@@ -772,6 +783,9 @@ private:
   float pending_plan_ms_              = 0.0f;
   int   pending_rejected_by_minpos_      = 0;
   int   pending_rejected_by_unreachable_ = 0;
+  // "" for a normal pick, else the fallback that made it: "hop-relaxed"
+  // (minimum hop dropped) or "revisit" (all near recently reached goals).
+  std::string pending_pick_fallback_;
 
   // Per-exploit-step diagnostics (filled by doExploitPlan/doExploitDwell,
   // drained by doLogStep when phase_ == EXPLOIT).
@@ -966,6 +980,26 @@ ExploPlannerNode::ExploPlannerNode()
         "xy_goal_tolerance (0.25) — see the goal_yaw_tolerance warning.",
         goal_xy_tol_);
   }
+  // Minimum hop. Candidates nearer than this are rejected in doPlan along with
+  // those inside goal_xy_tolerance. Two frontier bins stacked in z give goals
+  // ~1 m apart; once their info stops falling, utility keeps picking the
+  // nearer one and the robot bounces between them, reaching each, so the
+  // failed-goal blacklist only steps in when a goal fails. doPlan drops the
+  // hop for a pick it would leave empty.
+  const double min_hop_param = dp("candidate_min_goal_dist_m", 0.0);
+  cand_min_goal_dist_ = sanitizeMinHop(min_hop_param);
+  if (cand_min_goal_dist_ != min_hop_param) {
+    RCLCPP_WARN(get_logger(),
+        "candidate_min_goal_dist_m=%.2f is negative or not finite; the "
+        "minimum hop is off (use 0 to turn it off).", min_hop_param);
+  } else if (cand_min_goal_dist_ > 0.0 &&
+             cand_min_goal_dist_ <= goal_xy_tol_) {
+    RCLCPP_WARN(get_logger(),
+        "candidate_min_goal_dist_m=%.2f is not above goal_xy_tolerance=%.2f, "
+        "so it rejects nothing the arrival gate did not already reject and "
+        "the near-frontier oscillation it exists to prevent is still live.",
+        cand_min_goal_dist_, goal_xy_tol_);
+  }
   integrate_wait_ = dp("integrate_wait", 2.0);
 
   // Distance-budgeted navigate timeout. The total budget for a NAVIGATE
@@ -1006,6 +1040,15 @@ ExploPlannerNode::ExploPlannerNode()
       dp("failed_goal_radius_m", 2.0);
   failed_goal_ttl_sec_ =
       dp("failed_goal_ttl_sec", 60.0);
+  // Visited-goal suppression: EXPLORE candidates within visited_goal_radius_m
+  // of a goal reached in the last visited_goal_ttl_sec are skipped. Meant for
+  // two goals further apart than the minimum hop taking turns as the nearest.
+  // If it is what leaves no candidate, doPlan goes back to the area left
+  // longest ago (the revisit fallback). 0 = off. Reached goals are recorded
+  // either way: a pick with the minimum hop relaxed skips
+  // kRelaxedRevisitRadiusM around them.
+  visited_goal_radius_m_ = dp("visited_goal_radius_m", 0.0);
+  visited_goal_ttl_sec_  = dp("visited_goal_ttl_sec", 120.0);
 
   // Coverage-based termination. Each PLAN tick we measure the unknown
   // fraction of the ROI (source per done_coverage_source below). When it
@@ -1128,6 +1171,21 @@ ExploPlannerNode::ExploPlannerNode()
   // Frontier clustering bin size (m). See member doc; previously hardcoded 5.0f.
   frontier_cluster_radius_m_ =
       static_cast<float>(dp("frontier_cluster_radius_m", 5.0));
+  // Frontier search band: insets from the effective ROI band, so in terrain
+  // mode it is a flat slab at the band reference, not a height above the
+  // ground. Only ever narrows: a frontier outside the ingested band would
+  // reference voxels map_cache_ never loaded.
+  const double f_lo_off = dp("frontier_z_lo_offset_m", 0.0);
+  const double f_hi_off = dp("frontier_z_hi_offset_m", 0.0);
+  frontier_z_lo_off_ = static_cast<float>(std::max(0.0, f_lo_off));
+  frontier_z_hi_off_ = static_cast<float>(std::max(0.0, f_hi_off));
+  frontier_band_set_ = (frontier_z_lo_off_ > 0.0f || frontier_z_hi_off_ > 0.0f);
+  if (frontier_band_set_) {
+    RCLCPP_INFO(get_logger(),
+        "Frontier search band inset by %.2f m from the ROI floor and %.2f m "
+        "from its ceiling (ROI z [%.2f, %.2f]).",
+        frontier_z_lo_off_, frontier_z_hi_off_, roi_min_z_, roi_max_z_);
+  }
 
   // FOV evaluation
   FovConfig fcfg;
@@ -1161,9 +1219,9 @@ ExploPlannerNode::ExploPlannerNode()
   //   planning_map_clearance_m / _penalty: passable cells this close to an
   //     obstacle are a clearance zone — never a goal, and their step cost is
   //     multiplied by the penalty.
-  //   candidate_snap_radius_m: frontier candidates on an obstacle, in the
-  //     clearance zone or unreachable move to the nearest good cell within
-  //     this radius before scoring (0 = reject them as before).
+  //   candidate_snap_radius_m: candidates on an obstacle, in the clearance
+  //     zone or unreachable move to the nearest good cell within this radius
+  //     before scoring (0 = reject them as before).
   //   planning_map_robot_clear_m: blocked cells this close to the robot do
   //     not wall in its path search (its own body seen by the LiDAR).
   {
@@ -2282,6 +2340,7 @@ void ExploPlannerNode::doPlan() {
   auto plan_start = this->now();
 
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+  visited_goals_.prune(plan_start.seconds(), visited_goal_ttl_sec_);
   if (coord_) coord_->prune(plan_start);
 
   // Exploitation takes priority over exploration: the moment a target is
@@ -2393,8 +2452,25 @@ void ExploPlannerNode::doPlan() {
   auto candidates =
       candidate_gen_->generate(robot_pos, robot_yaw, terrain_map);
   size_t n_radial = candidates.size();
+  // Frontier search band: the effective ROI band, narrowed by
+  // frontier_z_lo/hi_offset_m when set.
+  float f_lo = eff_roi_min_z_, f_hi = eff_roi_max_z_;
+  if (frontier_band_set_) {
+    // Offsets ride the ROI band: in flat mode eff_roi_* are the absolute yaml
+    // values and these are absolute heights; in terrain mode they follow the
+    // band reference (a flat slab, see the param load).
+    f_lo = std::max(f_lo, eff_roi_min_z_ + frontier_z_lo_off_);
+    f_hi = std::min(f_hi, eff_roi_max_z_ - frontier_z_hi_off_);
+    if (f_lo >= f_hi) {          // degenerate: fall back rather than find none
+      f_lo = eff_roi_min_z_; f_hi = eff_roi_max_z_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "frontier_z_*_offset_m collapse the band to nothing — ignoring them "
+          "for this tick and searching the full ROI band [%.2f, %.2f].",
+          f_lo, f_hi);
+    }
+  }
   auto frontiers = map_cache_->findFrontierCentroids(
-      eff_roi_min_z_, eff_roi_max_z_, frontier_cluster_radius_m_);
+      f_lo, f_hi, frontier_cluster_radius_m_);
   candidate_gen_->addFrontierCandidates(candidates, frontiers, robot_pos,
                                         terrain_map);
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
@@ -2597,86 +2673,172 @@ void ExploPlannerNode::doPlan() {
   int rejected_unreachable = 0;
   int rejected_minpos = 0;
   int rejected_too_close = 0;
+  int rejected_under_hop = 0;  // the part of close= past goal_xy_tol_
   bool found = false;
+  bool hop_relaxed = false;
+  bool revisit = false;
   size_t selected_idx = 0;
-  for (size_t idx : order) {
-    const auto& vp = candidates[idx];
-    // 0. Skip candidates at the robot's feet — these are "already reached"
-    //    by goal_xy_tolerance so they waste a step without any movement.
-    {
-      float dx = vp.position.x() - robot_pos.x();
-      float dy = vp.position.y() - robot_pos.y();
-      if (dx * dx + dy * dy < static_cast<float>(
-              goal_xy_tol_ * goal_xy_tol_)) {
-        ++rejected_too_close;
+  // Candidates the first walk rejected only for being near a recently reached
+  // goal (everything before that check passed). The revisit fallback below.
+  std::vector<size_t> visited_pool;
+  // At most two walks, then the revisit fallback. When the minimum hop helped
+  // reject everything, the second walk drops it: those candidates stay near a
+  // robot that is not moving, so retrying with the hop could keep it in PLAN
+  // until the map or a blacklist entry changes. The second walk still skips
+  // candidates near a recently reached goal (at least kRelaxedRevisitRadiusM),
+  // so it does not hand back the goal the robot just came from.
+  for (int pass = 0; pass < 2 && !found; ++pass) {
+    double min_hop = cand_min_goal_dist_;
+    if (pass == 1) {
+      if (rejected_under_hop == 0) break;  // the hop rejected nothing
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Step %d: all %zu candidates rejected with the %.1f m minimum hop "
+          "(close=%d, %d of them past the arrival tolerance; map=%d clear=%d "
+          "unreach=%d blk=%d minpos=%d). Relaxing it for this pick.",
+          step_, candidates.size(), cand_min_goal_dist_, rejected_too_close,
+          rejected_under_hop, rejected_map, rejected_clearance,
+          rejected_unreachable, rejected_blacklist, rejected_minpos);
+      hop_relaxed = true;
+      min_hop = goal_xy_tol_;
+      rejected_map = rejected_clearance = rejected_blacklist = 0;
+      rejected_unreachable = rejected_minpos = 0;
+      rejected_too_close = rejected_under_hop = 0;
+    }
+    for (size_t idx : order) {
+      const auto& vp = candidates[idx];
+      // 0. Skip candidates at the robot's feet — these are "already reached"
+      //    by goal_xy_tolerance so they waste a step without any movement —
+      //    and anything inside candidate_min_goal_dist_m (see the param load).
+      {
+        float dx = vp.position.x() - robot_pos.x();
+        float dy = vp.position.y() - robot_pos.y();
+        const HopGate gate = hopGate(dx * dx + dy * dy, goal_xy_tol_, min_hop);
+        if (gate != HopGate::kPass) {
+          ++rejected_too_close;
+          if (gate == HopGate::kUnderHop) ++rejected_under_hop;
+          continue;
+        }
+      }
+      // 1. Single-cell free check on the planning_map. Frontier centroid
+      //    candidates are exempt from the unknown-cell rejection because
+      //    they naturally sit at the boundary where the 2D planning_map
+      //    cell is still unknown (-1). They are still rejected if the cell
+      //    is occupied/inflated (>= 50). Skipped entirely when no planning_map
+      //    is available (best-effort mode) — there is nothing to check against.
+      if (latest_plan_map_) {
+        if (vp.is_frontier) {
+          if (isCellOccupied(vp.position)) { ++rejected_map; continue; }
+        } else {
+          if (!isCellFree(vp.position)) { ++rejected_map; continue; }
+        }
+        // 1b. Not inside the clearance zone around an obstacle (on when
+        //     planning_map_clearance_m > 0): a goal brushing a bush is one the
+        //     navigator ends up pushing into. The snap above has already moved
+        //     what it could out of the zone.
+        if (cost_model_.clearance_m > 0.0f &&
+            cost_grid_->inClearanceZone(vp.position)) {
+          ++rejected_clearance;
+          continue;
+        }
+      }
+      // 2. Cost-grid reachability — catches free pockets sealed off by
+      //    inflated obstacles. Skipped when the flood barely reached
+      //    anything (robot trapped in inflation zone).
+      if (!skip_reachability && cost_grid_ &&
+          !cost_grid_->reachable(vp.position)) {
+        ++rejected_unreachable;
         continue;
       }
-    }
-    // 1. Single-cell free check on the planning_map. Frontier centroid
-    //    candidates are exempt from the unknown-cell rejection because
-    //    they naturally sit at the boundary where the 2D planning_map
-    //    cell is still unknown (-1). They are still rejected if the cell
-    //    is occupied/inflated (>= 50). Skipped entirely when no planning_map
-    //    is available (best-effort mode) — there is nothing to check against.
-    if (latest_plan_map_) {
-      if (vp.is_frontier) {
-        if (isCellOccupied(vp.position)) { ++rejected_map; continue; }
-      } else {
-        if (!isCellFree(vp.position)) { ++rejected_map; continue; }
-      }
-      // 1b. Not inside the clearance zone around an obstacle (on when
-      //     planning_map_clearance_m > 0): a goal brushing a bush is one the
-      //     navigator ends up pushing into. The snap above has already moved
-      //     what it could out of the zone.
-      if (cost_model_.clearance_m > 0.0f &&
-          cost_grid_->inClearanceZone(vp.position)) {
-        ++rejected_clearance;
+      // 3. Failed-goal blacklist (existing) + recently-visited suppression.
+      //    Both counted as `blk` in the per-step log: they reject for the same
+      //    reason from the planner's point of view -- do not go back there yet.
+      //    The relaxed walk keeps at least kRelaxedRevisitRadiusM of it.
+      const double visited_r = pass == 1
+          ? std::max(visited_goal_radius_m_, kRelaxedRevisitRadiusM)
+          : visited_goal_radius_m_;
+      if (visited_r > 0.0 && visited_goals_.isNear(vp.position, visited_r)) {
+        ++rejected_blacklist;
+        if (pass == 0) visited_pool.push_back(idx);
         continue;
       }
-    }
-    // 2. Cost-grid reachability — catches free pockets sealed off by
-    //    inflated obstacles. Skipped when the flood barely reached
-    //    anything (robot trapped in inflation zone).
-    if (!skip_reachability && cost_grid_ &&
-        !cost_grid_->reachable(vp.position)) {
-      ++rejected_unreachable;
-      continue;
-    }
-    // 3. Failed-goal blacklist (existing).
-    if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
-      ++rejected_blacklist;
-      continue;
-    }
-    // 4. MinPos peer-claim check (only when coordination is enabled).
-    // live_after: exploration contests LIVE claims only. Exploit claims are
-    // retained past expiry by the grace window so the vantage contests stay
-    // closed across delivery gaps, but out here a graced claim would keep a
-    // frontier candidate yielded to a peer we have not heard from in 10+
-    // seconds — exploration keeps the original TTL semantics.
-    if (coord_ && coord_->enabled()) {
-      const auto* peer = coord_->claimMatching(
-          vp.position, static_cast<float>(coord_claim_radius_m_),
-          &plan_start);
-      if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
-                                            *peer, robot_name_)) {
-        ++rejected_minpos;
+      if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) {
+        ++rejected_blacklist;
         continue;
       }
+      // 4. MinPos peer-claim check (only when coordination is enabled).
+      // live_after: exploration contests LIVE claims only. Exploit claims are
+      // retained past expiry by the grace window so the vantage contests stay
+      // closed across delivery gaps, but out here a graced claim would keep a
+      // frontier candidate yielded to a peer we have not heard from in 10+
+      // seconds — exploration keeps the original TTL semantics.
+      if (coord_ && coord_->enabled()) {
+        const auto* peer = coord_->claimMatching(
+            vp.position, static_cast<float>(coord_claim_radius_m_),
+            &plan_start);
+        if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
+                                              *peer, robot_name_)) {
+          ++rejected_minpos;
+          continue;
+        }
+      }
+      current_goal_ = vp;
+      selected_idx = idx;
+      found = true;
+      break;
     }
-    current_goal_ = vp;
-    selected_idx = idx;
-    found = true;
-    break;
+  }
+  // Revisit fallback. When every candidate left is near a goal reached in the
+  // last visited_goal_ttl_sec, go back to the area left longest ago instead of
+  // idling until an entry expires: a tour of the old goals, not a back and
+  // forth between the newest two. Only first-walk candidates, so the minimum
+  // hop still holds. The failed-goal and peer-claim checks never ran on them.
+  if (!found && !visited_pool.empty()) {
+    std::vector<Eigen::Vector3f> pool_pos;
+    pool_pos.reserve(visited_pool.size());
+    for (size_t idx : visited_pool) pool_pos.push_back(candidates[idx].position);
+    for (size_t k : leastRecentFirst(visited_goals_, pool_pos,
+                                     visited_goal_radius_m_)) {
+      const size_t idx = visited_pool[k];
+      const auto& vp = candidates[idx];
+      if (failed_goals_.isNear(vp.position, failed_goal_radius_m_)) continue;
+      if (coord_ && coord_->enabled()) {
+        const auto* peer = coord_->claimMatching(
+            vp.position, static_cast<float>(coord_claim_radius_m_),
+            &plan_start);
+        if (peer && !coord_->selfWinsAgainst(robot_pos, vp.position,
+                                              *peer, robot_name_)) {
+          continue;
+        }
+      }
+      current_goal_ = vp;
+      selected_idx = idx;
+      found = true;
+      revisit = true;
+      RCLCPP_WARN(get_logger(),
+          "Step %d: every candidate is near a goal reached in the last %.0f s; "
+          "going back to the area left longest ago, (%.2f, %.2f), last reached "
+          "near there %.0f s ago.",
+          step_, visited_goal_ttl_sec_, vp.position.x(), vp.position.y(),
+          plan_start.seconds() -
+              visited_goals_.newestTimeNear(vp.position,
+                                            visited_goal_radius_m_));
+      break;
+    }
   }
   if (!found) {
     // Throttled: this retries at the tick rate (the counters say why).
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "Step %d: all %zu candidates rejected (close=%d map=%d clear=%d "
         "unreach=%d blk=%d minpos=%d; snapped=%d nospot=%d). Retrying next "
-        "tick.",
+        "tick.%s%s",
         step_, candidates.size(), rejected_too_close,
         rejected_map, rejected_clearance, rejected_unreachable,
-        rejected_blacklist, rejected_minpos, n_snapped, n_snap_nospot);
+        rejected_blacklist, rejected_minpos, n_snapped, n_snap_nospot,
+        hop_relaxed ? " Minimum hop already relaxed; blk= includes goals near "
+                      "ones reached in the last visited_goal_ttl_sec."
+                    : "",
+        visited_pool.empty() ? ""
+            : " No revisit either: those are failed or claimed by a peer.");
     return;  // stay in PLAN, retry next tick
   }
 
@@ -2697,6 +2859,8 @@ void ExploPlannerNode::doPlan() {
       : cost_grid_->pathLengthTo(current_goal_.position);
   pending_rejected_by_minpos_      = rejected_minpos;
   pending_rejected_by_unreachable_ = rejected_unreachable;
+  pending_pick_fallback_ = revisit ? "revisit"
+                         : hop_relaxed ? "hop-relaxed" : "";
 
   auto plan_end = this->now();
   float plan_ms = static_cast<float>(
@@ -2706,14 +2870,16 @@ void ExploPlannerNode::doPlan() {
   RCLCPP_INFO(get_logger(),
       "Step %d: selected goal (%.2f, %.2f) yaw=%.2f U=%.3f "
       "info=%.2f cost=%.2f path=%.1fm [%zu cand, close=%d map=%d clear=%d "
-      "unreach=%d blk=%d minpos=%d, snapped=%d nospot=%d, peers=%zu, %.1fms]",
+      "unreach=%d blk=%d minpos=%d, snapped=%d nospot=%d, peers=%zu, %.1fms]%s",
       step_, current_goal_.position.x(), current_goal_.position.y(),
       current_goal_.yaw, current_goal_.score,
       pending_selected_info_gain_, pending_selected_path_cost_,
       pending_selected_path_len_,
       candidates.size(), rejected_too_close, rejected_map, rejected_clearance,
       rejected_unreachable, rejected_blacklist, rejected_minpos, n_snapped,
-      n_snap_nospot, coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms);
+      n_snap_nospot, coord_ ? coord_->livePeerCount(plan_end) : 0u, plan_ms,
+      revisit ? " REVISIT (counts are from the last walk)"
+      : hop_relaxed ? " HOP RELAXED (counts are from the relaxed walk)" : "");
 
   publishGoal(current_goal_);
   publishCandidateViz(candidates);
@@ -3031,6 +3197,9 @@ void ExploPlannerNode::doNavigate() {
       }
       // Exploration goal reached: integrate the new observation.
       have_active_intent_ = false;
+      // Park it in the visited set so the next PLANs do not pick it again
+      // (visited_goal_radius_m; with that 0 only a relaxed pick checks it).
+      visited_goals_.add(current_goal_.position, this->now().seconds());
       RCLCPP_INFO(get_logger(),
           "Goal reached: dist=%.2f yaw_err=%.1f deg", dist,
           yaw_err * 180.0f / static_cast<float>(M_PI));
@@ -3823,6 +3992,9 @@ StepMetrics ExploPlannerNode::writeStepRow() {
       : 0;
   m.rejected_by_minpos        = pending_rejected_by_minpos_;
   m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
+  // Cleared here: only doPlan sets it, so an exploit step reads "".
+  m.pick_fallback             = pending_pick_fallback_;
+  pending_pick_fallback_.clear();
 
   // Cumulative proximity-hold columns. LOG_STEP is never reached mid-hold
   // (holds only interrupt driving states), so these are always settled.
@@ -4490,6 +4662,7 @@ void ExploPlannerNode::doExploitPlan() {
   // Age out stale blacklist entries (same TTL as exploration) so a vantage that
   // failed earlier can be retried once its entry expires.
   failed_goals_.prune(plan_start.seconds(), failed_goal_ttl_sec_);
+  visited_goals_.prune(plan_start.seconds(), visited_goal_ttl_sec_);
 
   const auto robot_pos = latest_pos_;
 
