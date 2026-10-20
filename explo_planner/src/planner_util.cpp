@@ -144,4 +144,26 @@ double sanitizeMinHop(double min_hop) {
   return (std::isfinite(min_hop) && min_hop > 0.0) ? min_hop : 0.0;
 }
 
+namespace {
+
+void replaceAll(std::string& s, const std::string& from, const std::string& to) {
+  for (auto pos = s.find(from); pos != std::string::npos;
+       pos = s.find(from, pos + to.size())) {
+    s.replace(pos, from.size(), to);
+  }
+}
+
+}  // namespace
+
+std::string expandOutputPath(const std::string& path, const std::string& home,
+                             const std::string& robot, const std::string& stamp) {
+  std::string out = path;
+  if (!home.empty() && (out == "~" || out.rfind("~/", 0) == 0)) {
+    out.replace(0, 1, home);
+  }
+  replaceAll(out, "{robot}", robot);
+  replaceAll(out, "{stamp}", stamp);
+  return out;
+}
+
 } // namespace explo_planner

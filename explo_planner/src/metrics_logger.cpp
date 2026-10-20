@@ -2,10 +2,12 @@
 
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace explo_planner {
 
@@ -23,12 +25,21 @@ std::string epochSeconds(double t) {
   return ss.str();
 }
 
+// Creates the missing folders above csv_path, so a new output folder works on
+// first use. A failure here is left to the open, which reports it.
+const std::string& withParentDirs(const std::string& csv_path) {
+  const auto parent = std::filesystem::path(csv_path).parent_path();
+  std::error_code ec;
+  if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+  return csv_path;
+}
+
 }  // namespace
 
 MetricsLogger::MetricsLogger(const std::string& csv_path)
-    : file_(csv_path, std::ios::out | std::ios::trunc) {
+    : file_(withParentDirs(csv_path), std::ios::out | std::ios::trunc) {
   // Fail loudly. std::ofstream does not throw by default, so an unwritable
-  // output_csv (missing parent directory, read-only mount, bad permissions)
+  // output_csv (read-only mount, bad permissions, a parent that is a file)
   // used to leave every subsequent `file_ << ...` a silent no-op: the run
   // completed, the node logged "Step N logged" for every step, and the
   // experiment produced no data at all. There is nothing to salvage from a

@@ -190,7 +190,9 @@ How each overlay value was derived, and the keys to update before real runs:
 # field_curt.yaml   ('/**' so it matches the node in any namespace)
 /**:
   ros__parameters:
-    output_csv: "/tmp/RA-1_curt.csv"
+    # Under the container's bags mount, so the CSV is on the robot's disk next
+    # to the bag. {stamp} is the start time, so a restart does not overwrite.
+    output_csv: "/scovox/bags/explo-output/RA-1_curt_{stamp}.csv"
     # Peer robot pose from its localiser. Intents alone are too coarse to
     # brake on. Confirm the name with `ros2 topic list | grep pcl_pose`.
     proximity_peer_pose_topics: ["bunker:/bunker/pcl_pose"]
@@ -202,7 +204,7 @@ How each overlay value was derived, and the keys to update before real runs:
 | Setting | `bunker` | `curt` | If wrong |
 |---------|----------|--------|----------|
 | `robot_name` | `bunker` | `curt` | Sets default topic names **and** right of way (§3.2). |
-| `output_csv` | `/tmp/<run>_bunker.csv` | `/tmp/<run>_curt.csv` | No per-run metrics. |
+| `output_csv` | `/scovox/bags/explo-output/<run>_bunker_{stamp}.csv` | `/scovox/bags/explo-output/<run>_curt_{stamp}.csv` | No per-run metrics. Outside a mounted folder the CSV goes when the container is removed. |
 | `targets_topic` | `/exploration/targets/bunker` | `/exploration/targets/curt` | Both robots take both target lists and double-book the queue. |
 | `proximity_peer_pose_topics` | `["curt:/curt/pcl_pose"]` | `["bunker:/bunker/pcl_pose"]` | Braking falls back to the 1 Hz intents; the planner warns at startup. |
 | SCovox `integration_frame` | `bunker_map` | `curt_map` | The robots' maps overwrite each other. Each frame needs an identity static TF from `map`. |
@@ -308,7 +310,8 @@ un-namespaced `/explo_planner`, so the per-robot blocks do not apply, and
 its arguments beat the yaml for the frames. Pass `base_frame:=`:
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
-    robot:=bunker base_frame:=base_link output_csv:=/tmp/RA-1_bunker.csv \
+    robot:=bunker base_frame:=base_link \
+    output_csv:=/scovox/bags/explo-output/RA-1_bunker_{stamp}.csv \
     params_file:=$CFG/exploration_real_robot.yaml
 ```
 
@@ -487,7 +490,8 @@ received) are in both bags, as a fallback if one bag is lost.
 Per robot, after every run:
 
 1. `ros2 bag info` on the bag. Confirm duration and message counts.
-2. Planner CSV (`output_csv`).
+2. Planner CSV (`output_csv`; the planner logs the path at startup as
+   `Metrics CSV:`).
 3. Multispectral SD card and the closing calibration panel capture (curt).
 4. Run sheet: config git SHA, chrony offsets, lighting log, taped DBH,
    EXPLORE↔EXPLOIT switch counts, anomalies, battery state.

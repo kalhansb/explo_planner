@@ -23,7 +23,12 @@
     use_sim_time: false
     robot_name: "atlas"
     max_steps: 200
-    output_csv: "/tmp/exploration_eig.csv"
+    # Per-step metrics. A leading ~ is the home folder, {robot} is robot_name
+    # and {stamp} the start time (YYYYmmdd_HHMMSS), so runs do not overwrite
+    # each other. Missing folders are created; the node logs the path at
+    # startup ("Metrics CSV:"). Inside a container, use a mounted folder, or
+    # the file goes when the container is removed.
+    output_csv: "~/explo-output/explo_{robot}_{stamp}.csv"
     map_resolution: 0.10
 
     # Frames — planner reads dscovox map (in map_frame) and uses TF

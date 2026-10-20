@@ -41,7 +41,7 @@ def launch_setup(context):
         raise RuntimeError("multi_robot_exploration: 'robots' is empty")
 
     planner = LaunchConfiguration("planner").perform(context)
-    output_dir = LaunchConfiguration("output_dir").perform(context)
+    output_dir = os.path.expanduser(LaunchConfiguration("output_dir").perform(context))
     config_id = LaunchConfiguration("config_id").perform(context)
     world = LaunchConfiguration("world").perform(context)
     max_steps = LaunchConfiguration("max_steps").perform(context)
@@ -125,7 +125,7 @@ def generate_launch_description():
                                           "config/exploration_real_robot.yaml)"),
         DeclareLaunchArgument("planner", default_value="eig",
                               description="Planner type: eig, entropy, frontier, random"),
-        DeclareLaunchArgument("output_dir", default_value="/tmp",
+        DeclareLaunchArgument("output_dir", default_value="~/explo-output",
                               description="Directory for per-robot CSVs"),
         DeclareLaunchArgument("config_id", default_value="c1",
                               description="Start configuration id (for CSV filename)"),

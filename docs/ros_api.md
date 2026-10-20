@@ -72,7 +72,7 @@ One robot, pure exploration:
 
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
-    robot:=atlas use_sim_time:=true output_csv:=/tmp/run1.csv
+    robot:=atlas use_sim_time:=true output_csv:=~/explo-output/run1.csv
 ```
 
 Other launch forms: [§6](#6-launch-files) and the
@@ -154,7 +154,7 @@ values: [real_robot_tuning.md](real_robot_tuning.md).
 | `robot_name` | string | `atlas` | Seeds every *auto* topic, the intent `robot_id`, and right of way (lexicographic). |
 | `use_sim_time` | bool | `false` | See §2. |
 | `max_steps` | int | `200` | Step budget (explore + exploit), then DONE. |
-| `output_csv` | string | `/tmp/exploration_eig.csv` (C++ `/tmp/exploration.csv`) | Metrics CSV (§7). The node exits at startup if it cannot open it. |
+| `output_csv` | string | `~/explo-output/explo_{robot}_{stamp}.csv` (same in C++) | Metrics CSV (§7). A leading `~` is the home folder, `{robot}` is `robot_name` and `{stamp}` the start time (`YYYYmmdd_HHMMSS`). Missing folders are created, an existing file is overwritten, and the path is logged at startup (`Metrics CSV:`). The node exits at startup if it cannot open it. In a container, use a mounted folder. |
 | `map_frame` | string | `map` | Frame of the fused map, goals, targets and intents. |
 | `base_frame` | string | `""` | *auto* → `<robot_name>/base_link`. |
 | `map_resolution` | double | `0.10` | Map-cache voxel edge (m). Match the mapper. |
@@ -446,7 +446,7 @@ One planner, no target producer. Exploitation follows the yaml; set
 | `robot` | `atlas` | Robot name. |
 | `use_sim_time` | `false` | Sim and bag runs must pass `true`. |
 | `max_steps` | `200` | Step budget. |
-| `output_csv` | `/tmp/exploration.csv` | Metrics CSV. |
+| `output_csv` | `~/explo-output/explo_{robot}_{stamp}.csv` | Metrics CSV (placeholders as in §4.1). |
 | `dscovox_topic` | `''` | Map topic override. |
 | `map_frame` / `base_frame` | `map` / `''` | Frame overrides. |
 | `trajectory_scoring` | `false` | SSMI ablation. Always passed, so it wins over the yaml. |
@@ -463,7 +463,7 @@ detector with `use_detector:=true`.
 | `robot` | `atlas` | Robot name. |
 | `use_sim_time` | `false` | Also the scheduler's release clock. |
 | `max_steps` | `200` | Step budget (explore + exploit). |
-| `output_csv` | `/tmp/exploitation.csv` | Metrics CSV. |
+| `output_csv` | `~/explo-output/exploit_{robot}_{stamp}.csv` | Metrics CSV (placeholders as in §4.1). |
 | `targets_file` | `config/targets.yaml` | Scheduler parameter file. |
 | `use_detector` | `false` | `true` = run `tree_detector_node` instead of the scheduler. |
 | `use_semantics` | `true` | Detector gating; `false` on LiDAR-only maps. |
@@ -480,7 +480,7 @@ planner per robot PC by hand. This is the only launch that sets
 | `robots` | `atlas,rama` | Comma-separated team. Each planner runs in namespace `/<robot>`. |
 | `use_sim_time` | `false` | |
 | `planner` | `eig` | CSV filename label only; the node is EIG-only. |
-| `output_dir` / `config_id` / `world` | `/tmp` / `c1` / `flatforest` | Build the per-robot CSV name `exp7_<planner>_<world>_<config_id>_<robot>.csv`. |
+| `output_dir` / `config_id` / `world` | `~/explo-output` / `c1` / `flatforest` | Build the per-robot CSV name `exp7_<planner>_<world>_<config_id>_<robot>.csv`. |
 | `max_steps` | `100` | Per-robot step budget. |
 | `coordination_enabled` | `true` | MinPos deconfliction. |
 | `rendezvous_enabled` | `true` | Return-home reconnection. |

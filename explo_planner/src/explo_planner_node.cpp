@@ -30,6 +30,8 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <string>
@@ -42,6 +44,9 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+
+#include <pwd.h>
+#include <unistd.h>
 
 #include <Eigen/Core>
 #include <rclcpp/rclcpp.hpp>
@@ -83,6 +88,31 @@
 #include "explo_planner/vantage_planner.hpp"
 
 namespace explo_planner {
+
+namespace {
+
+// The home folder for a leading ~ in output_csv: $HOME, else the password
+// database, else "" (the ~ is then kept).
+std::string homeDir() {
+  if (const char* h = std::getenv("HOME"); h != nullptr && *h != '\0') return h;
+  if (const passwd* pw = ::getpwuid(::getuid());
+      pw != nullptr && pw->pw_dir != nullptr) {
+    return pw->pw_dir;
+  }
+  return "";
+}
+
+// Local wall-clock time as YYYYmmdd_HHMMSS, for {stamp} in output_csv.
+std::string wallStamp() {
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  localtime_r(&now, &tm);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+  return buf;
+}
+
+}  // namespace
 
 enum class State {
   WAIT_FOR_MAP,
@@ -947,7 +977,11 @@ ExploPlannerNode::ExploPlannerNode()
 
   max_steps_    = dp("max_steps", 200);
   robot_name_   = dp("robot_name", std::string("atlas"));
-  output_csv_   = dp("output_csv", std::string("/tmp/exploration.csv"));
+  // A leading ~, {robot} and {stamp} (the start time) are expanded, so each
+  // run gets its own file outside /tmp.
+  output_csv_   = expandOutputPath(
+      dp("output_csv", std::string("~/explo-output/explo_{robot}_{stamp}.csv")),
+      homeDir(), robot_name_, wallStamp());
   map_resolution_ = dp("map_resolution", 0.10);
   map_frame_    = dp("map_frame", std::string("map"));
   base_frame_   = dp("base_frame", std::string(""));
@@ -1885,6 +1919,7 @@ ExploPlannerNode::ExploPlannerNode()
       max_steps_, map_frame_.c_str(), base_frame_.c_str(),
       use_planning_map_ ? planning_map_topic.c_str() : "(disabled)",
       goal_topic.c_str());
+  RCLCPP_INFO(get_logger(), "Metrics CSV: %s", output_csv_.c_str());
   if (use_planning_map_) {
     RCLCPP_INFO(get_logger(),
         "planning_map: mode=%s obstacle>=%d trav_weight=%.2f unknown=%.0f "

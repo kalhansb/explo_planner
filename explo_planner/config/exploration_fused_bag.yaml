@@ -46,7 +46,9 @@
     use_sim_time: true               # bag-driven (ros2 bag play --clock)
     robot_name: "atlas"              # cosmetic here (all topics overridden)
     max_steps: 200
-    output_csv: "/tmp/exploration_fused_bag.csv"
+    # ~ and {stamp} as in shared_params.yaml. The replay scripts pass a path
+    # under /scovox/bags/explo-output, which is the host's bags/explo-output.
+    output_csv: "~/explo-output/explo_fused_bag_{stamp}.csv"
     map_resolution: 0.10             # matches scovox resolution
 
     # Frames — pose is TF map->base_frame; goals published in map_frame.

@@ -112,7 +112,8 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
   source /tmp/ovl/install/setup.bash
   ros2 run explo_planner explo_planner_node --ros-args \
     --params-file /tmp/ovl/install/explo_planner/share/explo_planner/config/exploration_fused_bag.yaml \
-    -p dscovox_topic:=/robot1/dscovox_node/scovox
+    -p dscovox_topic:=/robot1/dscovox_node/scovox \
+    -p "output_csv:=/scovox/bags/explo-output/explo_fused_bag_{stamp}.csv"
 '
 ```
 
@@ -186,8 +187,9 @@ What you see on each PLAN tick:
   '
   ```
 - **Planner cycling** (step 3 console): a `Step N: selected goal` line every
-  ~15–45 s of bag time. Per-step metrics go to `/tmp/exploration_fused_bag.csv`
-  inside the scovox container.
+  ~15–45 s of bag time. Per-step metrics go to
+  `bags/explo-output/explo_fused_bag_<start time>.csv` on the host (the
+  container's `/scovox/bags`).
 
 ## Troubleshooting
 

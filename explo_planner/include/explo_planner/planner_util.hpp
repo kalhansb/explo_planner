@@ -142,4 +142,10 @@ double sanitizeMinHop(double min_hop);
 /// seen in the field (1.12 m).
 constexpr double kRelaxedRevisitRadiusM = 2.0;
 
+/// `output_csv` as the node opens it: a leading `~` becomes `home` (kept when
+/// `home` is empty), and every `{robot}` and `{stamp}` becomes `robot` and
+/// `stamp`.
+std::string expandOutputPath(const std::string& path, const std::string& home,
+                             const std::string& robot, const std::string& stamp);
+
 } // namespace explo_planner

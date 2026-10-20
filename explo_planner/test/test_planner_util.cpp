@@ -190,3 +190,20 @@ TEST(PlannerUtil, SanitizeMinHop) {
   EXPECT_DOUBLE_EQ(sanitizeMinHop(std::numeric_limits<double>::infinity()), 0.0);
   EXPECT_DOUBLE_EQ(sanitizeMinHop(std::nan("")), 0.0);
 }
+
+TEST(PlannerUtil, ExpandOutputPath) {
+  const std::string home = "/home/u", robot = "bunker", stamp = "20261020_101500";
+  EXPECT_EQ(expandOutputPath("~/explo-output/explo_{robot}_{stamp}.csv", home,
+                             robot, stamp),
+            "/home/u/explo-output/explo_bunker_20261020_101500.csv");
+  EXPECT_EQ(expandOutputPath("~", home, robot, stamp), "/home/u");
+  // Only a leading ~ is the home directory.
+  EXPECT_EQ(expandOutputPath("/data/~x/a.csv", home, robot, stamp), "/data/~x/a.csv");
+  EXPECT_EQ(expandOutputPath("~user/a.csv", home, robot, stamp), "~user/a.csv");
+  // No home: ~ is left as it is.
+  EXPECT_EQ(expandOutputPath("~/a.csv", "", robot, stamp), "~/a.csv");
+  // Every placeholder, and a plain path unchanged.
+  EXPECT_EQ(expandOutputPath("/d/{robot}/{robot}_{stamp}.csv", home, robot, stamp),
+            "/d/bunker/bunker_20261020_101500.csv");
+  EXPECT_EQ(expandOutputPath("/tmp/run1.csv", home, robot, stamp), "/tmp/run1.csv");
+}

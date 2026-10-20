@@ -235,9 +235,6 @@
     base_frame: "base_link"
     map_frame: "map"
     nav_speed_estimate_mps: 0.22     # measured mean, tracked platform
-    # Used only by a hand-run `ros2 run`; both launch files compute their own
-    # output_csv in the per-node dict, which is applied after this file.
-    output_csv: "/tmp/exploration_bunker.csv"
     # Two-robot team membership. multi_robot_exploration.launch.py also sets
     # rendezvous_expected_peers from its robots:= list (its dict wins, with
     # the same value); targets_topic comes only from here, as do both on a
@@ -254,7 +251,6 @@
     base_frame: "base_link_curt"
     map_frame: "map"                 # map_curt if the two are NOT map-fused
     nav_speed_estimate_mps: 0.20     # measured mean, wheeled platform
-    output_csv: "/tmp/exploration_curt.csv"
     rendezvous_expected_peers: 1     # see bunker's block
     targets_topic: "/exploration/targets/curt"
     # This robot's own traversability_mapping (namespace:=curt

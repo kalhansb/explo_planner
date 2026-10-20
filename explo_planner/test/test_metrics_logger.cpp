@@ -350,8 +350,23 @@ TEST(MetricsLogger, ReopenTruncatesPreviousRun) {
 
 // An unwritable path must throw at construction rather than silently no-op
 // every subsequent write and produce an empty experiment.
+// A file where a folder should be (not a permission check: tests may run as
+// root).
 TEST(MetricsLogger, UnwritablePathThrows) {
   TempDir dir;
-  auto missing = dir.path() / "no_such_subdir" / "m.csv";
-  EXPECT_THROW(MetricsLogger log(missing.string()), std::runtime_error);
+  auto blocker = dir.path() / "a_file";
+  std::ofstream(blocker) << "x";
+  EXPECT_THROW(MetricsLogger log((blocker / "m.csv").string()),
+               std::runtime_error);
+}
+
+// Missing folders above the CSV are created.
+TEST(MetricsLogger, CreatesMissingDirectories) {
+  TempDir dir;
+  auto nested = dir.path() / "a" / "b" / "m.csv";
+  {
+    MetricsLogger log(nested.string());
+    log.logStep(StepMetrics{});
+  }
+  EXPECT_EQ(readLines(nested).size(), 2u);
 }
