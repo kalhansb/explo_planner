@@ -48,8 +48,11 @@ colcon build --symlink-install --packages-up-to explo_planner \
 
 ## Run
 
-**One robot, by hand** (`config/shared_params.yaml` is the documented
-parameter set):
+**One robot, by hand.** `ros2 run` loads only the files you name, so pass
+both: `shared_params.yaml`, then the hardware overlay
+`exploration_real_robot.yaml` (later files win). Without the overlay the
+planning map is off and goals are not checked for obstacles; the planner
+logs `use_planning_map is false on a wall-clock (hardware) run` at startup.
 
 ```bash
 source /home/jetsondevkit/hmr_explo/ws/install/setup.bash
@@ -57,6 +60,7 @@ CFG=$(ros2 pkg prefix explo_planner)/share/explo_planner/config
 
 ros2 run explo_planner explo_planner_node --ros-args \
   --params-file $CFG/shared_params.yaml \
+  --params-file $CFG/exploration_real_robot.yaml \
   -p robot_name:=robot1 \
   -p base_frame:=base_link \
   -p map_frame:=map \
@@ -67,6 +71,11 @@ ros2 run explo_planner explo_planner_node --ros-args \
 Set `map_resolution` to the mapper's `resolution`. It only seeds the grid;
 after the first message the planner uses the resolution carried on each fused
 map.
+
+This node is the un-namespaced `/explo_planner`, so it reads the planning
+map from the overlay's `/occupancy_map_local`: start
+`traversability_map.launch.py` without `namespace:=` (see
+[Traversability map](#traversability-map-keeps-goals-out-of-bushes)).
 
 Until the fused map, the pose and (if enabled) the planning map have all
 arrived, the planner waits in WAIT_FOR_MAP and logs what is missing every
@@ -104,6 +113,7 @@ single-robot launches (`exploration_experiment.launch.py`, or
 | --- | --- | --- |
 | One robot, sim/defaults | `exploration_experiment.launch.py robot:=<name>` | `shared_params.yaml` |
 | One robot, hardware | same, plus `base_frame:=<frame> params_file:=$CFG/exploration_real_robot.yaml` | shared + the overlay's `/**` block (its per-robot blocks do not match an un-namespaced node) |
+| One robot, hardware, by hand | `ros2 run` as above, with both `--params-file`s | the same two files, named in that order |
 | Two robots, hardware | `multi_robot_exploration.launch.py robots:=bunker,curt params_file:=$CFG/exploration_real_robot.yaml` | shared + `/**` + the `/bunker/…` and `/curt/…` blocks |
 | Bag replay (map-test-2) | `ws/src/run_explo_experiment.sh` (hmr_explo) | `exploration_fused_bag.yaml` only (not shared) |
 | Bag replay (CURT Mini) | `ws/src/run_explo_curtmini.sh` (hmr_explo) | see the script header |

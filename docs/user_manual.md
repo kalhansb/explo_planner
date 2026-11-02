@@ -307,7 +307,10 @@ ros2 run explo_planner explo_planner_node --ros-args -r __ns:=/bunker \
 ```
 For a robot running **alone**, use the single-robot launch. Its node is the
 un-namespaced `/explo_planner`, so the per-robot blocks do not apply, and
-its arguments beat the yaml for the frames. Pass `base_frame:=`:
+its arguments beat the yaml for the frames. Pass `base_frame:=`. It reads
+the planning map from the un-namespaced `/occupancy_map_local` (the
+overlay's `/**` block) and waits in WAIT_FOR_MAP until it arrives, so it
+does not see a traversability_mapping started with `namespace:=`:
 ```bash
 ros2 launch explo_planner exploration_experiment.launch.py \
     robot:=bunker base_frame:=base_link \
