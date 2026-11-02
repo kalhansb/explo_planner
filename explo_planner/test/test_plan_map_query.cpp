@@ -134,6 +134,58 @@ TEST(PlanMapQuery, UnknownFractionPartial) {
   EXPECT_NEAR(unknownFractionInRoi(g, {1.0f, 3.0f, 1.0f, 3.0f}), 1.0, 1e-9);
 }
 
+// occupiedWithin: a known cell >= threshold whose centre is within the radius.
+// Unknown, sub-threshold and out-of-bounds cells never count.
+TEST(PlanMapQuery, OccupiedWithinRadiusAndThreshold) {
+  auto g = makeGrid(20, 20, 0.1f, -1.0f, -1.0f);
+  const Eigen::Vector3f goal = cellCenter(g, 10, 10);
+  const Eigen::Vector3f far(100.0f, 100.0f, 0.0f);  // ignore disc elsewhere
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+
+  setCell(g, 15, 10, 100);  // 0.5 m east of the goal
+  EXPECT_TRUE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.45f, 50, far, 0.0f));
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 101, far, 0.0f));
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.0f, 50, far, 0.0f));
+
+  setCell(g, 15, 10, 49);
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+  setCell(g, 15, 10, -1);
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+
+  // Diagonal: (4, 4) cells is 0.566 m, inside 0.6; (5, 4) is 0.640 m.
+  setCell(g, 15, 14, 100);
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+  setCell(g, 14, 14, 100);
+  EXPECT_TRUE(occupiedWithin(g, goal, 0.6f, 50, far, 0.0f));
+
+  // A disc hanging off the grid edge is clipped, not mis-indexed.
+  auto edge = makeGrid(5, 5, 0.1f);
+  setCell(edge, 0, 0, 100);
+  EXPECT_TRUE(occupiedWithin(edge, Eigen::Vector3f(-0.2f, -0.2f, 0.0f), 0.4f,
+                             50, far, 0.0f));
+  EXPECT_FALSE(occupiedWithin(edge, Eigen::Vector3f(-5.0f, -5.0f, 0.0f), 0.4f,
+                              50, far, 0.0f));
+
+  auto empty = makeGrid(0, 0, 0.1f);
+  EXPECT_FALSE(occupiedWithin(empty, Eigen::Vector3f::Zero(), 1.0f, 50, far,
+                              0.0f));
+}
+
+// Cells within ignore_radius_m of ignore_center (the robot's body ring) are
+// skipped; the rest of the disc around the goal still counts.
+TEST(PlanMapQuery, OccupiedWithinIgnoresRobotDisc) {
+  auto g = makeGrid(30, 10, 0.1f);
+  const Eigen::Vector3f goal = cellCenter(g, 10, 5);
+  const Eigen::Vector3f robot = cellCenter(g, 4, 5);  // 0.6 m west of goal
+  setCell(g, 6, 5, 100);  // 0.2 m from the robot, 0.4 m from the goal
+  EXPECT_TRUE(occupiedWithin(g, goal, 0.6f, 50, robot, 0.0f));
+  EXPECT_FALSE(occupiedWithin(g, goal, 0.6f, 50, robot, 0.3f));
+
+  setCell(g, 14, 5, 100);  // 0.4 m east of the goal, 1.0 m from the robot
+  EXPECT_TRUE(occupiedWithin(g, goal, 0.6f, 50, robot, 0.3f));
+}
+
 // ROI is clipped to the grid; a non-overlapping ROI returns -1.0.
 TEST(PlanMapQuery, UnknownFractionRoiClippingAndMiss) {
   auto g = makeGrid(10, 10, 1.0f);

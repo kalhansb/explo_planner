@@ -34,7 +34,6 @@ void CostGrid::build(const nav_msgs::msg::OccupancyGrid& planning_map,
   origin_y_ = static_cast<float>(planning_map.info.origin.position.y);
 
   step_mul_.clear();
-  obst_dist_.clear();
   flood_clear_r2_ = -1;
   if (dims_x_ <= 0 || dims_y_ <= 0 || resolution_ <= 0.0f) {
     cost_.clear();
@@ -139,7 +138,6 @@ void CostGrid::markClearanceZone(float clearance_m) {
       flags_[i] |= kFlagClearance;
     }
   }
-  obst_dist_ = std::move(d);
 }
 
 void CostGrid::floodFrom(const Eigen::Vector3f& source_xy, float radius_cap_m,
@@ -314,16 +312,6 @@ bool CostGrid::inClearanceZone(const Eigen::Vector3f& xy) const {
   int gy = 0;
   if (!worldToGrid(xy.x(), xy.y(), gx, gy)) return false;
   return inClearanceZoneAt(gx, gy);
-}
-
-bool CostGrid::obstacleWithin(const Eigen::Vector3f& xy, float radius_m) const {
-  int gx = 0;
-  int gy = 0;
-  if (obst_dist_.empty() || !worldToGrid(xy.x(), xy.y(), gx, gy)) return false;
-  // The zone's own test, so a goal picked outside the zone is not within
-  // clearance_m here until the map changes.
-  return static_cast<float>(obst_dist_[idx(gx, gy)]) <=
-         3.0f * radius_m / resolution_;
 }
 
 size_t CostGrid::reachedCellCount() const {

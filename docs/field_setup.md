@@ -302,10 +302,11 @@ nodes read them with `as_double()` and die on an integer.
    obstacle — aborting navigation and re-planning`, outcome
    `goal-in-obstacle`). So does a goal with an obstacle newly mapped within
    `planning_map_abort_clearance_m` (0.6 m) of it (`… is now within 0.60 m
-   of an obstacle …`, outcome `goal-near-obstacle`), checked until the robot
-   is 1.6 m from the goal (`planning_map_robot_clear_m` + 0.6 m, so its own
-   ring of cells does not count). Expect both now and then: cells are scored
-   only once seen often enough and from close enough.
+   of an obstacle …`, outcome `goal-near-obstacle`). Cells within
+   `planning_map_robot_clear_m` (1 m) of the robot do not count, so its own
+   ring does not trip it. Both blacklist the goal like a failed one (2 m for
+   60 s), so the next pick goes elsewhere. Expect both now and then: cells
+   are scored only once seen often enough and from close enough.
 
 **Check it.**
 

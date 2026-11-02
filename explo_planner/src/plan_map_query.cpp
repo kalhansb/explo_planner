@@ -36,6 +36,45 @@ bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& m,
   return v == kCellNoData || v >= threshold;
 }
 
+bool occupiedWithin(const nav_msgs::msg::OccupancyGrid& m,
+                    const Eigen::Vector3f& pos, float radius_m,
+                    int8_t threshold, const Eigen::Vector3f& ignore_center,
+                    float ignore_radius_m) {
+  if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0 ||
+      m.data.size() != static_cast<size_t>(m.info.width) * m.info.height ||
+      !(radius_m > 0.0f))
+    return false;
+  const double res = m.info.resolution;
+  const double ox = m.info.origin.position.x;
+  const double oy = m.info.origin.position.y;
+  auto to_g = [&](double v, double o) {
+    return static_cast<int>(std::floor((v - o) / res));
+  };
+  int gx0 = std::max(0, to_g(pos.x() - radius_m, ox));
+  int gx1 = std::min(static_cast<int>(m.info.width) - 1,
+                     to_g(pos.x() + radius_m, ox));
+  int gy0 = std::max(0, to_g(pos.y() - radius_m, oy));
+  int gy1 = std::min(static_cast<int>(m.info.height) - 1,
+                     to_g(pos.y() + radius_m, oy));
+  const double r2 = static_cast<double>(radius_m) * radius_m;
+  const double ir2 = ignore_radius_m > 0.0f
+      ? static_cast<double>(ignore_radius_m) * ignore_radius_m : -1.0;
+  for (int gy = gy0; gy <= gy1; ++gy) {
+    for (int gx = gx0; gx <= gx1; ++gx) {
+      int8_t v = m.data[gy * m.info.width + gx];
+      if (v < 0 || v < threshold) continue;
+      const double cx = ox + (gx + 0.5) * res;
+      const double cy = oy + (gy + 0.5) * res;
+      const double dx = cx - pos.x(), dy = cy - pos.y();
+      if (dx * dx + dy * dy > r2) continue;
+      const double ix = cx - ignore_center.x(), iy = cy - ignore_center.y();
+      if (ix * ix + iy * iy <= ir2) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& m,
                             const Roi2D& roi) {
   if (m.info.resolution <= 0.0f || m.info.width == 0 || m.info.height == 0 ||

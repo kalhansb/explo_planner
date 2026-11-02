@@ -43,6 +43,15 @@ bool isCellFree(const nav_msgs::msg::OccupancyGrid& grid,
 bool isCellOccupied(const nav_msgs::msg::OccupancyGrid& grid,
                     const Eigen::Vector3f& pos, int8_t threshold = 50);
 
+/// True iff a known cell >= threshold has its centre within `radius_m` of
+/// `pos`. Unknown and out-of-bounds cells do not count, nor do cells whose
+/// centre is within `ignore_radius_m` of `ignore_center` (the robot's own body,
+/// which the LiDAR can map as a ring of obstacles around it).
+bool occupiedWithin(const nav_msgs::msg::OccupancyGrid& grid,
+                    const Eigen::Vector3f& pos, float radius_m,
+                    int8_t threshold, const Eigen::Vector3f& ignore_center,
+                    float ignore_radius_m);
+
 /// Fraction of cells in `roi` (clipped to the grid) whose value is -1
 /// (unknown). Returns -1.0 if the grid is degenerate (including `data` not
 /// matching `width * height`) or the ROI doesn't overlap it. An untransformed

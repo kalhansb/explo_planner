@@ -345,6 +345,9 @@ private:
 
   // NAVIGATE helpers
   void failGoal(const char* reason, double elapsed);
+  // The map changed under the goal being driven to: blacklist it, stop, and
+  // re-plan at once in the current phase's planner.
+  void dropGoalAndReplan(const char* outcome, const char* why);
   // No-progress watchdog window: restart it at `t` from the current position,
   // and the net XY displacement since that restart.
   void resetProgressWindow(const rclcpp::Time& t);
@@ -705,8 +708,9 @@ private:
   // Blocked cells within this radius of the robot are passable for its own
   // floods (planning_map_robot_clear_m; see CostGrid::floodFrom).
   float robot_clear_m_ = 0.0f;
-  // A goal being driven to is dropped once a blocked cell is mapped this close
-  // to it (planning_map_abort_clearance_m, <= the clearance zone; 0 = off).
+  // A goal being driven to is dropped once a blocked cell farther than
+  // robot_clear_m_ from the robot is mapped this close to it
+  // (planning_map_abort_clearance_m, <= the clearance zone; 0 = off).
   float abort_clearance_m_ = 0.0f;
   // planning_map_mode "accumulate": stitches the rolling window topic into one
   // ROI-sized grid (see TraversabilityAccumulator); null in "direct" mode.
@@ -3163,13 +3167,7 @@ void ExploPlannerNode::doNavigate() {
         "aborting navigation and re-planning.",
         step_, current_goal_.position.x(),
         current_goal_.position.y());
-    logGoalEnd("goal-in-obstacle", true);
-    have_active_intent_ = false;
-    // PLAN usually re-goals on the next tick, but nothing guarantees it does —
-    // and until it does nav2 is still driving INTO a now-mapped obstacle
-    // (invariant: see abandonNavGoal).
-    abandonNavGoal("goal inside obstacle");
-    transitionTo(State::PLAN);
+    dropGoalAndReplan("goal-in-obstacle", "goal inside obstacle");
     return;
   }
 
@@ -3177,27 +3175,20 @@ void ExploPlannerNode::doNavigate() {
   // A frontier goal is often picked over unseen ground, and the trunk or bush
   // beside it only shows up as the robot drives in. The radius sits inside the
   // clearance zone that selection keeps goals out of, so one new cell at the
-  // zone's edge does not drop the goal. Checked only while the robot is
-  // farther from the goal than robot_clear + abort_clearance: a robot can map
-  // its own body as a ring of obstacles (planning_map_robot_clear_m), and the
-  // goal would be next to that ring.
+  // zone's edge does not drop the goal. Cells within robot_clear of the robot
+  // do not count: a robot can map its own body as a ring of obstacles
+  // (planning_map_robot_clear_m), and near the goal that ring is beside it.
   if (latest_plan_map_ && abort_clearance_m_ > 0.0f &&
-      (current_goal_.position - latest_pos_).head<2>().norm() >
-          robot_clear_m_ + abort_clearance_m_) {
-    ensureCostGridBuilt();
-    if (cost_grid_->obstacleWithin(current_goal_.position,
-                                   abort_clearance_m_)) {
-      RCLCPP_WARN(get_logger(),
-          "Step %d: goal (%.2f, %.2f) is now within %.2f m of an obstacle — "
-          "aborting navigation and re-planning.",
-          step_, current_goal_.position.x(), current_goal_.position.y(),
-          static_cast<double>(abort_clearance_m_));
-      logGoalEnd("goal-near-obstacle", true);
-      have_active_intent_ = false;
-      abandonNavGoal("goal beside obstacle");
-      transitionTo(State::PLAN);
-      return;
-    }
+      occupiedWithin(*latest_plan_map_, current_goal_.position,
+                     abort_clearance_m_, plan_map_obstacle_threshold_,
+                     latest_pos_, robot_clear_m_)) {
+    RCLCPP_WARN(get_logger(),
+        "Step %d: goal (%.2f, %.2f) is now within %.2f m of an obstacle — "
+        "aborting navigation and re-planning.",
+        step_, current_goal_.position.x(), current_goal_.position.y(),
+        static_cast<double>(abort_clearance_m_));
+    dropGoalAndReplan("goal-near-obstacle", "goal beside obstacle");
+    return;
   }
 
   // In-flight cross-pick tiebreak, exploit VANTAGE hops only. The claim
@@ -3372,6 +3363,22 @@ void ExploPlannerNode::doNavigate() {
 
   // Keep-alive re-send (throttled; see republishGoal).
   republishGoal(current_goal_);
+}
+
+// Blacklisted like a failed goal, or a cell that flickers across the
+// threshold as the map updates is picked straight back. Straight to the
+// phase's planner: no INTEGRATE, so logGoalEnd stages the outcome for the next
+// row, and not PLAN in EXPLOIT, where PLAN ends the run once the step budget
+// is spent. The drive is stopped because the re-plan may not re-goal at once,
+// and until it does nav2 is still driving at the obstacle (invariant: see
+// abandonNavGoal).
+void ExploPlannerNode::dropGoalAndReplan(const char* outcome,
+                                         const char* why) {
+  failed_goals_.add(current_goal_.position, this->now().seconds());
+  logGoalEnd(outcome, true);
+  have_active_intent_ = false;
+  abandonNavGoal(why);
+  transitionTo(phase_ == Phase::EXPLOIT ? State::EXPLOIT_PLAN : State::PLAN);
 }
 
 // Park the current goal in the failed-goal blacklist with a tagged reason

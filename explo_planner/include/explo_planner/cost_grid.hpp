@@ -140,11 +140,6 @@ public:
   /// True for passable cells within CostModel::clearance_m of a blocked cell.
   bool inClearanceZoneAt(int gx, int gy) const;
   bool inClearanceZone(const Eigen::Vector3f& xy) const;
-  /// True if the cell containing `xy` is within `radius_m` of a blocked cell
-  /// (blocked cells included), on the clearance zone's distance transform: at
-  /// radius_m == CostModel::clearance_m it agrees with inClearanceZone(). False
-  /// out of bounds, with no blocked cell, and with the zone off (no transform).
-  bool obstacleWithin(const Eigen::Vector3f& xy, float radius_m) const;
   float costAt(int gx, int gy) const {
     return inBounds(gx, gy) ? cost_[idx(gx, gy)] : kInfCost;
   }
@@ -180,10 +175,6 @@ private:
   /// Per-cell step multiplier, populated only for a shaped CostModel (empty =
   /// every step costs its length).
   std::vector<float> step_mul_;
-
-  /// Chamfer distance to the nearest blocked cell, in thirds of a cell (see
-  /// markClearanceZone); empty unless the zone is on and a cell is blocked.
-  std::vector<uint16_t> obst_dist_;
 
   /// Source cell and squared source_clear_m radius (cells) of the last flood.
   int flood_sx_ = 0;

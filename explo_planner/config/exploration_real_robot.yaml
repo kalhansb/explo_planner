@@ -182,11 +182,11 @@
     #     to 0.1 m less on 0.2 m cells). At 0.6 m its corners would touch
     #     the obstacle. On the 2026-07-31 bag half the goals picked at 0.4 m had
     #     an obstacle cell 0.4-1 m away;
-    #   - a goal being driven to is dropped and re-planned once an obstacle
-    #     is mapped within 0.6 m of it (abort_clearance): a trunk or bush
-    #     behind unseen ground often shows up only on the way in. Smaller
-    #     than the zone, so a goal picked at the zone's edge is not dropped
-    #     over one more mapped cell beside it;
+    #   - a goal being driven to is dropped, blacklisted and re-planned once
+    #     an obstacle is mapped within 0.6 m of it (abort_clearance): a trunk
+    #     or bush behind unseen ground often shows up only on the way in.
+    #     Smaller than the zone, so a goal picked at the zone's edge is not
+    #     dropped over one more mapped cell beside it;
     #   - path cost is the Dijkstra cost over the grid: passable rough cells
     #     cost up to ~1.5x (trav_weight 1.0, values below 50), unseen cells
     #     1.25x (as if scored 25), the clearance zone 3x, so the

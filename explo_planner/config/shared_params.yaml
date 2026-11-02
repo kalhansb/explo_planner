@@ -75,9 +75,9 @@
     planning_map_unknown_value: 0.0
     planning_map_clearance_m: 0.0
     planning_map_clearance_penalty: 1.0
-    # A goal being driven to is dropped (goal_outcome goal-near-obstacle) once
-    # an obstacle is mapped this close to it; re-checked only while the robot
-    # is farther than robot_clear_m + this from the goal. Capped at
+    # A goal being driven to is dropped (goal_outcome goal-near-obstacle) and
+    # blacklisted like a failed goal once an obstacle is mapped this close to
+    # it. Cells within robot_clear_m of the robot do not count. Capped at
     # clearance_m; 0 = off.
     planning_map_abort_clearance_m: 0.0
     # Candidates on an obstacle, in the clearance zone or unreachable move to

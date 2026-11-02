@@ -348,32 +348,6 @@ TEST(CostGridModel, ClearanceZoneWithoutPenaltyKeepsMetricCost) {
   EXPECT_NEAR(cg.costTo(cellCenter(grid, 4, 0)), 4.0f, 1e-5f);
 }
 
-// obstacleWithin: the zone's distance transform at any radius, blocked cells
-// included; at radius == clearance_m it matches the zone. Nothing with the
-// zone off.
-TEST(CostGridModel, ObstacleWithinUsesZoneDistances) {
-  auto grid = makeGrid(11, 1, 0.5f);
-  block(grid, 5, 0);
-  CostModel m;
-  m.clearance_m = 1.0f;
-  CostGrid cg;
-  cg.build(grid, 50, m);
-  EXPECT_TRUE(cg.obstacleWithin(cellCenter(grid, 5, 0), 0.0f));   // blocked
-  EXPECT_TRUE(cg.obstacleWithin(cellCenter(grid, 4, 0), 0.6f));   // 0.5 m
-  EXPECT_FALSE(cg.obstacleWithin(cellCenter(grid, 3, 0), 0.6f));  // 1.0 m
-  EXPECT_TRUE(cg.obstacleWithin(cellCenter(grid, 3, 0), 1.0f));
-  for (int x = 0; x < 11; ++x) {
-    if (x == 5) continue;
-    EXPECT_EQ(cg.obstacleWithin(cellCenter(grid, x, 0), 1.0f),
-              cg.inClearanceZone(cellCenter(grid, x, 0))) << "x=" << x;
-  }
-  EXPECT_FALSE(cg.obstacleWithin(Eigen::Vector3f(-1.0f, 0.25f, 0.0f), 1.0f));
-
-  CostGrid off;
-  off.build(grid, 50);
-  EXPECT_FALSE(off.obstacleWithin(cellCenter(grid, 4, 0), 0.6f));
-}
-
 // Unknown cells are passable and flagged; the threshold is honoured.
 TEST(CostGridModel, UnknownAndThreshold) {
   auto grid = makeGrid(5, 1, 1.0f);
