@@ -75,6 +75,11 @@
     planning_map_unknown_value: 0.0
     planning_map_clearance_m: 0.0
     planning_map_clearance_penalty: 1.0
+    # A goal being driven to is dropped (goal_outcome goal-near-obstacle) once
+    # an obstacle is mapped this close to it; re-checked only while the robot
+    # is farther than robot_clear_m + this from the goal. Capped at
+    # clearance_m; 0 = off.
+    planning_map_abort_clearance_m: 0.0
     # Candidates on an obstacle, in the clearance zone or unreachable move to
     # the nearest good cell within this radius before scoring (0 = just reject
     # them); frontier candidates may land on unknown cells. Only acts with a

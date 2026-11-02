@@ -261,10 +261,14 @@ nodes read them with `as_double()` and die on an integer.
    republished latched on `~/traversability_map` for RViz.
 2. **Blocks.** Cells ≥ `planning_map_obstacle_threshold` (50) are obstacles.
    On traversability_mapping's 0–100 score (slope 0.5, step 0.3, roughness
-   0.2; hard obstacles forced to 100) that means steep, stepped or rough.
-3. **Keeps clear.** Passable cells within `planning_map_clearance_m` (0.6 m)
+   0.2; hard obstacles forced to 100) that means stepped, rough, or steep and
+   uneven. A smooth slope scores under 50 at any angle, so
+   traversability_mapping's `max_traversable_slope_deg` (30° in its shipped
+   config) forces anything steeper to 100.
+3. **Keeps clear.** Passable cells within `planning_map_clearance_m` (1.0 m)
    of an obstacle are never a goal, and cost `planning_map_clearance_penalty`
-   (3×) to drive through.
+   (3×) to drive through. A Bunker is ~1.0 × 0.78 m, so a goal at the edge
+   leaves ~0.6 m beside it.
 4. **Snaps.** A candidate on an obstacle, in the clearance zone or
    unreachable moves to the nearest good cell within
    `candidate_snap_radius_m` (2 m) inside the ROI. A frontier candidate moved
@@ -284,19 +288,30 @@ nodes read them with `as_double()` and die on an integer.
    out, inside a Bunker's footprint.
 7. **Re-checks.** While driving, a goal whose cell turns into an obstacle in
    a newer map aborts the drive and replans (`goal (x, y) is now inside an
-   obstacle — aborting navigation and re-planning`). Expect this now and
-   then: cells are scored only once seen often enough and from close enough.
+   obstacle — aborting navigation and re-planning`, outcome
+   `goal-in-obstacle`). So does a goal with an obstacle newly mapped within
+   `planning_map_abort_clearance_m` (0.6 m) of it (`… is now within 0.60 m
+   of an obstacle …`, outcome `goal-near-obstacle`), checked until the robot
+   is 1.6 m from the goal (`planning_map_robot_clear_m` + 0.6 m, so its own
+   ring of cells does not count). Expect both now and then: cells are scored
+   only once seen often enough and from close enough.
 
 **Check it.**
 
+- Startup on a robot without this overlay: `use_planning_map is false on a
+  wall-clock (hardware) run: goals get NO obstacle, clearance or
+  reachability check …` (an error). Stop and relaunch with
+  `params_file:=…/exploration_real_robot.yaml`.
 - Startup: `planning_map accumulate: 555x380 cells at 0.20 m over x [-56.2,
   54.8] y [-36.5, 39.5] (grid 0.2 MB; …)` and `planning_map: mode=accumulate
-  obstacle>=50 … robot_clear=1.00 m flood_cap=500.0 m`.
+  obstacle>=50 … clearance=1.00 m (x3.0) abort_clearance=0.60 m …
+  robot_clear=1.00 m flood_cap=500.0 m`.
 - While waiting: `accumulate: N windows integrated, M rejected (last: …), K
   known cells`. M stays 0. `outside the accumulator box` means the robot is
   far outside the ROI; `rotated origin` means a different publisher.
-- Per step: `[… clear=… unreach=… blk=…, snapped=… nospot=…]`. On the bag
-  ~12 % of candidates snapped and ~1 % found no spot.
+- Per step: `[… clear=… unreach=… blk=…, snapped=… nospot=…]`. On the bag,
+  at the earlier 0.6 m clearance, ~12 % of candidates snapped and ~1 % found
+  no spot. Expect more of both at 1.0 m.
 - `planning_map: no window for N s — planning on the stale accumulated
   map.` (after 5 s): traversability_map stopped, or its TF `map → base_link`
   is missing.
@@ -358,10 +373,11 @@ Memory:
   (bunker's Hesai); on the Ouster it is the top one (+21°). Flipping the
   rings changed little on the bag (9.8 % against 12.5 %), so they are left
   as they are. nav2 has not yet driven CURT on this map.
-- **Unscored cells read 0 (free).** traversability_mapping writes 0 for
-  ground it has seen but not scored (fewer than 10 observations, beyond
-  15 m, or no slope). Goals can land on such a cell; step 7 catches it once
-  scored.
+- **Unscored cells.** traversability_mapping only scores ground it has seen
+  10 times from within 15 m. With `publish_unscored_as_unknown: true` (its
+  shipped config) other seen cells publish −1, or 100 if its scan filter
+  already marks them. With `false` they publish 0, as flat ground, and
+  goals can land on them; step 7 catches that once they are scored.
 - **TF.** traversability_map projects each cloud with the latest `map →
   base_link`. With bunker's doubled `odom → base_link` (Requirements),
   consecutive clouds land ~0.12 m apart in height, which the scoring reads

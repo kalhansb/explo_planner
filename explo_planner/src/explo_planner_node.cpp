@@ -705,6 +705,9 @@ private:
   // Blocked cells within this radius of the robot are passable for its own
   // floods (planning_map_robot_clear_m; see CostGrid::floodFrom).
   float robot_clear_m_ = 0.0f;
+  // A goal being driven to is dropped once a blocked cell is mapped this close
+  // to it (planning_map_abort_clearance_m, <= the clearance zone; 0 = off).
+  float abort_clearance_m_ = 0.0f;
   // planning_map_mode "accumulate": stitches the rolling window topic into one
   // ROI-sized grid (see TraversabilityAccumulator); null in "direct" mode.
   std::unique_ptr<TraversabilityAccumulator> plan_map_accum_;
@@ -1258,6 +1261,10 @@ ExploPlannerNode::ExploPlannerNode()
   //     before scoring (0 = reject them as before).
   //   planning_map_robot_clear_m: blocked cells this close to the robot do
   //     not wall in its path search (its own body seen by the LiDAR).
+  //   planning_map_abort_clearance_m: a goal being driven to is dropped once
+  //     an obstacle is mapped this close to it. Capped at the clearance zone,
+  //     and best kept under it: a goal picked at the zone's edge would
+  //     otherwise drop the moment one more cell beside it is mapped.
   {
     const int thr = dp("planning_map_obstacle_threshold", 50);
     plan_map_obstacle_threshold_ =
@@ -1279,6 +1286,18 @@ ExploPlannerNode::ExploPlannerNode()
         std::max(0.0, dp("candidate_snap_radius_m", 0.0))));
     robot_clear_m_ = static_cast<float>(
         std::max(0.0, dp("planning_map_robot_clear_m", 0.0)));
+    const double abort_m =
+        std::max(0.0, dp("planning_map_abort_clearance_m", 0.0));
+    abort_clearance_m_ =
+        std::min(static_cast<float>(abort_m), cost_model_.clearance_m);
+    if (static_cast<float>(abort_m) > cost_model_.clearance_m) {
+      RCLCPP_WARN(get_logger(),
+          "planning_map_abort_clearance_m=%.2f is above "
+          "planning_map_clearance_m=%.2f, so goals would be dropped as soon as "
+          "they were picked; using %.2f.",
+          abort_m, static_cast<double>(cost_model_.clearance_m),
+          static_cast<double>(abort_clearance_m_));
+    }
   }
 
   // Trajectory-level scoring (path-integrated EIG ablation). When enabled,
@@ -1920,17 +1939,34 @@ ExploPlannerNode::ExploPlannerNode()
       use_planning_map_ ? planning_map_topic.c_str() : "(disabled)",
       goal_topic.c_str());
   RCLCPP_INFO(get_logger(), "Metrics CSV: %s", output_csv_.c_str());
+  // use_planning_map defaults off for sim and bag replays, so a robot launched
+  // without the hardware overlay drives to goals nothing has checked. The
+  // 2026-10-16 and 2026-10-23 field runs both did; the second put goals
+  // against trees and into a hill. Wall-clock time is the hardware tell.
+  {
+    bool sim = false;
+    get_parameter("use_sim_time", sim);
+    if (!sim && !use_planning_map_) {
+      RCLCPP_ERROR(get_logger(),
+          "use_planning_map is false on a wall-clock (hardware) run: goals get "
+          "NO obstacle, clearance or reachability check and can land in "
+          "bushes, against trunks or on slopes the robot cannot climb. On a "
+          "robot, launch with params_file:=<explo_planner "
+          "share>/config/exploration_real_robot.yaml and run "
+          "traversability_mapping.");
+    }
+  }
   if (use_planning_map_) {
     RCLCPP_INFO(get_logger(),
         "planning_map: mode=%s obstacle>=%d trav_weight=%.2f unknown=%.0f "
-        "clearance=%.2f m (x%.1f) snap_radius=%.2f m robot_clear=%.2f m "
-        "flood_cap=%.1f m",
+        "clearance=%.2f m (x%.1f) abort_clearance=%.2f m snap_radius=%.2f m "
+        "robot_clear=%.2f m flood_cap=%.1f m",
         plan_map_accum_ ? "accumulate" : "direct",
         static_cast<int>(plan_map_obstacle_threshold_),
         cost_model_.trav_weight, cost_model_.unknown_value,
         cost_model_.clearance_m,
-        cost_model_.clearance_penalty, snapper_->radius(), robot_clear_m_,
-        cost_grid_radius_cap_m_);
+        cost_model_.clearance_penalty, abort_clearance_m_, snapper_->radius(),
+        robot_clear_m_, cost_grid_radius_cap_m_);
   }
   if (terrain_relative_z_) {
     RCLCPP_INFO(get_logger(),
@@ -3137,6 +3173,33 @@ void ExploPlannerNode::doNavigate() {
     return;
   }
 
+  // Same for a goal that now has an obstacle within abort_clearance_m_ of it.
+  // A frontier goal is often picked over unseen ground, and the trunk or bush
+  // beside it only shows up as the robot drives in. The radius sits inside the
+  // clearance zone that selection keeps goals out of, so one new cell at the
+  // zone's edge does not drop the goal. Checked only while the robot is
+  // farther from the goal than robot_clear + abort_clearance: a robot can map
+  // its own body as a ring of obstacles (planning_map_robot_clear_m), and the
+  // goal would be next to that ring.
+  if (latest_plan_map_ && abort_clearance_m_ > 0.0f &&
+      (current_goal_.position - latest_pos_).head<2>().norm() >
+          robot_clear_m_ + abort_clearance_m_) {
+    ensureCostGridBuilt();
+    if (cost_grid_->obstacleWithin(current_goal_.position,
+                                   abort_clearance_m_)) {
+      RCLCPP_WARN(get_logger(),
+          "Step %d: goal (%.2f, %.2f) is now within %.2f m of an obstacle — "
+          "aborting navigation and re-planning.",
+          step_, current_goal_.position.x(), current_goal_.position.y(),
+          static_cast<double>(abort_clearance_m_));
+      logGoalEnd("goal-near-obstacle", true);
+      have_active_intent_ = false;
+      abandonNavGoal("goal beside obstacle");
+      transitionTo(State::PLAN);
+      return;
+    }
+  }
+
   // In-flight cross-pick tiebreak, exploit VANTAGE hops only. The claim
   // heartbeat is 1 Hz, so around a target release both robots can select the
   // SAME ring angle before either has heard the other's claim — the
@@ -3367,11 +3430,11 @@ void ExploPlannerNode::startNavEpisode(float path_len_m) {
 //   [, last error <code> <NAME> "<msg>"][, <m> m to go]
 // kind is explore / vantage / approach / home. The same outcome, time, path
 // and nav2 counts go into the next CSV row. Some ends write no row of their
-// own (goal-in-obstacle, target-switch, yielded and team-reconnected re-plan;
-// an approach waypoint reached goes on to the vantage; every drive home goes
-// to RETURN_SYNC), so outcomes since the last row are joined with '+' and the
-// numbers describe the last goal. Outcomes still pending when the run ends
-// get a last row on DONE.
+// own (goal-in-obstacle, goal-near-obstacle, target-switch, yielded and
+// team-reconnected re-plan; an approach waypoint reached goes on to the
+// vantage; every drive home goes to RETURN_SYNC), so outcomes since the last
+// row are joined with '+' and the numbers describe the last goal. Outcomes
+// still pending when the run ends get a last row on DONE.
 void ExploPlannerNode::logGoalEnd(const char* outcome, bool warn) {
   const double elapsed = (this->now() - state_enter_time_).seconds();
   const float short_m =

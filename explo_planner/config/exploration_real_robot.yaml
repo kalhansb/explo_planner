@@ -175,11 +175,18 @@
     #   - cells >= 50 (steep / stepped / rough, and every hard obstacle) are
     #     obstacles; frontier goals on them snap up to 2 m to the nearest
     #     good cell (inherited candidate_snap_radius_m) or are dropped;
-    #   - goals never sit within 0.6 m of an obstacle (clearance zone):
+    #   - goals never sit within 1.0 m of an obstacle (clearance zone):
     #     frontier goals, tree vantages and approach points alike. An
-    #     AgileX Bunker is ~0.78 m wide: at 0.4 m its sides end at the bush
-    #     edge, and on the 2026-07-31 bag half the goals picked at 0.4 m had
+    #     AgileX Bunker is ~1.0 x 0.78 m: a goal at 1.0 m leaves ~0.6 m
+    #     beside it and ~0.35 m off its corners as it turns on the spot (up
+    #     to 0.1 m less on 0.2 m cells). At 0.6 m its corners would touch
+    #     the obstacle. On the 2026-07-31 bag half the goals picked at 0.4 m had
     #     an obstacle cell 0.4-1 m away;
+    #   - a goal being driven to is dropped and re-planned once an obstacle
+    #     is mapped within 0.6 m of it (abort_clearance): a trunk or bush
+    #     behind unseen ground often shows up only on the way in. Smaller
+    #     than the zone, so a goal picked at the zone's edge is not dropped
+    #     over one more mapped cell beside it;
     #   - path cost is the Dijkstra cost over the grid: passable rough cells
     #     cost up to ~1.5x (trav_weight 1.0, values below 50), unseen cells
     #     1.25x (as if scored 25), the clearance zone 3x, so the
@@ -205,8 +212,9 @@
     # every one beyond 10 m unreachable. A full flood of the ~211 k-cell grid is
     # ~20-40 ms; it runs at most once per map snapshot (1 s) or 0.25 m of motion.
     cost_grid_radius_cap_m: 500.0
-    planning_map_clearance_m: 0.6
+    planning_map_clearance_m: 1.0
     planning_map_clearance_penalty: 3.0
+    planning_map_abort_clearance_m: 0.6
     planning_map_trav_weight: 1.0
     # Unseen (-1) cells are weighted as if scored 25/100: with 0 a path through
     # unmapped scrub looked as cheap as one over mapped open ground.
