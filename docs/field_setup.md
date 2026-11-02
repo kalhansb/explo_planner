@@ -272,9 +272,10 @@ nodes read them with `as_double()` and die on an integer.
 2. **Blocks.** Cells ≥ `planning_map_obstacle_threshold` (50) are obstacles.
    On traversability_mapping's 0–100 score (slope 0.5, step 0.3, roughness
    0.2; hard obstacles forced to 100) that means stepped, rough, or steep and
-   uneven. A smooth slope scores under 50 at any angle, so
-   traversability_mapping's `max_traversable_slope_deg` (30° in its shipped
-   config) forces anything steeper to 100.
+   uneven. A smooth slope scores under 50 at any angle. With the shipped
+   config it reaches 100 only past ~51°, where the height spread across the
+   0.4 m footprint passes 0.5 m, so a smooth slope too steep to climb is not
+   an obstacle to the planner.
 3. **Keeps clear.** Passable cells within `planning_map_clearance_m` (1.0 m)
    of an obstacle are never a goal, and cost `planning_map_clearance_penalty`
    (3×) to drive through. A Bunker is ~1.0 × 0.78 m, so a goal at the edge
@@ -383,11 +384,10 @@ Memory:
   (bunker's Hesai); on the Ouster it is the top one (+21°). Flipping the
   rings changed little on the bag (9.8 % against 12.5 %), so they are left
   as they are. nav2 has not yet driven CURT on this map.
-- **Unscored cells.** traversability_mapping only scores ground it has seen
-  10 times from within 15 m. With `publish_unscored_as_unknown: true` (its
-  shipped config) other seen cells publish −1, or 100 if its scan filter
-  already marks them. With `false` they publish 0, as flat ground, and
-  goals can land on them; step 7 catches that once they are scored.
+- **Unscored cells read 0 (free).** traversability_mapping writes 0 for
+  ground it has seen but not scored (fewer than 10 observations, or only
+  from beyond 15 m). Goals can land on such a cell; step 7 catches it once
+  scored.
 - **TF.** traversability_map projects each cloud with the latest `map →
   base_link`. With bunker's doubled `odom → base_link` (Requirements),
   consecutive clouds land ~0.12 m apart in height, which the scoring reads
