@@ -155,6 +155,7 @@ values: [real_robot_tuning.md](real_robot_tuning.md).
 | `use_sim_time` | bool | `false` | See §2. |
 | `max_steps` | int | `200` | Step budget (explore + exploit), then DONE. |
 | `output_csv` | string | `~/explo-output/explo_{robot}_{stamp}.csv` (same in C++) | Metrics CSV (§7). A leading `~` is the home folder, `{robot}` is `robot_name` and `{stamp}` the start time (`YYYYmmdd_HHMMSS`). Missing folders are created, an existing file is overwritten, and the path is logged at startup (`Metrics CSV:`). The node exits at startup if it cannot open it. In a container, use a mounted folder. |
+| `metrics_status_period_sec` | double | `10` (same in C++) | Seconds between `status` rows in the CSV (§7) while no other row has been written. `0` = off. |
 | `map_frame` | string | `map` | Frame of the fused map, goals, targets and intents. |
 | `base_frame` | string | `""` | *auto* → `<robot_name>/base_link`. |
 | `map_resolution` | double | `0.10` | Map-cache voxel edge (m). Match the mapper. |
@@ -525,8 +526,22 @@ lists the details). Needs Jazzy or later. What the planner needs from nav2:
 
 ## 7. The metrics CSV
 
-One row per LOG_STEP (each completed explore step, exploit hop or dwell),
-written to `output_csv`. Columns, in order:
+Written to `output_csv`. `row_type` says what each row is:
+
+- `step`: one per LOG_STEP (each completed explore step, exploit hop or dwell).
+- `status`: every `metrics_status_period_sec` while no other row has been
+  written, including before the first step. Filter these out when counting
+  steps. `step` is the step in progress, and the map and area columns repeat
+  the last step's.
+- `end`: on entering DONE, with the reason in `run_end_reason`. `step` is the
+  number of steps done, not a step of its own. A run that resumes for late
+  targets can have more than one.
+
+`status` rows carry on in every state, DONE included. So if rows stop before the
+planner was stopped, the node hung or died; otherwise the last rows say which
+state it was waiting in.
+
+Columns, in order:
 
 | Column | Meaning |
 |---|---|
@@ -539,10 +554,23 @@ written to `output_csv`. Columns, in order:
 | `phase`, `target_id`, `vantage_index` | `explore` or `exploit`; active target and dwelled ring index (`-1` in explore). |
 | `n_vantages_valid`, `vantage_los_clear`, `dwell_sec` | Selectable vantages this tick; clear-LoS flag; capture time (s), not counting dwell-sync waiting. |
 | `prox_hold_count`, `prox_hold_total_sec` | Cumulative proximity holds and their total time (s). Subtract consecutive rows for per-step values. |
-| `goal_outcome` | How the goal that ended since the previous row ended: `reached`, `budget`, `budget-rotate`, `no-progress`, `nav2-aborted`, `goal-in-obstacle` (its cell became an obstacle), `goal-near-obstacle` (an obstacle was mapped within `planning_map_abort_clearance_m` of it; both blacklist the goal), `target-switch`, `yielded` (a teammate picked the same vantage at the same moment), `team-reconnected` (drive home cut short). Empty if none ended. Ends that write no row of their own (the last five, a reached approach waypoint, and every drive home) are joined to the next row's with `+`, e.g. `goal-in-obstacle+budget`; the next five columns describe the last of them. Ends still pending when the run stops get one last row at DONE. |
+| `goal_outcome` | How the goal that ended since the previous row ended: `reached`, `budget`, `budget-rotate`, `no-progress`, `nav2-aborted`, `goal-in-obstacle` (its cell became an obstacle), `goal-near-obstacle` (an obstacle was mapped within `planning_map_abort_clearance_m` of it; both blacklist the goal), `target-switch`, `yielded` (a teammate picked the same vantage at the same moment), `team-reconnected` (drive home cut short). Empty if none ended. Ends that write no row of their own (the last five, a reached approach waypoint, and every drive home) are joined to the next row's with `+`, e.g. `goal-in-obstacle+budget`; the next five columns describe the last of them. Ends still pending when the run stops are on the `end` row. |
 | `nav_elapsed_sec`, `goal_path_length_m` | Time the goal took (s), and the distance its budget was built from (m): planned path length, or the straight line. |
 | `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | nav2's aborts of this goal, the recoveries it ran on it, and the last abort's error code (Jazzy; `-1` = none, or Humble). `0` / `0` / `-1` when nav2 is not watched. |
 | `pick_fallback` | How the goal was picked when the normal walk left no candidate: `hop-relaxed` (`candidate_min_goal_dist_m` dropped) or `revisit` (every candidate near a recently reached goal; the area left longest ago). Empty for a normal pick and in exploit. |
+| `row_type`, `run_end_reason` | See above. The reason is `coverage-saturated` or `step-budget`, empty on other rows. |
+| `planner_state`, `state_elapsed_sec` | State machine state, and the seconds in it (`0` before the first transition). |
+| `robot_x`, `robot_y`, `robot_z`, `robot_yaw`, `robot_in_roi` | Pose in `map_frame` (m, rad), and whether it is inside the ROI (`1` / `0`). `nan` / `-1` before the first pose. |
+| `goal_x`, `goal_y`, `goal_z`, `goal_yaw`, `goal_dist_m` | The current goal, and the robot's XY distance from it now. `nan` when no goal is in play: WAIT_FOR_MAP, PLAN, EXPLOIT_PLAN, RETURN_SYNC and DONE. |
+| `goal_trav_value` | Planning-map value at the goal now: `-1` unknown, `0`..`100`, `-2` no goal, no map or off the map. |
+| `area_mapped_m2`, `roi_area_m2` | ROI x/y columns with any observed voxel, and all ROI columns (m²). The lidar sees far, so this says what has been seen, not where the robot has been. On a `step` row the map is the one this step planned on, so it lags by one drive. |
+| `unknown_fraction`, `done_streak` | The value the coverage stop compares with `done_unknown_fraction` (`-1` = cannot measure), and how many measurements in a row have passed. |
+| `area_traversable_m2`, `area_obstacle_m2` | Planning-map cells in the ROI below / at `planning_map_obstacle_threshold` (m²). `-1` with no planning map. Unknown cells count in neither. |
+| `area_driven_m2` | 1 m cells the robot's centre has been in, anywhere (m²). |
+| `n_candidates`, `rejected_too_close`, `rejected_map`, `rejected_clearance`, `rejected_blacklist` | The latest exploration PLAN's candidates and rejections, the step line's `close=`, `map=`, `clear=` and `blk=`. Status rows during a PLAN that rejects them all show why. `0` in exploit. |
+| `nav2_status` | nav2's latest status for the current goal, e.g. `EXECUTING`; `no status` if none has arrived. |
+| `nav2_publishers`, `goal_subscribers` | Publishers on `nav_status_action`'s status topic and subscribers on the goal topic. `nav2_publishers` `0` means nav2 is down or the name is wrong, and then the `nav2_*` columns stay at their defaults; `-1` means nav2 is not watched. |
+| `map_age_sec`, `plan_map_age_sec` | Seconds since the last fused map and planning-map window arrived. `-1` = none yet, or not accumulating. `plan_map_age_sec` is wall-clock time, so on a bag replay it ignores the playback rate. |
 
 ---
 

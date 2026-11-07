@@ -61,4 +61,14 @@ bool occupiedWithin(const nav_msgs::msg::OccupancyGrid& grid,
 double unknownFractionInRoi(const nav_msgs::msg::OccupancyGrid& grid,
                             const Roi2D& roi);
 
+/// The cells unknownFractionInRoi walks, by kind: all of them, the unknown
+/// (-1) ones, and the known ones >= threshold. All 0 where it returns -1.0.
+struct RoiCellCounts {
+  int total = 0;
+  int unknown = 0;
+  int obstacle = 0;
+};
+RoiCellCounts roiCellCounts(const nav_msgs::msg::OccupancyGrid& grid,
+                            const Roi2D& roi, int8_t threshold = 50);
+
 } // namespace explo_planner

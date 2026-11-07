@@ -198,6 +198,27 @@ TEST(PlanMapQuery, UnknownFractionRoiClippingAndMiss) {
   EXPECT_EQ(unknownFractionInRoi(empty, {0.0f, 1.0f, 0.0f, 1.0f}), -1.0);
 }
 
+// Each cell lands in one count, at the threshold it is passed; a miss is all 0.
+TEST(PlanMapQuery, RoiCellCountsByKind) {
+  auto g = makeGrid(10, 10, 1.0f);
+  setCell(g, 0, 0, -1);
+  setCell(g, 1, 0, -1);
+  setCell(g, 2, 0, 50);
+  setCell(g, 3, 0, 100);
+  setCell(g, 4, 0, 49);
+  const Roi2D whole{0.0f, 10.0f, 0.0f, 10.0f};
+  const auto c = roiCellCounts(g, whole);
+  EXPECT_EQ(c.total, 100);
+  EXPECT_EQ(c.unknown, 2);
+  EXPECT_EQ(c.obstacle, 2);
+  EXPECT_EQ(roiCellCounts(g, whole, 40).obstacle, 3);
+
+  const auto miss = roiCellCounts(g, {-50.0f, -40.0f, 0.0f, 10.0f});
+  EXPECT_EQ(miss.total, 0);
+  EXPECT_EQ(miss.unknown, 0);
+  EXPECT_EQ(miss.obstacle, 0);
+}
+
 // A rotated ROI counts only the cells whose centre is inside it. The diamond
 // (yaw 45 deg, side 4 m, corner at (5, 1)) sits inside a 10x10 grid; marking
 // every cell OUTSIDE it unknown must leave the ROI fraction at 0.

@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -253,6 +254,10 @@ private:
   void doLogStep();
   // Builds and writes one CSV row (doLogStep, and the last row on DONE).
   StepMetrics writeStepRow();
+  // Columns read fresh for every kind of row.
+  void fillLiveColumns(StepMetrics& m);
+  // A "status" row when no row has been written for metrics_status_period_sec.
+  void maybeWriteStatusRow();
 
   // Rendezvous (multi-robot reconnection). finishOrRendezvous decides, at
   // exploration exhaustion, between DONE and returning home;
@@ -628,6 +633,15 @@ private:
   std::unique_ptr<FovEvaluator> fov_eval_;
   ScoreFn score_fn_;
   std::unique_ptr<MetricsLogger> logger_;
+  // Status rows. A hung tick writes none, so a CSV whose rows just stop means
+  // the node hung or died, unlike one that keeps saying which state it is in.
+  double metrics_status_period_sec_ = 10.0;
+  double last_row_sec_ = 0.0;
+  StepMetrics last_row_;
+  // "coverage-saturated" / "step-budget", for the "end" row.
+  std::string run_end_reason_;
+  // 1 m cells the robot's centre has been in (area_driven_m2).
+  std::unordered_set<uint64_t> driven_cells_;
   std::unique_ptr<CostGrid> cost_grid_;
   std::unique_ptr<Coordination> coord_;
   std::unique_ptr<ProximityGuard> prox_guard_;
@@ -823,6 +837,11 @@ private:
   // "" for a normal pick, else the fallback that made it: "hop-relaxed"
   // (minimum hop dropped) or "revisit" (all near recently reached goals).
   std::string pending_pick_fallback_;
+  int   pending_n_candidates_       = 0;
+  int   pending_rejected_too_close_ = 0;
+  int   pending_rejected_map_       = 0;
+  int   pending_rejected_clearance_ = 0;
+  int   pending_rejected_blacklist_ = 0;
 
   // Per-exploit-step diagnostics (filled by doExploitPlan/doExploitDwell,
   // drained by doLogStep when phase_ == EXPLOIT).
@@ -1070,6 +1089,7 @@ ExploPlannerNode::ExploPlannerNode()
   // Diagnostics only: warn when a published goal is farther than this (m)
   // from the robot — likely off a nav2 costmap. 0 disables.
   far_goal_warn_m_ = dp("far_goal_warn_m", 50.0);
+  metrics_status_period_sec_ = dp("metrics_status_period_sec", 10.0);
 
   // Failed-goal blacklist. When a navigate cycle times out before reaching
   // the goal, the goal position is parked here for `failed_goal_ttl_sec`
@@ -2170,6 +2190,7 @@ void ExploPlannerNode::tick() {
   updatePoseFromTF();
   trackDistance();
   checkDiagnostics();
+  maybeWriteStatusRow();
   // Accumulate mode: publish a new planning-map snapshot when due. Before the
   // dispatch so WAIT_FOR_MAP sees the first one and every state plans on the
   // same map within a tick.
@@ -2367,8 +2388,8 @@ void ExploPlannerNode::transitionTo(State s) {
   if (s == State::DONE) publishPresenceIntent();
   // A goal that ended since the last row (the drive home, typically: its
   // ends go to RETURN_SYNC, not LOG_STEP) would otherwise never reach the
-  // CSV. One last row carries it.
-  if (s == State::DONE && !pending_goal_outcome_.empty()) writeStepRow();
+  // CSV. The "end" row carries it, and says why the run ended.
+  if (s == State::DONE) writeStepRow();
   // The dwell-sync barrier is per-DWELL: its wait clock starts at entry (the
   // moment the robot is physically staged on the vantage) and neither latch may
   // survive into the next capture — a timed-out barrier would otherwise disable
@@ -2561,6 +2582,10 @@ void ExploPlannerNode::doPlan() {
         robot_pos.x(), robot_pos.y(), inRoi(robot_pos) ? "inside" : "OUTSIDE",
         frontiers.size(),
         candidate_gen_->config().enable_polar ? "on" : "off");
+    // Or the status rows would show the last PLAN's candidates.
+    pending_n_candidates_ = pending_rejected_too_close_ = pending_rejected_map_ =
+        pending_rejected_clearance_ = pending_rejected_blacklist_ =
+        pending_rejected_by_minpos_ = pending_rejected_by_unreachable_ = 0;
     return;
   }
 
@@ -2900,6 +2925,16 @@ void ExploPlannerNode::doPlan() {
       break;
     }
   }
+  // Staged here as well as on success: a PLAN that rejects everything is what
+  // the status rows then have to explain.
+  pending_n_candidates_       = static_cast<int>(candidates.size());
+  pending_rejected_too_close_ = rejected_too_close;
+  pending_rejected_map_       = rejected_map;
+  pending_rejected_clearance_ = rejected_clearance;
+  pending_rejected_blacklist_ = rejected_blacklist;
+  pending_rejected_by_minpos_      = rejected_minpos;
+  pending_rejected_by_unreachable_ = rejected_unreachable;
+
   if (!found) {
     // Throttled: this retries at the tick rate (the counters say why).
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -2932,8 +2967,6 @@ void ExploPlannerNode::doPlan() {
   pending_selected_path_len_ = (skip_reachability || !cost_grid_)
       ? path_cost[selected_idx]
       : cost_grid_->pathLengthTo(current_goal_.position);
-  pending_rejected_by_minpos_      = rejected_minpos;
-  pending_rejected_by_unreachable_ = rejected_unreachable;
   pending_pick_fallback_ = revisit ? "revisit"
                          : hop_relaxed ? "hop-relaxed" : "";
 
@@ -3501,6 +3534,7 @@ void ExploPlannerNode::logGoalEnd(const char* outcome, bool warn) {
 // mission ends with the whole team parked together inside the starting comms
 // bubble, each robot countable by later finishers.
 void ExploPlannerNode::finishOrRendezvous(const char* reason) {
+  run_end_reason_ = reason;
   // livePeerCount, not the raw table size: exploit claims are retained past
   // expiry by the grace window (vantage-contest lenience), and a graced claim
   // must not count a 10-s-silent teammate as "present" for the barrier.
@@ -4075,11 +4109,138 @@ void ExploPlannerNode::doIntegrate() {
 // LOG_STEP state
 // ==================================================================
 
+void ExploPlannerNode::fillLiveColumns(StepMetrics& m) {
+  const auto now = this->now();
+  m.step = step_;
+  m.sim_time_sec = now.seconds();
+  m.distance_traveled = cumulative_distance_;
+  // livePeerCount: the column documents "peers heard within one TTL", and
+  // grace-retained exploit claims must not inflate it (CSV schema unchanged,
+  // only the count's honesty restored).
+  m.coord_active_peers  = coord_
+      ? static_cast<int>(coord_->livePeerCount(now))
+      : 0;
+  m.rejected_by_minpos        = pending_rejected_by_minpos_;
+  m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
+  if (phase_ != Phase::EXPLOIT) {
+    m.n_candidates       = pending_n_candidates_;
+    m.rejected_too_close = pending_rejected_too_close_;
+    m.rejected_map       = pending_rejected_map_;
+    m.rejected_clearance = pending_rejected_clearance_;
+    m.rejected_blacklist = pending_rejected_blacklist_;
+  } else {
+    m.n_candidates = m.rejected_too_close = m.rejected_map =
+        m.rejected_clearance = m.rejected_blacklist = 0;
+  }
+
+  // Cumulative proximity-hold columns. LOG_STEP is never reached mid-hold
+  // (holds only interrupt driving states), so these are settled on a step row;
+  // a status row during a hold leaves that hold out of them.
+  m.prox_hold_count     = prox_hold_count_;
+  m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
+
+  m.planner_state = stateName(state_);
+  // Not set until the first transition, in WAIT_FOR_MAP.
+  m.state_elapsed_sec = state_enter_time_.nanoseconds() > 0
+      ? static_cast<float>(m.sim_time_sec - state_enter_time_.seconds())
+      : 0.0f;
+
+  if (have_pose_) {
+    m.robot_x = latest_pos_.x();
+    m.robot_y = latest_pos_.y();
+    m.robot_z = latest_pos_.z();
+    m.robot_yaw = latest_yaw_;
+    m.robot_in_roi = inRoi(latest_pos_) ? 1 : 0;
+  }
+  // current_goal_ outlives its goal: while planning or finished it is stale.
+  const bool goal_in_play =
+      have_first_goal_pub_ && state_ != State::WAIT_FOR_MAP &&
+      state_ != State::PLAN && state_ != State::EXPLOIT_PLAN &&
+      state_ != State::RETURN_SYNC && state_ != State::DONE;
+  if (goal_in_play) {
+    m.goal_x = current_goal_.position.x();
+    m.goal_y = current_goal_.position.y();
+    m.goal_z = current_goal_.position.z();
+    m.goal_yaw = current_goal_.yaw;
+    if (have_pose_) {
+      m.goal_dist_m = (latest_pos_ - current_goal_.position).head<2>().norm();
+    }
+    m.goal_trav_value = latest_plan_map_
+        ? planMapCellAt(*latest_plan_map_, current_goal_.position)
+        : kCellNoData;
+  } else {
+    m.goal_x = m.goal_y = m.goal_z = m.goal_yaw = m.goal_dist_m =
+        std::numeric_limits<float>::quiet_NaN();
+    m.goal_trav_value = kCellNoData;
+  }
+
+  m.done_streak = coverage_done_streak_;
+  m.area_driven_m2 = static_cast<float>(driven_cells_.size());
+
+  m.nav2_status = navStatusName(nav_ep_last_status_);
+  m.nav2_publishers = nav_status_sub_
+      ? static_cast<int>(nav_status_sub_->get_publisher_count())
+      : -1;
+  m.goal_subscribers = goal_pub_
+      ? static_cast<int>(goal_pub_->get_subscription_count())
+      : 0;
+  m.map_age_sec = latest_scovox_map_
+      ? static_cast<float>(m.sim_time_sec - last_map_rx_time_.seconds())
+      : -1.0f;
+  // Rejected windows count: they still show the mapper is alive.
+  m.plan_map_age_sec = plan_map_windows_ok_ + plan_map_windows_rejected_ > 0
+      ? static_cast<float>(std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - plan_map_last_window_time_)
+            .count())
+      : -1.0f;
+}
+
+void ExploPlannerNode::maybeWriteStatusRow() {
+  if (metrics_status_period_sec_ <= 0.0) return;
+  // A clock that went back (a restarted bag) writes a row now, rather than none
+  // until it catches up, which would read as a hung node.
+  const double since = this->now().seconds() - last_row_sec_;
+  if (since >= 0.0 && since < metrics_status_period_sec_) return;
+  // The map and area columns repeat the last step's: computing them needs a
+  // map walk, and map_cache_ only refreshes in PLAN anyway.
+  StepMetrics m = last_row_;
+  m.row_type = "status";
+  m.run_end_reason.clear();
+  // The latest plan's pick, which is the goal being driven, not the last row's.
+  m.selected_score      = current_goal_.score;
+  m.selected_utility    = current_goal_.score;
+  m.plan_time_ms        = pending_plan_ms_;
+  m.mean_info_gain      = pending_mean_info_gain_;
+  m.mean_path_cost      = pending_mean_path_cost_;
+  m.selected_info_gain  = pending_selected_info_gain_;
+  m.selected_path_cost  = pending_selected_path_cost_;
+  m.pick_fallback       = pending_pick_fallback_;
+  m.goal_outcome.clear();
+  m.nav_elapsed_sec = 0.0f;
+  m.goal_path_length_m = 0.0f;
+  m.nav2_aborts = 0;
+  m.nav2_recoveries = 0;
+  m.nav2_error_code = -1;
+  fillLiveColumns(m);
+  m.phase = phase_ == Phase::EXPLOIT ? "exploit" : "explore";
+  if (state_ == State::NAVIGATE || state_ == State::RETURN_NAV ||
+      state_ == State::PROXIMITY_HOLD) {
+    // The goal still being driven, so far.
+    m.nav_elapsed_sec = m.state_elapsed_sec;
+    m.goal_path_length_m = nav_ep_path_len_m_;
+    m.nav2_aborts = nav_ep_aborts_;
+    m.nav2_recoveries = nav_ep_recoveries_;
+    m.nav2_error_code = nav_ep_error_code_;
+  }
+  logger_->logStep(m);
+  last_row_sec_ = m.sim_time_sec;
+}
+
 StepMetrics ExploPlannerNode::writeStepRow() {
   StepMetrics m;
-  m.step = step_;
-  m.sim_time_sec = this->now().seconds();
-  m.distance_traveled = cumulative_distance_;
+  m.row_type = state_ == State::DONE ? "end" : "step";
+  if (state_ == State::DONE) m.run_end_reason = run_end_reason_;
+  fillLiveColumns(m);
   m.selected_score = current_goal_.score;
   m.plan_time_ms = pending_plan_ms_;
 
@@ -4089,22 +4250,9 @@ StepMetrics ExploPlannerNode::writeStepRow() {
   m.selected_info_gain  = pending_selected_info_gain_;
   m.selected_path_cost  = pending_selected_path_cost_;
   m.selected_utility    = current_goal_.score;
-  // livePeerCount: the column documents "peers heard within one TTL", and
-  // grace-retained exploit claims must not inflate it (CSV schema unchanged,
-  // only the count's honesty restored).
-  m.coord_active_peers  = coord_
-      ? static_cast<int>(coord_->livePeerCount(this->now()))
-      : 0;
-  m.rejected_by_minpos        = pending_rejected_by_minpos_;
-  m.rejected_by_unreachable   = pending_rejected_by_unreachable_;
   // Cleared here: only doPlan sets it, so an exploit step reads "".
   m.pick_fallback             = pending_pick_fallback_;
   pending_pick_fallback_.clear();
-
-  // Cumulative proximity-hold columns. LOG_STEP is never reached mid-hold
-  // (holds only interrupt driving states), so these are always settled.
-  m.prox_hold_count     = prox_hold_count_;
-  m.prox_hold_total_sec = static_cast<float>(prox_hold_total_sec_);
 
   // How the goal behind this row ended (staged by logGoalEnd), then cleared
   // so a row with no goal end in between reads "" rather than a stale one.
@@ -4144,11 +4292,38 @@ StepMetrics ExploPlannerNode::writeStepRow() {
   m.mean_entropy          = stats.mean_entropy;
   m.mean_variance         = stats.mean_variance;
 
+  // Area covered, on the same map_cache_ as the stats above.
+  const auto columns = map_cache_->columnCoverage(roi_xy_);
+  const double column_m2 = map_cache_->resolution() * map_cache_->resolution();
+  m.area_mapped_m2 = static_cast<float>(columns.observed * column_m2);
+  m.roi_area_m2    = static_cast<float>(columns.total * column_m2);
+  const char* cov_src = "";
+  m.unknown_fraction = static_cast<float>(coverageUnknownFraction(&cov_src));
+  if (latest_plan_map_) {
+    const auto cells = roiCellCounts(*latest_plan_map_, roi_xy_,
+                                     plan_map_obstacle_threshold_);
+    const double cell_m2 = static_cast<double>(latest_plan_map_->info.resolution) *
+                           latest_plan_map_->info.resolution;
+    m.area_traversable_m2 = static_cast<float>(
+        (cells.total - cells.unknown - cells.obstacle) * cell_m2);
+    m.area_obstacle_m2 = static_cast<float>(cells.obstacle * cell_m2);
+  }
+
   logger_->logStep(m);
-  RCLCPP_INFO(get_logger(),
-      "Step %d logged: voxels=%d frontiers=%d dist=%.2f mean_eig=%.4f",
-      step_, m.total_observed_voxels, m.frontier_voxels,
-      m.distance_traveled, m.mean_eig);
+  last_row_ = m;
+  last_row_sec_ = m.sim_time_sec;
+  if (m.row_type == "end") {
+    // step_ is the number of steps done by now, not a step of its own.
+    RCLCPP_INFO(get_logger(),
+        "End row logged (%s): %d steps, voxels=%d frontiers=%d dist=%.2f",
+        m.run_end_reason.c_str(), step_, m.total_observed_voxels,
+        m.frontier_voxels, m.distance_traveled);
+  } else {
+    RCLCPP_INFO(get_logger(),
+        "Step %d logged: voxels=%d frontiers=%d dist=%.2f mean_eig=%.4f",
+        step_, m.total_observed_voxels, m.frontier_voxels,
+        m.distance_traveled, m.mean_eig);
+  }
   return m;
 }
 
@@ -5341,6 +5516,10 @@ void ExploPlannerNode::trackDistance() {
   }
   prev_pos_ = latest_pos_;
   first_pos_ = false;
+  driven_cells_.insert(
+      (static_cast<uint64_t>(static_cast<uint32_t>(
+           static_cast<int32_t>(std::floor(latest_pos_.x())))) << 32) |
+      static_cast<uint32_t>(static_cast<int32_t>(std::floor(latest_pos_.y()))));
 }
 
 // ==================================================================

@@ -418,7 +418,8 @@ the two robots' `fused_voxels` converge.
 
 ### Per-step CSV
 
-Written to `output_csv` on each robot. Columns worth watching live:
+Written to `output_csv` on each robot, one `row_type` = `step` row per step.
+Columns worth watching live:
 
 | Column | Reading |
 |--------|---------|
@@ -431,6 +432,17 @@ Written to `output_csv` on each robot. Columns worth watching live:
 | `goal_outcome`, `nav_elapsed_sec`, `goal_path_length_m` | How each goal ended, how long it took, and its route length. A run of `no-progress` / `nav2-aborted` means the robot is fighting the terrain. |
 | `nav2_aborts`, `nav2_recoveries`, `nav2_error_code` | Nav2's side of the same goal (error code on Jazzy only). |
 | `pick_fallback` | `hop-relaxed` or `revisit` when a fallback picked the goal (see `candidate_min_goal_dist_m` and `visited_goal_radius_m`), empty otherwise. Many in a row can mean the robot is bouncing again. |
+| `robot_x`, `robot_y`, `goal_x`, `goal_y`, `goal_trav_value` | Where the robot and goal were, and how the planning map scored the goal cell. Plots the route without a bag. |
+| `area_mapped_m2`, `roi_area_m2`, `area_driven_m2` | What has been seen in the ROI, the ROI's size, and the ground actually driven. |
+
+If the robot stops getting goals, read the end of the file:
+
+| The file ends with | Meaning |
+|--------------------|---------|
+| An `end` row, then `status` rows, `planner_state` `DONE` | The planner finished. The `end` row's `run_end_reason` says why, its `unknown_fraction` how close the coverage stop was. |
+| `status` rows, `planner_state` `NAVIGATE` | It is waiting on a goal. `nav2_publishers` `0` means nav2 is down; otherwise read `nav2_status`, `nav2_recoveries` and `goal_dist_m`. |
+| `status` rows, `planner_state` `PLAN` | It finds no goal. `n_candidates` and the `rejected_*` columns say why. |
+| Rows that just stop, more than `metrics_status_period_sec` before the planner was stopped | The node hung or died. |
 
 ---
 

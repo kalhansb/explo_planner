@@ -29,6 +29,10 @@
     # startup ("Metrics CSV:"). Inside a container, use a mounted folder, or
     # the file goes when the container is removed.
     output_csv: "~/explo-output/explo_{robot}_{stamp}.csv"
+    # Seconds between "status" rows in that CSV while no other row has been
+    # written: what the planner is doing between steps, so a run that goes
+    # quiet can be read without its logs. 0 = off.
+    metrics_status_period_sec: 10.0
     map_resolution: 0.10
 
     # Frames — planner reads dscovox map (in map_frame) and uses TF

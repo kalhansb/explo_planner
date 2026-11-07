@@ -67,7 +67,16 @@ void MetricsLogger::writeHeader() {
         << "prox_hold_count,prox_hold_total_sec,"
         << "goal_outcome,nav_elapsed_sec,goal_path_length_m,"
         << "nav2_aborts,nav2_recoveries,nav2_error_code,"
-        << "pick_fallback\n";
+        << "pick_fallback,"
+        << "row_type,run_end_reason,planner_state,state_elapsed_sec,"
+        << "robot_x,robot_y,robot_z,robot_yaw,robot_in_roi,"
+        << "goal_x,goal_y,goal_z,goal_yaw,goal_dist_m,goal_trav_value,"
+        << "area_mapped_m2,roi_area_m2,unknown_fraction,done_streak,"
+        << "area_traversable_m2,area_obstacle_m2,area_driven_m2,"
+        << "n_candidates,rejected_too_close,rejected_map,rejected_clearance,"
+        << "rejected_blacklist,"
+        << "nav2_status,nav2_publishers,goal_subscribers,"
+        << "map_age_sec,plan_map_age_sec\n";
   header_written_ = true;
 }
 
@@ -105,7 +114,39 @@ void MetricsLogger::logStep(const StepMetrics& m) {
         << m.nav2_aborts << ","
         << m.nav2_recoveries << ","
         << m.nav2_error_code << ","
-        << m.pick_fallback << "\n";
+        << m.pick_fallback << ","
+        << m.row_type << ","
+        << m.run_end_reason << ","
+        << m.planner_state << ","
+        << m.state_elapsed_sec << ","
+        << m.robot_x << ","
+        << m.robot_y << ","
+        << m.robot_z << ","
+        << m.robot_yaw << ","
+        << m.robot_in_roi << ","
+        << m.goal_x << ","
+        << m.goal_y << ","
+        << m.goal_z << ","
+        << m.goal_yaw << ","
+        << m.goal_dist_m << ","
+        << m.goal_trav_value << ","
+        << m.area_mapped_m2 << ","
+        << m.roi_area_m2 << ","
+        << m.unknown_fraction << ","
+        << m.done_streak << ","
+        << m.area_traversable_m2 << ","
+        << m.area_obstacle_m2 << ","
+        << m.area_driven_m2 << ","
+        << m.n_candidates << ","
+        << m.rejected_too_close << ","
+        << m.rejected_map << ","
+        << m.rejected_clearance << ","
+        << m.rejected_blacklist << ","
+        << m.nav2_status << ","
+        << m.nav2_publishers << ","
+        << m.goal_subscribers << ","
+        << m.map_age_sec << ","
+        << m.plan_map_age_sec << "\n";
   file_.flush();
 }
 

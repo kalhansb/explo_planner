@@ -126,6 +126,17 @@ public:
   /// observed. Returns -1.0 on a degenerate or non-finite ROI.
   double unknownColumnFraction(const Roi2D& roi) const;
 
+  /// The column counts behind unknownColumnFraction, for reporting area:
+  /// columns with an observed voxel, and all columns. total is 0 where the
+  /// fraction returns -1.0.
+  struct ColumnCoverage {
+    int64_t observed = 0;
+    int64_t total = 0;
+  };
+  ColumnCoverage columnCoverage(float min_x, float max_x,
+                                float min_y, float max_y) const;
+  ColumnCoverage columnCoverage(const Roi2D& roi) const;
+
 private:
   double resolution_;
   std::unique_ptr<Grid> grid_;

@@ -59,6 +59,19 @@ TEST(MapCacheColumnFraction, FullCoverageIsZero) {
               0.0, 1e-9);
 }
 
+// The counts behind the fraction, which the CSV turns into square metres.
+TEST(MapCacheColumnFraction, CoverageCountsColumns) {
+  std::vector<Eigen::Vector3f> occ;
+  for (int i = 0; i < kCols / 2; ++i)
+    for (int j = 0; j < kCols; ++j)
+      occ.emplace_back(center(i), center(j), 0.5f);
+  MapCache map = makeMap(occ);
+  const auto c = map.columnCoverage(0.0f, kBoxMax, 0.0f, kBoxMax);
+  EXPECT_EQ(c.total, static_cast<int64_t>(kCols) * kCols);
+  EXPECT_EQ(c.observed, static_cast<int64_t>(kCols / 2) * kCols);
+  EXPECT_EQ(map.columnCoverage(1.0f, 0.0f, 0.0f, kBoxMax).total, 0);
+}
+
 TEST(MapCacheColumnFraction, HalfCoverageIsHalf) {
   // Fill only the 5 low-x column rows: 50 of 100 columns observed.
   std::vector<Eigen::Vector3f> occ;

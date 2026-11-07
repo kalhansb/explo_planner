@@ -291,12 +291,31 @@ float MapCache::groundZAt(float x, float y, float z_low, float z_high,
   return kNaN;
 }
 
+namespace {
+
+double unknownFraction(const MapCache::ColumnCoverage& c) {
+  if (c.total <= 0) return -1.0;
+  return 1.0 - static_cast<double>(c.observed) / static_cast<double>(c.total);
+}
+
+}  // namespace
+
 double MapCache::unknownColumnFraction(float min_x, float max_x,
                                        float min_y, float max_y) const {
+  return unknownFraction(columnCoverage(min_x, max_x, min_y, max_y));
+}
+
+double MapCache::unknownColumnFraction(const Roi2D& roi) const {
+  return unknownFraction(columnCoverage(roi));
+}
+
+MapCache::ColumnCoverage MapCache::columnCoverage(float min_x, float max_x,
+                                                  float min_y,
+                                                  float max_y) const {
   if (!std::isfinite(min_x) || !std::isfinite(max_x) ||
       !std::isfinite(min_y) || !std::isfinite(max_y) ||
       !(max_x > min_x) || !(max_y > min_y))
-    return -1.0;
+    return {};
 
   // Work in coord space so the column count and the membership test share the
   // same floor() convention as voxel ingest (posToCoord). Inclusive bounds:
@@ -309,7 +328,7 @@ double MapCache::unknownColumnFraction(float min_x, float max_x,
   const int64_t nx = static_cast<int64_t>(c_max.x) - c_min.x + 1;
   const int64_t ny = static_cast<int64_t>(c_max.y) - c_min.y + 1;
   const int64_t total = nx * ny;
-  if (total <= 0) return -1.0;
+  if (total <= 0) return {};
 
   // One walk over active cells, projecting each to its (x, y) column. The
   // shift-or pack (x zero-extended into the high 32 bits, y into the low 32)
@@ -325,19 +344,18 @@ double MapCache::unknownColumnFraction(float min_x, float max_x,
         static_cast<uint32_t>(c.y));
   });
 
-  return 1.0 - static_cast<double>(observed.size()) /
-                   static_cast<double>(total);
+  return {static_cast<int64_t>(observed.size()), total};
 }
 
-double MapCache::unknownColumnFraction(const Roi2D& roi) const {
+MapCache::ColumnCoverage MapCache::columnCoverage(const Roi2D& roi) const {
   if (!roi.transformed())
-    return unknownColumnFraction(roi.min_x, roi.max_x, roi.min_y, roi.max_y);
+    return columnCoverage(roi.min_x, roi.max_x, roi.min_y, roi.max_y);
   if (!std::isfinite(roi.min_x) || !std::isfinite(roi.max_x) ||
       !std::isfinite(roi.min_y) || !std::isfinite(roi.max_y) ||
       !std::isfinite(roi.yaw) || !std::isfinite(roi.origin_x) ||
       !std::isfinite(roi.origin_y) ||
       !(roi.max_x > roi.min_x) || !(roi.max_y > roi.min_y))
-    return -1.0;
+    return {};
 
   // A rotated box has no closed-form column count on the grid, so walk the
   // columns of its map-frame bounding box and keep those whose centre is
@@ -358,7 +376,7 @@ double MapCache::unknownColumnFraction(const Roi2D& roi) const {
   for (int32_t cy = c_min.y; cy <= c_max.y; ++cy)
     for (int32_t cx = c_min.x; cx <= c_max.x; ++cx)
       if (inside(cx, cy)) ++total;
-  if (total <= 0) return -1.0;
+  if (total <= 0) return {};
 
   // Same column packing as the box overload.
   std::unordered_set<uint64_t> observed;
@@ -371,8 +389,7 @@ double MapCache::unknownColumnFraction(const Roi2D& roi) const {
         static_cast<uint32_t>(c.y));
   });
 
-  return 1.0 - static_cast<double>(observed.size()) /
-                   static_cast<double>(total);
+  return {static_cast<int64_t>(observed.size()), total};
 }
 
 MapCache::MapStats MapCache::computeStats() const {

@@ -2,6 +2,7 @@
 /// @file metrics_logger.hpp
 /// @brief Per-step CSV metric logging for exploration experiments.
 
+#include <limits>
 #include <string>
 #include <fstream>
 
@@ -69,6 +70,69 @@ struct StepMetrics {
   // "revisit" (every candidate near a recently reached goal; the area left
   // longest ago). "" for a normal pick and in exploit.
   std::string pick_fallback;
+
+  // What kind of row this is. "step": one per LOG_STEP, as above. "status":
+  // written every metrics_status_period_sec while no other row has been, so
+  // a run that goes quiet still says what the planner was doing; its step is
+  // the one in progress, and the map and area columns repeat the last step's.
+  // "end": written on entering DONE, with run_end_reason "coverage-saturated"
+  // or "step-budget", and step the number of steps done.
+  std::string row_type = "step";
+  std::string run_end_reason;
+  std::string planner_state;
+  float  state_elapsed_sec = 0.0f;
+
+  // Where the robot and the goal are. NaN when there is no pose yet, or no
+  // goal in play (planning, DONE). goal_trav_value is the planning map's value
+  // at the goal (-1 unknown, 0..100, -2 no map or off it).
+  float  robot_x = std::numeric_limits<float>::quiet_NaN();
+  float  robot_y = std::numeric_limits<float>::quiet_NaN();
+  float  robot_z = std::numeric_limits<float>::quiet_NaN();
+  float  robot_yaw = std::numeric_limits<float>::quiet_NaN();
+  int    robot_in_roi = -1;  // 1 inside the ROI, 0 outside, -1 no pose yet
+  float  goal_x = std::numeric_limits<float>::quiet_NaN();
+  float  goal_y = std::numeric_limits<float>::quiet_NaN();
+  float  goal_z = std::numeric_limits<float>::quiet_NaN();
+  float  goal_yaw = std::numeric_limits<float>::quiet_NaN();
+  float  goal_dist_m = std::numeric_limits<float>::quiet_NaN();
+  int    goal_trav_value = -2;
+
+  // Area covered, all inside the ROI except area_driven_m2. area_mapped_m2 is
+  // the fused map's x/y columns with any observed voxel, roi_area_m2 all of
+  // them. unknown_fraction is the value the coverage stop compares with
+  // done_unknown_fraction (-1 = cannot measure), done_streak its count of
+  // passes so far. area_traversable_m2 / area_obstacle_m2 are the planning
+  // map's known cells below / at its obstacle threshold (-1 = no map).
+  // area_driven_m2 is the 1 m cells the robot's centre has been in.
+  float  area_mapped_m2 = 0.0f;
+  float  roi_area_m2 = 0.0f;
+  float  unknown_fraction = -1.0f;
+  int    done_streak = 0;
+  float  area_traversable_m2 = -1.0f;
+  float  area_obstacle_m2 = -1.0f;
+  float  area_driven_m2 = 0.0f;
+
+  // The latest exploration PLAN's candidates and the rejections
+  // rejected_by_minpos / rejected_by_unreachable leave out, updated by a PLAN
+  // that rejects them all too. 0 in exploit.
+  int    n_candidates = 0;
+  int    rejected_too_close = 0;
+  int    rejected_map = 0;
+  int    rejected_clearance = 0;
+  int    rejected_blacklist = 0;
+
+  // Whether the things the planner depends on are alive. nav2_status is nav2's
+  // latest status for the current goal. nav2_publishers counts publishers on
+  // nav_status_action's status topic (0 = nav2 down or the wrong name, and
+  // then the nav2_* columns stay at their defaults; -1 = not watched).
+  // goal_subscribers counts subscribers on the goal topic. map_age_sec /
+  // plan_map_age_sec are the seconds since the last fused map / planning-map
+  // window arrived (-1 = none yet, or not accumulating).
+  std::string nav2_status;
+  int    nav2_publishers = -1;
+  int    goal_subscribers = 0;
+  float  map_age_sec = -1.0f;
+  float  plan_map_age_sec = -1.0f;
 };
 
 class MetricsLogger {

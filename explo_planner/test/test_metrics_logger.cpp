@@ -98,7 +98,7 @@ TEST(MetricsLogger, HeaderAndRowHaveSameColumnCount) {
   EXPECT_EQ(splitCsv(lines[0]).size(), splitCsv(lines[1]).size());
   // Pin the width too: a field added to StepMetrics but wired into NEITHER
   // writeHeader nor logStep is invisible to the comparison above.
-  EXPECT_EQ(splitCsv(lines[0]).size(), 33u)
+  EXPECT_EQ(splitCsv(lines[0]).size(), 65u)
       << "column count changed — update writeHeader, logStep, and the "
          "expected list in ColumnOrderMatchesHeaderNames together";
 }
@@ -145,6 +145,38 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
   m.nav2_recoveries         = 31;
   m.nav2_error_code         = 32;
   m.pick_fallback           = "revisit";
+  m.row_type                = "end";
+  m.run_end_reason          = "step-budget";
+  m.planner_state           = "DONE";
+  m.state_elapsed_sec       = 37;
+  m.robot_x                 = 38;
+  m.robot_y                 = 39;
+  m.robot_z                 = 40;
+  m.robot_yaw               = 41;
+  m.robot_in_roi            = 42;
+  m.goal_x                  = 43;
+  m.goal_y                  = 44;
+  m.goal_z                  = 45;
+  m.goal_yaw                = 46;
+  m.goal_dist_m             = 47;
+  m.goal_trav_value         = 48;
+  m.area_mapped_m2          = 49;
+  m.roi_area_m2             = 50;
+  m.unknown_fraction        = 51;
+  m.done_streak             = 52;
+  m.area_traversable_m2     = 53;
+  m.area_obstacle_m2        = 54;
+  m.area_driven_m2          = 55;
+  m.n_candidates            = 56;
+  m.rejected_too_close      = 57;
+  m.rejected_map            = 58;
+  m.rejected_clearance      = 59;
+  m.rejected_blacklist      = 60;
+  m.nav2_status             = "EXECUTING";
+  m.nav2_publishers         = 62;
+  m.goal_subscribers        = 63;
+  m.map_age_sec             = 64;
+  m.plan_map_age_sec        = 65;
 
   TempDir dir;
   auto csv = dir.file("m.csv");
@@ -189,10 +221,44 @@ TEST(MetricsLogger, ColumnOrderMatchesHeaderNames) {
       {"nav2_recoveries", 31},
       {"nav2_error_code", 32},
       {"pick_fallback", 0},  // string column
+      {"row_type", 0},  // string column
+      {"run_end_reason", 0},  // string column
+      {"planner_state", 0},  // string column
+      {"state_elapsed_sec", 37},
+      {"robot_x", 38},
+      {"robot_y", 39},
+      {"robot_z", 40},
+      {"robot_yaw", 41},
+      {"robot_in_roi", 42},
+      {"goal_x", 43},
+      {"goal_y", 44},
+      {"goal_z", 45},
+      {"goal_yaw", 46},
+      {"goal_dist_m", 47},
+      {"goal_trav_value", 48},
+      {"area_mapped_m2", 49},
+      {"roi_area_m2", 50},
+      {"unknown_fraction", 51},
+      {"done_streak", 52},
+      {"area_traversable_m2", 53},
+      {"area_obstacle_m2", 54},
+      {"area_driven_m2", 55},
+      {"n_candidates", 56},
+      {"rejected_too_close", 57},
+      {"rejected_map", 58},
+      {"rejected_clearance", 59},
+      {"rejected_blacklist", 60},
+      {"nav2_status", 0},  // string column
+      {"nav2_publishers", 62},
+      {"goal_subscribers", 63},
+      {"map_age_sec", 64},
+      {"plan_map_age_sec", 65},
   };
   const std::vector<std::pair<std::string, std::string>> text_columns = {
       {"phase", "exploit"}, {"goal_outcome", "nav2-aborted"},
-      {"pick_fallback", "revisit"}};
+      {"pick_fallback", "revisit"}, {"row_type", "end"},
+      {"run_end_reason", "step-budget"}, {"planner_state", "DONE"},
+      {"nav2_status", "EXECUTING"}};
 
   auto names  = splitCsv(lines[0]);
   auto values = splitCsv(lines[1]);
@@ -280,6 +346,14 @@ TEST(MetricsLogger, ExploreRowCarriesDocumentedDefaults) {
   EXPECT_EQ(valueOf(names, values, "nav2_recoveries"), "0");
   EXPECT_EQ(valueOf(names, values, "nav2_error_code"), "-1");
   EXPECT_EQ(valueOf(names, values, "pick_fallback"), "");
+  EXPECT_EQ(valueOf(names, values, "row_type"), "step");
+  EXPECT_EQ(valueOf(names, values, "run_end_reason"), "");
+  EXPECT_EQ(valueOf(names, values, "robot_in_roi"), "-1");
+  EXPECT_EQ(valueOf(names, values, "goal_trav_value"), "-2");
+  EXPECT_EQ(valueOf(names, values, "unknown_fraction"), "-1");
+  EXPECT_EQ(valueOf(names, values, "area_traversable_m2"), "-1");
+  EXPECT_EQ(valueOf(names, values, "nav2_publishers"), "-1");
+  EXPECT_EQ(valueOf(names, values, "plan_map_age_sec"), "-1");
 }
 
 // The header is written once, on the first row — not per row.

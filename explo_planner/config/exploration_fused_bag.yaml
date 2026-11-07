@@ -49,6 +49,10 @@
     # ~ and {stamp} as in shared_params.yaml. The replay scripts pass a path
     # under /scovox/bags/explo-output, which is the host's bags/explo-output.
     output_csv: "~/explo-output/explo_fused_bag_{stamp}.csv"
+    # Seconds between "status" rows in that CSV while no other row has been
+    # written: what the planner is doing between steps, so a run that goes
+    # quiet can be read without its logs. 0 = off.
+    metrics_status_period_sec: 10.0
     map_resolution: 0.10             # matches scovox resolution
 
     # Frames — pose is TF map->base_frame; goals published in map_frame.
